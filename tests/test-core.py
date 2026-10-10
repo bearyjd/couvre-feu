@@ -702,18 +702,53 @@ class CoreTests(unittest.TestCase):
                                    env=self.fixture.env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
+        expiry_process = None
         try:
-            process.stdin.write(json.dumps(desired))
+            payload = json.dumps(desired)
+            process.stdin.write(payload)
             process.stdin.flush()  # Intentionally keep a complete JSON document's stream open.
-            time.sleep(0.25)
-            expired = self.success(self.fixture.run("expire", timeout=6))
+            # Synchronize on the reader consuming this document, rather than
+            # guessing how long shell startup takes on a shared CI runner.
+            input_file = self.fixture.root / "tmp" / f"couvrefeu-input.{process.pid}" / "input"
+            deadline = time.monotonic() + 20
+            while not input_file.exists() or input_file.stat().st_size != len(payload.encode()):
+                self.assertIsNone(process.poll(), "open stdin sync exited before reader readiness")
+                self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
+                time.sleep(0.01)
+            self.assertFalse((self.fixture.root / "etc/couvrefeu/runtime/lock").exists(),
+                             "incomplete input must not acquire the mutation mutex")
+            desired_before = (self.fixture.root / "etc/couvrefeu/state").read_bytes()
+            expiry_log = self.fixture.root / "expiry-work.jsonl"
+            expiry_env = dict(self.fixture.env, CF_BACKEND_LOG=str(expiry_log))
+            expiry_process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "expire"],
+                                              env=expiry_env, text=True, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, start_new_session=True)
+            deadline = time.monotonic() + 20
+            while not expiry_log.exists() or expiry_log.stat().st_size == 0:
+                self.assertIsNone(process.poll(), "sync deadline elapsed before concurrent expiry began work")
+                self.assertTrue(input_file.exists(), "expiry waited for the blocked reader to finish")
+                self.assertIsNone(expiry_process.poll(), "expiry refused instead of beginning backend work")
+                self.assertLess(time.monotonic(), deadline, "expiry never began backend work")
+                time.sleep(0.01)
+            self.assertIsNone(process.poll(), "expiry work began only after sync terminated")
+            self.assertTrue(input_file.exists(), "expiry work must overlap the blocked stdin reader")
+            stdout, stderr = expiry_process.communicate(timeout=20)
+            expired = self.success(subprocess.CompletedProcess(expiry_process.args, expiry_process.returncode,
+                                                              stdout, stderr))
             self.assertEqual(expired["desiredRevision"], 1)
             self.assertEqual(expired["observed"]["paused"], [])
+            self.assertEqual((self.fixture.root / "etc/couvrefeu/state").read_bytes(), desired_before)
             process.wait(timeout=18)
             self.assertNotEqual(process.returncode, 0, "unterminated sync stream was accepted")
             status = self.success(self.fixture.run("status", "--json"))
             self.assertEqual(status["desiredRevision"], 1)
         finally:
+            if expiry_process is not None:
+                if expiry_process.poll() is None:
+                    os.killpg(expiry_process.pid, signal.SIGKILL)
+                    expiry_process.wait(timeout=5)
+                expiry_process.stdout.close()
+                expiry_process.stderr.close()
             process.stdin.close()
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
