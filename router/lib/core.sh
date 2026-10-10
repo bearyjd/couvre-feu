@@ -1,0 +1,442 @@
+# shellcheck disable=SC2034,SC2015
+# Cross-module globals; A && B || fail intentionally rejects either failure.
+# Couvre-feu durable policy and safe command boundary.
+CF_DIR=$CF_BASE/etc/couvrefeu
+CF_STATE=$CF_DIR/state
+CF_PROTECTED=$CF_DIR/protected
+CF_RUNTIME=$CF_DIR/runtime
+CF_ERROR=
+CF_LOCKED=0
+CF_NOW_VALUE=
+CF_EXPIRY_NOW=
+CF_OWNER=$(id -u)
+
+cf_fail() { CF_ERROR=$1; return 1; }
+cf_backend_available() {
+    cf_backend_name=$1
+    if [ "$CF_LOCAL_TEST" = 1 ];then
+        cf_executable=$CF_BACKEND_DIR/$cf_backend_name
+        [ -f "$cf_executable" ] && [ ! -L "$cf_executable" ] && [ -x "$cf_executable" ]
+        return $?
+    fi
+    case $cf_backend_name in
+        iptables|ip6tables|ipset|conntrack)cf_backend_paths="/usr/sbin/$cf_backend_name /sbin/$cf_backend_name";;
+        uci|fw3)cf_backend_paths="/sbin/$cf_backend_name /usr/sbin/$cf_backend_name";;
+        ip)cf_backend_paths='/sbin/ip /usr/sbin/ip /bin/ip';;
+        *)return 1;;
+    esac
+    for cf_backend_path in $cf_backend_paths;do
+        if [ -x "$cf_backend_path" ];then cf_executable=$cf_backend_path;return 0;fi
+    done
+    return 1
+}
+cf_backend() {
+    cf_cmd=$1; shift
+    cf_backend_available "$cf_cmd" || { cf_fail missing_backend;return 127; }
+    "$cf_executable" "$@"
+}
+cf_safe_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    cf_meta=$(stat -c '%u:%a' "$1" 2>/dev/null) || return 1
+    [ "$cf_meta" = "$CF_OWNER:600" ]
+}
+cf_private_dir() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    [ "$(stat -c '%u:%a' "$1" 2>/dev/null)" = "$CF_OWNER:700" ]
+}
+cf_mac_valid() {
+    printf '%s\n' "$1" | awk '
+    length($0)!=17 {exit 1}
+    {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00")exit 1}'
+}
+cf_id_valid() { case $1 in ''|*[!a-z0-9_]*|[!a-z]*) return 1;; esac; [ "${#1}" -le 32 ]; }
+cf_number_valid() {
+    printf '%s\n' "$1" | awk '$0!~/^(0|[1-9][0-9]*)$/ || length($0)>10 || $0+0>2147483647 {exit 1}'
+}
+cf_clock() {
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_NOW-}" ]; then CF_NOW_VALUE=$CF_NOW; else CF_NOW_VALUE=$(date +%s) || return 1; fi
+    cf_number_valid "$CF_NOW_VALUE" || { cf_fail invalid_clock; return 1; }
+    # Reject clocks before 2020: silently applying schedules on an unsynced clock is unsafe.
+    [ "$CF_NOW_VALUE" -ge 1577836800 ] || { cf_fail invalid_clock; return 1; }
+    CF_EXPIRY_NOW=$CF_NOW_VALUE
+    if [ -e "$CF_RUNTIME/expiry" ] || [ -L "$CF_RUNTIME/expiry" ];then
+        cf_safe_file "$CF_RUNTIME/expiry" || { cf_fail unsafe_expiry_record;return 1; }
+        cf_highwater=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/expiry") || { cf_fail unsafe_expiry_record;return 1; }
+        cf_number_valid "$cf_highwater" || { cf_fail unsafe_expiry_record;return 1; }
+        [ "$cf_highwater" -le "$CF_EXPIRY_NOW" ] || CF_EXPIRY_NOW=$cf_highwater
+    fi
+}
+cf_protected_valid() {
+    cf_safe_file "$CF_PROTECTED" && [ -s "$CF_PROTECTED" ] || { cf_fail unsafe_protected_file; return 1; }
+    awk 'length($0)!=17 {exit 1} {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00" || seen[$0]++)exit 1}' "$CF_PROTECTED" || { cf_fail invalid_protected_mac; return 1; }
+}
+cf_canonical() { sort | awk -F '\t' '$1=="V"{v=$0;next}$1=="R"{r=$0;next}{a[++n]=$0}END{print v;print r;for(i=1;i<=n;i++)print a[i]}'; }
+cf_state_json() {
+    awk -F '\t' '
+    function bad(){exit 2}
+    BEGIN{people="";pauses="";sched="";d4="";d6=""}
+    $1=="V"{if(NF!=2||v++)bad();version=$2;next}
+    $1=="R"{if(NF!=2||r++)bad();revision=$2;next}
+    $1=="P"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[-0-9a-f:]+$/)bad();person[$2]=1;if($3!="-"){mac[$2]=mac[$2] (mac[$2]==""?"":",") "\"" $3 "\""}next}
+    $1=="A"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[0-9]+$/)bad();pauses=pauses (pauses==""?"":",") "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
+    $1=="S"{if(NF!=6||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[a-z][a-z0-9_]*$/||$4!~/^[A-Za-z,]+$/||$5!~/^[0-9:]+$/||$6!~/^[0-9:]+$/)bad();n=split($4,a,",");days="";for(i=1;i<=n;i++)days=days (i==1?"":",") "\"" a[i] "\"";sched=sched (sched==""?"":",") "{\"person\":\"" $2 "\",\"id\":\"" $3 "\",\"weekdays\":[" days "],\"start\":\"" $5 "\",\"stop\":\"" $6 "\"}";next}
+    $1=="D4"{if(NF!=2||$2!~/^[0-9.]+$/)bad();d4=d4 (d4==""?"":",") "\"" $2 "\"";next}
+    $1=="D6"{if(NF!=2||$2!~/^[0-9a-f:]+$/)bad();d6=d6 (d6==""?"":",") "\"" $2 "\"";next}
+    {bad()}
+    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person)people=people (people==""?"":",") "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}";print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "],\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
+}
+cf_state_load() {
+    cf_safe_file "$CF_STATE" || { cf_fail unsafe_state_file; return 1; }
+    [ "$(wc -c < "$CF_STATE")" -le 65536 ] || { cf_fail state_too_large; return 1; }
+    cf_raw=$(cf_state_json "$CF_STATE") || { cf_fail invalid_state; return 1; }
+    CF_POLICY=$(printf '%s\n' "$cf_raw" | awk -f "$CF_LIB/json.awk" | cf_canonical) || { cf_fail invalid_state; return 1; }
+    # Pipelines cannot carry awk failures in POSIX sh: compare canonical exact records too.
+    [ -n "$CF_POLICY" ] && [ "$CF_POLICY" = "$(cf_canonical < "$CF_STATE")" ] || { cf_fail invalid_state; return 1; }
+    CF_REVISION=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="R"{print $2}')
+    CF_DIGEST=$(printf '%s\n' "$CF_POLICY" | sha256sum | awk '{print $1}')
+}
+cf_policy_safe() {
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' 'NR==FNR{protected[$1]=1;next}$1=="P"&&protected[$3]{exit 1}' "$CF_PROTECTED" - || { cf_fail protected_mac_overlap; return 1; }
+}
+cf_runtime_prepare() {
+    if [ ! -e "$CF_RUNTIME" ]; then mkdir -m 700 "$CF_RUNTIME" || { cf_fail runtime_create_failed; return 1; }; fi
+    cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime; return 1; }
+}
+cf_install_gate() {
+    CF_INSTALL_AUTH=0
+    if [ "$CF_LOCAL_TEST" = 1 ];then
+        cf_install_lock=$CF_BASE/.couvrefeu-install.lock
+        cf_recovery_base=$CF_BASE
+    else
+        cf_install_lock=/tmp/couvrefeu-install.lock
+        cf_recovery_base=/etc
+    fi
+    if [ -e "$cf_install_lock" ] || [ -L "$cf_install_lock" ];then
+        case $1 in apply-fw|remove-fw) ;;*)cf_fail installation_in_progress;return 1;;esac
+        cf_private_dir "$cf_install_lock" && cf_safe_file "$cf_install_lock/pid" && cf_safe_file "$cf_install_lock/token" || { cf_fail unsafe_install_lock;return 1; }
+        cf_install_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$cf_install_lock/pid") || return 1
+        case $cf_install_pid in ''|*[!0-9]*)cf_fail unsafe_install_lock;return 1;;esac
+        [ "$cf_install_pid" -gt 1 ] && kill -0 "$cf_install_pid" 2>/dev/null || { cf_fail stale_install_lock;return 1; }
+        cf_install_token=$(awk 'NR==1{print}NR>1{exit 2}' "$cf_install_lock/token") || return 1
+        case $cf_install_token in ''|*[!0-9a-f]*)cf_fail unsafe_install_lock;return 1;;esac
+        [ "${#cf_install_token}" = 64 ] && [ "${CF_INSTALL_TOKEN-}" = "$cf_install_token" ] || { cf_fail installation_in_progress;return 1; }
+        CF_INSTALL_AUTH=1
+    fi
+    # Durable recovery phases survive a failed uninstall, a released lock, or reboot.
+    for cf_recovery_marker in "$CF_DIR/backup/kernel-cleaned" "$CF_DIR/backup/kernel-cleaned.next" "$CF_DIR/backup/restoring" "$CF_DIR/backup/restoring.next" "$CF_DIR/backup/no-kernel-mutations" "$CF_DIR/backup/no-kernel-mutations.next" "$cf_recovery_base/.couvrefeu-recovery" "$cf_recovery_base/.couvrefeu-recovery.done";do
+        if [ -e "$cf_recovery_marker" ] || [ -L "$cf_recovery_marker" ];then
+            [ "$1" = remove-fw ] && [ "$CF_INSTALL_AUTH" = 1 ] || { cf_fail uninstall_recovery_in_progress;return 1; }
+        fi
+    done
+    if [ -e "$CF_RUNTIME/firewall.cleanup" ] || [ -L "$CF_RUNTIME/firewall.cleanup" ];then
+        [ "$1" = remove-fw ] || { cf_fail firewall_cleanup_in_progress;return 1; }
+    fi
+}
+
+cf_control_dirs() {
+    for cf_dir in "$CF_BASE/etc" "$CF_DIR";do
+        [ -d "$cf_dir" ] && [ ! -L "$cf_dir" ] || { cf_fail unsafe_control_directory;return 1; }
+        cf_dir_meta=$(stat -c '%u:%a' "$cf_dir") || return 1
+        case $cf_dir_meta in "$CF_OWNER:700"|"$CF_OWNER:755"|"$CF_OWNER:750") ;;*)cf_fail unsafe_control_directory;return 1;;esac
+    done
+}
+cf_lock() {
+    cf_runtime_prepare || return 1
+    if ! mkdir -m 700 "$CF_RUNTIME/lock" 2>/dev/null; then
+        cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" || { cf_fail unsafe_lock; return 1; }
+        cf_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/lock/pid") || { cf_fail unsafe_lock; return 1; }
+        case $cf_pid in ''|*[!0-9]*) cf_fail unsafe_lock; return 1;; esac
+        [ "$cf_pid" -gt 1 ] || { cf_fail unsafe_lock; return 1; }
+        if kill -0 "$cf_pid" 2>/dev/null || [ -e "/proc/$cf_pid" ]; then cf_fail locked; return 1; fi
+        # Demonstrably dead PID. Remove only the two known records, never a tree.
+        [ ! -e "$CF_RUNTIME/lock/reload" ] || cf_safe_file "$CF_RUNTIME/lock/reload" || { cf_fail unsafe_lock; return 1; }
+        rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" || return 1
+        rmdir "$CF_RUNTIME/lock" || { cf_fail unsafe_lock; return 1; }
+        mkdir -m 700 "$CF_RUNTIME/lock" || { cf_fail locked; return 1; }
+    fi
+    printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
+    CF_LOCKED=1
+    trap 'cf_unlock; exit 129' HUP
+    trap 'cf_unlock; exit 130' INT
+    trap 'cf_unlock; exit 143' TERM
+    trap 'cf_unlock' 0
+}
+cf_unlock() {
+    if [ "$CF_LOCKED" = 1 ]; then
+        if [ "$(awk 'NR==1{print}' "$CF_RUNTIME/lock/pid" 2>/dev/null)" = "$$" ]; then
+            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload"
+            rmdir "$CF_RUNTIME/lock" 2>/dev/null || :
+        fi
+        CF_LOCKED=0
+    fi
+}
+cf_reentrant_include() {
+    [ -n "${CF_RELOAD_TOKEN-}" ] || return 1
+    cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" && cf_safe_file "$CF_RUNTIME/lock/reload" || return 1
+    [ "$(awk 'NR==1{print}' "$CF_RUNTIME/lock/reload")" = "$CF_RELOAD_TOKEN" ] || return 1
+    cf_pid=$(awk 'NR==1{print}' "$CF_RUNTIME/lock/pid")
+    case $cf_pid in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$cf_pid" 2>/dev/null || return 1
+    printf '%s\n' '{"ok":false,"deferred":true,"errors":["outer_reload_in_progress"]}'
+}
+cf_addresses() {
+    # Only current, unique attribution can authorize address-based rules/eviction.
+    cf_network || return 1
+    cf_neigh4=$(cf_backend ip -4 neigh show dev br-lan) || return 1
+    cf_neigh6=$(cf_backend ip -6 neigh show dev br-lan) || return 1
+    # The fixed collectors already select br-lan: ip legitimately omits dev.
+    cf_neigh=$(printf '%s\n%s\n' "$cf_neigh4" "$cf_neigh6" | awk '
+    NF{
+        dev="";mac="";state="";nd=nm=ns=0
+        for(i=2;i<=NF;i++){
+            if($i=="dev"){if(++nd>1||i==NF||$(i+1)!="br-lan")exit 2;dev=$(++i)}
+            else if($i=="lladdr"){if(++nm>1||i==NF)exit 2;mac=tolower($(++i))}
+            else if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE)$/){if(++ns>1)exit 2;state=$i}
+            else if($i!~/^(router|proxy|extern_learn|extern_valid|managed|use)$/)exit 2
+        }
+        if(state=="FAILED"||state=="INCOMPLETE"||state=="NONE"||state=="NOARP")next
+        if(nm!=1||ns!=1)exit 2
+        print "N\t" $1 "\t" mac "\t" state
+    }') || { cf_fail unsafe_neighbor_output;return 1; }
+    cf_leases=
+    if [ -e "$CF_BASE/tmp/dhcp.leases" ];then
+        [ -f "$CF_BASE/tmp/dhcp.leases" ] && [ ! -L "$CF_BASE/tmp/dhcp.leases" ] || return 1
+        cf_leases=$(awk 'NF>=3{print "L\t" $3 "\t" tolower($2) "\t" $1}' "$CF_BASE/tmp/dhcp.leases") || return 1
+    fi
+    cf_address_kids=$(cf_kids)
+    cf_address_protected=$(awk '{print}' "$CF_PROTECTED")
+    cf_address_result=$(printf '%s\n%s\n' "$cf_neigh" "$cf_leases" | awk -F '\t' -v now="$CF_NOW_VALUE" -v kids="$cf_address_kids" -v protected="$cf_address_protected" -v lan="$CF_LAN_IP" -v lan6="$CF_ROUTER6" '
+    function ip4(s,a,n,i){n=split(s,a,".");if(n!=4)return 0;for(i=1;i<=4;i++)if(a[i]!~/^(0|[1-9][0-9]*)$/||length(a[i])>3||a[i]+0>255)return 0;return 1}
+    function ip6(s,a,n,i,t,k){if(s!~/^[0-9a-f:]+$/||length(s)>39||index(s,":::")||!index(s,":"))return 0;k=index(s,"::");if(k&&index(substr(s,k+2),"::"))return 0;if((substr(s,1,1)==":"&&substr(s,1,2)!="::")||(substr(s,length(s),1)==":"&&substr(s,length(s)-1,2)!="::"))return 0;n=split(s,a,":");for(i=1;i<=n;i++)if(a[i]!=""){if(length(a[i])>4)return 0;t++}return k?t<8:t==8}
+    function canon6(s,a,b,n,i,k,t,m,beg,out,j){k=index(s,"::");if(k){t=substr(s,1,k-1);n=split(t,a,":");if(t=="")n=0;t=substr(s,k+2);m=split(t,b,":");if(t=="")m=0;for(i=1;i<=m;i++)a[8-m+i]=b[i];for(i=n+1;i<=8-m;i++)a[i]="0"}else split(s,a,":");for(i=1;i<=8;i++){sub(/^0+/,"",a[i]);if(a[i]=="")a[i]="0"}m=0;for(i=1;i<=8;i++)if(a[i]=="0"){j=i;while(j<=8&&a[j]=="0")j++;if(j-i>m){m=j-i;beg=i}i=j-1}if(m<2)beg=0;out="";for(i=1;i<=8;i++){if(i==beg){out=out "::";i+=m-1;continue}if(out!=""&&substr(out,length(out),1)!=":")out=out ":";out=out a[i]}return out}
+    function mac(s,a,n,i){if(length(s)!=17)return 0;n=split(s,a,":");if(n!=6)return 0;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)return 0;return index("02468ace",substr(a[1],2,1))&&s!="00:00:00:00:00:00"}
+    BEGIN{n=split(kids,a,"\n");for(i=1;i<=n;i++)kid[a[i]]=1;n=split(protected,a,"\n");for(i=1;i<=n;i++)adult[a[i]]=1;n=split(lan6,a,"\n");router[lan]=1;for(i=1;i<=n;i++)if(ip6(a[i]))router[canon6(a[i])]=1}
+    $1=="N"&&(NF!=4||!mac($3)){exit 2}
+    NF==4&&mac($3){
+        ip=tolower($2);if(ip6(ip))ip=canon6(ip);else if(!ip4(ip)){if($1=="N")exit 2;next}
+        if($1=="L"){
+            if($4!~/^(0|[1-9][0-9]*)$/||length($4)>10||$4+0>2147483647||($4!=0&&$4<=now))next
+            fresh[ip SUBSEP $3]=1
+        }else if($1=="N"){
+            if($4!~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE)$/)next
+            if($4~/^(REACHABLE|PERMANENT)$/)fresh[ip SUBSEP $3]=1
+        }else next
+        if(!owner[ip SUBSEP $3]++){count[ip]++;chosen[ip]=$3}
+        if(adult[$3])protectedip[ip]=$3
+        if(kid[$3])relevant[ip]=1
+    }
+    END{
+        for(ip in count){
+            if(protectedip[ip])print "PROTECTED\t" ip "\t" protectedip[ip]
+            if(count[ip]==1&&!router[ip]&&fresh[ip SUBSEP chosen[ip]])print ip "\t" chosen[ip]
+            if(relevant[ip]&&(count[ip]!=1||router[ip]||protectedip[ip]||!fresh[ip SUBSEP chosen[ip]])){
+                for(key in owner){split(key,b,SUBSEP);if(b[1]==ip&&kid[b[2]])print "UNCERTAIN\t" ip "\t" b[2]}
+            }
+        }
+    }') || { cf_fail unsafe_address_attribution;return 1; }
+    printf '%s\n' "$cf_address_result" | sort -u
+}
+cf_address_refresh() {
+    CF_ADDRESS_OK=false
+    CF_ADDRESS_DATA=$(cf_addresses) || return 1
+    cf_address_required=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" '$1=="P"&&$3!="-"{m[$2]=m[$2] " " $3}$1=="S"||$1=="A"&&($3==0||$3>now){p[$2]=1}END{for(id in p){n=split(m[id],a," ");for(i=1;i<=n;i++)if(a[i]!="")print a[i]}}' | sort -u)
+    if printf '%s\n' "$CF_ADDRESS_DATA" | awk -F '\t' -v required="$cf_address_required" 'BEGIN{n=split(required,a,"\n");for(i=1;i<=n;i++)if(a[i]!="")need[a[i]]=1}NF==2{have[$2]=1}$1=="UNCERTAIN"&&($3 in need){bad=1}END{for(m in need)if(!have[m])bad=1;exit bad}';then CF_ADDRESS_OK=true;fi
+}
+cf_ssh_guard() {
+    [ -n "${SSH_CONNECTION-}${SSH_CLIENT-}" ] || return 0
+    cf_ip=$(printf '%s\n' "${SSH_CONNECTION:-${SSH_CLIENT-}}" | awk 'NF==4||NF==3{print $1}')
+    [ -n "$cf_ip" ] || { cf_fail unknown_ssh_client; return 1; }
+    cf_pairs=$(cf_addresses) || { cf_fail unknown_ssh_client; return 1; }
+    cf_macs=$(printf '%s\n' "$cf_pairs" | awk -F '\t' -v ip="$cf_ip" '$1==ip{print $2}' | sort -u)
+    [ "$(printf '%s\n' "$cf_macs" | awk 'NF{n++}END{print n+0}')" = 1 ] || { cf_fail ambiguous_ssh_client; return 1; }
+    cf_mac_valid "$cf_macs" || { cf_fail unknown_ssh_client; return 1; }
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v mac="$cf_macs" '$1=="P"&&$3==mac{exit 1}' || { cf_fail ssh_client_overlap; return 1; }
+    if ! awk -v mac="$cf_macs" '$0==mac{yes=1}END{exit !yes}' "$CF_PROTECTED"; then
+        cf_temp=$CF_RUNTIME/.protected.$$
+        [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || { cf_fail unsafe_temporary; return 1; }
+        { awk '{print}' "$CF_PROTECTED"; printf '%s\n' "$cf_macs"; } > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_PROTECTED" || { cf_fail protected_update_failed; return 1; }
+    fi
+}
+cf_write_policy() {
+    cf_temp=$CF_RUNTIME/.candidate.$$
+    [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || { cf_fail unsafe_temporary; return 1; }
+    printf '%s\n' "$CF_POLICY" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_STATE" || { cf_fail state_write_failed; return 1; }
+    CF_DIGEST=$(printf '%s\n' "$CF_POLICY" | sha256sum | awk '{print $1}')
+}
+cf_person_exists() { printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$1" '$1=="P"&&$2==p{yes=1}END{exit !yes}'; }
+cf_pause_edit() {
+    cf_person=$1; cf_until=$2
+    cf_id_valid "$cf_person" && cf_person_exists "$cf_person" || { cf_fail unknown_person; return 1; }
+    cf_number_valid "$cf_until" || { cf_fail invalid_until; return 1; }
+    [ "$cf_until" = 0 ] || [ "$cf_until" -gt "$CF_EXPIRY_NOW" ] || { cf_fail expired_until; return 1; }
+    [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
+    CF_REVISION=$((CF_REVISION + 1))
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&$2==p{next}{print}END{print "A",p,u}' | cf_canonical)
+}
+cf_resume_edit() {
+    cf_person=$1
+    cf_id_valid "$cf_person" && cf_person_exists "$cf_person" || { cf_fail unknown_person; return 1; }
+    [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
+    CF_REVISION=$((CF_REVISION + 1))
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&$2==p{next}{print}' | cf_canonical)
+}
+cf_timeout_available() {
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_TIMEOUT-}" = 'busybox timeout' ];then
+        CF_TIMEOUT=$(command -v busybox) || { cf_fail missing_input_deadline_dependency;return 1; }
+        CF_TIMEOUT_BUSYBOX=1
+        return 0
+    fi
+    CF_TIMEOUT_BUSYBOX=0
+    for cf_timeout_path in /usr/bin/timeout /bin/timeout;do
+        if [ -x "$cf_timeout_path" ];then CF_TIMEOUT=$cf_timeout_path;return 0;fi
+    done
+    cf_fail missing_input_deadline_dependency
+    return 1
+}
+cf_input_deadline() {
+    if [ "$CF_TIMEOUT_BUSYBOX" = 1 ];then "$CF_TIMEOUT" timeout "$@";else "$CF_TIMEOUT" "$@";fi
+}
+
+cf_input_cleanup() {
+    if [ -n "${CF_INPUT_DIR-}" ];then
+        rm -f "$CF_INPUT_DIR/input"
+        rmdir "$CF_INPUT_DIR" 2>/dev/null || :
+        CF_INPUT_DIR=
+    fi
+}
+cf_sync_stage() {
+    cf_timeout_available || return 1
+    cf_input_parent=$CF_BASE/tmp
+    [ -d "$cf_input_parent" ] && [ ! -L "$cf_input_parent" ] && [ "$(CDPATH='' cd -- "$cf_input_parent" && pwd -P)" = "$cf_input_parent" ] || { cf_fail unsafe_input_directory;return 1; }
+    CF_INPUT_DIR=$cf_input_parent/couvrefeu-input.$$
+    mkdir -m 700 "$CF_INPUT_DIR" || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
+    trap 'cf_input_cleanup; cf_unlock' 0
+    trap 'cf_input_cleanup; cf_unlock;exit 129' HUP
+    trap 'cf_input_cleanup; cf_unlock;exit 130' INT
+    trap 'cf_input_cleanup; cf_unlock;exit 143' TERM
+    # Deadline and byte bound apply before acquiring the policy mutation lock.
+    cf_input_deadline 10 dd bs=1 count=65537 of="$CF_INPUT_DIR/input" 2>/dev/null || { cf_input_cleanup;cf_fail input_deadline_or_read_failure;return 1; }
+    cf_input_size=$(wc -c < "$CF_INPUT_DIR/input")
+    if [ "$cf_input_size" -gt 65536 ];then cf_input_cleanup;cf_fail policy_too_large;return 1;fi
+    cf_ascii_size=$(tr -cd '\11\12\15\40-\176' < "$CF_INPUT_DIR/input" | wc -c)
+    [ "$cf_ascii_size" = "$cf_input_size" ] || { cf_input_cleanup;cf_fail invalid_policy_bytes;return 1; }
+    cf_parsed=$(awk -f "$CF_LIB/json.awk" "$CF_INPUT_DIR/input")
+    cf_rc=$?
+    cf_input_cleanup
+    [ "$cf_rc" = 0 ] || { cf_fail invalid_policy;return 1; }
+    CF_STAGED_POLICY=$(printf '%s\n' "$cf_parsed" | cf_canonical)
+}
+cf_sync_read() {
+    cf_new=$CF_STAGED_POLICY
+    cf_new_rev=$(printf '%s\n' "$cf_new" | awk -F '\t' '$1=="R"{print $2}')
+    [ "$cf_new_rev" -ge "$CF_REVISION" ] || { cf_fail stale_revision;return 1; }
+    if [ "$cf_new_rev" = "$CF_REVISION" ] && [ "$cf_new" != "$CF_POLICY" ];then cf_fail conflicting_revision;return 1;fi
+    CF_POLICY=$cf_new;CF_REVISION=$cf_new_rev
+}
+cf_check() {
+    cf_missing=
+    cf_timeout_available || cf_missing=timeout
+    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mv rm rmdir wc cmp cp tr id dirname env; do
+        command -v "$cf_dep" >/dev/null 2>&1 || cf_missing="$cf_missing $cf_dep"
+    done
+    for cf_dep in iptables ip6tables ipset uci conntrack ip fw3; do
+        cf_backend_available "$cf_dep" || cf_missing="$cf_missing $cf_dep"
+    done
+    if [ -n "$cf_missing" ]; then printf '%s\n' '{"ok":false,"errors":["missing_dependencies"]}'; return 1; fi
+    # This checks the shipped parser, not an unverified desktop substitute.
+    cf_probe=$(printf '%s\n' '{"version":1,"revision":0,"people":[],"pauses":[],"schedules":[]}' | awk -f "$CF_LIB/json.awk") || return 1
+    [ "$cf_probe" = "$(printf 'V\t1\nR\t0')" ] || return 1
+    printf '%s\n' '{"ok":true,"capabilities":{"parser":"strict-posix-awk","routerCompatibilityVerified":false},"errors":[]}'
+}
+cf_error_record() {
+    [ "$CF_LOCKED" = 1 ] || return 0
+    cf_temp=$CF_RUNTIME/.error.$$
+    [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
+    printf '%s\n' "${CF_ERROR:-apply_failed}" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/error"
+}
+cf_status() {
+    if [ -d "$CF_RUNTIME/lock" ] && [ "$CF_LOCKED" != 1 ];then
+        cf_state_load || :
+        CF_ERROR=${CF_ERROR:-operation_in_progress}
+        cf_busy_result
+        return 1
+    fi
+    cf_status_error=$CF_ERROR
+    cf_ok=true; cf_drift=false; cf_confirmed=null
+    CF_REVISION=0; CF_POLICY=; CF_DIGEST=
+    cf_control_dirs || cf_ok=false
+    cf_state_load || cf_ok=false
+    cf_clock || cf_ok=false
+    cf_protected_valid || cf_ok=false
+    [ "$cf_ok" = false ] || cf_policy_safe || cf_ok=false
+    cf_kids_json='[]';cf_paused_json='[]'
+    if [ "$cf_ok" = true ]; then
+        cf_address_refresh || cf_ok=false
+        CF_EXPECTED=$(cf_plan) || cf_ok=false
+        cf_observed_kids=$(cf_set_members cf_kids) || { cf_ok=false;cf_fail observed_set_read_failed; }
+        cf_observed_paused=$(cf_set_members cf_paused) || { cf_ok=false;cf_fail observed_set_read_failed; }
+        cf_kids_json=$(printf '%s\n' "$cf_observed_kids" | cf_json_strings)
+        cf_paused_json=$(printf '%s\n' "$cf_observed_paused" | cf_json_strings)
+        cf_verify || { cf_ok=false;cf_drift=true;[ -n "$CF_ERROR" ] || cf_fail observed_verification_failed; }
+    else cf_drift=true; fi
+    if cf_safe_file "$CF_RUNTIME/confirmed"; then
+        cf_confirmed=$(awk 'NR==1&&$1~/^[0-9]+$/{print $1}' "$CF_RUNTIME/confirmed")
+        [ -n "$cf_confirmed" ] || cf_confirmed=null
+        cf_old_digest=$(awk 'NR==1{print $2}' "$CF_RUNTIME/confirmed")
+        cf_old_effective=$(awk 'NR==1{print $3}' "$CF_RUNTIME/confirmed")
+        [ "$cf_old_digest" = "$CF_DIGEST" ] && [ "$cf_old_effective" = "$(cf_effective_digest)" ] || { cf_ok=false;cf_drift=true; }
+    else cf_ok=false; cf_drift=true; fi
+    if [ -e "$CF_RUNTIME/firewall.intent" ] || [ -L "$CF_RUNTIME/firewall.intent" ];then cf_ok=false;cf_drift=true;[ -n "$CF_ERROR" ] || CF_ERROR=apply_incomplete;fi
+    if [ -e "$CF_RUNTIME/error" ]; then
+        cf_safe_file "$CF_RUNTIME/error" || CF_ERROR=unsafe_error_record
+        cf_ok=false
+        [ -n "$CF_ERROR" ] || CF_ERROR=previous_apply_failed
+    fi
+    if [ -d "$CF_RUNTIME/lock" ] && [ "$CF_LOCKED" != 1 ]; then cf_ok=false;cf_drift=true;[ -n "$CF_ERROR" ] || CF_ERROR=operation_in_progress; fi
+    [ -z "$cf_status_error" ] || { CF_ERROR=$cf_status_error;cf_ok=false; }
+    cf_desired=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' 'BEGIN{printf "["}$1=="A"{printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
+    cf_effective=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" 'BEGIN{printf "["}$1=="A"&&($3==0||$3>now){printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
+    cf_errors='[]'
+    if [ -n "$CF_ERROR" ]; then cf_errors=$(printf '%s\n' "$CF_ERROR" | cf_json_strings); fi
+    printf '{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,"nativeKernelConfirmed":%s,"addressCoverageComplete":%s,"routerCompatibilityVerified":false},"errors":%s}\n' "$cf_ok" "$CF_REVISION" "$cf_confirmed" "$cf_desired" "$cf_effective" "$cf_kids_json" "$cf_paused_json" "$cf_drift" "${CF_IPV6_OK:-false}" "${CF_CONNTRACK_OK:-false}" "${CF_NATIVE_OK:-false}" "${CF_ADDRESS_OK:-false}" "$cf_errors"
+    [ "$cf_ok" = true ]
+}
+cf_json_strings() { awk 'BEGIN{printf "["}NF{gsub(/\\/,"\\\\");gsub(/"/,"\\\"");gsub(/[[:cntrl:]]/,"?");printf "%s\"%s\"",sep,$0;sep=","}END{print "]"}'; }
+cf_busy_result() {
+    printf '{"ok":false,"desiredRevision":%s,"confirmedRevision":null,"desiredPauses":[],"effectivePauses":[],"observed":{"kids":[],"paused":[]},"drift":true,"capabilities":{"ipv6":false,"conntrack":false,"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":["%s"]}\n' "${CF_REVISION:-0}" "${CF_ERROR:-locked}"
+}
+cf_main() {
+    cf_action=${1-}
+    case $cf_action in
+        check) [ "$#" = 1 ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_check;return $?;;
+        status) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_status;return 0;;
+        pause) if [ "$#" = 2 ]; then cf_until=0;elif [ "$#" = 4 ] && [ "$3" = --until ];then cf_until=$4;else cf_action=invalid;fi;;
+        resume) [ "$#" = 2 ] || cf_action=invalid;;
+        expire|apply-fw|sync|remove-fw) [ "$#" = 1 ] || cf_action=invalid;;
+        *)cf_action=invalid;;
+    esac
+    if [ "$cf_action" = invalid ]; then printf '%s\n' '{"ok":false,"errors":["invalid_command"]}';return 2;fi
+    if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
+    if [ "$cf_action" = apply-fw ] && cf_reentrant_include; then return 0;fi
+    if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock || ! cf_policy_safe; then cf_status;return 1;fi
+    if [ "$cf_action" = sync ] && ! cf_sync_stage;then cf_status;return 1;fi
+    if ! cf_lock;then cf_busy_result;return 1;fi
+    if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
+    # A different operation may have committed between the first read and mkdir.
+    if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock || ! cf_policy_safe;then cf_status;return 1;fi
+    case $cf_action in
+        sync) cf_sync_read || { cf_status;return 1; };;
+        pause) cf_pause_edit "$2" "$cf_until" || { cf_status;return 1; };;
+        resume) cf_resume_edit "$2" || { cf_status;return 1; };;
+    esac
+    if ! cf_policy_safe || ! cf_ssh_guard; then cf_status;return 1;fi
+    if [ "$cf_action" = remove-fw ];then
+        cf_remove_fw || { cf_error_record;cf_status;return 1; }
+        printf '{"ok":true,"removed":true,"zeroOwnedMutations":%s,"errors":[]}\n' "${CF_ZERO_OWNED:-false}";return 0
+    fi
+    # Validate capabilities and foreign-object ownership BEFORE accepting a new revision.
+    if ! cf_preflight; then cf_status;return 1;fi
+    case $cf_action in sync|pause|resume) cf_write_policy || { cf_error_record;cf_status;return 1; };;esac
+    if ! cf_apply;then cf_error_record;cf_status;return 1;fi
+    cf_status
+}

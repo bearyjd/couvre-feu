@@ -1,0 +1,3 @@
+#!/bin/sh
+# fw3 reload calls the controller; no unrelated firewall edits.
+exec /usr/sbin/cfctl apply-fw
