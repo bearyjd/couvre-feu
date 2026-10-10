@@ -1,0 +1,43 @@
+#!/bin/sh
+# shellcheck disable=SC1091,SC2034
+# Dynamic installed helpers share variables with this entry point.
+# Couvre-feu router entry point. POSIX ash; never run live from a test root.
+set -f
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+umask 077
+CF_LOCAL_TEST=0
+if [ "${CF_TEST_MODE-}" = 1 ]; then
+    case ${CF_ROOT-} in /tmp/couvre-feu-*) ;; *) printf '%s\n' '{"ok":false,"errors":["unsafe_test_root"]}'; exit 2;; esac
+    case ${CF_BACKEND_DIR-} in "$CF_ROOT"/*) ;; *) printf '%s\n' '{"ok":false,"errors":["unsafe_test_backend"]}'; exit 2;; esac
+    if [ ! -d "$CF_ROOT" ] || [ -L "$CF_ROOT" ] || [ ! -d "$CF_BACKEND_DIR" ] || [ -L "$CF_BACKEND_DIR" ] || [ ! -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] || [ -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ]; then
+        printf '%s\n' '{"ok":false,"errors":["unsafe_test_backend"]}'; exit 2
+    fi
+    if [ "$(CDPATH='' cd -- "$CF_ROOT" && pwd -P)" != "$CF_ROOT" ] || [ "$(CDPATH='' cd -- "$CF_BACKEND_DIR" && pwd -P)" != "$CF_BACKEND_DIR" ];then
+        printf '%s\n' '{"ok":false,"errors":["unsafe_test_backend"]}';exit 2
+    fi
+    CF_LOCAL_TEST=1
+    CF_BASE=$CF_ROOT
+    if [ "$0" = "$CF_ROOT/usr/sbin/cfctl" ];then
+        CF_LIB=$CF_ROOT/usr/lib/couvrefeu
+        [ -d "$CF_LIB" ] && [ ! -L "$CF_LIB" ] && [ "$(CDPATH='' cd -- "$CF_LIB" && pwd -P)" = "$CF_LIB" ] || exit 2
+    else
+        CF_LIB=$(CDPATH='' cd -- "$(dirname -- "$0")/lib" && pwd -P) || exit 2
+    fi
+else
+    if [ -n "${CF_ROOT-}" ] || [ -n "${CF_BACKEND_DIR-}" ]; then
+        printf '%s\n' '{"ok":false,"errors":["test_environment_requires_test_mode"]}'; exit 2
+    fi
+    CF_BASE=
+    CF_LIB=/usr/lib/couvrefeu
+    if [ "$(id -u)" != 0 ]; then printf '%s\n' '{"ok":false,"errors":["root_required"]}'; exit 2; fi
+fi
+if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_AWK-}" = "busybox awk" ]; then
+    CF_BUSYBOX=$(command -v busybox) || exit 2
+    awk() { "$CF_BUSYBOX" awk "$@"; }
+fi
+. "$CF_LIB/core.sh"
+. "$CF_LIB/firewall.sh"
+cf_main "$@"

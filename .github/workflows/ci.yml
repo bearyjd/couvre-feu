@@ -1,0 +1,22 @@
+name: isolated-router-fixtures
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CI-only ash and lint tools
+        run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
+      - name: Recovery fixtures, shell checks, then core fixtures
+        env:
+          CF_TEST_SHELL: busybox ash
+          CF_TEST_AWK: busybox awk
+          CF_TEST_TIMEOUT: busybox timeout
+        run: sh tests/run.sh
+      - name: Record pending real integration and live gates
+        run: sh tests/acceptance.sh --preflight

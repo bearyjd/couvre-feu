@@ -1,0 +1,197 @@
+#!/bin/sh
+# Default: validate/stage only. Installation requires explicit --activate.
+set -eu
+set -f
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091
+. "$HERE/lib/install-common.sh"
+ACTIVATE=0
+PROTECTED=
+SOURCE=$HERE
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --activate) ACTIVATE=1; shift;;
+        --protect)
+            [ "$#" -ge 2 ] || fail '--protect requires a canonical MAC'
+            PROTECTED="$PROTECTED$2
+"
+            shift 2;;
+        --source-dir)
+            [ "$#" -ge 2 ] || fail '--source-dir requires a directory'
+            SOURCE=$2; shift 2;;
+        *) fail 'usage: install.sh [--activate] [--protect aa:bb:cc:dd:ee:ff] [--source-dir DIR]';;
+    esac
+done
+safe_paths
+if ! { [ "$BACKUP" != "$RECOVERY" ] && [ ! -e "$DONE" ]; }; then
+    fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
+fi
+if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
+    fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
+fi
+for file in cfctl cfctl-ssh lib/core.sh lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh; do
+    if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
+        fail "missing/unsafe source: $file"
+    fi
+    case "$file" in *.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
+done
+
+backend() {
+    name=$1; shift
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then
+        case "${CF_BACKEND_DIR:-}" in "$ROOT"/*) ;; *) fail 'fixture backend must be below fixture root';; esac
+        [ "$(CDPATH='' cd -- "$CF_BACKEND_DIR" && pwd -P)" = "$CF_BACKEND_DIR" ] || fail 'fixture backend must be canonical with no symlink ancestors'
+        if ! { [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] && [ ! -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ]; }; then
+            fail 'fixture backend marker missing'
+        fi
+        if ! { [ ! -L "$CF_BACKEND_DIR" ] && [ -x "$CF_BACKEND_DIR/$name" ] && [ ! -L "$CF_BACKEND_DIR/$name" ]; }; then
+            fail "fixture backend unavailable: $name"
+        fi
+        "$CF_BACKEND_DIR/$name" "$@"
+    else
+        command -v "$name" >/dev/null 2>&1 || fail "missing dependency: $name"
+        "$name" "$@"
+    fi
+}
+
+# A live SSH client must be uniquely mapped on br-lan even if explicit adults
+# were supplied. An unresolved client is never permission to proceed.
+if [ -n "${SSH_CONNECTION:-}" ]; then
+    # Deliberate token splitting; globbing disabled above.
+    # shellcheck disable=SC2086
+    set -- $SSH_CONNECTION
+    [ "$#" = 4 ] || fail 'invalid SSH_CONNECTION'
+    CLIENT=$1
+    # Fixed dev br-lan collector may omit the selected device in its output.
+    CLIENT_MAC=$(backend ip neigh show "$CLIENT" dev br-lan | awk -v ip="$CLIENT" '
+        NF {
+            if($1!=ip){bad=1;next}
+            dev="";rowmac="";state="";nd=nm=ns=0
+            for(i=2;i<=NF;i++){
+                if($i=="dev"){if(++nd>1||i==NF||$(i+1)!="br-lan"){bad=1;break}dev=$(++i)}
+                else if($i=="lladdr"){if(++nm>1||i==NF){bad=1;break}rowmac=tolower($(++i))}
+                else if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE)$/){if(++ns>1){bad=1;break}state=$i}
+                else if($i!~/^(router|proxy|extern_learn|extern_valid|managed|use)$/){bad=1;break}
+            }
+            if(nm==1&&ns==1&&state~/^(REACHABLE|PERMANENT)$/){mac=rowmac;count++}
+        }
+        END {if(!bad&&count==1) print mac; else exit 1}
+    ') || fail 'SSH client identity unresolved or ambiguous'
+    PROTECTED="$PROTECTED$CLIENT_MAC
+"
+fi
+
+# Build staging outside managed paths. In fixtures it stays under CF_ROOT.
+if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
+else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
+cleanup() {
+    for file in cfctl cfctl-ssh include protected state firewall sysupgrade cron; do rm -f "$STAGE/$file"; done
+    for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
+    if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
+    rmdir "$STAGE" 2>/dev/null || :
+    unlock_install
+}
+trap cleanup 0
+if [ -e "$BASE/protected" ]; then
+    valid_protection "$BASE/protected" || fail 'existing protected list invalid'
+    cp "$BASE/protected" "$STAGE/protected"
+else : > "$STAGE/protected"; fi
+printf '%s' "$PROTECTED" >> "$STAGE/protected"
+awk '!seen[$0]++' "$STAGE/protected" > "$STAGE/state"
+mv "$STAGE/state" "$STAGE/protected"
+valid_protection "$STAGE/protected" || fail 'at least one unique canonical protected MAC is required'
+chmod 600 "$STAGE/protected"
+cp "$SOURCE/cfctl" "$STAGE/cfctl"
+cp "$SOURCE/cfctl-ssh" "$STAGE/cfctl-ssh"
+chmod 755 "$STAGE/cfctl" "$STAGE/cfctl-ssh"
+printf '%s\n' '#!/bin/sh' 'exec /usr/sbin/cfctl apply-fw' > "$STAGE/include"
+chmod 755 "$STAGE/include"
+if [ -e "$BASE/state" ]; then cp -p "$BASE/state" "$STAGE/state"
+else printf 'V\t1\nR\t0\n' > "$STAGE/state"; fi
+chmod 600 "$STAGE/state"
+for pair in 'firewall:etc/config/firewall' 'sysupgrade:etc/sysupgrade.conf' 'cron:etc/crontabs/root'; do
+    file=${pair%%:*} rel=${pair#*:}
+    if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$STAGE/$file"
+    else : > "$STAGE/$file"; chmod 644 "$STAGE/$file"; fi
+done
+if awk '/couvrefeu|couvre-feu|cfctl/ {found=1} END {exit !found}' "$STAGE/firewall" "$STAGE/sysupgrade" "$STAGE/cron"; then
+    [ -f "$BACKUP/ready" ] || fail 'unrecorded existing installation; refusing without originals'
+fi
+if [ -e "$BASE/runtime" ] && [ ! -f "$BACKUP/ready" ]; then
+    fail 'preexisting runtime directory has no installation journal; preserved'
+fi
+if [ -e "$BACKUP" ]; then
+    preflight
+    if [ -f "$BACKUP/complete" ]; then expected_protected=$BASE/protected
+    else expected_protected=$BACKUP/etc_couvrefeu_protected.staged; fi
+    cmp -s "$STAGE/protected" "$expected_protected" || fail 'reinstallation cannot change protected identities; use a separately reviewed policy change'
+    # Resume from the immutable staged journal; do not append integration twice.
+    if [ "$ACTIVATE" = 0 ]; then printf '%s\n' 'Recorded installation validated; no changes made.'; exit 0; fi
+else
+    printf '\nconfig include '\''couvrefeu'\''\n\toption type '\''script'\''\n\toption path '\''/etc/firewall.couvrefeu'\''\n\toption reload '\''1'\''\n' >> "$STAGE/firewall"
+    printf '\n/etc/couvrefeu\n/usr/sbin/cfctl\n/usr/sbin/cfctl-ssh\n/usr/lib/couvrefeu\n/etc/firewall.couvrefeu\n/etc/crontabs/root\n' >> "$STAGE/sysupgrade"
+    printf '\n* * * * * /usr/sbin/cfctl expire\n' >> "$STAGE/cron"
+    chmod 600 "$STAGE/cron"
+    if [ "$ACTIVATE" = 0 ]; then
+        printf '%s\n' 'Sources and protected identities staged/validated. No installation or activation performed. Use --activate only with separate live authorization.'
+        exit 0
+    fi
+fi
+# Mandatory read-only backend gate occurs before any managed file changes.
+sh "$SOURCE/cfctl" check || fail 'core dependency/capability gate failed'
+if [ ! -e "$BACKUP" ]; then
+    # Validate the native UCI configuration from the staging directory.
+    mkdir "$STAGE/.delta"
+    backend uci -c "$STAGE" -t "$STAGE/.delta" show firewall >/dev/null || fail 'staged UCI firewall validation failed'
+    # Capture directory modes before creating anything in managed paths.
+    for rel in $DIRS; do
+        k=$(key "$rel")
+        if [ -d "$ROOT/$rel" ]; then stat -c %a "$ROOT/$rel" > "$STAGE/dir_$k"
+        else printf '%s\n' absent > "$STAGE/dir_$k"; fi
+    done
+    mkdir -p "$BACKUP"
+    chmod 700 "$BASE" "$BACKUP"
+    for rel in $DIRS; do k=$(key "$rel"); mv "$STAGE/dir_$k" "$BACKUP/dir_$k"; done
+    for rel in $FILES; do
+        k=$(key "$rel")
+        signature "$ROOT/$rel" > "$BACKUP/$k.before"
+        if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.original"; fi
+        case "$rel" in
+            usr/lib/couvrefeu/core.sh) staged=lib/core.sh;;
+            usr/lib/couvrefeu/firewall.sh) staged=lib/firewall.sh;;
+            usr/lib/couvrefeu/json.awk) staged=lib/json.awk;;
+            usr/lib/couvrefeu/rules.awk) staged=lib/rules.awk;;
+            usr/lib/couvrefeu/install-common.sh) staged=lib/install-common.sh;;
+            usr/sbin/cfctl) staged=cfctl;; usr/sbin/cfctl-ssh) staged=cfctl-ssh;;
+            etc/firewall.couvrefeu) staged=include;; etc/config/firewall) staged=firewall;;
+            etc/sysupgrade.conf) staged=sysupgrade;; etc/crontabs/root) staged=cron;;
+            etc/couvrefeu/protected) staged=protected;; etc/couvrefeu/state) staged=state;;
+        esac
+        case "$staged" in lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; chmod 644 "$BACKUP/$k.staged";;
+            *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
+        signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
+    done
+    printf '%s\n' 1 > "$BACKUP/ready"
+fi
+preflight
+runtime_preflight
+COUNT=0
+for rel in $FILES; do
+    k=$(key "$rel")
+    mkdir -p "$(dirname "$ROOT/$rel")"
+    # Reinstall/resume never overwrites legitimate mutable runtime contents.
+    case "$rel" in etc/couvrefeu/state|etc/couvrefeu/protected)
+        if [ -f "$BACKUP/complete" ]; then continue; fi;;
+    esac
+    atomic_copy "$BACKUP/$k.staged" "$ROOT/$rel"
+    COUNT=$((COUNT + 1))
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_FAIL_AFTER:-0}" = "$COUNT" ]; then fail 'injected partial installation'; fi
+done
+# Record possible kernel mutation *before* invoking the backend, for recovery
+# even when apply fails or the process is interrupted.
+printf '%s\n' 1 > "$BACKUP/activated"
+if live_tools; then
+    installed_core apply-fw || fail 'apply failed; journal retained; use uninstall for recovery'
+fi
+printf '%s\n' 1 > "$BACKUP/complete"
+printf '%s\n' 'Installation recorded. Live packet enforcement requires separate acceptance.'
