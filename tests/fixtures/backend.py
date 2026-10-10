@@ -26,6 +26,9 @@ def main():
             if (failure["command"] == command
                     and all(part in args for part in failure.get("contains", []))
                     and failure.get("remaining", 1)):
+                if failure.get("skip", 0):
+                    failure["skip"] -= 1
+                    continue
                 failure["remaining"] = failure.get("remaining", 1) - 1
                 state_path.write_text(json.dumps(state))
                 print(failure.get("message", "injected backend failure"), file=sys.stderr)

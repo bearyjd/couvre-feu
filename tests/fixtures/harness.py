@@ -120,4 +120,5 @@ class RouterFixture:
                 if call["command"] == "conntrack"
                 or call["command"] == "ipset" and call["argv"][0] not in ("list", "save", "test", "-L")
                 or call["command"] in ("iptables", "ip6tables") and any(arg in call["argv"] for arg in ("-A", "-I", "-D", "-N", "-X", "-F"))
-                or call["command"] == "uci" and any(arg in call["argv"] for arg in ("set", "delete", "commit", "add_list", "batch"))]
+                or call["command"] == "uci" and any(arg in call["argv"] for arg in ("set", "delete", "commit", "add_list", "batch"))
+                or call["command"] in ("fw3", "firewall") and "reload" in call["argv"]]
