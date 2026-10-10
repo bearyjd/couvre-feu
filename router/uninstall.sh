@@ -47,7 +47,9 @@ if [ ! -f "$BACKUP/kernel-cleaned" ]; then
 fi
 if [ "$BACKUP" != "$RECOVERY" ]; then
     phase restoring
-    [ ! -e "$RECOVERY" ] && [ ! -L "$RECOVERY" ] || fail 'recovery path collision'
+    if ! { [ ! -e "$RECOVERY" ] && [ ! -L "$RECOVERY" ]; }; then
+        fail 'recovery path collision'
+    fi
     mv "$BACKUP" "$RECOVERY"
     BACKUP=$RECOVERY
 fi

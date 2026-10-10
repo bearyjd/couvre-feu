@@ -23,10 +23,16 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 safe_paths
-[ "$BACKUP" != "$RECOVERY" ] && [ ! -e "$DONE" ] || fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
-[ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ] || fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
+if ! { [ "$BACKUP" != "$RECOVERY" ] && [ ! -e "$DONE" ]; }; then
+    fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
+fi
+if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
+    fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
+fi
 for file in cfctl cfctl-ssh lib/core.sh lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh; do
-    [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ] || fail "missing/unsafe source: $file"
+    if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
+        fail "missing/unsafe source: $file"
+    fi
     case "$file" in *.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
 done
 
@@ -35,8 +41,12 @@ backend() {
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         case "${CF_BACKEND_DIR:-}" in "$ROOT"/*) ;; *) fail 'fixture backend must be below fixture root';; esac
         [ "$(CDPATH='' cd -- "$CF_BACKEND_DIR" && pwd -P)" = "$CF_BACKEND_DIR" ] || fail 'fixture backend must be canonical with no symlink ancestors'
-        [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] && [ ! -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] || fail 'fixture backend marker missing'
-        [ ! -L "$CF_BACKEND_DIR" ] && [ -x "$CF_BACKEND_DIR/$name" ] && [ ! -L "$CF_BACKEND_DIR/$name" ] || fail "fixture backend unavailable: $name"
+        if ! { [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] && [ ! -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ]; }; then
+            fail 'fixture backend marker missing'
+        fi
+        if ! { [ ! -L "$CF_BACKEND_DIR" ] && [ -x "$CF_BACKEND_DIR/$name" ] && [ ! -L "$CF_BACKEND_DIR/$name" ]; }; then
+            fail "fixture backend unavailable: $name"
+        fi
         "$CF_BACKEND_DIR/$name" "$@"
     else
         command -v "$name" >/dev/null 2>&1 || fail "missing dependency: $name"

@@ -15,22 +15,24 @@ python3 tests/test-install.py
 
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck --version
-    find router tests -type f | while IFS= read -r script; do
-        if is_shell "$script"; then shellcheck -s sh "$script"; fi
-    done
 else
     printf '%s\n' 'FAIL: shellcheck is required for the complete fixture gate.' >&2
     exit 1
 fi
-find router tests -type f | while IFS= read -r script; do
-    if is_shell "$script"; then
+find router tests -type f | {
+    static_failed=0
+    while IFS= read -r script; do
+        if is_shell "$script"; then
+            if ! shellcheck -s sh "$script"; then static_failed=1; fi
             if command -v busybox >/dev/null 2>&1; then
-                busybox ash -n "$script"
+                if ! busybox ash -n "$script"; then static_failed=1; fi
             else
-                sh -n "$script"
+                if ! sh -n "$script"; then static_failed=1; fi
             fi
-    fi
-done
+        fi
+    done
+    [ "$static_failed" -eq 0 ]
+}
 if ! command -v busybox >/dev/null 2>&1; then
     printf '%s\n' 'PENDING: BusyBox ash runtime; host sh syntax alone is not ash proof.'
 fi

@@ -43,7 +43,7 @@ case "${1:---preflight}" in
         }
         PATH=/usr/sbin:/usr/bin:/sbin:/bin
         export PATH
-        [ -x /usr/sbin/cfctl ] && [ ! -L /usr/sbin/cfctl ] || exit 1
+        if [ ! -x /usr/sbin/cfctl ] || [ -L /usr/sbin/cfctl ]; then exit 1; fi
         printf '%s\n' 'Read-only installed checks: no expiry, apply, reload or packet probes.'
         /usr/sbin/cfctl check
         STATUS=$(/usr/sbin/cfctl status --json)
@@ -61,7 +61,7 @@ case "${1:---preflight}" in
             }
         done
         for PRIVATE in /etc/couvrefeu/state /etc/couvrefeu/protected; do
-            [ -f "$PRIVATE" ] && [ ! -L "$PRIVATE" ] && [ "$(stat -c '%a:%u' "$PRIVATE")" = 600:0 ] || exit 1
+            if [ ! -f "$PRIVATE" ] || [ -L "$PRIVATE" ] || [ "$(stat -c '%a:%u' "$PRIVATE")" != 600:0 ]; then exit 1; fi
         done
         printf '%s\n' 'PASS: current installed structure and observed state; packet/reboot/key/upgrade gates pending.'
         ;;
@@ -71,9 +71,9 @@ case "${1:---preflight}" in
             printf '%s\n' 'REFUSED: explicit CF_ACCEPT_LIVE=1 and supplied TEST_MAC are required.' >&2
             exit 2
         }
-        [ -n "${PROTECTED_MAC_FILE:-}" ] && [ -f "$PROTECTED_MAC_FILE" ] && [ ! -L "$PROTECTED_MAC_FILE" ] || {
+        if [ -z "${PROTECTED_MAC_FILE:-}" ] || [ ! -f "$PROTECTED_MAC_FILE" ] || [ -L "$PROTECTED_MAC_FILE" ]; then
             printf '%s\n' 'REFUSED: supply a readable, nonsymlink PROTECTED_MAC_FILE.' >&2; exit 2;
-        }
+        fi
         awk -v target="${TEST_MAC:-}" '
         function valid(mac,a,n,i){n=split(mac,a,":");if(n!=6||length(mac)!=17||mac=="00:00:00:00:00:00")return 0;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)return 0;return index("02468ace",substr(a[1],2,1))>0}
         BEGIN{if(!valid(target))exit 2}
