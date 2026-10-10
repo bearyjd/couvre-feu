@@ -79,7 +79,10 @@ cf_kids() { printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="P"&&$3!="-"{print $3}
 cf_desired_set() {
     case $1 in cf_kids)cf_kids;;cf_paused)cf_effective_macs;;cf_doh)printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="D4"{print $2}' | sort -u;;cf_doh6)printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="D6"{print $2}' | sort -u;;*)return 1;;esac
 }
-cf_effective_digest() { { printf '%s\n' "$CF_DIGEST";cf_effective_macs;printf '%s\n' "$CF_EXPECTED"; } | sha256sum | awk '{print $1}'; }
+cf_effective_digest() {
+    # Fresh address/protection evidence also invalidates unchanged reconciliation.
+    { printf '%s\n' "$CF_DIGEST";cf_effective_macs;printf '%s\n' "$CF_EXPECTED" "$CF_ADDRESS_DATA";sha256sum "$CF_PROTECTED"; } | sha256sum | awk '{print $1}'
+}
 cf_table() { cf_t_family=$1;shift;if [ "$cf_t_family" = 4 ];then cf_backend iptables "$@";else cf_backend ip6tables "$@";fi; }
 cf_normal_rules() {
     # iptables serializes built-in selectors before modules, uppercases MACs,
@@ -250,13 +253,45 @@ cf_snapshot() {
     done
     cf_schedule_specs | awk -F '\t' 'NF{print "SCHEDULE " $0}'
 }
+cf_native_config_verify() {
+    cf_config_specs=$(cf_schedule_specs) || return 1
+    cf_config_names=$(printf '%s\n' "$cf_config_specs" | awk -F '\t' 'NF{print $1}' | sort)
+    cf_config_lines=$(cf_backend uci -q show firewall) || { cf_fail native_metadata_inspection_failed;return 1; }
+    # Unknown persistent selectors can narrow the next reload even while the
+    # current kernel witness remains correct. Require the complete owned schema.
+    printf '%s\n' "$cf_config_lines" | awk -v names="$cf_config_names" '
+    BEGIN{n=split(names,a,"\n");for(i=1;i<=n;i++)if(a[i]!="")want[a[i]]=1}
+    {eq=index($0,"=");if(!eq)next;k=substr($0,1,eq-1);n=split(k,a,".");if(a[1]!="firewall"||a[2]!~/^cf_sched_/)next
+        if(!(a[2] in want)||n<2||n>3||seen[k]++)exit 2
+        if(n==2){section[a[2]]=1;next}
+        if(a[3]!~/^(couvrefeu_owner|name|src|dest|target|proto|src_mac|weekdays|start_time|stop_time|utc_time|enabled)$/)exit 2
+    }
+    END{for(name in want)if(!section[name])exit 2}' || { cf_fail native_metadata_drift;return 1; }
+    cf_tab=$(printf '\t')
+    while IFS="$cf_tab" read -r cf_name cf_person cf_mac cf_days cf_start cf_stop;do
+        [ -n "$cf_name" ] || continue
+        cf_config_type=$(cf_backend uci -q get "firewall.$cf_name") || { cf_fail native_metadata_inspection_failed;return 1; }
+        [ "$cf_config_type" = rule ] || { cf_fail native_metadata_drift;return 1; }
+        for cf_pair in 'couvrefeu_owner=v1' "name=$cf_name" 'src=lan' 'dest=wan' 'target=REJECT' 'proto=all' "src_mac=$cf_mac" "weekdays=$(printf '%s\n' "$cf_days" | tr ',' ' ')" "start_time=$cf_start" "stop_time=$cf_stop" 'utc_time=0' 'enabled=1';do
+            cf_key=${cf_pair%%=*};cf_value=${cf_pair#*=}
+            cf_actual=$(cf_backend uci -q get "firewall.$cf_name.$cf_key") || { cf_fail native_metadata_inspection_failed;return 1; }
+            [ "$cf_actual" = "$cf_value" ] || { cf_fail native_metadata_drift;return 1; }
+        done
+    done <<EOF
+$cf_config_specs
+EOF
+}
 cf_native_apply() {
     cf_specs=$(cf_schedule_specs) || return 1
     cf_new_native=$(printf '%s\n' "$cf_specs" | sha256sum | awk '{print $1}')
     cf_old_native=
     if cf_safe_file "$CF_RUNTIME/firewall.snapshot";then cf_old_native=$(awk '/^SCHEDULE /{sub(/^SCHEDULE /,"");print}' "$CF_RUNTIME/firewall.snapshot" | sha256sum | awk '{print $1}');fi
     # Empty initial policy needs no UCI write or reload.
-    if [ "$cf_new_native" = "$cf_old_native" ] || { [ -z "$cf_specs" ] && [ -z "$cf_uci_sections" ]; };then return 0;fi
+    if [ "$cf_new_native" = "$cf_old_native" ] || { [ -z "$cf_specs" ] && [ -z "$cf_uci_sections" ]; };then
+        if cf_native_config_verify;then return 0;fi
+        # Drift defeats the metadata shortcut and follows normal staged repair.
+        CF_ERROR=
+    fi
     cf_stage=$CF_RUNTIME/.uci.$$
     [ ! -e "$cf_stage" ] && [ ! -L "$cf_stage" ] || { cf_fail unsafe_staging;return 1; }
     mkdir -m 700 "$cf_stage" || return 1
@@ -338,12 +373,34 @@ cf_flush_connections() {
         done
     done
 }
+cf_unchanged_verified() {
+    cf_ownership_valid && cf_safe_file "$CF_RUNTIME/firewall.snapshot" && cf_safe_file "$CF_RUNTIME/confirmed" || return 1
+    [ "$(wc -c < "$CF_RUNTIME/confirmed")" -le 160 ] || return 1
+    for cf_pending in error firewall.intent firewall.cleanup;do
+        [ ! -e "$CF_RUNTIME/$cf_pending" ] && [ ! -L "$CF_RUNTIME/$cf_pending" ] || return 1
+    done
+    cf_prior_confirmation=$(awk 'NR!=1||NF!=3||$1!~/^(0|[1-9][0-9]*)$/||length($1)>10||$1+0>2147483647||length($2)!=64||$2~/[^0-9a-f]/||length($3)!=64||$3~/[^0-9a-f]/{exit 2}{print}END{if(NR!=1)exit 2}' "$CF_RUNTIME/confirmed") || return 1
+    [ "$cf_prior_confirmation" = "$CF_REVISION $CF_DIGEST $(cf_effective_digest)" ] || return 1
+    cf_noop_snapshot=$(cf_snapshot) || return 1
+    [ "$cf_noop_snapshot" = "$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")" ] || return 1
+    # Private metadata is only eligibility. Verify all actual kernel objects,
+    # hook ordering and native persistent/kernel witnesses under the lock.
+    cf_verify
+}
 cf_apply() {
     cf_address_refresh || return 1
     cf_temp=$CF_RUNTIME/.expiry.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
     printf '%s\n' "$CF_EXPIRY_NOW" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/expiry" || { cf_fail expiry_record_failed;return 1; }
     CF_EXPECTED=$(cf_plan) || { cf_fail plan_failed;return 1; }
+    if cf_unchanged_verified;then
+        if [ "${cf_action-}" = pause ];then cf_flush_connections || return 1;cf_verify || return 1;fi
+        cf_confirm_apply
+        return $?
+    fi
+    # Failed eligibility/observation never confirms. Reconstruction and final
+    # verification must complete before a fresh success is recorded.
+    CF_ERROR=
     cf_write_intent || return 1
     if ! cf_ownership_valid;then
         [ ! -e "$CF_RUNTIME/firewall.owned" ] || return 1
@@ -372,6 +429,9 @@ EOF
     cf_hook 4 nat prerouting_rule cf_dns || { cf_fail hook_apply_failed;return 1; }
     cf_flush_connections || return 1
     cf_verify || return 1
+    cf_confirm_apply
+}
+cf_confirm_apply() {
     cf_temp=$CF_RUNTIME/.snapshot.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
     cf_snapshot > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/firewall.snapshot" || { cf_fail snapshot_failed;return 1; }
@@ -379,7 +439,10 @@ EOF
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
     printf '%s %s %s\n' "$CF_REVISION" "$CF_DIGEST" "$(cf_effective_digest)" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/confirmed" || { cf_fail confirmation_failed;return 1; }
     [ ! -e "$CF_RUNTIME/error" ] || { cf_safe_file "$CF_RUNTIME/error" && rm -f "$CF_RUNTIME/error"; } || return 1
-    cf_safe_file "$CF_RUNTIME/firewall.intent" && rm -f "$CF_RUNTIME/firewall.intent"
+    if [ -e "$CF_RUNTIME/firewall.intent" ] || [ -L "$CF_RUNTIME/firewall.intent" ];then
+        cf_safe_file "$CF_RUNTIME/firewall.intent" && rm -f "$CF_RUNTIME/firewall.intent" || return 1
+    fi
+    return 0
 }
 cf_native_reject_path() {
     if [ -z "${CF_WAN_DEVICES-}" ];then
@@ -396,15 +459,11 @@ cf_native_verify() {
     CF_WAN_DEVICES=
     cf_specs=$(cf_schedule_specs)
     CF_NATIVE_OK=true
+    cf_native_config_verify || { CF_NATIVE_OK=false;return 1; }
     [ -n "$cf_specs" ] || return 0
     cf_tab=$(printf '\t')
     while IFS="$cf_tab" read -r cf_name cf_person cf_mac cf_days cf_start cf_stop;do
         [ -n "$cf_name" ] || continue
-        for cf_pair in 'couvrefeu_owner=v1' "name=$cf_name" 'src=lan' 'dest=wan' 'target=REJECT' 'proto=all' "src_mac=$cf_mac" "weekdays=$(printf '%s\n' "$cf_days" | tr ',' ' ')" "start_time=$cf_start" "stop_time=$cf_stop" 'utc_time=0' 'enabled=1';do
-            cf_key=${cf_pair%%=*};cf_value=${cf_pair#*=}
-            cf_actual=$(cf_backend uci -q get "firewall.$cf_name.$cf_key") || { CF_NATIVE_OK=false;cf_fail native_metadata_drift;return 1; }
-            [ "$cf_actual" = "$cf_value" ] || { CF_NATIVE_OK=false;cf_fail native_metadata_drift;return 1; }
-        done
         for cf_f in 4 6;do
             cf_native_rules=$(cf_table "$cf_f" -t filter -S zone_lan_forward 2>/dev/null) || { CF_NATIVE_OK=false;cf_fail native_kernel_pending;return 1; }
             # Earlier ACCEPT/RETURN paths cannot shadow the named schedule.
@@ -445,7 +504,8 @@ cf_verify() {
     done
     for cf_f in 4 6;do
         for cf_chain in cf_fwd cf_input;do
-            cf_actual=$(cf_table "$cf_f" -t filter -S "$cf_chain" | cf_normal_rules | awk '/^-A /{print}')
+            cf_raw_rules=$(cf_table "$cf_f" -t filter -S "$cf_chain") || { cf_fail rule_inspection_failed;return 1; }
+            cf_actual=$(printf '%s\n' "$cf_raw_rules" | cf_normal_rules | awk '/^-A /{print}')
             cf_desired=$(printf '%s\n' "$CF_EXPECTED" | awk -F '\t' -v f="$cf_f" -v c="$cf_chain" '$1==f&&$2=="filter"&&$3==c{print "-A " c " " $4}' | cf_normal_rules)
             [ "$cf_actual" = "$cf_desired" ] || { cf_fail rule_drift;return 1; }
         done
@@ -461,7 +521,8 @@ cf_verify() {
         cf_parent_order "$cf_f" filter FORWARD forwarding_rule || return 1
         cf_parent_order "$cf_f" filter INPUT input_rule || return 1
     done
-    cf_actual=$(cf_table 4 -t nat -S cf_dns | cf_normal_rules | awk '/^-A /{print}')
+    cf_raw_rules=$(cf_table 4 -t nat -S cf_dns) || { cf_fail dns_rule_inspection_failed;return 1; }
+    cf_actual=$(printf '%s\n' "$cf_raw_rules" | cf_normal_rules | awk '/^-A /{print}')
     cf_desired=$(printf '%s\n' "$CF_EXPECTED" | awk -F '\t' '$1==4&&$2=="nat"&&$3=="cf_dns"{print "-A cf_dns " $4}' | cf_normal_rules)
     [ "$cf_actual" = "$cf_desired" ] || { cf_fail dns_rule_drift;return 1; }
     cf_lines=$(cf_table 4 -t nat -S prerouting_rule) || return 1

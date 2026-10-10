@@ -283,13 +283,15 @@ class CoreTests(unittest.TestCase):
 
     def test_pause_flushes_every_known_ipv4_ipv6_source_and_destination(self):
         self.sync()
-        self.success(self.fixture.run("pause", "alice"))
-        calls = [call["argv"] for call in self.fixture.calls() if call["command"] == "conntrack"]
-        for address in ("192.168.1.20", "192.168.1.21", "192.168.1.22", "2001:db8::20", "2001:db8::21"):
-            for direction in ("-s", "-d"):
-                with self.subTest(address=address, direction=direction):
-                    self.assertTrue(any(direction in args and address in args for args in calls), calls)
-        self.assertFalse(any("192.168.1.10" in args for args in calls))
+        for repeat in range(2):
+            offset = len(self.fixture.calls())
+            self.success(self.fixture.run("pause", "alice"))
+            calls = [call["argv"] for call in self.fixture.calls()[offset:] if call["command"] == "conntrack"]
+            for address in ("192.168.1.20", "192.168.1.21", "192.168.1.22", "2001:db8::20", "2001:db8::21"):
+                for direction in ("-s", "-d"):
+                    with self.subTest(repeat=repeat, address=address, direction=direction):
+                        self.assertTrue(any(direction in args and address in args for args in calls), calls)
+            self.assertFalse(any("192.168.1.10" in args for args in calls))
 
     def test_expiry_is_local_and_same_revision_replay_cannot_resurrect(self):
         document = policy()
@@ -298,7 +300,9 @@ class CoreTests(unittest.TestCase):
         self.sync(document)
         self.assertCountEqual(self.paused(), [KID, OTHER_KID])
         self.fixture.env["CF_NOW"] = str(expiry + 1)
+        before = len(self.fixture.mutation_calls())
         self.success(self.fixture.run("expire"))
+        self.assertGreater(len(self.fixture.mutation_calls()), before, "a newly elapsed timer must defeat the no-op shortcut")
         self.assertEqual(self.paused(), [])
         status = self.sync(document)
         self.assertEqual(status["desiredRevision"], 1)
@@ -347,12 +351,176 @@ class CoreTests(unittest.TestCase):
         for key in ("sets", "tables", "uci"):
             self.assertEqual(after[key], before[key], key)
 
+    def test_healthy_unchanged_expire_and_apply_verify_without_kernel_mutations(self):
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": int(self.fixture.env["CF_NOW"]) + 3600}]
+        document["schedules"] = [{"person": "alice", "id": "day", "weekdays": ["Mon"], "start": "10:00", "stop": "11:00"}]
+        document["doh"] = {"ipv4": ["1.1.1.1"], "ipv6": ["2606:4700:4700::1111"]}
+        self.sync(document)
+        confirmed = self.fixture.root / "etc/couvrefeu/runtime/confirmed"
+        original_confirmation = confirmed.read_bytes()
+        original = self.fixture.backend()
+        for action in ("expire", "apply-fw", "expire"):
+            with self.subTest(action=action):
+                offset = len(self.fixture.calls())
+                mutation_offset = len(self.fixture.mutation_calls())
+                status = self.success(self.fixture.run(action))
+                self.assertEqual(status["desiredRevision"], 1)
+                self.assertEqual(status["confirmedRevision"], 1)
+                writes = [call for call in self.fixture.mutation_calls()[mutation_offset:]
+                          if call["command"] != "conntrack"]
+                self.assertEqual(writes, [],
+                                 "healthy unchanged policy must not flush sets, rebuild chains or reload")
+                reads = self.fixture.calls()[offset:]
+                self.assertTrue(any(call["command"] == "ipset" and "save" in call["argv"] for call in reads))
+                for family in ("iptables", "ip6tables"):
+                    self.assertTrue(any(call["command"] == family and "-S" in call["argv"] for call in reads))
+                self.assertTrue(any(call["command"] == "uci" for call in reads))
+                self.assertEqual(confirmed.read_bytes(), original_confirmation)
+                after = self.fixture.backend()
+                for key in ("sets", "tables", "uci"):
+                    self.assertEqual(after[key], original[key], key)
+
     def test_observation_accepts_equivalent_iptables_serialization(self):
         self.fixture.update_backend(canonical_rules=True)
         self.sync()
         self.success(self.fixture.run("pause", "alice"))
         self.success(self.fixture.run("status", "--json"))
         self.success(self.fixture.run("apply-fw"))
+
+    def test_changed_child_address_rebuilds_inbound_guards(self):
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        self.sync(document)
+        state = self.fixture.backend()
+        for row in state["neighbors"]:
+            if row["ip"] == "2001:db8::21":
+                row["ip"] = "2001:db8::23"
+        self.fixture.update_backend(neighbors=state["neighbors"])
+        before = len(self.fixture.mutation_calls())
+        self.success(self.fixture.run("expire"))
+        self.assertGreater(len(self.fixture.mutation_calls()), before)
+        rules = self.fixture.backend()["tables"]["ip6tables"]["filter"]["cf_fwd"]
+        self.assertTrue(any("2001:db8::23" in row and "-d" in row and "REJECT" in row for row in rules))
+        self.assertFalse(any("2001:db8::21" in row for row in rules))
+
+    def test_set_drift_rebuilds_instead_of_skipping_actual_verification(self):
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        self.sync(document)
+        state = self.fixture.backend()
+        state["sets"]["cf_paused"]["members"] = [KID]
+        self.fixture.update_backend(sets=state["sets"])
+        before = len(self.fixture.mutation_calls())
+        repaired = self.success(self.fixture.run("apply-fw"))
+        self.assertGreater(len(self.fixture.mutation_calls()), before)
+        self.assertCountEqual(repaired["observed"]["paused"], [KID, OTHER_KID])
+
+    def test_higher_revision_with_same_effective_rules_updates_confirmation(self):
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        self.sync(document)
+        before = self.fixture.backend()
+        document["revision"] = 2
+        updated = self.sync(document)
+        self.assertEqual(updated["desiredRevision"], 2)
+        self.assertEqual(updated["confirmedRevision"], 2)
+        self.assertEqual((self.fixture.root / "etc/couvrefeu/runtime/confirmed").read_text().split()[0], "2")
+        after = self.fixture.backend()
+        for key in ("sets", "tables", "uci"):
+            self.assertEqual(after[key], before[key], key)
+
+    def test_pending_apply_records_and_missing_confirmation_require_recovery_work(self):
+        self.sync()
+        runtime = self.fixture.root / "etc/couvrefeu/runtime"
+        for pending in ("firewall.intent", "error", "confirmed"):
+            with self.subTest(pending=pending):
+                path = runtime / pending
+                if pending == "confirmed":
+                    path.unlink()
+                elif pending == "error":
+                    path.write_text("chain_apply_failed\n")
+                    path.chmod(0o600)
+                else:
+                    records = []
+                    for line in (runtime / "firewall.snapshot").read_text().splitlines():
+                        parts = line.split(" ", 6)
+                        if len(parts) == 7 and parts[0] == "RULE" and parts[4] == "-A":
+                            records.append("\t".join((parts[1], parts[2], parts[3], parts[6])))
+                    self.assertTrue(records)
+                    path.write_text("\n".join(records) + "\n")
+                    path.chmod(0o600)
+                before = len(self.fixture.mutation_calls())
+                self.success(self.fixture.run("apply-fw"))
+                self.assertGreater(len(self.fixture.mutation_calls()), before,
+                                   "an unconfirmed or interrupted apply must not use the healthy shortcut")
+                self.assertFalse((runtime / "firewall.intent").exists())
+                self.assertFalse((runtime / "error").exists())
+                self.assertTrue((runtime / "confirmed").is_file())
+
+    def test_failed_empty_owned_chain_read_cannot_confirm_a_new_revision(self):
+        self.sync()
+        self.assertEqual(self.fixture.backend()["tables"]["ip6tables"]["filter"]["cf_input"], [])
+        confirmed = self.fixture.root / "etc/couvrefeu/runtime/confirmed"
+        before = confirmed.read_bytes()
+        # Allow the existing-chain check to succeed; fail the subsequent
+        # verification read, where a pipeline once mistook errors for emptiness.
+        self.fixture.update_backend(failures=[{"command": "ip6tables", "contains": ["-S", "cf_input"], "skip": 1, "remaining": 100}])
+        result = self.fixture.run("sync", document=policy(2))
+        self.assertNotEqual(result.returncode, 0, "an unreadable empty chain is not verified absence of rules")
+        self.assertIs(json.loads(result.stdout)["ok"], False)
+        self.assertEqual(confirmed.read_bytes(), before)
+
+    def test_failed_set_observation_during_apply_cannot_replace_confirmation(self):
+        self.sync()
+        confirmed = self.fixture.root / "etc/couvrefeu/runtime/confirmed"
+        before = confirmed.read_bytes()
+        self.fixture.update_backend(failures=[{"command": "ipset", "contains": ["save", "cf_kids"], "remaining": 100}])
+        result = self.fixture.run("sync", document=policy(2))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIs(json.loads(result.stdout)["ok"], False)
+        self.assertEqual(confirmed.read_bytes(), before)
+
+    def test_latent_native_selector_cannot_be_blessed_by_healthy_kernel_witness(self):
+        document = policy()
+        document["schedules"] = [{"person": "alice", "id": "day", "weekdays": ["Mon"], "start": "10:00", "stop": "11:00"}]
+        self.sync(document)
+        firewall = self.fixture.root / "etc/config/firewall"
+        sections = [key.split(".")[1] for key, value in self.fixture.backend()["uci"].items()
+                    if key.count(".") == 1 and key.startswith("firewall.cf_sched_") and value == "rule"]
+        self.assertTrue(sections)
+        section = sorted(sections)[0]
+        contents = firewall.read_text()
+        headers = [line for line in contents.splitlines(keepends=True)
+                   if line in (f"config rule {section}\n", f"config rule '{section}'\n")]
+        self.assertEqual(len(headers), 1)
+        header = headers[0]
+        firewall.write_text(contents.replace(header, header + "\toption src_ip '192.0.2.222'\n", 1))
+        selector = subprocess.run([str(self.fixture.bin / "uci"), "-q", "get", f"firewall.{section}.src_ip"],
+                                  env=self.fixture.env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(selector.returncode, 0, selector.stderr)
+        self.assertEqual(selector.stdout.strip(), "192.0.2.222", "attack must narrow an owned native section")
+        before = (self.fixture.root / "etc/couvrefeu/runtime/confirmed").read_bytes()
+        result = self.fixture.run("apply-fw")
+        if result.returncode == 0:
+            self.assertNotIn("option src_ip", firewall.read_text(), "successful apply must repair latent native narrowing")
+            self.assertIs(json.loads(result.stdout)["ok"], True)
+        else:
+            self.assertIs(json.loads(result.stdout)["ok"], False)
+            self.assertEqual((self.fixture.root / "etc/couvrefeu/runtime/confirmed").read_bytes(), before)
+
+    def test_surplus_owned_native_section_cannot_survive_healthy_empty_schedule(self):
+        self.sync()
+        firewall = self.fixture.root / "etc/config/firewall"
+        firewall.write_text(firewall.read_text() + "\nconfig rule 'cf_sched_surplus'\n\toption couvrefeu_owner 'v1'\n\toption target 'REJECT'\n\toption src 'lan'\n\toption dest 'wan'\n")
+        before = (self.fixture.root / "etc/couvrefeu/runtime/confirmed").read_bytes()
+        result = self.fixture.run("expire")
+        if result.returncode == 0:
+            self.assertNotIn("cf_sched_surplus", firewall.read_text(), "successful expiry must remove surplus persistent policy")
+            self.assertIs(json.loads(result.stdout)["ok"], True)
+        else:
+            self.assertIs(json.loads(result.stdout)["ok"], False)
+            self.assertEqual((self.fixture.root / "etc/couvrefeu/runtime/confirmed").read_bytes(), before)
 
     def test_host_prefix_equivalence_is_family_specific(self):
         state = self.fixture.backend()
@@ -415,7 +583,9 @@ class CoreTests(unittest.TestCase):
             family["nat"] = {"PREROUTING": family["nat"]["PREROUTING"],
                              "prerouting_rule": []}
         self.fixture.update_backend(sets=state["sets"], tables=state["tables"])
+        before = len(self.fixture.mutation_calls())
         self.success(self.fixture.run("apply-fw"))
+        self.assertGreater(len(self.fixture.mutation_calls()), before, "missing objects require reconstruction")
         self.assertCountEqual(self.paused(), [KID, OTHER_KID])
         self.assertCountEqual(self.success(self.fixture.run("status", "--json"))["observed"]["kids"], [KID, OTHER_KID])
 
