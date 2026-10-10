@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
-      - name: Recovery first, then core fixtures and shell checks
+      - name: Recovery fixtures, shell checks, then core fixtures
         env:
           CF_TEST_SHELL: busybox ash
           CF_TEST_AWK: busybox awk

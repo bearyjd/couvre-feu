@@ -5,7 +5,9 @@ umask 077
 
 fail() { printf '%s\n' "couvre-feu: $*" >&2; exit 1; }
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then
-    [ -n "${CF_ROOT:-}" ] && [ "$CF_ROOT" != / ] || fail 'fixture root required'
+    if ! { [ -n "${CF_ROOT:-}" ] && [ "$CF_ROOT" != / ]; }; then
+        fail 'fixture root required'
+    fi
     case "$CF_ROOT" in /tmp/couvre-feu-*) ;; *) fail 'fixture root must use /tmp/couvre-feu-*';; esac
     ROOT=${CF_ROOT%/}
     [ "$(CDPATH='' cd -- "$ROOT" && pwd -P)" = "$ROOT" ] || fail 'fixture root must be canonical with no symlink ancestors'
@@ -20,7 +22,9 @@ if [ "${CF_TEST_MODE:-0}" = 1 ]; then RECOVERY=$ROOT/.couvrefeu-recovery
 else RECOVERY=/etc/.couvrefeu-recovery; fi
 DONE=$RECOVERY.done
 recovery_parent=${RECOVERY%/*}
-[ -d "$recovery_parent" ] && [ ! -L "$recovery_parent" ] || fail 'unsafe recovery parent'
+if ! { [ -d "$recovery_parent" ] && [ ! -L "$recovery_parent" ]; }; then
+    fail 'unsafe recovery parent'
+fi
 [ "$(stat -c %u "$recovery_parent")" = "$(id -u)" ] || fail 'unsafe recovery parent owner'
 recovery_parent_mode=$(stat -c %a "$recovery_parent")
 [ "$((0$recovery_parent_mode & 022))" = 0 ] || fail 'unsafe writable recovery parent'
@@ -29,11 +33,15 @@ for recovery_path in "$RECOVERY" "$DONE"; do
     [ ! -L "$recovery_path" ] || fail 'recovery path is a symlink'
 done
 if [ -e "$RECOVERY" ]; then
-    [ ! -e "$BACKUP" ] && [ ! -L "$BACKUP" ] || fail 'ambiguous installation and recovery journals'
+    if ! { [ ! -e "$BACKUP" ] && [ ! -L "$BACKUP" ]; }; then
+        fail 'ambiguous installation and recovery journals'
+    fi
     BACKUP=$RECOVERY
 fi
 if [ -e "$DONE" ]; then
-    [ ! -e "$BASE/backup" ] && [ ! -L "$BASE/backup" ] || fail 'ambiguous completed recovery and installation journal'
+    if ! { [ ! -e "$BASE/backup" ] && [ ! -L "$BASE/backup" ]; }; then
+        fail 'ambiguous completed recovery and installation journal'
+    fi
     BACKUP=$RECOVERY
 fi
 FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state'
@@ -64,8 +72,12 @@ trap 'exit 1' 1 2 15
 if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then
     case "${1:-}" in
         firewall-prepare|firewall-commit)
-            [ -d "$BASE/runtime/lock" ] && [ ! -L "$BASE/runtime/lock" ] || fail 'unsafe core lock'
-            [ -f "$BASE/runtime/lock/pid" ] && [ ! -L "$BASE/runtime/lock/pid" ] || fail 'unsafe core owner'
+            if ! { [ -d "$BASE/runtime/lock" ] && [ ! -L "$BASE/runtime/lock" ]; }; then
+                fail 'unsafe core lock'
+            fi
+            if ! { [ -f "$BASE/runtime/lock/pid" ] && [ ! -L "$BASE/runtime/lock/pid" ]; }; then
+                fail 'unsafe core owner'
+            fi
             owner=$(awk 'NR==1 {print; exit}' "$BASE/runtime/lock/pid")
             if [ "$owner" != "${PPID:-}" ] || ! kill -0 "$owner" 2>/dev/null; then fail 'journal caller does not own the core lock'; fi;;
         *) fail 'core operation is running; no installation/recovery changes made';;
@@ -89,7 +101,9 @@ safe_paths() {
 }
 signature() {
     if [ -e "$1" ]; then
-        [ -f "$1" ] && [ ! -L "$1" ] || fail "unsafe file: $1"
+        if ! { [ -f "$1" ] && [ ! -L "$1" ]; }; then
+            fail "unsafe file: $1"
+        fi
         printf '%s:%s:%s:%s\n' "$(sha256sum "$1" | awk '{print $1}')" "$(stat -c %a "$1")" "$(stat -c %u "$1")" "$(stat -c %g "$1")"
     else
         printf '%s\n' absent
@@ -123,11 +137,15 @@ valid_signature_record() {
 # leaves both the installation and every backup intact.
 journal_preflight() {
     owner_ids=$(id -u):$(id -g)
-    [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ] && [ "$(metadata "$BACKUP")" = "700:$owner_ids" ] || fail 'unsafe backup directory metadata'
+    if ! { [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ] && [ "$(metadata "$BACKUP")" = "700:$owner_ids" ]; }; then
+        fail 'unsafe backup directory metadata'
+    fi
     if [ "$BACKUP" != "$RECOVERY" ]; then
         [ "$(metadata "$BASE")" = "700:$owner_ids" ] || fail 'unsafe installation directory metadata'
     elif [ "${1:-}" != cleanup ]; then
-        [ -f "$BACKUP/restoring" ] && [ -f "$BACKUP/kernel-cleaned" ] || fail 'recovery phase missing'
+        if ! { [ -f "$BACKUP/restoring" ] && [ -f "$BACKUP/kernel-cleaned" ]; }; then
+            fail 'recovery phase missing'
+        fi
         if [ -e "$BASE" ]; then
             original_mode=$(awk 'NR==1 {print; exit}' "$BACKUP/dir_etc_couvrefeu")
             base_metadata=$(metadata "$BASE")
@@ -150,7 +168,9 @@ journal_preflight() {
     done
     for entry in "$BACKUP"/* "$BACKUP"/.[!.]* "$BACKUP"/..?*; do
         [ -e "$entry" ] || [ -L "$entry" ] || continue
-        [ -f "$entry" ] && [ ! -L "$entry" ] || fail 'backup entry is not a regular file; preserved'
+        if ! { [ -f "$entry" ] && [ ! -L "$entry" ]; }; then
+            fail 'backup entry is not a regular file; preserved'
+        fi
         name=${entry##*/}
         case "$name" in *[!a-z0-9_.-]*) fail 'invalid backup filename';; esac
         case " $allowed_entries " in *" $name "*) ;; *) fail "unexpected backup entry: $name; all files preserved";; esac
@@ -176,12 +196,16 @@ journal_preflight() {
 # transaction may contain either originals or our recorded installed files.
 preflight() {
     safe_paths
-    journal_preflight
-    [ -f "$BACKUP/ready" ] && [ ! -L "$BACKUP/ready" ] || fail 'incomplete backup; manual recovery required'
+    journal_preflight full
+    if ! { [ -f "$BACKUP/ready" ] && [ ! -L "$BACKUP/ready" ]; }; then
+        fail 'incomplete backup; manual recovery required'
+    fi
     owned_temp "$BACKUP/etc_config_firewall.staged" || fail 'temporary journal path collision'
     for rel in $FILES; do
         k=$(key "$rel")
-        [ -f "$BACKUP/$k.before" ] && [ -f "$BACKUP/$k.after" ] || fail "missing manifest: $rel"
+        if ! { [ -f "$BACKUP/$k.before" ] && [ -f "$BACKUP/$k.after" ]; }; then
+            fail "missing manifest: $rel"
+        fi
         if ! valid_signature_record "$BACKUP/$k.before" 1 || ! valid_signature_record "$BACKUP/$k.after" 0; then fail "invalid signature record: $rel"; fi
         before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
         after=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.after")
@@ -192,14 +216,20 @@ preflight() {
             tx_old=$(awk 'NR==1 {print}' "$BACKUP/firewall.transaction")
             tx_new=$(awk 'NR==2 {print}' "$BACKUP/firewall.transaction")
             awk 'END {exit NR!=2}' "$BACKUP/firewall.transaction" || fail 'invalid firewall transaction length'
-            [ -n "$tx_old" ] && [ -n "$tx_new" ] && [ "$(signature "$BACKUP/firewall.pending")" = "$tx_new" ] || fail 'corrupt firewall transaction'
+            if ! { [ -n "$tx_old" ] && [ -n "$tx_new" ] && [ "$(signature "$BACKUP/firewall.pending")" = "$tx_new" ]; }; then
+                fail 'corrupt firewall transaction'
+            fi
         fi
         if [ "$rel" = etc/couvrefeu/protected ] && [ "$current" != "$before" ]; then
-            [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ] || fail 'protected metadata drift'
+            if ! { [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
+                fail 'protected metadata drift'
+            fi
             valid_protection "$ROOT/$rel" || fail 'invalid protected list'
             awk 'NR==FNR {baseline[++n]=$0; next} FNR<=n && $0!=baseline[FNR] {exit 1} END {if(FNR<n) exit 1}' "$BACKUP/$k.staged" "$ROOT/$rel" || fail 'protected baseline was changed'
         elif [ "$rel" = etc/couvrefeu/state ] && [ "$current" != "$before" ]; then
-            [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ] || fail 'runtime state metadata drift'
+            if ! { [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
+                fail 'runtime state metadata drift'
+            fi
         else
             [ "$current" = "$before" ] || [ "$current" = "$after" ] || [ "$current" = "$tx_old" ] || [ "$current" = "$tx_new" ] || fail "drift at /$rel; preserved current file and backup; resolve explicitly"
         fi
@@ -262,7 +292,9 @@ atomic_copy() (
 fixture_tools() {
     case "${CF_BACKEND_DIR:-}" in "$ROOT"/*) ;; *) fail 'fixture backend must be below fixture root';; esac
     [ "$(CDPATH='' cd -- "$CF_BACKEND_DIR" && pwd -P)" = "$CF_BACKEND_DIR" ] || fail 'fixture backend must be canonical with no symlink ancestors'
-    [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] && [ ! -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] || fail 'fixture backend marker missing'
+    if ! { [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] && [ ! -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ]; }; then
+        fail 'fixture backend marker missing'
+    fi
 }
 live_tools() {
     [ "${CF_TEST_MODE:-0}" != 1 ] || [ "${CF_TEST_INSTALL_KERNEL:-0}" = 1 ]
@@ -281,7 +313,9 @@ installed_core() {
 reload_firewall() {
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         fixture_tools
-        [ -x "$CF_BACKEND_DIR/firewall" ] && [ ! -L "$CF_BACKEND_DIR/firewall" ] || fail 'fixture firewall tool unavailable'
+        if ! { [ -x "$CF_BACKEND_DIR/firewall" ] && [ ! -L "$CF_BACKEND_DIR/firewall" ]; }; then
+            fail 'fixture firewall tool unavailable'
+        fi
         "$CF_BACKEND_DIR/firewall" reload
     else /etc/init.d/firewall reload; fi
 }
@@ -291,8 +325,12 @@ reload_firewall() {
 runtime_preflight() {
     runtime=$BASE/runtime
     [ -e "$runtime" ] || [ -L "$runtime" ] || return 0
-    [ -d "$runtime" ] && [ ! -L "$runtime" ] || fail 'unsafe runtime directory'
-    [ ! -e "$runtime/lock" ] && [ ! -L "$runtime/lock" ] || fail 'runtime lock present; installation/recovery stopped'
+    if ! { [ -d "$runtime" ] && [ ! -L "$runtime" ]; }; then
+        fail 'unsafe runtime directory'
+    fi
+    if ! { [ ! -e "$runtime/lock" ] && [ ! -L "$runtime/lock" ]; }; then
+        fail 'runtime lock present; installation/recovery stopped'
+    fi
     expected_owner=$(stat -c '%u:%g' "$BACKUP/etc_couvrefeu_state.staged")
     [ "$(metadata "$runtime")" = "700:$expected_owner" ] || fail 'runtime directory metadata drift'
     for p in "$runtime"/* "$runtime"/.[!.]* "$runtime"/..?*; do
@@ -302,18 +340,26 @@ runtime_preflight() {
             .uci.*)
                 suffix=${name##*.}
                 case "$suffix" in ''|*[!0-9]*) fail "unowned runtime directory: $name";; esac
-                [ -d "$p" ] && [ ! -L "$p" ] && [ "$(metadata "$p")" = "700:$expected_owner" ] || fail 'unsafe UCI staging directory'
+                if ! { [ -d "$p" ] && [ ! -L "$p" ] && [ "$(metadata "$p")" = "700:$expected_owner" ]; }; then
+                    fail 'unsafe UCI staging directory'
+                fi
                 for child in "$p"/* "$p"/.[!.]* "$p"/..?*; do
                     [ -e "$child" ] || [ -L "$child" ] || continue
                     if [ "${child##*/}" = .delta ]; then
-                        [ -d "$child" ] && [ ! -L "$child" ] && [ "$(metadata "$child")" = "700:$expected_owner" ] || fail 'unsafe UCI delta directory'
+                        if ! { [ -d "$child" ] && [ ! -L "$child" ] && [ "$(metadata "$child")" = "700:$expected_owner" ]; }; then
+                            fail 'unsafe UCI delta directory'
+                        fi
                         for delta in "$child"/* "$child"/.[!.]* "$child"/..?*; do
                             [ -e "$delta" ] || [ -L "$delta" ] || continue
-                            [ "${delta##*/}" = firewall ] && [ -f "$delta" ] && [ ! -L "$delta" ] || fail 'unowned UCI delta contents'
+                            if ! { [ "${delta##*/}" = firewall ] && [ -f "$delta" ] && [ ! -L "$delta" ]; }; then
+                                fail 'unowned UCI delta contents'
+                            fi
                             [ "$(metadata "$delta")" = "600:$expected_owner" ] || fail 'UCI delta metadata drift'
                         done
                     else
-                        [ "${child##*/}" = firewall ] && [ -f "$child" ] && [ ! -L "$child" ] || fail 'unowned UCI staging contents'
+                        if ! { [ "${child##*/}" = firewall ] && [ -f "$child" ] && [ ! -L "$child" ]; }; then
+                            fail 'unowned UCI staging contents'
+                        fi
                         [ "$(metadata "$child")" = "$(metadata "$BACKUP/etc_config_firewall.staged")" ] || fail 'UCI staging metadata drift'
                     fi
                 done
@@ -324,7 +370,9 @@ runtime_preflight() {
                 case "$suffix" in ''|*[!0-9]*) fail "unowned runtime file: $name";; esac;;
             *) fail "unowned runtime file: $name";;
         esac
-        [ -f "$p" ] && [ ! -L "$p" ] || fail 'runtime lock/directory/symlink present; preserved'
+        if ! { [ -f "$p" ] && [ ! -L "$p" ]; }; then
+            fail 'runtime lock/directory/symlink present; preserved'
+        fi
         [ "$(metadata "$p")" = "600:$expected_owner" ] || fail "runtime file metadata drift: $name"
     done
 }
@@ -348,7 +396,9 @@ case "${1:-}" in
         preflight
         if [ -e "$BACKUP/firewall.transaction" ]; then firewall_commit; fi
         candidate=$2
-        [ -f "$candidate" ] && [ ! -L "$candidate" ] || fail 'unsafe firewall candidate'
+        if ! { [ -f "$candidate" ] && [ ! -L "$candidate" ]; }; then
+            fail 'unsafe firewall candidate'
+        fi
         [ "$(metadata "$candidate")" = "$(metadata "$ROOT/etc/config/firewall")" ] || fail 'firewall candidate metadata mismatch'
         cp -p "$candidate" "$BACKUP/firewall.pending"
         { signature "$ROOT/etc/config/firewall"; signature "$BACKUP/firewall.pending"; } > "$BACKUP/firewall.transaction.next"
