@@ -48,8 +48,14 @@ export interface PersonDTO {
     effectiveManualPause: {
         until: number;
     } | null;
-    scheduleBlocked: boolean;
+    scheduleBlocked: boolean | null;
     scheduleExplanation: string;
+    scheduleTimezone?: string;
+    scheduleWitness?: 'none' | 'unverified' | 'owner-reviewed-clock';
+    /** Exclusive epoch deadline for a configured schedule claim; null means unknown. */
+    scheduleValidUntil?: number | null;
+    /** Service epoch when this configured schedule claim was evaluated. */
+    scheduleCheckedAt?: number | null;
     observationHealth: 'healthy' | 'unconfirmed' | 'unreachable';
     status: OperationState;
     latestOperation: OperationDTO | null;

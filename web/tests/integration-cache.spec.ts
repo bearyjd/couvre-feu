@@ -56,3 +56,77 @@ test('enabled integration distinguishes automatic queue, sent request and unknow
     await expect(page.locator('[data-control="resume"]')).toBeDisabled();
     await expect(page.getByRole('button', {name: /retry/i})).toHaveCount(0);
 });
+
+test('integration distinguishes active, inactive and unknown owner schedules while resume remains a manual control', async ({page, demo}) => {
+    const scope = 'f'.repeat(64), now = Math.floor(Date.now() / 1000);
+    const provenance = {source: 'real-router-integration', integrationScope: scope, routerCompatibilityVerified: false};
+    const actor = {id: 'fixture_parent', displayName: 'Explicit schedule fixture', role: 'parent', personIds: ['pilot'], permissionVersion: '1'};
+    const person = {id: 'pilot', name: 'Schedule test person', devices: [{id: 'phone', label: 'Explicit test device'}], manualPause: null, effectiveManualPause: null, scheduleBlocked: true as boolean | null,
+        scheduleExplanation: 'Owner schedules in America/New_York: bedtime: Mon, Tue 21:00–07:00. Resume clears only manual pause. Active at the router observation: bedtime.', scheduleWitness: 'owner-reviewed-clock', scheduleValidUntil: now + 31, scheduleCheckedAt: now, observationHealth: 'healthy', status: 'confirmed', latestOperation: null};
+    await page.clock.install({time: new Date((now - 1) * 1000)});
+    await page.clock.pauseAt(new Date(now * 1000));
+    await page.route(demo.origin + '/', async route => {
+        const response = await route.fetch();
+        const html = (await response.text()).replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}" data-automatic-dispatch="true">`);
+        await route.fulfill({response, body: html});
+    });
+    await page.route('**/auth/session', route => route.fulfill({json: {...provenance, actor, csrfToken: 'explicit-browser-fixture', expiresAt: now + 600}}));
+    await page.route('**/people', route => route.fulfill({json: {...provenance, packetAcceptance: 'unmeasured', people: [person], serviceDesiredRevision: 0, routerDesiredRevision: 0, routerConfirmedRevision: 0,
+        revisionToken: '"s0-r0-' + 'a'.repeat(64) + '"', observedAt: now, statusAgeSeconds: 0, lastSuccessfulConfirmationAt: now, errors: []}}));
+    await page.goto(demo.origin);
+    const schedule = page.locator('#people .reasons dd').nth(1);
+    await expect(schedule).toContainText('Schedule currently blocks access');
+    await expect(page.getByText(/Owner schedules in America\/New_York/)).toBeVisible();
+    await expect(page.locator('[data-control="resume"]')).toBeEnabled();
+    person.scheduleBlocked = null; person.scheduleExplanation = 'Owner schedules in America/New_York: bedtime: Mon, Tue 21:00–07:00. Current schedule state unknown: router clock calibration expired. Resume clears only manual pause.';
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(schedule).toContainText('Schedule state unknown');
+    await expect(schedule).not.toContainText('No active schedule block');
+    await expect(page.locator('[data-control="resume"]')).toBeEnabled();
+    person.scheduleBlocked = false; person.scheduleExplanation = 'No owner window active at the router observation.';
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(schedule).toContainText('No active schedule block');
+    await page.context().setOffline(true);
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+    await expect(schedule).toContainText('Schedule state unknown');
+    await expect(page.locator('[data-control="resume"]')).toBeDisabled();
+    await page.context().setOffline(false);
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(schedule).toContainText('No active schedule block');
+    await page.clock.fastForward(31000);
+    await expect(schedule).toContainText('Schedule state unknown');
+    await expect(page.locator('[data-control="resume"]')).toBeDisabled();
+});
+
+test.describe('schedule deadline clock validity', () => {
+test.use({serviceWorkers: 'block'});
+test('a frozen real schedule response expires at its calibration deadline while manual controls remain fresh', async ({page, demo}) => {
+    const scope = '1'.repeat(64), now = Math.floor(Date.now() / 1000);
+    const provenance = {source: 'real-router-integration', integrationScope: scope, routerCompatibilityVerified: false};
+    const actor = {id: 'deadline_parent', displayName: 'Explicit deadline fixture', role: 'parent', personIds: ['pilot'], permissionVersion: '1'};
+    await page.clock.install({time: new Date((now - 1) * 1000)});
+    await page.clock.pauseAt(new Date(now * 1000));
+    await page.route(demo.origin + '/', async route => {
+        const response = await route.fetch();
+        await route.fulfill({response, body: (await response.text()).replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}" data-automatic-dispatch="true">`)});
+    });
+    await page.route('**/auth/session', route => route.fulfill({json: {...provenance, actor, csrfToken: 'explicit-deadline-fixture', expiresAt: now + 600}}));
+    await page.route('**/people', route => route.fulfill({json: {...provenance, packetAcceptance: 'unmeasured', people: [{id: 'pilot', name: 'Deadline test person', devices: [], manualPause: null, effectiveManualPause: null,
+        scheduleBlocked: false, scheduleExplanation: 'No owner window active at the last router observation.', scheduleTimezone: 'America/New_York', scheduleWitness: 'owner-reviewed-clock', scheduleValidUntil: now + 3, scheduleCheckedAt: now,
+        observationHealth: 'healthy', status: 'confirmed', latestOperation: null}], serviceDesiredRevision: 0, routerDesiredRevision: 0, routerConfirmedRevision: 0,
+        revisionToken: '"s0-r0-' + 'a'.repeat(64) + '"', observedAt: now, statusAgeSeconds: 0, lastSuccessfulConfirmationAt: now, errors: []}}));
+    await page.goto(demo.origin);
+    const heading = page.locator('[data-schedule-state="pilot"]');
+    await expect(heading).toHaveText('No active schedule block');
+    const cached = await page.evaluate(() => JSON.parse(localStorage.getItem(localStorage.getItem('cf-status-active:v1')!)!).status.people[0]);
+    expect(cached.scheduleValidUntil).toBe(now + 3); expect(cached.scheduleWitness).toBe('owner-reviewed-clock'); expect(cached.scheduleCheckedAt).toBe(now);
+    await page.clock.fastForward(2000); await expect(heading).toHaveText('No active schedule block');
+    await page.clock.fastForward(1000); await expect(heading).toHaveText('Schedule state unknown');
+    await expect(page.locator('[data-control="resume"]')).toBeEnabled();
+    await page.clock.setSystemTime(new Date((now - 60) * 1000));
+    await page.clock.fastForward(1000); await expect(heading).toHaveText('Schedule state unknown');
+    await page.reload(); // A new receipt basis cannot bless a clock-skewed frozen response.
+    await expect(heading).toHaveText('Schedule state unknown');
+});
+});

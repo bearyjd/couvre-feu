@@ -26,6 +26,14 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.dispatch, undefined);
         save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
         const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
+        const scheduled = {...manifest, enrollment: {...manifest.enrollment, schedules: [{person: 'pilot', id: 'bedtime', weekdays: ['Mon'], start: '21:00', stop: '07:00'}]}, scheduleClock: {timezone: 'America/New_York'}};
+        save(scheduled); const unverified = integrationConfig(path);
+        assert.equal(unverified.enrollment.schedules.length, 1); assert.equal(unverified.scheduleClock?.conformance, undefined);
+        const conformance = {utcOffsetMinutes: -240, verifiedAt: 1791763200, validUntil: 1791849600, evidenceSha256: 'e'.repeat(64)};
+        save({...scheduled, scheduleClock: {...scheduled.scheduleClock, conformance}});
+        assert.deepEqual(integrationConfig(path).scheduleClock?.conformance, conformance);
+        save({...scheduled, scheduleClock: undefined}); assert.throws(() => integrationConfig(path), /owner_schedule_clock_required/);
+        save({...scheduled, scheduleClock: {...scheduled.scheduleClock, conformance: {...conformance, validUntil: conformance.verifiedAt + 7 * 86400 + 1}}}); assert.throws(() => integrationConfig(path), /invalid_schedule_conformance/);
         for (const dispatch of [{enabled: 'true', pollSeconds: 2, maxBackoffSeconds: 60}, {enabled: true, pollSeconds: 0, maxBackoffSeconds: 60}, {enabled: true, pollSeconds: 2, maxBackoffSeconds: 301}, {enabled: true, pollSeconds: 10, maxBackoffSeconds: 2}, {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60, bypass: true}]) { save({...manifest, dispatch}); assert.throws(() => integrationConfig(path)); }
         save(manifest);
         assert.equal(c.provenance.source, 'real-router-integration'); assert.equal(c.provenance.routerCompatibilityVerified, false);
