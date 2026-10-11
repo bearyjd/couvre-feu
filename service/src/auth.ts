@@ -82,7 +82,7 @@ export function issueBootstrap(store: Store, accountId: string, now = Math.floor
 export class Auth {
     readonly store: Store;
     readonly origin: string;
-    readonly rpID = 'localhost';
+    readonly rpID: string;
     readonly now: () => number;
     private attempts: number[] = [];
     readonly provenance: Provenance;
@@ -90,6 +90,7 @@ export class Auth {
     constructor(store: Store, origin: string, now = () => Math.floor(Date.now() / 1000), context: {provenance?: Provenance; rpName?: string} = {}) {
         this.store = store;
         this.origin = origin;
+        this.rpID = new URL(origin).hostname;
         this.now = now;
         this.provenance = context.provenance ?? provenance;
         this.rpName = context.rpName ?? 'Couvre-feu fictional demo';

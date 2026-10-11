@@ -42,7 +42,7 @@ export class IntegrationPolicy {
             // A historical confirmation is retained in confirmedAt, never rendered as current enforcement.
             state: uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state, createdAt: op.created_at, updatedAt: op.updated_at,
             error: uncertainClaim ? 'dispatch_lease_expired_remote_outcome_unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'router_receipt_historical' : 'current_router_confirmation_unavailable' : op.error, confirmedAt: op.confirmed_at,
-            currentHealthy: healthy, accepted: r.delivery === 'accepted', dispatch: r.phase === 'queued' ? 'awaiting_operator_dispatch' : r.phase === 'claimed' ? 'consumed' : r.phase === 'uncertain' ? 'uncertain' : 'resolved'};
+            currentHealthy: healthy, accepted: r.delivery === 'accepted', dispatch: r.phase === 'queued' ? this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch' : r.phase === 'claimed' ? 'consumed' : r.phase === 'uncertain' ? 'uncertain' : 'resolved'};
     }
     operation(actor: Actor, id: string): OperationDTO {
         const op = this.row(id);
@@ -64,7 +64,7 @@ export class IntegrationPolicy {
         const body = object(input, action === 'pause' ? ['until'] : []), until = action === 'pause' ? integer(body.until) : null;
         if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) throw new AppError(428, 'revision_precondition_required');
-        const request = JSON.stringify({person, action, until, precondition});
+        const request = JSON.stringify({person, action, until, precondition, permissionVersion: actor.permissionVersion});
         const op = this.store.transaction(() => {
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
             if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
@@ -80,7 +80,7 @@ export class IntegrationPolicy {
             validatePilotPolicy(policy, this.store.config, false);
             const id = randomUUID(), now = this.now();
             const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
-            this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,'awaiting_operator_dispatch')", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now);
+            this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
             this.store.run("INSERT INTO operation_rpc(operation_id,generation,base_digest,request_digest,envelope_json,phase) VALUES(?,?,?,?,?,'queued')", id, o.generation, o.policyDigest, requestDigest(envelope), JSON.stringify(envelope));
             this.store.run('UPDATE integration_state SET active_operation_id=? WHERE singleton=1', id);
             this.store.run('UPDATE service_state SET desired_json=?,highwater=highwater+1 WHERE singleton=1', policyJSON(policy));
@@ -110,5 +110,8 @@ export class IntegrationPolicy {
         if (actor.role !== 'admin') throw new AppError(403, 'admin_required');
         const p = this.store.config.person;
         return {...this.store.config.provenance, devices: [{...p.device, personId: p.id}]};
+    }
+    private automaticEnabled(): boolean {
+        return !!this.store.config.dispatch?.enabled && this.store.get<{enabled: number}>('SELECT enabled FROM automatic_dispatch WHERE singleton=1')?.enabled === 1;
     }
 }

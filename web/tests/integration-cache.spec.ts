@@ -29,3 +29,30 @@ test('real-source cached status is scoped to source, installation and authentica
     });
     expect(result).toEqual({first: 'real-router-integration', secretLeaked: false, otherInstallation: null, wrongSource: null, allowed: ['pilot'], wrongAccountScope: null});
 });
+
+test('enabled integration distinguishes automatic queue, sent request and unknown outcome without offering retry', async ({page, demo}) => {
+    const scope = 'e'.repeat(64), now = Math.floor(Date.now() / 1000);
+    const provenance = {source: 'real-router-integration', integrationScope: scope, routerCompatibilityVerified: false};
+    const actor = {id: 'fixture_parent', displayName: 'Explicit UI fixture', role: 'parent', personIds: ['pilot'], permissionVersion: '1'};
+    const operation = {...provenance, id: '00000000-0000-4000-8000-000000000000', personId: 'pilot', action: 'pause', revision: 1, state: 'pending', createdAt: now, updatedAt: now, error: null, confirmedAt: null, dispatch: 'awaiting_automatic_dispatch'};
+    await page.route(demo.origin + '/', async route => {
+        const response = await route.fetch();
+        const html = (await response.text()).replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}" data-automatic-dispatch="true">`);
+        await route.fulfill({response, body: html});
+    });
+    await page.route('**/auth/session', route => route.fulfill({json: {...provenance, actor, csrfToken: 'explicit-browser-fixture', expiresAt: now + 600}}));
+    await page.route('**/people', route => route.fulfill({json: {...provenance, packetAcceptance: 'unmeasured', people: [{id: 'pilot', name: 'Explicit test person', devices: [{id: 'phone', label: 'Explicit test device'}], manualPause: null, effectiveManualPause: null, scheduleBlocked: false, scheduleExplanation: 'Schedules unavailable in this fixture.', observationHealth: 'healthy', status: operation.state, latestOperation: operation}], serviceDesiredRevision: 1, routerDesiredRevision: 0, routerConfirmedRevision: 0, revisionToken: null, observedAt: now, statusAgeSeconds: 0, lastSuccessfulConfirmationAt: now, errors: []}}));
+    await page.goto(demo.origin);
+    await expect(page.getByText('Pause pending. Waiting for automatic router confirmation.', {exact: true})).toBeVisible();
+    await expect(page.locator('[data-control="pause"]')).toBeDisabled();
+    await expect(page.locator('[data-control="resume"]')).toBeDisabled();
+    operation.dispatch = 'consumed';
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(page.getByText('Pause pending. Waiting for the router receipt.', {exact: true})).toBeVisible();
+    operation.state = 'unknown'; operation.dispatch = 'uncertain';
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(page.getByText(/Pause outcome unknown.*No retry is authorized/)).toBeVisible();
+    await expect(page.locator('[data-control="pause"]')).toBeDisabled();
+    await expect(page.locator('[data-control="resume"]')).toBeDisabled();
+    await expect(page.getByRole('button', {name: /retry/i})).toHaveCount(0);
+});

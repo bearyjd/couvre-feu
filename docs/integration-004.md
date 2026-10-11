@@ -4,7 +4,7 @@ Status: **implemented source runbook; target acceptance pending**. Independently
 reviewed release identity is recorded in [PR #3](https://github.com/bearyjd/couvre-feu/pull/3);
 consult its [checks](https://github.com/bearyjd/couvre-feu/pull/3/checks) for final exact-head CI.
 No command
-in this runbook authorizes a live connection or mutation. Every live batch requires
+in this runbook authorizes a live connection or mutation. Maintenance live batches require
 approval of its exact script, hash, target, admitted MAC, protected identities,
 effects, bounds and rollback. [PRP-004](prp/PRP-004-router-integration.md) defines
 the protocol; [acceptance-004](acceptance-004.md) records measured versus pending gates.
@@ -29,7 +29,8 @@ changed installation or mismatched host identity. A new installation needs expli
 private configuration and fresh database/enrollment; a revision reset is insufficient.
 The manifest's enrollment policy is a local template; startup does not enroll the
 router. Enrollment requires its own approved live command, followed by an approved
-observation before controls. This pilot rejects schedules; do not interpret real
+observation before controls. In owner-enabled mode the supervisor supplies that observation;
+activating this mode requires separately reviewed deployment authorization. This pilot rejects schedules; do not interpret real
 schedule truth as UTC. Schedule integration requires later evidence and design.
 Before opening SQLite, lstat checks the DB, WAL, SHM and rollback `-journal` paths;
 unsafe files and dangling symlinks fail rather than being followed or repaired.
@@ -39,6 +40,44 @@ Required manifest groups are `version: 1`, `mode: "integration"`, `port`, `dataD
 `router` supplies host/user/port, knownHosts, hostFingerprint, agentSocket,
 publicIdentity, publicKeyFingerprint and generation. `person` binds one device MAC;
 accounts bind explicit roles/person IDs. Sensitive values stay private.
+
+Optional `dispatch` is an exact object with `enabled` (boolean), `pollSeconds`
+(integer 2–15) and `maxBackoffSeconds` (integer from `pollSeconds` through 300).
+Omitting it or using `enabled: false` preserves exact one-use maintenance permits.
+`enabled: true` starts the serialized supervisor from `integration:start`; each
+authenticated queued intent gets at most one durable apply attempt. Every cycle
+first observes the pinned generation and accepted base. Failures back off read-only
+polling; uncertain operations receive receipt reads and never automatic reapply.
+Dispatch binds the exact manifest/target digests, public identity, protected MACs,
+installation generation and a revocable local owner epoch. Actor permission changes
+before the claim fail the intent without applying it. Accounts still require genuine
+passkeys, CSRF, resource scope and revision preconditions.
+
+Automatic observe and receipt polling retain at most 64 completed read invocations,
+plus consumed callbacks that remain in flight. A bounded summary per read kind
+records the cumulative dispatch count and latest timing/outcome. Unchanged operation
+state/error outcomes are coalesced, while fresh observation timestamps still update.
+Apply claims, operation envelopes/expiry, accepted receipt evidence, meaningful
+operation/security/revocation audits and manually approved permit history are never
+removed by this retention policy. Old unmarked history remains conservative evidence;
+only explicitly marked automatic reads are compacted. Claim and lease cleanup use
+an index, so continuous polling does not scan retained dispatch history.
+
+Optional `origin` is an exact canonical HTTPS origin with a DNS hostname, for
+example `https://parent.example.test` (a fictional documentation placeholder).
+Choose the stable private hostname before creating passkeys. The RP ID derives
+from its hostname; Host and Origin must match exactly, and auth cookies use Secure.
+Without this field, origin remains `http://localhost:<port>`. The service always
+binds `127.0.0.1`: supply a separately deployed private TLS reverse proxy that
+preserves the configured Host and browser Origin and forwards only to loopback.
+Forwarded headers never select origin, host, user or RP identity. This change
+installs no proxy, certificate or phone/network deployment.
+
+Any manifest edit changes its digest and existing database bindings refuse it.
+Restart is mandatory; use reviewed private backup/recovery or fresh explicit
+database/account enrollment rather than editing identity markers to bypass refusal.
+Do not discard unresolved operations when migrating configuration. Source support
+for continuous dispatch does not establish router safety or packet acceptance.
 
 The following names are placeholders, **not runnable provisioning commands**:
 
@@ -104,11 +143,12 @@ Enrollment uses only supplied private accounts, assigned resources and genuine
 WebAuthn. Parent HTTP requests retain session/CSRF/role/resource/precondition and
 idempotency checks. GET `/people` and GET `/operations/:id` use cached observations;
 UI polling cannot make a remote call. POST `/people/:personId/pause` and
-`/people/:personId/resume` create intent that waits for operator dispatch.
+`/people/:personId/resume` create intent. Default mode waits for operator dispatch;
+explicit owner-enabled mode dispatches through the background supervisor.
 
 Prepare one invocation locally, inspect its exact target/argv/stdin/hash/deadlines
 and abort/rollback, obtain approval, then execute its one-use CLI permit.
-Each observation, apply, receipt lookup or retry needs its own disclosed step.
+In maintenance mode each observation, apply or receipt lookup needs its own disclosed step.
 Changed payload/target/generation or a spent permit refuses dispatch. Shutdown
 revokes ready steps and fences late completions; it does not invoke router cleanup.
 
@@ -125,6 +165,14 @@ a receipt/status read first. A historical receipt prevents a replacement apply;
 absence alone does not drain an old queued request. Conclusively complete/fence it
 before restoration or another mutation. Keep current runtime and historical outcome
 separate after local changes, expiry, restart or drift.
+
+`integration:dispatch -- stop <PRIVATE_MANIFEST>` revokes the automatic epoch as
+well as outstanding permits. The running supervisor then makes no further calls;
+starting a new explicitly enabled service creates a new epoch. Shutdown waits for
+bounded local work and fences late replies. Neither stopping a service nor expiry
+of a local lease proves a remote SSH command ended. Preserve uncertain envelopes
+and perform receipt reconciliation or a reviewed remote generation fence before
+restoration/uninstall; never treat a local kill as remote drain.
 
 At handoff record the exact reviewed source, batch hashes, measured/unavailable
 checks, private evidence locations, dispatch state, final router installation and
