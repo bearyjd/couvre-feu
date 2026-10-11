@@ -1,4 +1,4 @@
-name: isolated-router-fixtures
+name: isolated-project-checks
 on:
   push:
   pull_request:
@@ -20,3 +20,23 @@ jobs:
         run: sh tests/run.sh
       - name: Record pending real integration and live gates
         run: sh tests/acceptance.sh --preflight
+  local-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.8.1'
+          cache: npm
+      - name: Install locked project dependencies
+        run: |
+          node --version
+          npm --version
+          npm ci
+      - name: Check types and durable fake-router service behavior
+        run: npm run typecheck && npm run test:service
+      - name: Install isolated browser-test runtime
+        run: npx playwright install --with-deps chromium
+      - name: Verify authenticated browser and offline behavior
+        run: npm run test:web

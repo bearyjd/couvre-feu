@@ -1,8 +1,34 @@
 # Couvre-feu
 
-Router-local internet pause and schedules for assigned devices. This first PR delivers a shell core and recovery tooling for GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. It is a locally testable implementation, with real OpenWrt packet behavior and live-router acceptance still pending. No service, PWA, companion, telemetry collector, bonus grant, or deployment is included.
+Router-local internet pause and schedules for assigned devices, plus an authenticated local parent-app prototype. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. The app uses fictional accounts and an independent fake-router process: it cannot control a household router. Real packet behavior, target acceptance and deployment remain pending; companions, activity collection and bonus grants are later work.
 
-AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforcement-core.md) and [inspection report](docs/spike-001.md) explain the target. [Enforcement contract](docs/enforcement-contract.md), [acceptance and recovery](docs/acceptance-001.md), [future service contract](docs/service-contract.md), and [companion limits](docs/companion-capabilities.md) document the remaining work. No Fengard source was copied.
+AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforcement-core.md) and [inspection report](docs/spike-001.md) explain the target. [Enforcement contract](docs/enforcement-contract.md), [acceptance and recovery](docs/acceptance-001.md), [parent PWA specification](docs/prp/PRP-002-parent-pwa.md), [policy service specification](docs/prp/PRP-003-policy-service.md), and [companion limits](docs/companion-capabilities.md) describe each phase. No Fengard source was copied.
+
+## Run the local parent demo
+
+Use Node 26.8.1 and npm 11.19.0. Install locked dependencies with `npm ci`, then run these in separate terminals from the repository:
+
+```sh
+npm run demo:router
+```
+
+```sh
+npm run demo:start
+```
+
+```sh
+npm run demo:bootstrap -- bryn
+```
+
+Open `http://localhost:4173`, enter the generated one-use token and create a demo passkey. Bryn is a fictional parent assigned only Alex; `jd` creates a fictional administrator token. Permissions are fixed by the server. The app provides pause, timed pause, resume, schedule explanations and read-only offline status. Usage, domains and app history are unavailable.
+
+The listener binds to loopback, and the demo has no SSH or production-router transport. Its separate fake engine owns expiry while the service is stopped. Local passkeys are tied to this localhost origin; household enrollment and private HTTPS deployment are separate work. [Demo runbook](docs/demo-002.md), [PWA acceptance](docs/acceptance-002.md), [service acceptance](docs/acceptance-003.md), and [dependency review](docs/dependencies-002.md) explain scenarios, reset, tested behavior and remaining gates.
+
+```sh
+npm run typecheck
+npm run test:service
+npm run test:web
+```
 
 ## Local verification
 
@@ -12,7 +38,7 @@ sh tests/acceptance.sh --preflight
 sh tests/acceptance.sh --fixtures
 ```
 
-The runner executes installer recovery fixtures before core fixtures and available shell checks. Fixtures use private marked roots below `/tmp/couvre-feu-*`, with simulated router tools. They do not prove packet forwarding, stream cutoff, DNS behavior, target ash/awk compatibility, or firmware persistence. The acceptance script defaults to read-only local prerequisite discovery. `--fixtures` runs the fixture suite with PRP §8 coverage mapping. `--installed` performs read-only installed checks when deliberately run as router root and still requires approval of its exact live invocation; it does not run packet probes. A prior complete local run passed 43 installer and 64 core fixtures plus ShellCheck/syntax checks using host sh. Independent source review passed at its reviewed head. Genuine BusyBox ash/awk/timeout CI and final latest-head checks/review are merge gates; their current status is available in [PR checks](https://github.com/bearyjd/couvre-feu/pull/1/checks).
+The runner executes installer recovery fixtures before core fixtures and available shell checks. Fixtures use private marked roots below `/tmp/couvre-feu-*`, with simulated router tools. They do not prove packet forwarding, stream cutoff, DNS behavior, target ash/awk compatibility, or firmware persistence. The acceptance script defaults to read-only local prerequisite discovery. `--fixtures` runs the fixture suite with PRP §8 coverage mapping. `--installed` performs read-only installed checks when deliberately run as router root and still requires approval of its exact live invocation; it does not run packet probes. The merged router baseline passed 43 installer and 73 core fixtures, genuine BusyBox ash/awk/timeout checks and ShellCheck. Independent source review passed at its reviewed head. Final latest-head CI and independent review remain merge gates; their current status is available in [PR checks](https://github.com/bearyjd/couvre-feu/pull/2/checks).
 
 ## Installation boundary
 

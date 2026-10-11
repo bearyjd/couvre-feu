@@ -92,7 +92,9 @@ class RouterFixture:
     def close(self):
         self.tmp.cleanup()
 
-    def run(self, *args, document=None, raw=None, timeout=20, env=None):
+    # Hundreds of Python backend processes need headroom on shared CI hosts.
+    # Explicit caller deadlines and router input deadlines remain independent.
+    def run(self, *args, document=None, raw=None, timeout=60, env=None):
         if document is not None:
             raw = json.dumps(document, separators=(",", ":"))
         return subprocess.run(self.shell + [str(REPO / "router/cfctl"), *args],
