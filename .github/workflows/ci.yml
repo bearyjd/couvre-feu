@@ -7,8 +7,8 @@ permissions:
 jobs:
   fixtures:
     runs-on: ubuntu-latest
-    # Recovery, core and RPC crash/race fixtures use isolated Python backends.
-    timeout-minutes: 35
+    # Two concurrent backend lanes reduce CI contention; per-operation bounds stay fixed.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install CI-only ash and lint tools
@@ -18,7 +18,10 @@ jobs:
           CF_TEST_SHELL: busybox ash
           CF_TEST_AWK: busybox awk
           CF_TEST_TIMEOUT: busybox timeout
-        run: sh tests/run.sh
+          CF_TEST_WORKERS: '2'
+        run: |
+          busybox 2>&1 | awk 'NR == 1 { print }'
+          sh tests/run.sh
       - name: Record pending real integration and live gates
         run: sh tests/acceptance.sh --preflight
   local-demo:

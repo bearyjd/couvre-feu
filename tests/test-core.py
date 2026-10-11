@@ -14,23 +14,12 @@ import unittest
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
-from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy
+from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy, run_owned_process
 
 
-def run_fixture_process(command, *, env, raw=None, timeout=60):
-    """Bound fixture work and terminate its entire owned group on failure."""
-    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE if raw is not None else None,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        stdout, stderr = process.communicate(raw, timeout=timeout)
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-    except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate(timeout=5)
-        raise
+def run_fixture_process(command, *, env, raw=None, timeout=60, started=None):
+    return run_owned_process(command, env=env, input=raw, timeout=timeout, started=started,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 def evaluate_fixture_chain(chains, chain, packet, sets, depth=0):
@@ -1152,19 +1141,30 @@ class FixtureProcessTests(unittest.TestCase):
         script = """
 import os, subprocess, sys, time
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+from pathlib import Path
+Path(sys.argv[1]).write_text(str(child.pid))
 print(child.pid, flush=True)
 time.sleep(60)
 """
-        with self.assertRaises(subprocess.TimeoutExpired) as caught:
-            run_fixture_process([sys.executable, "-c", script], env=os.environ, timeout=3)
-        output = caught.exception.output
-        if isinstance(output, bytes):
-            output = output.decode()
-        child_pid = int(output.strip())
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-core-ready-', dir='/tmp') as directory:
+            ready = Path(directory) / 'child'
+            def started(process, raw):
+                deadline = time.monotonic() + 60
+                while not ready.exists() or not ready.read_text():
+                    self.assertIsNone(process.poll(), 'owner exited before its child was ready')
+                    self.assertLess(time.monotonic(), deadline, 'child startup exceeded fixture budget')
+                    time.sleep(0.01)
+                return raw
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                run_fixture_process([sys.executable, "-c", script, str(ready)], env=os.environ, timeout=3, started=started)
+            self.assertEqual(caught.exception.timeout, 3)
+            child_pid = int(ready.read_text())
         status = Path('/proc') / str(child_pid) / 'stat'
-        if status.exists():
-            self.assertEqual(status.read_text().split(')', 1)[1].split()[0], 'Z',
-                             'the timed-out descendant must be terminated before fixture cleanup')
+        try:
+            state = status.read_text().split(')', 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            state = None
+        self.assertIn(state, (None, 'Z'), 'the timed-out descendant must be terminated before fixture cleanup')
 
 
 class AcceptanceScopeTests(unittest.TestCase):
