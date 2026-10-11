@@ -129,3 +129,16 @@ offload, AdGuard health, key confinement, lifecycle/restoration and packet gates
 remain unresolved; this checkpoint neither changes the PR #3/#4 source evidence
 nor approves an empty-policy rehearsal or household production.
 Those remain separate evidence gates; no new test total or live pass is claimed here.
+
+## Supplemental inspection checkpoint
+
+The separately approved [spike-005](spike-005.md) collection reached its deliberate
+exit-2 boundary with unresolved checks. BusyBox lacks the `stat` applet and
+callable `od` is missing; metadata prerequisites still block installation, and
+the exact compatible package/dependency/rollback plan remains unverified. One
+child had a fresh matching neighbor; the other was `FAILED` without a MAC and
+was not enrollable at that instant. User-reported primary adult router-admin
+access does not establish fresh router-side binding, continuous adult probes or
+tested recovery action. No Couvre-feu writes, package installation or lifecycle
+rehearsal occurred. The existing acceptance matrix and production gates remain
+open; further inspection needs fresh exact-command approval.
