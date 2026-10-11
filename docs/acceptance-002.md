@@ -6,7 +6,7 @@ Scope: local, authenticated, fictional parent PWA and fake-router behavior. No r
 
 On 2026-10-11, Node 26.8.1, npm 11.19.0 and project Playwright 1.61.0 exercised cached Chromium 153.0.8010.12. The primary viewport was 390 × 844. The browser used real CTAP2 resident credentials with user verification; `@simplewebauthn/server` verified actual registration/assertion responses against the localhost RP/origin and server-owned bootstrap account. No runtime identity header or role selector was used.
 
-The final local suite passed **14/14 scenarios in 20.8 seconds** after auth cancellation and server browser-episode fixes. `npm run typecheck` passed on the same source. Tests used reduced motion for stable evidence. Independent final source approval and exact-head CI remain pending.
+The final local suite passed **14/14 scenarios in 20.8 seconds** after auth cancellation and server browser-episode fixes. `npm run typecheck` passed on the same source. Tests used reduced motion for stable evidence. Latest final independent source review and exact-head CI evidence are recorded in [PR #2](https://github.com/bearyjd/couvre-feu/pull/2).
 
 The initial renderer failed with `SkFontMgr_FontConfigInterface.cpp:163 Not implemented`. An isolated `/tmp` Fontconfig file/cache using existing Liberation fonts restored rendering. No system/font installation or host cache modification was performed. Loopback/browser execution required the environment’s sandbox escalation, within the approved synthetic-local scope. CI uses its normal browser/font environment unless explicitly configured otherwise.
 
@@ -36,6 +36,6 @@ Timed expiry uses a deterministic fake clock and an independent fake-engine time
 
 Run `npm run test:web` and `npm run typecheck`; local startup and the optional isolated font workaround are in [demo-002](demo-002.md). Browser fixtures use localhost port 4273, temporary fictional databases and direct fixture constructors/CLI token issuance, never test-identity HTTP routes. No authentication traces or credential/token screenshots are recorded. The parent screenshots are `/tmp/couvre-feu-parent-phone.png` and `/tmp/couvre-feu-parent-desktop.png`, local artifacts, not tracked household captures.
 
-Independent final source review, exact-head CI and merge approval are pending and owned by the session orchestrator. A passing local browser suite alone cannot satisfy those gates.
+Latest final independent review, exact-head CI and merge evidence are recorded in [PR #2](https://github.com/bearyjd/couvre-feu/pull/2). A passing local browser suite alone cannot satisfy those gates.
 
 Actual target router compatibility, packet behavior/five-second cutoff, private HTTPS PWA installation, genuine phone/device browser matrix, production recovery/auth enrollment and household deployment are **pending, untested and outside this prototype’s acceptance**. Usage/domain/app-history collectors are excluded and unavailable.
