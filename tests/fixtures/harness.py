@@ -101,6 +101,16 @@ class RouterFixture:
                               env=self.env if env is None else env, input=raw,
                               capture_output=True, text=True, timeout=timeout)
 
+    def slot(self):
+        marker = self.root / "etc/couvrefeu/runtime/firewall.owned"
+        return marker.read_text().splitlines()[1] if marker.exists() else "a"
+
+    def active_set(self, suffix):
+        return f"cf2_{self.slot()}_{suffix}"
+
+    def active_chain(self, suffix):
+        return f"cf2_{self.slot()}_{suffix}"
+
     def backend(self):
         return json.loads(self.state.read_text())
 
@@ -121,6 +131,6 @@ class RouterFixture:
         return [call for call in self.calls()
                 if call["command"] == "conntrack"
                 or call["command"] == "ipset" and call["argv"][0] not in ("list", "save", "test", "-L")
-                or call["command"] in ("iptables", "ip6tables") and any(arg in call["argv"] for arg in ("-A", "-I", "-D", "-N", "-X", "-F"))
+                or call["command"] in ("iptables", "ip6tables") and any(arg in call["argv"] for arg in ("-A", "-I", "-D", "-N", "-X", "-F", "-R"))
                 or call["command"] == "uci" and any(arg in call["argv"] for arg in ("set", "delete", "commit", "add_list", "batch"))
                 or call["command"] in ("fw3", "firewall") and "reload" in call["argv"]]

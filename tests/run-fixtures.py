@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Run independent private-root cases in four bounded subprocess lanes."""
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+REPO = Path(__file__).resolve().parents[1]
+
+
+def cases(suite):
+    for case in suite:
+        if isinstance(case, unittest.TestSuite):
+            yield from cases(case)
+        else:
+            yield case.id().split('.', 1)[1]
+
+
+def main():
+    jobs = []
+    for filename in ('test-transition.py', 'test-rpc.py', 'test-core.py'):
+        name = 'fixture_' + filename.replace('-', '_').removesuffix('.py')
+        spec = importlib.util.spec_from_file_location(name, REPO / 'tests' / filename)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        names = sorted(cases(unittest.defaultTestLoader.loadTestsFromModule(module)))
+        for index in range(4):
+            group = names[index::4]
+            if group:
+                jobs.append((filename, index, group))
+    directory = Path(tempfile.mkdtemp(prefix='couvre-feu-suite-', dir='/tmp'))
+    directory.chmod(0o700)
+
+    def run(job):
+        filename, index, group = job
+        log = directory / f'{filename}-{index}.log'
+        with log.open('w') as stream:
+            log.chmod(0o600)
+            try:
+                result = subprocess.run([sys.executable, str(REPO / 'tests' / filename), *group],
+                                        cwd=REPO, env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),
+                                        stdout=stream, stderr=subprocess.STDOUT, timeout=1800)
+                return filename, index, len(group), result.returncode, log
+            except subprocess.TimeoutExpired:
+                return filename, index, len(group), 124, log
+
+    failed = False
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for future in as_completed([pool.submit(run, job) for job in jobs]):
+            filename, index, count, status, log = future.result()
+            print(f'{"PASS" if status == 0 else "FAIL"}: {filename} lane {index + 1}, {count} cases', flush=True)
+            if status:
+                failed = True
+                print(log.read_text(), flush=True)
+    if failed:
+        print(f'Private fixture failure logs retained: {directory}', flush=True)
+        return 1
+    for log in directory.iterdir():
+        log.unlink()
+    directory.rmdir()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

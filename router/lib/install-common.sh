@@ -309,8 +309,14 @@ live_tools() {
 installed_core() {
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         fixture_tools
-        if [ "${CF_TEST_SHELL:-}" = 'busybox ash' ];then
-            fixture_busybox=$(command -v busybox) || fail 'BusyBox test shell unavailable'
+        fixture_busybox=
+        case ${CF_TEST_SHELL:-} in
+            'busybox ash')fixture_busybox=$(command -v busybox) || fail 'BusyBox test shell unavailable';;
+            /tmp/*/busybox\ ash)
+                fixture_busybox=${CF_TEST_SHELL% ash}
+                [ -f "$fixture_busybox" ] && [ ! -L "$fixture_busybox" ] && [ -x "$fixture_busybox" ] || fail 'BusyBox test shell unavailable';;
+        esac
+        if [ -n "$fixture_busybox" ];then
             CF_INSTALL_TOKEN=$INSTALL_TOKEN "$fixture_busybox" ash "$ROOT/usr/sbin/cfctl" "$1"
             return $?
         fi
@@ -371,7 +377,7 @@ runtime_preflight() {
                     fi
                 done
                 continue;;
-            confirmed|error|firewall.snapshot|firewall.owned|firewall.intent|firewall.cleanup|expiry) ;;
+            confirmed|error|firewall.snapshot|firewall.owned|firewall.intent|firewall.preflight|firewall.cleanup|expiry|schedule.clock) ;;
             .candidate.*|.protected.*|.fw.*|.input.*|.error.*|.confirmed.*|.snapshot.*|.expiry.*|.intent.*|.cleanup.*)
                 suffix=${name##*.}
                 case "$suffix" in ''|*[!0-9]*) fail "unowned runtime file: $name";; esac;;

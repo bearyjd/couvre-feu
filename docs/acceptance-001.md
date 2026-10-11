@@ -51,3 +51,9 @@ After an approved partial install or activation failure, preserve `/etc/couvrefe
 On drift, stop: uninstall must refuse destructive restoration and preserve changed configurations. Compare the journal originals with current files and choose an explicitly reviewed resolution; do not delete changed files, force blanket restoration, or erase the journal. If dedicated-key setup was manually approved, its independently saved authorized-key originals and permissions require a separate reviewed restoration action.
 
 No live test, SSH action, activation or firmware operation has been executed as part of this documentation.
+
+## Immutable transition acceptance (v2)
+
+Before enrollment, demonstrate the exact vendor selective `fw3 -q reload` path preserves both dispatchers, both complete slot generations, temporary guards, ipsets and early hook order. Observe actual manual and schedule cutoff with the acceleration mode that will remain enabled, fresh protected/child mappings, both directions/families, TCP/UDP router DNS, and router/kernel timezone through a DST boundary. Minute cron is supplementary connection eviction and does not establish sub-five-second scheduled cutoff. Keep capability and packet claims pending when any witness is missing.
+
+Exercise interruption after first guard, each dispatcher switch, first unguard and old-slot cleanup; distinguish atomic accepted receipt from fresh runtime confirmation. Reboot/restart acceptance measures reconstruction latency and post-restoration health separately from normal online continuity. Uninstall must remove the exact remaining active/staged/guard inventory and restore original files before any enrollment is authorized. Every exact live invocation, including reads, still requires user approval.
