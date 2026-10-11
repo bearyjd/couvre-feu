@@ -115,4 +115,17 @@ does not authenticate the capture or certify scope/protection, completed lifecyc
 adult connectivity/DNS, uninstall restoration, packet behavior or authorization.
 Only `PASS_EMPTY_WITNESS` exits 0; failure/unavailable exits nonzero and never relaxes
 the existing service IPv6/full-health requirement.
+
+## Later read-only inspection checkpoint
+
+The approved collection documented in [spike-004](spike-004.md) reached its deliberate
+exit-2 boundary with partial prerequisite evidence; it updates the earlier pending-
+inspection note only. Firmware/tool versions, saved fw3 topology and DNS listener
+ownership were observed, with no LAN IPv6 service in that snapshot. Standalone
+`stat` was absent; BusyBox `stat` compatibility remains untested. A scoped renderer
+error prevents fresh target-identity acceptance. No installation, target mutation or
+on-router uninstall occurred. Metadata, protection/recovery/adult probes, clock,
+offload, AdGuard health, key confinement, lifecycle/restoration and packet gates
+remain unresolved; this checkpoint neither changes the PR #3/#4 source evidence
+nor approves an empty-policy rehearsal or household production.
 Those remain separate evidence gates; no new test total or live pass is claimed here.
