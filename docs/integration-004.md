@@ -30,8 +30,10 @@ private configuration and fresh database/enrollment; a revision reset is insuffi
 The manifest's enrollment policy is a local template; startup does not enroll the
 router. Enrollment requires its own approved live command, followed by an approved
 observation before controls. In owner-enabled mode the supervisor supplies that observation;
-activating this mode requires separately reviewed deployment authorization. This pilot rejects schedules; do not interpret real
-schedule truth as UTC. Schedule integration requires later evidence and design.
+activating this mode requires separately reviewed deployment authorization. The manifest can
+configure up to eight weekly schedule windows for the admitted person; parent pause/resume
+preserves these exact windows. Router-native schedules enforce independently of the service.
+Current schedule truth requires the explicit clock calibration described below.
 Before opening SQLite, lstat checks the DB, WAL, SHM and rollback `-journal` paths;
 unsafe files and dangling symlinks fail rather than being followed or repaired.
 
@@ -40,6 +42,68 @@ Required manifest groups are `version: 1`, `mode: "integration"`, `port`, `dataD
 `router` supplies host/user/port, knownHosts, hostFingerprint, agentSocket,
 publicIdentity, publicKeyFingerprint and generation. `person` binds one device MAC;
 accounts bind explicit roles/person IDs. Sensitive values stay private.
+
+Owner schedules are the full normalized `enrollment.schedules` array, using existing
+v1 `{person, id, weekdays, start, stop}` records. Windows include the start minute and
+exclude the stop minute; cross-midnight windows use the weekday on which they start.
+No schedule editor or parent bypass is provided. Any unexpected observed schedule
+change refuses the observation rather than copying it into a new parent operation.
+Empty unenrolled router policy stays read-only and displays the configured windows
+with unknown current state.
+
+Schedules require optional manifest `scheduleClock`, an exact object with a canonical
+IANA `timezone` such as `America/New_York` and optional `conformance`. Without
+conformance, configured windows are visible but their current state is unknown.
+The exact conformance record has `utcOffsetMinutes` (integer −840 through 840),
+`verifiedAt`, `validUntil` (epoch seconds, a positive interval of at most seven days),
+and `evidenceSha256` (lowercase SHA256 of the private reviewed evidence). It is an
+explicit owner assertion bound by the manifest's existing target, installation
+generation and manifest digest, not a router-reported capability. Do not create a
+record until the exact target's shell clock, kernel `--kerneltz` schedule behavior,
+schedule boundary/stream acceptance and protected-device checks have passed review.
+Evidence must identify that target/generation and the reviewed timezone/offset.
+Source fixtures do not supply that evidence or authorize activation.
+
+Validation checks the declared offset across the admitted interval, using hourly
+samples and both endpoints (the last included second at
+`validUntil - 1`). This is a bounded check for supported modern IANA transitions,
+not a universal historical proof of subhour timezone changes. A transition exactly
+at `validUntil` is outside the record. Both observed router time and current service
+time must still have the reviewed offset when state is evaluated.
+
+Current schedule state uses the actual freshly observed `routerTime` in the declared
+timezone, only with healthy runtime and a record covering both observation and current
+service time. Missing/expired records, unhealthy/stale observations or a timezone
+offset differing from the calibrated kernel offset display **schedule state unknown**,
+never an inactive claim. An offset change at DST therefore makes the state unknown;
+automatic DST support is not implemented. `routerCompatibilityVerified` remains false
+and packet acceptance remains unmeasured in API/UI source. Safe manual pause/resume
+still requires fresh router health/CAS and preserves schedules even while calibration
+is unknown. Resume never bypasses bedtime.
+
+Configured schedule results include `scheduleCheckedAt` (service evaluation epoch)
+and exclusive `scheduleValidUntil`, bounded by calibration expiry and the existing
+observation freshness deadline. Unknown results have null timing fields. The browser
+checks receipt wall time within one second of the evaluation time; high latency or
+detected skew makes the schedule claim unknown. It advances the received deadline
+using a monotonic clock and a conservative maximum with wall time, so a wall-clock
+rewind cannot extend a previously received deadline. These schedule-only checks do
+not change manual controls or establish a general browser/server time authority;
+the informational startup tolerance is at most one second. Cached timing fields keep
+their original values, so reloaded old cache never renews schedule confidence.
+
+This calibration has an operator maintenance gap: it expires within seven days and
+renewal changes the manifest digest. Renew through reviewed private backup/recovery
+or fresh explicit enrollment while preserving uncertain operations; do not hot-edit
+the record or database identity marker. The MVP cannot claim continuously calibrated
+or automatic DST-aware schedule truth across that expiry. Router enforcement itself
+continues when the service or calibration expires.
+
+RPC v1 has no boot identity. Installation generation does not establish that a
+kernel clock calibration survived reboot, timezone changes or restore. Deployment
+must invalidate the record externally after any such reviewed event and re-establish
+exact-target clock/schedule evidence before definitive schedule state. This is an
+operational acceptance gate; local date/IANA conversion cannot substitute for it.
 
 Optional `dispatch` is an exact object with `enabled` (boolean), `pollSeconds`
 (integer 2–15) and `maxBackoffSeconds` (integer from `pollSeconds` through 300).

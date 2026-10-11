@@ -8,6 +8,7 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { validatePilotPolicy } from './integration-config.ts';
+import { integrationScheduleState } from './integration-schedules.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
@@ -100,7 +101,7 @@ export class IntegrationPolicy {
         if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
         return {...this.store.config.provenance, packetAcceptance: 'unmeasured', people: actor.personIds.includes(p.id) ? [{id: p.id, name: p.name, devices: [{id: p.device.id, label: p.device.label}],
             manualPause: o?.acceptedPolicy.pauses.find(a => a.person === p.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === p.id) ?? null,
-            scheduleBlocked: false, scheduleExplanation: 'This one-device pilot has no schedules. Router timezone and schedule behavior remain unverified.',
+            ...integrationScheduleState(enrolled ? o!.acceptedPolicy : this.store.config.enrollment, this.store.config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1),
             observationHealth: info.observation_error ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: dto?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: dto}] : [],
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,

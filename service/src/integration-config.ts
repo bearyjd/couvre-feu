@@ -7,11 +7,13 @@ import { id, integer, mac, normalizePolicy } from '../../shared/src/router-schem
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import { hexDigest, sha256 } from '../../shared/src/router-rpc.ts';
 import type { Role, Provenance } from '../../shared/src/contracts.ts';
+import { scheduleClockReader } from './schedule-clock.ts';
 
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
     origin?: string;
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
+    scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
     router: {host: string; user: 'root'; port: 22; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
     person: {id: string; name: string; device: {id: string; label: string; mac: string}};
     protectedMacs: string[];
@@ -68,7 +70,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'scheduleClock']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -97,7 +99,8 @@ export function integrationConfig(path: string): IntegrationConfig {
         if (typeof settings.enabled !== 'boolean' || pollSeconds < 2 || pollSeconds > 15 || maxBackoffSeconds < pollSeconds || maxBackoffSeconds > 300) bad('invalid_dispatch_bounds');
         dispatch = {enabled: settings.enabled as boolean, pollSeconds, maxBackoffSeconds};
     }
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {})};
+    const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(scheduleClock ? {scheduleClock} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort()}));
@@ -111,9 +114,31 @@ export function privateHTTPSOrigin(value: unknown): string {
     if (url.protocol !== 'https:' || url.origin !== value || url.username || url.password || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/.test(url.hostname) || url.hostname.length > 253) bad('invalid_private_https_origin');
     return url.origin;
 }
-export function validatePilotPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'person' | 'protectedMacs'>, allowEmpty = true): void {
+export function normalizeScheduleClock(value: unknown): NonNullable<IntegrationManifest['scheduleClock']> {
+    const clock = object(value, ['timezone'], ['conformance']);
+    if (typeof clock.timezone !== 'string' || clock.timezone.length > 128) bad('invalid_schedule_timezone');
+    try {
+        if (new Intl.DateTimeFormat('en-US', {timeZone: clock.timezone as string}).resolvedOptions().timeZone !== clock.timezone) bad('invalid_schedule_timezone');
+    } catch { bad('invalid_schedule_timezone'); }
+    if (clock.conformance === undefined) return {timezone: clock.timezone as string};
+    const record = object(clock.conformance, ['utcOffsetMinutes', 'verifiedAt', 'validUntil', 'evidenceSha256']);
+    const offset = record.utcOffsetMinutes, verifiedAt = integer(record.verifiedAt), validUntil = integer(record.validUntil);
+    if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < -840 || offset > 840 || validUntil <= verifiedAt || validUntil - verifiedAt > 7 * 86400) bad('invalid_schedule_conformance');
+    const readClock = scheduleClockReader(clock.timezone as string);
+    // Modern timezone transitions cannot be hidden by matching only the interval endpoints.
+    // Bounded hourly samples plus the final second cover the entire admitted seven-day span.
+    for (let time = verifiedAt; time < validUntil; time += 3600) {
+        if (readClock(time).utcOffsetMinutes !== offset) bad('schedule_conformance_offset_changed');
+    }
+    if (readClock(validUntil - 1).utcOffsetMinutes !== offset) bad('schedule_conformance_offset_changed');
+    return {timezone: clock.timezone as string, conformance: {utcOffsetMinutes: offset as number, verifiedAt, validUntil, evidenceSha256: hexDigest(record.evidenceSha256)}};
+}
+export function validatePilotPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'person' | 'protectedMacs' | 'enrollment' | 'scheduleClock'>, allowEmpty = true): void {
     normalizePolicy(policy, config.protectedMacs);
-    if (policy.schedules.length) bad('pilot_schedules_not_verified');
-    if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0) return;
+    if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
     if (policy.people.length !== 1 || policy.people[0].id !== config.person.id || policy.people[0].macs.length !== 1 || policy.people[0].macs[0] !== config.person.device.mac) bad('pilot_enrollment_mismatch');
+    if (policy.schedules.length > 8) bad('owner_schedule_limit');
+    if (policy.schedules.length > 0 && !config.scheduleClock) bad('owner_schedule_clock_required');
+    if (config.scheduleClock) normalizeScheduleClock(config.scheduleClock);
+    if (JSON.stringify(normalizePolicy(policy).schedules) !== JSON.stringify(normalizePolicy(config.enrollment).schedules)) bad('owner_schedule_configuration_changed');
 }

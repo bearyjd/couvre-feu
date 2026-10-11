@@ -13,6 +13,7 @@ const state = {
   busy: false, needsRefresh: true, refreshing: false, localUnknown: false, operation: null,
   generation: 0, renderKey: '', logoutRequired: needsServerLogout(), durations: new Map(),
   authController: null,
+  scheduleClockBasis: null,
 };
 
 class APIError extends Error {
@@ -37,6 +38,17 @@ function announce(message, error = false) {
 
 function actor() { return state.session?.actor ?? state.snapshotActor; }
 function age() { return state.people?.observedAt ? Math.max(0, now() - state.people.observedAt) : Infinity; }
+function scheduleLabel(person) {
+  const basis = state.scheduleClockBasis, wall = Date.now() / 1000;
+  const elapsed = basis ? Math.max(0, performance.now() / 1000 - basis.started) : 0;
+  const expected = basis ? basis.wall + elapsed : wall;
+  const clockValid = basis && Number.isSafeInteger(person.scheduleCheckedAt) && Math.abs(basis.wall - person.scheduleCheckedAt) <= 1 && Math.abs(wall - expected) <= 1;
+  const deadlineValid = person.scheduleWitness === 'none' || person.scheduleWitness === 'owner-reviewed-clock' && clockValid && Number.isSafeInteger(person.scheduleValidUntil) && person.scheduleValidUntil > person.scheduleCheckedAt
+    && person.scheduleValidUntil <= person.scheduleCheckedAt + FRESH_SECONDS + 1
+    && person.scheduleValidUntil > Math.max(wall, expected, person.scheduleCheckedAt + elapsed);
+  const blocked = isReal() && (state.offline || state.localUnknown || age() > FRESH_SECONDS || person.observationHealth !== 'healthy' || !deadlineValid) ? null : person.scheduleBlocked;
+  return blocked === null ? 'Schedule state unknown' : blocked ? 'Schedule currently blocks access' : 'No active schedule block';
+}
 function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
 function canControl() {
   return Boolean(state.session && state.people && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh && !unsettled() && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now());
@@ -45,7 +57,7 @@ function canControl() {
 function resetView() {
   state.generation++;
   state.authController?.abort(); state.authController = null;
-  state.session = null; state.snapshotActor = null; state.snapshotExpiresAt = null; state.people = null; state.savedAt = null;
+  state.session = null; state.snapshotActor = null; state.snapshotExpiresAt = null; state.people = null; state.savedAt = null; state.scheduleClockBasis = null;
   state.operation = null; state.localUnknown = false; state.needsRefresh = true; state.renderKey = '';
   state.busy = false; state.refreshing = false; state.durations.clear();
   clearStatusCache();
@@ -56,6 +68,7 @@ function showCachedStatus() {
   const snapshot = readStatus();
   if (!snapshot) return false;
   state.snapshotActor = snapshot.actor; state.people = snapshot.status; state.savedAt = snapshot.savedAt;
+  state.scheduleClockBasis = {wall: Date.now() / 1000, started: performance.now() / 1000};
   state.snapshotExpiresAt = snapshot.sessionExpiresAt;
   state.session = null; state.needsRefresh = true;
   render();
@@ -102,6 +115,7 @@ async function refresh({ quiet = false } = {}) {
     if (generation !== state.generation) return false;
     if (people.source !== session.source || (people.integrationScope ?? null) !== (session.integrationScope ?? null)) throw new APIError(401, 'installation_scope_changed', 'The installation changed. Reload and sign in again.');
     state.people = people; state.savedAt = now(); state.offline = false; state.needsRefresh = false;
+    state.scheduleClockBasis = {wall: Date.now() / 1000, started: performance.now() / 1000};
     const latest = state.operation && people.people.find((person) => person.id === state.operation.personId)?.latestOperation;
     if (latest?.id === state.operation?.id) state.operation = latest;
     // An uncertain response is resolved only through a fresh server observation.
@@ -318,7 +332,7 @@ function renderPeople() {
     const choices = [['0', 'Until I resume'], ['60', isReal() ? '1 minute' : '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
       <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
-      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd>${person.scheduleBlocked ? 'Schedule currently blocks access' : 'No active schedule block'}<span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
+      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
       <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}</li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="Resume ${label} manual pause">Resume</button></div>
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
@@ -350,6 +364,10 @@ function render() {
 
 function tick() {
   const currentAge = age();
+  for (const label of document.querySelectorAll('[data-schedule-state]')) {
+    const person = state.people?.people.find(person => person.id === label.dataset.scheduleState);
+    if (person) label.textContent = scheduleLabel(person);
+  }
   for (const label of document.querySelectorAll('[data-age]')) label.textContent = Number.isFinite(currentAge) ? `${duration(currentAge)} ago` : 'age unavailable';
   for (const label of document.querySelectorAll('[data-until]')) {
     const remaining = Number(label.dataset.until) - now();
