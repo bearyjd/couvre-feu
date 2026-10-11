@@ -17,6 +17,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy
 
 
+def run_fixture_process(command, *, env, raw=None, timeout=60):
+    """Bound fixture work and terminate its entire owned group on failure."""
+    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE if raw is not None else None,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(raw, timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate(timeout=5)
+        raise
+
+
 def evaluate_fixture_chain(chains, chain, packet, sets, depth=0):
     """Small argv-rule model for regression attacks; not a kernel packet test."""
     if depth > 10:
@@ -475,11 +491,19 @@ class CoreTests(unittest.TestCase):
         self.sync()
         confirmed = self.fixture.root / "etc/couvrefeu/runtime/confirmed"
         before = confirmed.read_bytes()
-        self.fixture.update_backend(failures=[{"command": "ipset", "contains": ["save", self.fixture.active_set("k")], "remaining": 100}])
+        calls = len(self.fixture.calls())
+        mutations = len(self.fixture.mutation_calls())
+        # The complete inventory now uses `ipset save` without a set name.
+        # Unreadable inventory must retain the prior confirmation.
+        self.fixture.update_backend(failures=[{"command": "ipset", "contains": ["save"], "remaining": 100}])
         result = self.fixture.run("sync", document=policy(2))
         self.assertNotEqual(result.returncode, 0)
         self.assertIs(json.loads(result.stdout)["ok"], False)
         self.assertEqual(confirmed.read_bytes(), before)
+        self.assertTrue(any(call["command"] == "ipset" and call["argv"] == ["save"]
+                            for call in self.fixture.calls()[calls:]), "must exercise the actual full inventory read")
+        self.assertLess(self.fixture.backend()["failures"][0]["remaining"], 100)
+        self.assertEqual(len(self.fixture.mutation_calls()), mutations)
 
     def test_latent_native_selector_cannot_be_blessed_by_healthy_kernel_witness(self):
         document = policy()
@@ -892,6 +916,7 @@ class CoreTests(unittest.TestCase):
             desired_before = (self.fixture.root / "etc/couvrefeu/state").read_bytes()
             expiry_log = self.fixture.root / "expiry-work.jsonl"
             expiry_env = dict(self.fixture.env, CF_BACKEND_LOG=str(expiry_log))
+            expiry_started = time.monotonic()
             expiry_process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "expire"],
                                               env=expiry_env, text=True, stdout=subprocess.PIPE,
                                               stderr=subprocess.PIPE, start_new_session=True)
@@ -904,14 +929,16 @@ class CoreTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertIsNone(process.poll(), "expiry work began only after sync terminated")
             self.assertTrue(input_file.exists(), "expiry work must overlap the blocked stdin reader")
-            stdout, stderr = expiry_process.communicate(timeout=20)
+            # Reader admission/deadline stays independent of the expensive
+            # mocked backend reconciliation, which uses the usual 60s budget.
+            process.wait(timeout=18)
+            self.assertNotEqual(process.returncode, 0, "unterminated sync stream was accepted")
+            stdout, stderr = expiry_process.communicate(timeout=max(0.001, expiry_started + 60 - time.monotonic()))
             expired = self.success(subprocess.CompletedProcess(expiry_process.args, expiry_process.returncode,
                                                               stdout, stderr))
             self.assertEqual(expired["desiredRevision"], 1)
             self.assertEqual(expired["observed"]["paused"], [])
             self.assertEqual((self.fixture.root / "etc/couvrefeu/state").read_bytes(), desired_before)
-            process.wait(timeout=18)
-            self.assertNotEqual(process.returncode, 0, "unterminated sync stream was accepted")
             status = self.success(self.fixture.run("status", "--json"))
             self.assertEqual(status["desiredRevision"], 1)
         finally:
@@ -962,6 +989,130 @@ class CoreTests(unittest.TestCase):
                 with self.subTest(family=family, destination=destination):
                     self.assertEqual(decision in ("DROP", "REJECT"), should_block, decision)
 
+    def stopped_sync(self, checkpoint):
+        marker = self.fixture.root / "rpc-stopped"
+        marker.unlink(missing_ok=True)
+        process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "sync"],
+                                   env=dict(self.fixture.env, CF_TEST_RPC_STOP=checkpoint),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        try:
+            process.stdin.write(json.dumps(policy()))
+            process.stdin.close()
+            process.stdin = None
+            deadline = time.monotonic() + 60
+            while not marker.exists():
+                self.assertIsNone(process.poll(), "sync exited before checkpoint")
+                self.assertLess(time.monotonic(), deadline, "sync checkpoint not reached")
+                time.sleep(0.02)
+            return process
+        except BaseException:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+            raise
+
+    def test_wholly_absent_interrupted_initial_staging_recovers_old_policy(self):
+        state = (self.fixture.root / "etc/couvrefeu/state").read_bytes()
+        backend = self.fixture.backend()
+        for tables in backend["tables"].values():
+            tables.setdefault("mangle", {})
+            tables.setdefault("raw", {})
+        process = self.stopped_sync("after_initial_intent")
+        try:
+            runtime = self.fixture.root / "etc/couvrefeu/runtime"
+            intent = runtime / "firewall.intent"
+            self.assertIn("PHASE staging", intent.read_text())
+            self.assertEqual(self.fixture.backend()["sets"], backend["sets"])
+            self.assertEqual(self.fixture.backend()["tables"], backend["tables"])
+            self.assertEqual(self.fixture.mutation_calls(), [])
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0)
+            recovered = self.success(self.fixture.run("apply-fw"))
+            self.assertEqual(recovered["desiredRevision"], 0)
+            self.assertEqual((self.fixture.root / "etc/couvrefeu/state").read_bytes(), state)
+            self.assertFalse(intent.exists())
+            self.assertEqual(recovered["confirmedRevision"], 0)
+            self.assertEqual(recovered["observed"]["kids"], [])
+            self.assertEqual(recovered["observed"]["paused"], [])
+            rebuilt = self.fixture.backend()
+            self.assertEqual(set(rebuilt["sets"]),
+                             {self.fixture.active_set(suffix) for suffix in ("k", "p", "d4", "d6")})
+            self.assertTrue(all(not metadata["members"] for metadata in rebuilt["sets"].values()))
+            # Rebuilding empty revision zero may install owned infrastructure.
+            # Every preexisting rule remains in order, and new chains are owned.
+            for family, tables in backend["tables"].items():
+                for table, chains in tables.items():
+                    current = rebuilt["tables"][family][table]
+                    for chain, rules in chains.items():
+                        original = iter(current[chain])
+                        for rule in rules:
+                            self.assertTrue(any(candidate == rule for candidate in original))
+                    self.assertTrue(all(chain.startswith("cf") for chain in current.keys() - chains.keys()))
+            # Compare with normal initialization: revision zero installs the
+            # owned input defaults as well as empty enforcement infrastructure.
+            reference = RouterFixture()
+            try:
+                self.success(reference.run("apply-fw"))
+                for field in ("sets", "tables", "uci"):
+                    self.assertEqual(rebuilt[field], reference.backend()[field], field)
+                self.assertEqual(rebuilt.get("conntrack_deletions", []),
+                                 reference.backend().get("conntrack_deletions", []))
+            finally:
+                reference.close()
+            self.assertGreater(len(self.fixture.mutation_calls()), 0)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=10)
+
+    def test_missing_prepared_set_refuses_recovery_and_preserves_journal(self):
+        process = self.stopped_sync("transition_staged")
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+            intent = self.fixture.root / "etc/couvrefeu/runtime/firewall.intent"
+            before = intent.read_bytes()
+            self.assertIn(b"PHASE staged", before)
+            slot = next(line.split()[1] for line in before.decode().splitlines() if line.startswith("SLOT "))
+            backend = self.fixture.backend()
+            backend["sets"].pop("cf2_" + slot + "_k")
+            self.fixture.update_backend(sets=backend["sets"])
+            mutations = len(self.fixture.mutation_calls())
+            result = self.fixture.run("apply-fw")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("transition_object_drift", json.loads(result.stdout)["errors"])
+            self.assertEqual(intent.read_bytes(), before)
+            self.assertEqual(self.fixture.backend()["sets"], backend["sets"])
+            self.assertEqual(self.fixture.backend()["tables"], backend["tables"])
+            self.assertEqual(len(self.fixture.mutation_calls()), mutations)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=10)
+
+    def test_transition_inventory_parser_refuses_unknown_and_explicit_blank_records(self):
+        # Exercise the source-identical parser with controlled snapshot output.
+        # Empty inventory is zero records; a real blank/unknown record is drift.
+        script = '''
+. "$1"
+CF_TRANSITION=$CF_TEST_TRANSITION CF_SLOT=a
+cf_snapshot() { printf '%s' "$CF_TEST_SNAPSHOT"; }
+cf_reference_guard_v2() { :; }
+cf_fail() { printf '%s\n' "$1"; }
+cf_transition_inventory_check
+'''
+        record = "RULE 4 filter cf2_a_f -N cf2_a_f"
+        transition = "PHASE staging\nAFTER " + record
+        for snapshot, valid in (("", True), (record, True), ("\n" + record, False), ("UNKNOWN owned\n" + record, False)):
+            with self.subTest(snapshot=repr(snapshot)):
+                result = subprocess.run(self.fixture.shell + ["-c", script, "fixture", str(REPO / "router/lib/firewall.sh")],
+                                        env=dict(self.fixture.env, CF_TEST_SNAPSHOT=snapshot, CF_TEST_TRANSITION=transition), capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, valid, result.stdout + result.stderr)
+                if not valid:
+                    self.assertIn("transition_object_drift", result.stdout)
+
     def test_alive_lock_refuses_concurrent_mutation_then_interruption_recovers(self):
         self.fixture.update_backend(delays=[{"command": "ipset", "contains": ["create"], "seconds": 10}])
         process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "sync"],
@@ -994,6 +1145,26 @@ class CoreTests(unittest.TestCase):
                 process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
+
+
+class FixtureProcessTests(unittest.TestCase):
+    def test_timeout_terminates_owned_descendants_and_reaps_owner(self):
+        script = """
+import os, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(child.pid, flush=True)
+time.sleep(60)
+"""
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            run_fixture_process([sys.executable, "-c", script], env=os.environ, timeout=3)
+        output = caught.exception.output
+        if isinstance(output, bytes):
+            output = output.decode()
+        child_pid = int(output.strip())
+        status = Path('/proc') / str(child_pid) / 'stat'
+        if status.exists():
+            self.assertEqual(status.read_text().split(')', 1)[1].split()[0], 'Z',
+                             'the timed-out descendant must be terminated before fixture cleanup')
 
 
 class AcceptanceScopeTests(unittest.TestCase):
@@ -1252,9 +1423,8 @@ class InstalledPackageTests(unittest.TestCase):
                                  (REPO / "router/lib" / helper).read_bytes())
 
             def run_installed(*args, document=None):
-                result = subprocess.run(fixture.shell + [str(installed), *args], env=fixture.env,
-                                        input=json.dumps(document) if document is not None else None,
-                                        text=True, capture_output=True, timeout=20)
+                result = run_fixture_process(fixture.shell + [str(installed), *args], env=fixture.env,
+                                             raw=json.dumps(document) if document is not None else None)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 status = json.loads(result.stdout)
                 self.assertIs(status["ok"], True, status)

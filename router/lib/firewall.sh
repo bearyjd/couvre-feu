@@ -472,7 +472,7 @@ cf_transition_inventory_check() {
     cf_tic_after=$(printf '%s\n' "$CF_TRANSITION" | awk '/^AFTER /{sub(/^AFTER /,"");print}')
     # Only exactly recorded chain bodies, ordered staging prefixes and complete
     # dispatch targets can survive a crash. Foreign additions never authorize cleanup.
-    printf '%s\n' "$cf_tic_current" | awk -v before="$cf_tic_before" -v repaired="$cf_tic_repaired" -v repair_before="$cf_tic_repair_before" -v after="$cf_tic_after" -v slot="$CF_SLOT" -v phase="$(printf '%s\n' "$CF_TRANSITION" | awk '$1=="PHASE"{print $2}')" '
+    printf '%s' "$cf_tic_current" | awk -v before="$cf_tic_before" -v repaired="$cf_tic_repaired" -v repair_before="$cf_tic_repair_before" -v after="$cf_tic_after" -v slot="$CF_SLOT" -v phase="$(printf '%s\n' "$CF_TRANSITION" | awk '$1=="PHASE"{print $2}')" '
     function key(line,a){split(line,a," ");if(a[1]=="RULE")return "chain " a[2] " " a[3] " " a[4];if(a[1]=="SETDEF"||a[1]=="SET")return "set " a[2];return ""}
     BEGIN{n=split(before,a,"\n");for(i=1;i<=n;i++){k=key(a[i]);if(k!="")old[k]=old[k] a[i] "\n"}n=split(after,a,"\n");for(i=1;i<=n;i++){k=key(a[i]);if(k!="")new[k]=new[k] a[i] "\n"}n=split(repaired,a,"\n");for(i=1;i<=n;i++){k=key(a[i]);if(k!="")fix[k]=fix[k] a[i] "\n"}n=split(repair_before,a,"\n");for(i=1;i<=n;i++){k=key(a[i]);if(k!="")pre[k]=pre[k] a[i] "\n"}}
     $1=="SCHEDULE"{next}
