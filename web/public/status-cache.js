@@ -7,6 +7,12 @@ export const SCOPE_EVENT = 'cf-scope-event:v1';
 export function actorScope(actor) {
   return JSON.stringify([actor.id, actor.permissionVersion, actor.role, [...actor.personIds].sort()]);
 }
+function statusScope(actor, status) {
+  return status.source === 'synthetic-fake-router' && !status.integrationScope ? actorScope(actor) : JSON.stringify([status.source, status.integrationScope]) + ':' + actorScope(actor);
+}
+function expectedSource() {
+  return { source: document.documentElement.dataset.source ?? 'synthetic-fake-router', integrationScope: document.documentElement.dataset.integrationScope ?? null };
+}
 
 export function clearStatusCache() {
   try {
@@ -18,7 +24,9 @@ export function clearStatusCache() {
 export function saveStatus(session, status) {
   const actor = session.actor;
   if (typeof actor.permissionVersion !== 'string') return;
-  const scope = actorScope(actor);
+  const expected = expectedSource();
+  if (status.source !== expected.source || (status.integrationScope ?? null) !== expected.integrationScope || session.source !== status.source || (session.integrationScope ?? null) !== expected.integrationScope) return;
+  const scope = statusScope(actor, status);
   const key = PREFIX + scope;
   try {
     if (localStorage.getItem(ACTIVE) !== key) clearStatusCache();
@@ -40,6 +48,7 @@ export function saveStatus(session, status) {
         observedAt: status.observedAt, statusAgeSeconds: status.statusAgeSeconds,
         lastSuccessfulConfirmationAt: status.lastSuccessfulConfirmationAt, errors: status.errors,
         source: status.source, routerCompatibilityVerified: false,
+        integrationScope: status.integrationScope, packetAcceptance: status.packetAcceptance,
       },
     };
     localStorage.setItem(key, JSON.stringify(snapshot));
@@ -53,11 +62,12 @@ export function readStatus() {
     const key = localStorage.getItem(ACTIVE);
     if (!key?.startsWith(PREFIX)) return null;
     const snapshot = JSON.parse(localStorage.getItem(key) ?? 'null');
-    if (!snapshot || key !== PREFIX + actorScope(snapshot.actor) || snapshot.sessionExpiresAt <= Date.now() / 1000) {
+    if (!snapshot || key !== PREFIX + statusScope(snapshot.actor, snapshot.status) || snapshot.sessionExpiresAt <= Date.now() / 1000) {
       clearStatusCache();
       return null;
     }
-    if (snapshot.status.source !== 'synthetic-fake-router' || snapshot.status.routerCompatibilityVerified !== false) return null;
+    const expected = expectedSource();
+    if (snapshot.status.source !== expected.source || (snapshot.status.integrationScope ?? null) !== expected.integrationScope || snapshot.status.routerCompatibilityVerified !== false) { clearStatusCache(); return null; }
     const permitted = new Set(snapshot.actor.personIds);
     if (!snapshot.status.people.every((person) => permitted.has(person.id))) return null;
     return snapshot;

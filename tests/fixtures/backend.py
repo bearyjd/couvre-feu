@@ -48,6 +48,11 @@ def main():
 
 
 def dispatch(command, args, state):
+    if command == "sync":
+        if args:
+            raise ValueError("sync takes no arguments")
+        state["durability_barriers"] = state.get("durability_barriers", 0) + 1
+        return 0, ""
     if command == "ipset":
         return ipset(args, state)
     if command in ("iptables", "ip6tables"):

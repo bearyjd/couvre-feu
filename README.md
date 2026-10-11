@@ -1,6 +1,6 @@
 # Couvre-feu
 
-Router-local internet pause and schedules for assigned devices, plus an authenticated local parent-app prototype. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. The app uses fictional accounts and an independent fake-router process: it cannot control a household router. Real packet behavior, target acceptance and deployment remain pending; companions, activity collection and bonus grants are later work.
+Router-local internet pause and schedules, an authenticated fictional parent demo, and a separate operator-dispatched one-device integration path. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. Integration source implements exact policy CAS, durable receipts and asynchronous SSH; it is not installed or accepted on the target router. Real packet behavior and household production remain pending; companions, activity collection and bonus grants are later work.
 
 AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforcement-core.md) and [inspection report](docs/spike-001.md) explain the target. [Enforcement contract](docs/enforcement-contract.md), [acceptance and recovery](docs/acceptance-001.md), [parent PWA specification](docs/prp/PRP-002-parent-pwa.md), [policy service specification](docs/prp/PRP-003-policy-service.md), and [companion limits](docs/companion-capabilities.md) describe each phase. No Fengard source was copied.
 
@@ -30,6 +30,26 @@ npm run test:service
 npm run test:web
 ```
 
+## Operate the separate integration path
+
+Use the [integration runbook](docs/integration-004.md), [PRP-004](docs/prp/PRP-004-router-integration.md) and [acceptance record](docs/acceptance-004.md). This limited mode admits one explicitly bound person/device/network MAC, with protected adult/control identities and a separate owner-only manifest/database outside the source tree. It selects an agent-held public identity and pinned host record; it never reads a private key or seeds demo accounts. Startup does not enroll the router or invoke SSH.
+
+Replace the quoted placeholders with reviewed private absolute paths and account identifiers. The first commands are local; `execute` invokes SSH and requires approval of that exact prepared invocation first:
+
+```sh
+npm run integration:start -- "<PRIVATE_MANIFEST>"
+npm run integration:bootstrap -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>"
+npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<UNUSED_PRIVATE_PERMIT>" observe
+npm run integration:dispatch -- execute "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" "<EXACT_SCRIPT_SHA256>"
+npm run integration:dispatch -- stop "<PRIVATE_MANIFEST>"
+```
+
+`prepare` writes a private review artifact containing fixed argv and exact stdin; it does not connect. Each permit covers one invocation, expires after 15 minutes and has no automatic retries. HTTP requests and app polling only read cache or persist pending intent. Apply needs a separately approved cached observation no older than 30 seconds. Missing receipts, local timeouts and stopped processes cannot prove a delayed remote request is drained. Historical acceptance, fresh runtime health and real packet measurements are distinct; caches separate source, generation and account.
+
+Read-only inspection still awaits its exact-command approval; no assistant target command has run in this session. Before one-device enrollment, an approved scoped empty activation/uninstall must restore originals, modes and prior absence exactly while protected adult/control access remains usable. A temporary separate service key must pass runtime restrictions before enrollment. Every live read, apply, recovery, retry and disruptive test needs its disclosed approval. Production remains blocked by non-atomic changed-policy/drift/reload transitions and unmeasured IPv6/offload/packet gates.
+
+The temporary [client probe](tests/client-probe/README.md) is prepared and tested offline only. Public WebSocket echoes are application observations, not packet acceptance or proof of family/offload coverage.
+
 ## Local verification
 
 ```sh
@@ -38,18 +58,20 @@ sh tests/acceptance.sh --preflight
 sh tests/acceptance.sh --fixtures
 ```
 
-The runner executes installer recovery fixtures before core fixtures and available shell checks. Fixtures use private marked roots below `/tmp/couvre-feu-*`, with simulated router tools. They do not prove packet forwarding, stream cutoff, DNS behavior, target ash/awk compatibility, or firmware persistence. The acceptance script defaults to read-only local prerequisite discovery. `--fixtures` runs the fixture suite with PRP §8 coverage mapping. `--installed` performs read-only installed checks when deliberately run as router root and still requires approval of its exact live invocation; it does not run packet probes. The merged router baseline passed 43 installer and 73 core fixtures, genuine BusyBox ash/awk/timeout checks and ShellCheck. Independent source review passed at its reviewed head. Final latest-head CI and independent review remain merge gates; their current status is available in [PR checks](https://github.com/bearyjd/couvre-feu/pull/2/checks).
+The runner executes installer recovery fixtures, offline probe fixtures, core/RPC fixtures and available shell checks. Fixtures use private marked roots below `/tmp/couvre-feu-*`, with simulated router tools. They do not prove packet forwarding, stream cutoff, DNS behavior, target ash/awk compatibility or firmware persistence. The acceptance script defaults to read-only local prerequisites; `--fixtures` runs local fixtures, while `--installed` is a separately approved read-only router invocation.
+
+At the initial integration source checkpoint `d070ccf`, independent code/security review approved source, and verifier checks passed typecheck, 70 service/schema tests, 15 browser tests, 43 installer fixtures and four offline probe tests. This checkpoint does not record completed full core/RPC or genuine BusyBox acceptance. See [acceptance-004](docs/acceptance-004.md) for limits; [PR #3](https://github.com/bearyjd/couvre-feu/pull/3) records the release identity and independent evidence, and its [checks](https://github.com/bearyjd/couvre-feu/pull/3/checks) are authoritative for final exact-head CI. Source review and fixture results do not establish target or packet acceptance.
 
 ## Installation boundary
 
-`router/install.sh` validates and stages by default; only `--activate` installs files and applies enforcement. Even staging on the router needs approval of its exact invocation. Activation is a later separately approved action with one approved test MAC, protected adults/control client, and reviewed rollback. No live test MAC has been supplied.
+`router/install.sh` validates and stages by default; only `--activate` installs files and applies enforcement. Even staging on the router needs approval of its exact invocation. Scoped integration uses `--rpc-allow <TEST_NETWORK_MAC>` and protected identities; legacy installations require a separately reviewed migration. No live activation or on-router uninstall acceptance has occurred.
 
 Installation records original contents, permissions and absent paths before mutation. The journal and expected checksums protect against overwriting unrelated later changes. `router/uninstall.sh` restores originals only after drift checks; it refuses destructive restoration on drift. Preserve the journal and changed files for explicit resolution. Durable cleanup intent and uninstall phase markers block ordinary mutations through interrupted recovery; safe retries validate remaining owned objects and exact originals. Only validated durable zero-owned-mutation proof skips recovery firewall reload; partial-owned cleanup still reloads. Read the recovery runbook before activation. Do not delete the journal or replace refusal with blanket firewall restoration.
 
 The installer does not install an SSH key. A future approved manual dedicated-key setup uses this authorized-key prefix:
 
 ```text
-command="/usr/sbin/cfctl-ssh",no-port-forwarding,no-agent-forwarding,no-pty ssh-ed25519 <dedicated-public-key> couvre-feu
+command="/usr/sbin/cfctl-ssh --rpc-only",no-port-forwarding,no-agent-forwarding,no-pty ssh-ed25519 <dedicated-public-key> <key-label>
 ```
 
 Dropbear runtime restriction remains untested. Keep a separately protected recovery session and original authorized-key bytes/mode before any approved edit; do not reuse an unrestricted administrator key for the service.
@@ -66,8 +88,10 @@ These are reference commands for a future approved installation; no live command
 | `cfctl resume child` | Remove manual pause; an active schedule can still block |
 | `cfctl expire` | Router-local expiry and policy reconstruction, normally from minute cron |
 | `cfctl sync` | Read bounded desired JSON from stdin; apply and return observed status |
+| `cfctl rpc-status --json [operation_id]` | Read accepted policy, installation generation, receipt and current runtime witness |
+| `cfctl rpc-sync` | Exact generation/revision/digest CAS envelope from stdin; persist acceptance receipt, then apply |
 
-`check` is the local dependency/parser gate; `apply-fw` is include reconstruction. `remove-fw` is an internal recovery command and is denied by the restricted SSH wrapper. A status process exit alone is not a success signal: consumers must require JSON `ok=true`, matching desired/confirmed revisions and no drift/errors. Active address coverage gaps are explicit through `capabilities.addressCoverageComplete=false` and `incomplete_address_coverage`; expiry/resume/reconstruction still clear obsolete enforcement without claiming healthy active coverage. `routerCompatibilityVerified=false` remains explicit.
+The `--rpc-only` service wrapper admits only the two RPC commands; legacy commands above need a separately authorized management path. Accepted history retains 128 identities without eviction and fails closed for new acceptance at capacity. `check` is the local dependency/parser gate; `apply-fw` is include reconstruction. `remove-fw` is internal recovery. A status exit or receipt alone is insufficient: require fresh exact identity, healthy runtime/address coverage and no drift/errors. `routerCompatibilityVerified=false` remains explicit.
 
 Example policy uses a fictional child MAC `02:00:00:00:00:20`; a fictional protected adult could be `02:00:00:00:00:10`. Neither is an enrollment instruction:
 
@@ -87,4 +111,4 @@ Healthy unchanged `expire`, `apply-fw` and identical same-revision sync verify a
 
 Reconstruction for changed policy, drift or reload is **not atomic**: it can briefly open enforcement, and a mid-apply failure can leave enforcement open until successful repair. Production activation is blocked pending explicit design acceptance and actual integration evidence for this behavior. Local fixture passes do not remove this gate.
 
-Timed pauses expire through router cron even if the future service is absent; normal cron tolerance is about one minute after expiry, subject to clock/cron health. Firmware file preservation is configured, but actual upgrade compatibility and enforcement recovery are unverified. This package has no production-readiness claim.
+Timed pauses expire through router cron even if the service is absent; normal cron tolerance is about one minute after expiry, subject to clock/cron health. Firmware file preservation is configured, but actual upgrade compatibility and enforcement recovery are unverified. This package has no production-readiness claim.

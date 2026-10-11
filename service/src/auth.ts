@@ -1,7 +1,7 @@
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 import type { RegistrationResponseJSON, AuthenticationResponseJSON, AuthenticatorTransportFuture } from '@simplewebauthn/server';
-import type { Actor, SessionDTO } from '../../shared/src/contracts.ts';
+import type { Actor, SessionDTO, Provenance } from '../../shared/src/contracts.ts';
 import { provenance } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
@@ -85,10 +85,14 @@ export class Auth {
     readonly rpID = 'localhost';
     readonly now: () => number;
     private attempts: number[] = [];
-    constructor(store: Store, origin: string, now = () => Math.floor(Date.now() / 1000)) {
+    readonly provenance: Provenance;
+    readonly rpName: string;
+    constructor(store: Store, origin: string, now = () => Math.floor(Date.now() / 1000), context: {provenance?: Provenance; rpName?: string} = {}) {
         this.store = store;
         this.origin = origin;
         this.now = now;
+        this.provenance = context.provenance ?? provenance;
+        this.rpName = context.rpName ?? 'Couvre-feu fictional demo';
     }
     private account(id: string): AccountRow {
         const row = this.store.get<AccountRow>('SELECT * FROM accounts WHERE id=? AND active=1', id);
@@ -165,7 +169,7 @@ export class Auth {
             throw new AppError(409, 'account_already_enrolled');
         }
         const options = await generateRegistrationOptions({
-            rpName: 'Couvre-feu fictional demo', rpID: this.rpID,
+            rpName: this.rpName, rpID: this.rpID,
             userName: account.display_name, userDisplayName: account.display_name, userID: Buffer.from(account.webauthn_user_id, 'base64url'),
             attestationType: 'none', authenticatorSelection: {
                 residentKey: 'required', userVerification: 'required'
@@ -292,7 +296,7 @@ export class Auth {
         this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', account.id, 'session_created', this.now(), 'authenticated');
         return {
             token, dto: {
-                ...provenance, actor: this.actor(account), csrfToken: csrf, expiresAt
+                ...this.provenance, actor: this.actor(account), csrfToken: csrf, expiresAt
             } as SessionDTO
         };
     }
@@ -312,7 +316,7 @@ export class Auth {
         }
         return {
             hash, browserHash: row.browser_hash, browserEpoch: row.browser_epoch, dto: {
-                ...provenance, actor: this.actor(account), csrfToken: row.csrf, expiresAt: row.expires_at
+                ...this.provenance, actor: this.actor(account), csrfToken: row.csrf, expiresAt: row.expires_at
             }
         };
     }

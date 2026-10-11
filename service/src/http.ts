@@ -65,7 +65,9 @@ function send(response: ServerResponse, status: number, value: unknown) {
     });
     response.end(JSON.stringify(value));
 }
-export function appServer(auth: Auth, policy: PolicyService, config: DemoConfig) {
+type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'>;
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
+    const provenance = auth.provenance;
     const server = createServer(async (request, response) => {
         response.setHeader('Cache-Control', 'no-store');
         response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -90,7 +92,12 @@ export function appServer(auth: Auth, policy: PolicyService, config: DemoConfig)
             }
             if (request.method === 'GET' && STATIC[path]) {
                 const [name, type] = STATIC[path];
-                const data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
+                let data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
+                if (name === 'index.html' && provenance.source === 'real-router-integration') {
+                    data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!));
+                }
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v1'", `'cf-shell-integration-${provenance.integrationScope}'`));
+                if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
                 return;
@@ -132,7 +139,7 @@ export function appServer(auth: Auth, policy: PolicyService, config: DemoConfig)
                 auth.csrf(session, request.headers['x-csrf-token']);
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
                 if (match) {
-                    const result = policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
+                    const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;
@@ -148,17 +155,17 @@ export function appServer(auth: Auth, policy: PolicyService, config: DemoConfig)
                 return;
             }
             if (path === '/people') {
-                send(response, 200, policy.people(session.dto.actor));
+                send(response, 200, await policy.people(session.dto.actor));
                 return;
             }
             if (path === '/devices') {
-                send(response, 200, policy.devices(session.dto.actor));
+                send(response, 200, await policy.devices(session.dto.actor));
                 return;
             }
             const operation = /^\/operations\/([0-9a-f-]{36})$/.exec(path);
             if (operation) {
-                policy.reconcile();
-                send(response, 200, policy.operation(session.dto.actor, operation[1]));
+                await policy.reconcile();
+                send(response, 200, await policy.operation(session.dto.actor, operation[1]));
                 return;
             }
             throw new AppError(404, 'route_not_found');
@@ -181,4 +188,18 @@ export function appServer(auth: Auth, policy: PolicyService, config: DemoConfig)
     server.headersTimeout = 5000;
     server.maxHeadersCount = 40;
     return server;
+}
+function integrationHTML(html: string, scope: string): string {
+    if (!/^[a-f0-9]{64}$/.test(scope)) throw new Error('invalid_integration_scope');
+    return html.replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}">`)
+        .replace('Fictional, local Couvre-feu parent-control prototype.', 'Private one-device Couvre-feu router integration.')
+        .replace('Couvre-feu · synthetic demo', 'Couvre-feu · private router integration')
+        .replace('<strong>Synthetic demo</strong><span>Fictional people · fake router · target compatibility unverified</span>', '<strong>Private router integration</strong><span>One test device · operator approval required · packet behavior unverified</span>')
+        .replace('Local prototype / 002', 'Private one-device pilot')
+        .replace('This demo changes a fake router. It does not control a household connection.', 'Requests wait for an operator-approved router invocation. Router observations and packet measurements are separate.')
+        .replace('Sign in to the fictional account bound to your passkey.', 'Sign in to the private account bound to your passkey.')
+        .replace('Use the token from the local demo bootstrap. It already identifies your fictional account.', 'Use the token from the private integration bootstrap. It fixes your account and permissions.')
+        .replace('Create a demo passkey', 'Create a passkey')
+        .replace('Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.', 'Source: real router integration. Accepted policy, current runtime health and packet acceptance are distinct. Packet cutoff and target compatibility remain unverified.')
+        .replace('Local, fictional prototype', 'Private one-device pilot');
 }

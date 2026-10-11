@@ -39,5 +39,6 @@ if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_AWK-}" = "busybox awk" ]; then
     awk() { "$CF_BUSYBOX" awk "$@"; }
 fi
 . "$CF_LIB/core.sh"
+. "$CF_LIB/rpc.sh"
 . "$CF_LIB/firewall.sh"
 cf_main "$@"

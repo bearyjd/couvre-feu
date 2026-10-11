@@ -7,6 +7,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$HERE/lib/install-common.sh"
 ACTIVATE=0
 PROTECTED=
+RPC_ALLOW=
 SOURCE=$HERE
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -16,6 +17,11 @@ while [ "$#" -gt 0 ]; do
             PROTECTED="$PROTECTED$2
 "
             shift 2;;
+        --rpc-allow)
+            if [ "$#" -lt 2 ] || [ -n "$RPC_ALLOW" ];then
+                fail '--rpc-allow requires one canonical MAC'
+            fi
+            RPC_ALLOW=$2;shift 2;;
         --source-dir)
             [ "$#" -ge 2 ] || fail '--source-dir requires a directory'
             SOURCE=$2; shift 2;;
@@ -29,7 +35,7 @@ fi
 if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
 fi
-for file in cfctl cfctl-ssh lib/core.sh lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh; do
+for file in cfctl cfctl-ssh lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh; do
     if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
         fail "missing/unsafe source: $file"
     fi
@@ -85,7 +91,7 @@ fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
 else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
 cleanup() {
-    for file in cfctl cfctl-ssh include protected state firewall sysupgrade cron; do rm -f "$STAGE/$file"; done
+    for file in cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron; do rm -f "$STAGE/$file"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
@@ -109,6 +115,44 @@ chmod 755 "$STAGE/include"
 if [ -e "$BASE/state" ]; then cp -p "$BASE/state" "$STAGE/state"
 else printf 'V\t1\nR\t0\n' > "$STAGE/state"; fi
 chmod 600 "$STAGE/state"
+if [ -n "$RPC_ALLOW" ];then
+    printf '%s\n' "$RPC_ALLOW" > "$STAGE/rpc-allowed"
+    valid_protection "$STAGE/rpc-allowed" || fail '--rpc-allow requires a canonical unicast MAC'
+    awk -v mac="$RPC_ALLOW" '$0==mac{exit 1}' "$STAGE/protected" || fail 'RPC allowed MAC is protected'
+    chmod 600 "$STAGE/rpc-allowed"
+    if [ -e "$BACKUP" ];then
+        [ -f "$BACKUP/etc_couvrefeu_rpc-allowed.staged" ] || fail 'scoped migration of a legacy installation is not supported'
+        cmp -s "$STAGE/rpc-allowed" "$BACKUP/etc_couvrefeu_rpc-allowed.staged" || fail 'reinstallation cannot change RPC scope'
+    else
+        # Read exactly 32 bytes, check the read, then encode without deriving identity.
+        dd if=/dev/urandom bs=1 count=32 of="$STAGE/generation" 2>/dev/null || fail 'generation entropy read failed'
+        [ "$(wc -c < "$STAGE/generation")" = 32 ] || fail 'short generation entropy read'
+        GENERATION=$(od -An -tx1 "$STAGE/generation" | tr -d ' \n')
+        [ "${#GENERATION}" = 64 ] || fail 'invalid generation entropy'
+        # Validate the original envelope before creating fresh activation metadata.
+        awk -f "$SOURCE/lib/state.awk" "$STAGE/state" >/dev/null || fail 'invalid preinstallation state'
+        # Preserve original bytes for rollback; a fresh activation resets metadata.
+        awk '$1 !~ /^(X|G|C|O)$/ {print}' "$STAGE/state" > "$STAGE/generation"
+        mv "$STAGE/generation" "$STAGE/state"
+        printf 'X\t1\nG\t%s\nC\t-\n' "$GENERATION" >> "$STAGE/state"
+        chmod 600 "$STAGE/state"
+    fi
+    # Every scoped admission, including initial activation, precedes managed writes.
+    (
+        # shellcheck disable=SC2034
+        CF_BASE=$ROOT CF_LIB=$SOURCE/lib
+        # shellcheck disable=SC1091
+        . "$SOURCE/lib/core.sh"
+        stage_records=$(awk -f "$SOURCE/lib/state.awk" "$STAGE/state") || exit 1
+        stage_json=$(printf '%s\n' "$stage_records" | cf_state_json /dev/stdin) || exit 1
+        stage_valid=$(printf '%s\n' "$stage_json" | awk -f "$SOURCE/lib/json.awk") || exit 1
+        [ "$(printf '%s\n' "$stage_valid" | cf_canonical)" = "$(printf '%s\n' "$stage_records" | cf_canonical)" ] || exit 1
+        printf '%s\n' "$stage_records" | awk -F '\t' -v mac="$RPC_ALLOW" '$1=="P"&&$3!="-"&&$3!=mac{exit 1}' || exit 1
+        printf '%s\n' "$stage_records" | awk -F '\t' 'NR==FNR{protected[$1]=1;next}$1=="P"&&protected[$3]{exit 1}' "$STAGE/protected" -
+    ) || fail 'initial state violates scoped policy or protected identities'
+elif [ -e "$BACKUP/etc_couvrefeu_rpc-allowed.after" ];then
+    fail 'recorded scoped installation requires explicit --rpc-allow'
+fi
 for pair in 'firewall:etc/config/firewall' 'sysupgrade:etc/sysupgrade.conf' 'cron:etc/crontabs/root'; do
     file=${pair%%:*} rel=${pair#*:}
     if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$STAGE/$file"
@@ -158,6 +202,9 @@ if [ ! -e "$BACKUP" ]; then
         if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.original"; fi
         case "$rel" in
             usr/lib/couvrefeu/core.sh) staged=lib/core.sh;;
+            usr/lib/couvrefeu/rpc.sh) staged=lib/rpc.sh;;
+            usr/lib/couvrefeu/state.awk) staged=lib/state.awk;;
+            etc/couvrefeu/rpc-allowed) staged=rpc-allowed;;
             usr/lib/couvrefeu/firewall.sh) staged=lib/firewall.sh;;
             usr/lib/couvrefeu/json.awk) staged=lib/json.awk;;
             usr/lib/couvrefeu/rules.awk) staged=lib/rules.awk;;
@@ -187,6 +234,11 @@ for rel in $FILES; do
     COUNT=$((COUNT + 1))
     if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_FAIL_AFTER:-0}" = "$COUNT" ]; then fail 'injected partial installation'; fi
 done
+# Scoped RPC requires an activation-owned runtime parent; a delayed request must
+# never recreate it after uninstall. The global install lock fences this creation.
+if [ -n "$RPC_ALLOW" ] && [ ! -e "$BASE/runtime" ];then
+    mkdir -m 700 "$BASE/runtime"
+fi
 # Record possible kernel mutation *before* invoking the backend, for recovery
 # even when apply fails or the process is interrupted.
 printf '%s\n' 1 > "$BACKUP/activated"
