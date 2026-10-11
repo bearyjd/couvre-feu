@@ -90,3 +90,29 @@ Process-kill/rename/SQLite fixtures do not establish physical power-loss durabil
 Keep household production blocked by the existing non-atomic changed-policy/drift/
 reload transition even if the one-device normal-path measurements pass. Record final
 dispatch/router state, retained recovery/key records and any incomplete milestone.
+
+## Supplied empty witness gate
+
+This additional local read-only check does not revise the PR #3 checkpoint above
+or establish a live rehearsal result:
+
+```sh
+node tests/empty-witness.ts EXPECTED_GENERATION MIN_ROUTER_TIME MAX_ROUTER_TIME < /absolute/private/rpc-observation.json
+```
+
+Supply raw version-1 RPC JSON, not legacy status JSON. Independently establish the
+expected generation from the same activation's installer journal and explicit
+trusted router-time bounds; deriving generation from the response or time bounds
+from `Date.now()` alone defeats the gate. Input is bounded to 128 KiB ASCII with a
+ten-second EOF deadline; parsing reuses production code.
+The supplied window does not itself prove freshness, clock synchronization,
+monotonic lifecycle or its own truth; those require inspected capture/clock evidence.
+
+Require exact empty revision-0 policy, empty people/pauses/schedules/DoH arrays,
+null current operation/receipt, empty errors and the existing full-health predicate.
+IPv6 capability is still required; unavailable evidence is not a pass. The result
+does not authenticate the capture or certify scope/protection, completed lifecycle,
+adult connectivity/DNS, uninstall restoration, packet behavior or authorization.
+Only `PASS_EMPTY_WITNESS` exits 0; failure/unavailable exits nonzero and never relaxes
+the existing service IPv6/full-health requirement.
+Those remain separate evidence gates; no new test total or live pass is claimed here.

@@ -146,3 +146,33 @@ failure, missing adult echoes or uncertain clock/lifecycle makes the trial unava
 Echo results are application observations only. Correlate approved router timestamps,
 actual source interface/family and acceleration separately; the probe never declares
 packet acceptance. A later expiry needs its own short observation window.
+
+## Check a supplied empty-installation witness
+
+This local read-only gate consumes an already supplied raw version-1 RPC observation;
+legacy status JSON is insufficient. It generates no router command and makes no
+network call. Replace the argument placeholders with independently established
+values, and supply the private capture through stdin:
+
+```sh
+node tests/empty-witness.ts EXPECTED_GENERATION MIN_ROUTER_TIME MAX_ROUTER_TIME < /absolute/private/rpc-observation.json
+```
+
+`EXPECTED_GENERATION` must come from independent installer-journal evidence for
+this same activation, never from the response being checked. It must be exactly
+64 lowercase hexadecimal characters. Supply explicit trusted inclusive router-time
+bounds: positive integers through 2147483647, with minimum no greater than maximum.
+Do not guess the bounds from `Date.now()`.
+Checking supplied bounds does not certify capture freshness, clock synchronization,
+monotonic lifecycle or the caller's window; final rehearsal needs inspected evidence.
+The CLI limits input to 128 KiB of ASCII and waits at most ten seconds for EOF.
+It imports the production RPC parser and full runtime-health predicate.
+
+The witness requires exactly revision 0, empty people/pauses/schedules and both DoH
+arrays, no current operation or receipt, no errors, and complete healthy empty
+runtime state. Required IPv6 capability remains part of the service contract;
+unavailable or missing evidence does not pass. A successful result validates supplied
+data only: it proves neither transport authenticity, admitted/protected scope,
+lifecycle completion, adult probes, exact uninstall restoration, packets nor approval.
+Only `PASS_EMPTY_WITNESS` exits 0; `FAIL` and `UNAVAILABLE` exit nonzero. Output keeps
+router compatibility unverified, packet acceptance unmeasured and restoration unverified.
