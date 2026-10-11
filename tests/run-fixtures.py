@@ -23,7 +23,7 @@ def cases(suite):
             yield case.id().split('.', 1)[1]
 
 
-def run_lane(job, directory, timeout=1800):
+def run_lane(job, directory, timeout=1800, started=None):
     filename, index, group = job
     log = directory / f'{filename}-{index}.log'
     with log.open('w') as stream:
@@ -32,13 +32,25 @@ def run_lane(job, directory, timeout=1800):
             result = run_owned_process([sys.executable, str(REPO / 'tests' / filename), *group],
                                        cwd=REPO, env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1', CF_TEST_LANE='1'),
                                        stdout=stream, stderr=subprocess.STDOUT, timeout=timeout,
-                                       interrupt_on_timeout=True)
+                                       interrupt_on_timeout=True, started=started)
             return filename, index, len(group), result.returncode, log
         except subprocess.TimeoutExpired:
             return filename, index, len(group), 124, log
 
 
+def worker_count():
+    value = os.environ.get('CF_TEST_WORKERS', '4')
+    if value not in ('1', '2', '3', '4'):
+        raise ValueError('CF_TEST_WORKERS must be an integer from 1 through 4')
+    return int(value)
+
+
 def main():
+    try:
+        workers = worker_count()
+    except ValueError as error:
+        print(f'FAIL: {error}', file=sys.stderr, flush=True)
+        return 2
     jobs = []
     for filename in ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py'):
         name = 'fixture_' + filename.replace('-', '_').removesuffix('.py')
@@ -54,7 +66,8 @@ def main():
     directory.chmod(0o700)
 
     failed = False
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Partitions remain four per suite; this only bounds concurrent lane execution.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         for future in as_completed([pool.submit(run_lane, job, directory) for job in jobs]):
             filename, index, count, status, log = future.result()
             print(f'{"PASS" if status == 0 else "FAIL"}: {filename} lane {index + 1}, {count} cases', flush=True)

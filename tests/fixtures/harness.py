@@ -36,6 +36,8 @@ def _terminate_owned_process(process):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    if process.stdin is not None and process.stdin.closed:
+        process.stdin = None
     try:
         return process.communicate(timeout=5)
     except subprocess.TimeoutExpired as error:
@@ -47,7 +49,7 @@ def _terminate_owned_process(process):
         return error.stdout, error.stderr
 
 
-def run_owned_process(command, *, timeout, input=None, interrupt_on_timeout=False, **kwargs):
+def run_owned_process(command, *, timeout, input=None, interrupt_on_timeout=False, started=None, **kwargs):
     """Bound work, terminate the owned group, and reap its owner on every exit."""
     global _changing_process_groups
     if input is not None:
@@ -62,6 +64,9 @@ def run_owned_process(command, *, timeout, input=None, interrupt_on_timeout=Fals
             _changing_process_groups -= 1
         if _pending_lane_shutdown:
             raise KeyboardInterrupt("fixture lane shutdown")
+        if started is not None:
+            # Deliberate timeout regressions prepare input and await bounded readiness.
+            input = started(process, input)
         stdout, stderr = process.communicate(input, timeout=timeout)
     except BaseException as error:
         failure = error
@@ -169,12 +174,12 @@ class RouterFixture:
 
     # Hundreds of Python backend processes need headroom on shared CI hosts.
     # Explicit caller deadlines and router input deadlines remain independent.
-    def run(self, *args, document=None, raw=None, timeout=60, env=None):
+    def run(self, *args, document=None, raw=None, timeout=60, env=None, started=None):
         if document is not None:
             raw = json.dumps(document, separators=(",", ":"))
         return run_owned_process(self.shell + [str(REPO / "router/cfctl"), *args],
                                  env=self.env if env is None else env, input=raw,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, started=started)
 
     def slot(self):
         marker = self.root / "etc/couvrefeu/runtime/firewall.owned"
