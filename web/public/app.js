@@ -7,6 +7,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
 const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 const FRESH_SECONDS = 30;
+const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
   busy: false, needsRefresh: true, refreshing: false, localUnknown: false, operation: null,
@@ -63,6 +64,7 @@ function showCachedStatus() {
 
 function acceptSession(session) {
   const previous = actor() ?? readStatus()?.actor;
+  if (session.source !== (isReal() ? 'real-router-integration' : 'synthetic-fake-router') || (session.integrationScope ?? null) !== (document.documentElement.dataset.integrationScope ?? null)) throw new APIError(401, 'installation_scope_changed', 'The source or installation changed. Reload and sign in again.');
   if (previous && actorScope(previous) !== actorScope(session.actor)) {
     clearStatusCache();
     state.people = null; state.operation = null; state.localUnknown = false; state.renderKey = '';
@@ -98,6 +100,7 @@ async function refresh({ quiet = false } = {}) {
     render();
     const people = await api('/people');
     if (generation !== state.generation) return false;
+    if (people.source !== session.source || (people.integrationScope ?? null) !== (session.integrationScope ?? null)) throw new APIError(401, 'installation_scope_changed', 'The installation changed. Reload and sign in again.');
     state.people = people; state.savedAt = now(); state.offline = false; state.needsRefresh = false;
     const latest = state.operation && people.people.find((person) => person.id === state.operation.personId)?.latestOperation;
     if (latest?.id === state.operation?.id) state.operation = latest;
@@ -144,7 +147,7 @@ async function authenticate(kind, token) {
     acceptSession(session);
     state.busy = false;
     await refresh({ quiet: true });
-    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. All status is fictional.`);
+    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
   } catch (error) {
     if (generation !== state.generation) return;
     const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.' : error.message;
@@ -222,7 +225,7 @@ async function mutate(personId, action) {
     } else {
       state.localUnknown = true;
       state.offline = !navigator.onLine;
-      announce('Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
+      announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
     }
   } finally {
     if (generation === state.generation) { state.busy = false; render(); }
@@ -231,6 +234,13 @@ async function mutate(personId, action) {
 
 function operationText(operation) {
   const verb = operation.action === 'resume' ? 'Resume' : 'Pause';
+  if (isReal()) return ({
+    pending: `${verb} pending. Waiting for an exact operator-approved router invocation.`,
+    confirmed: `${verb} confirmed by a fresh router receipt and current runtime observation. Packet behavior remains unmeasured.`,
+    failed: `${verb} was not delivered. Review the operation details before another deliberate action.`,
+    unknown: `${verb} outcome unknown. A historical receipt or local timeout cannot establish current enforcement. No retry is authorized.`,
+    conflict: `${verb} conflict. The accepted router policy changed; review a separately approved fresh observation.`,
+  })[operation.state] ?? 'Operation status unavailable.';
   return ({
     pending: `${verb} pending. Waiting for healthy fake-router confirmation.`,
     confirmed: `${verb} confirmed by the fake router. ${operation.action === 'resume' ? 'An active schedule can still block access.' : 'Real packet behavior remains unverified.'}`,
@@ -287,9 +297,9 @@ function renderConnection() {
   if (!state.people) return;
   const stale = age() > FRESH_SECONDS || state.needsRefresh;
   const diagnosticsOpen = $('#connection details')?.open;
-  const status = state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : 'Connected · current synthetic observation';
+  const status = state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : isReal() ? 'Connected · cached router observation' : 'Connected · current synthetic observation';
   $('#connection').className = `connection${state.offline ? ' offline' : stale ? ' stale' : ''}`;
-  $('#connection').innerHTML = `<strong>${escape(status)}</strong>Observed ${escape(time(state.people.observedAt))} · <span data-age>${Number.isFinite(age()) ? escape(duration(age())) + ' ago' : 'age unavailable'}</span>${state.savedAt ? ` · cached ${escape(time(state.savedAt))}` : ''}<details class="diagnostics" ${diagnosticsOpen ? 'open' : ''}><summary>Advanced demo status</summary><p>Service desired ${escape(state.people.serviceDesiredRevision)} · router desired ${escape(state.people.routerDesiredRevision ?? 'unknown')} · router confirmed ${escape(state.people.routerConfirmedRevision ?? 'unconfirmed')}${state.people.errors.length ? `<br>Observation errors: ${escape(state.people.errors.join(', '))}` : ''}<br>Source: synthetic fake router · target compatibility unverified</p></details>`;
+  $('#connection').innerHTML = `<strong>${escape(status)}</strong>Observed ${escape(time(state.people.observedAt))} · <span data-age>${Number.isFinite(age()) ? escape(duration(age())) + ' ago' : 'age unavailable'}</span>${state.savedAt ? ` · cached ${escape(time(state.savedAt))}` : ''}<details class="diagnostics" ${diagnosticsOpen ? 'open' : ''}><summary>${isReal() ? 'Router observation details' : 'Advanced demo status'}</summary><p>Service desired ${escape(state.people.serviceDesiredRevision)} · router desired ${escape(state.people.routerDesiredRevision ?? 'unknown')} · router confirmed ${escape(state.people.routerConfirmedRevision ?? 'unconfirmed')}${state.people.errors.length ? `<br>Observation errors: ${escape(state.people.errors.join(', '))}` : ''}<br>Source: ${isReal() ? 'real router integration · packet acceptance unmeasured' : 'synthetic fake router · target compatibility unverified'}</p></details>`;
 }
 
 function renderPeople() {
@@ -305,14 +315,14 @@ function renderPeople() {
     const effectiveManual = person.effectiveManualPause;
     const operation = person.latestOperation;
     const personStatus = state.localUnknown || person.observationHealth !== 'healthy' && person.status === 'confirmed' ? 'unknown' : person.status;
-    const choices = [['0', 'Until I resume'], ['60', '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
+    const choices = [['0', 'Until I resume'], ['60', isReal() ? '1 minute' : '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
-      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">Fictional person · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
+      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
       <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd>${person.scheduleBlocked ? 'Schedule currently blocks access' : 'No active schedule block'}<span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
       <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}</li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="Resume ${label} manual pause">Resume</button></div>
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
-      <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy synthetic confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
+      <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy ${isReal() ? 'router' : 'synthetic'} confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
     </article>`;
   }).join('') || '<p>No people are assigned to this account.</p>';
   if (focused) document.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus();
@@ -332,7 +342,7 @@ function render() {
     $('#logout')?.addEventListener('click', () => void logout());
   }
   if (hasStatus) {
-    $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted fictional people`;
+    $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
     renderConnection(); renderPeople(); renderControlState();
   }
   renderAuthControls();

@@ -11,7 +11,7 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
-FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/firewall.sh', 'usr/lib/couvrefeu/json.awk', 'usr/lib/couvrefeu/rules.awk', 'usr/lib/couvrefeu/install-common.sh', 'usr/sbin/cfctl', 'usr/sbin/cfctl-ssh', 'etc/firewall.couvrefeu',
+FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/rpc.sh', 'usr/lib/couvrefeu/state.awk', 'usr/lib/couvrefeu/firewall.sh', 'usr/lib/couvrefeu/json.awk', 'usr/lib/couvrefeu/rules.awk', 'usr/lib/couvrefeu/install-common.sh', 'usr/sbin/cfctl', 'usr/sbin/cfctl-ssh', 'etc/firewall.couvrefeu',
          'etc/config/firewall', 'etc/sysupgrade.conf', 'etc/crontabs/root',
          'etc/couvrefeu/protected', 'etc/couvrefeu/state')
 DIRS = ('etc', 'usr', 'usr/sbin', 'usr/lib', 'usr/lib/couvrefeu', 'etc/config', 'etc/crontabs', 'etc/couvrefeu')
@@ -184,9 +184,9 @@ check) [ "${CF_TEST_CHECK_FAIL:-0}" != 1 ];;
 esac
 ''')
         (self.source / 'cfctl-ssh').write_text('#!/bin/sh\nexit 0\n')
-        for lib in ('core.sh', 'firewall.sh'):
+        for lib in ('core.sh', 'rpc.sh', 'firewall.sh'):
             (self.source / 'lib' / lib).write_text(':\n')
-        for lib in ('json.awk', 'rules.awk'):
+        for lib in ('json.awk', 'state.awk', 'rules.awk'):
             (self.source / 'lib' / lib).write_text('BEGIN {exit 0}\n')
         shutil.copy2(REPO / 'router/lib/install-common.sh', self.source / 'lib/install-common.sh')
         backend = self.root / 'bin'

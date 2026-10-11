@@ -1,7 +1,7 @@
 import { AppError } from './errors.ts';
 /** Duplicate-aware bounded JSON. The router mode matches cfctl's ASCII subset. */
-export function parseJSON(input: string, router = false): unknown {
-    if (Buffer.byteLength(input) > 65536) {
+export function parseJSON(input: string, router = false, maxBytes = 65536): unknown {
+    if (Buffer.byteLength(input) > maxBytes) {
         throw new AppError(413, 'body_too_large');
     }
     let cursor = 0, nodes = 0;

@@ -4,9 +4,13 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 export class Store {
     readonly db: DatabaseSync;
-    constructor(path: string, migrationSQL?: string) {
+    constructor(path: string, migrationSQL?: string, internalMode?: 'integration') {
         const migrations = migrationSQL === undefined
-            ? ['001.sql', '002.sql'].map(name => readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8'))
+            ? ['001.sql', '002.sql'].map(name => {
+                const sql = readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8');
+                // CAS allocates base+1. An explicitly never-delivered intent cannot reserve that router revision.
+                return internalMode === 'integration' && name === '001.sql' ? sql.replace('revision INTEGER NOT NULL UNIQUE', 'revision INTEGER NOT NULL') : sql;
+            })
             : [migrationSQL];
         if (path !== ':memory:') {
             mkdirSync(dirname(resolve(path)), {
@@ -20,6 +24,9 @@ export class Store {
             chmodSync(path, 0o600);
         }
         try {
+            const marker = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='integration_state'").get();
+            if (marker && internalMode !== 'integration') throw new Error('integration_database_forbidden');
+            if (internalMode === 'integration' && !marker && this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'").get()) throw new Error('demo_database_forbidden');
             this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;');
             const version = this.db.prepare('PRAGMA user_version').get()!.user_version;
             if (typeof version !== 'number' || version < 0 || version > migrations.length) {

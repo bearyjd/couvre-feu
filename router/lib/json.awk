@@ -101,23 +101,23 @@ function canon6(s,    a,b,n,i,j,k,t,m,beg,len,out) {
     return out
 }
 function clock(p,    s,h,m) {s=text(p);if(s!~/^[0-9][0-9]:[0-9][0-9]$/)bad("clock format");h=substr(s,1,2)+0;m=substr(s,4,2)+0;if(h>23||m>59)bad("clock range");return s}
-function validate(    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s) {
-    object("$","version revision people pauses schedules doh","version revision people pauses schedules")
-    if(integer("$/version",1)!=1)bad("version")
-    rev=integer("$/revision",2147483647)
-    array("$/people",64)
-    for(i=0;i<count["$/people"];i++) {
-        p="$/people/" i;object(p,"id macs","id macs");id=ident(p "/id")
+function validate(root,    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s) {
+    object(root,"version revision people pauses schedules doh","version revision people pauses schedules")
+    if(integer(root "/version",1)!=1)bad("version")
+    rev=integer(root "/revision",2147483647)
+    array(root "/people",64)
+    for(i=0;i<count[root "/people"];i++) {
+        p=root "/people/" i;object(p,"id macs","id macs");id=ident(p "/id")
         if(person[id]++)bad("duplicate person")
         array(p "/macs",32); personmac[id]=count[p "/macs"]
         if(count[p "/macs"]==0)out[++outn]="P\t" id "\t-"
         for(j=0;j<count[p "/macs"];j++) {m=text(p "/macs/" j);if(!macok(m)||owner[m]++)bad("invalid/shared MAC");if(++macn>256)bad("MAC limit");out[++outn]="P\t" id "\t" m}
     }
-    array("$/pauses",64)
-    for(i=0;i<count["$/pauses"];i++) {p="$/pauses/" i;object(p,"person until","person until");id=ident(p "/person");if(!person[id]||paused[id]++)bad("undefined/duplicate pause");u=integer(p "/until",2147483647);out[++outn]="A\t" id "\t" u}
-    array("$/schedules",256)
-    for(i=0;i<count["$/schedules"];i++) {
-        p="$/schedules/" i;object(p,"person id weekdays start stop","person id weekdays start stop");id=ident(p "/person");sid=ident(p "/id")
+    array(root "/pauses",64)
+    for(i=0;i<count[root "/pauses"];i++) {p=root "/pauses/" i;object(p,"person until","person until");id=ident(p "/person");if(!person[id]||paused[id]++)bad("undefined/duplicate pause");u=integer(p "/until",2147483647);out[++outn]="A\t" id "\t" u}
+    array(root "/schedules",256)
+    for(i=0;i<count[root "/schedules"];i++) {
+        p=root "/schedules/" i;object(p,"person id weekdays start stop","person id weekdays start stop");id=ident(p "/person");sid=ident(p "/id")
         if(!person[id]||schedule[id "/" sid]++)bad("undefined/duplicate schedule")
         start=clock(p "/start");stop=clock(p "/stop");if(start==stop)bad("empty schedule")
         q=p "/weekdays";array(q,7);if(!count[q])bad("empty weekdays");days=""
@@ -126,8 +126,8 @@ function validate(    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s) {
         expanded+=personmac[id]*(start>stop&&stop!="00:00"?2:1);if(expanded>256)bad("expanded schedule limit")
         out[++outn]="S\t" id "\t" sid "\t" days "\t" start "\t" stop
     }
-    if(seen["$/doh"]) {
-        p="$/doh";object(p,"ipv4 ipv6","ipv4 ipv6");array(p "/ipv4",256);array(p "/ipv6",256)
+    if(seen[root "/doh"]) {
+        p=root "/doh";object(p,"ipv4 ipv6","ipv4 ipv6");array(p "/ipv4",256);array(p "/ipv6",256)
         for(i=0;i<count[p "/ipv4"];i++){s=text(p "/ipv4/" i);if(!ipv4(s)||doh4[s]++)bad("IPv4 address");out[++outn]="D4\t" s}
         for(i=0;i<count[p "/ipv6"];i++){s=text(p "/ipv6/" i);if(!ipv6(s))bad("IPv6 address");s=canon6(s);if(doh6[s]++)bad("duplicate IPv6 address");out[++outn]="D6\t" s}
     }
@@ -135,4 +135,4 @@ function validate(    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s) {
     for(i=1;i<=outn;i++)print out[i]
 }
 { if(length(src)+length($0)+1>65536)bad("input limit");src=src $0 "\n" }
-END {if(!failed){pos=1;value("$",0);ws();if(pos<=length(src))bad("trailing JSON");validate()}}
+END {if(!failed){pos=1;value("$",0);ws();if(pos<=length(src))bad("trailing JSON");if(rpc){object("$","rpc_version generation operation_id expected_revision expected_digest policy","rpc_version generation operation_id expected_revision expected_digest policy");if(integer("$/rpc_version",1)!=1)bad("RPC version");g=text("$/generation");id=text("$/operation_id");digest=text("$/expected_digest");base=integer("$/expected_revision",2147483647);if(length(g)!=64||g~/[^0-9a-f]/||length(digest)!=64||digest~/[^0-9a-f]/||id!~/^[a-z0-9_-]+$/||id=="-"||length(id)>64)bad("RPC identity");if(base==2147483647||integer("$/policy/revision",2147483647)!=base+1)bad("RPC revision");print "Q\t" g "\t" id "\t" base "\t" digest;validate("$/policy")}else validate("$")}}

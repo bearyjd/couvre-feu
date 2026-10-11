@@ -21,6 +21,7 @@ cf_backend_available() {
     fi
     case $cf_backend_name in
         iptables|ip6tables|ipset|conntrack)cf_backend_paths="/usr/sbin/$cf_backend_name /sbin/$cf_backend_name";;
+        sync)cf_backend_paths='/bin/sync /usr/bin/sync';;
         uci|fw3)cf_backend_paths="/sbin/$cf_backend_name /usr/sbin/$cf_backend_name";;
         ip)cf_backend_paths='/sbin/ip /usr/sbin/ip /bin/ip';;
         *)return 1;;
@@ -87,15 +88,26 @@ cf_state_json() {
 }
 cf_state_load() {
     cf_safe_file "$CF_STATE" || { cf_fail unsafe_state_file; return 1; }
-    [ "$(wc -c < "$CF_STATE")" -le 65536 ] || { cf_fail state_too_large; return 1; }
-    cf_raw=$(cf_state_json "$CF_STATE") || { cf_fail invalid_state; return 1; }
-    CF_POLICY=$(printf '%s\n' "$cf_raw" | awk -f "$CF_LIB/json.awk" | cf_canonical) || { cf_fail invalid_state; return 1; }
-    # Pipelines cannot carry awk failures in POSIX sh: compare canonical exact records too.
-    [ -n "$CF_POLICY" ] && [ "$CF_POLICY" = "$(cf_canonical < "$CF_STATE")" ] || { cf_fail invalid_state; return 1; }
+    [ "$(wc -c < "$CF_STATE")" -le 131072 ] || { cf_fail state_too_large; return 1; }
+    cf_policy_records=$(awk -f "$CF_LIB/state.awk" "$CF_STATE") || { cf_fail invalid_state;return 1; }
+    CF_METADATA=$(awk -v mode=meta -f "$CF_LIB/state.awk" "$CF_STATE") || { cf_fail invalid_state;return 1; }
+    [ "${#cf_policy_records}" -lt 65536 ] || { cf_fail state_too_large;return 1; }
+    cf_raw=$(printf '%s\n' "$cf_policy_records" | cf_state_json /dev/stdin) || { cf_fail invalid_state; return 1; }
+    cf_validated=$(printf '%s\n' "$cf_raw" | awk -f "$CF_LIB/json.awk") || { cf_fail invalid_state;return 1; }
+    CF_POLICY=$(printf '%s\n' "$cf_validated" | cf_canonical)
+    [ -n "$CF_POLICY" ] && [ "$CF_POLICY" = "$(printf '%s\n' "$cf_policy_records" | cf_canonical)" ] || { cf_fail invalid_state; return 1; }
     CF_REVISION=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="R"{print $2}')
     CF_DIGEST=$(printf '%s\n' "$CF_POLICY" | sha256sum | awk '{print $1}')
+    CF_GENERATION=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="G"{print $2}')
+    CF_CURRENT=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="C"{print $2}')
+    if [ -n "$CF_CURRENT" ] && [ "$CF_CURRENT" != - ];then
+        printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_CURRENT" -v rev="$CF_REVISION" -v digest="$CF_DIGEST" '$1=="O"&&$2==id{if($6!=rev||$7!=digest)exit 1}' || { cf_fail invalid_receipt_pointer;return 1; }
+    fi
+    cf_rpc_binding
 }
+
 cf_policy_safe() {
+    cf_scope_safe || return 1
     printf '%s\n' "$CF_POLICY" | awk -F '\t' 'NR==FNR{protected[$1]=1;next}$1=="P"&&protected[$3]{exit 1}' "$CF_PROTECTED" - || { cf_fail protected_mac_overlap; return 1; }
 }
 cf_runtime_prepare() {
@@ -141,7 +153,9 @@ cf_control_dirs() {
     done
 }
 cf_lock() {
-    cf_runtime_prepare || return 1
+    if [ "${CF_RPC_REQUIRE_RUNTIME:-0}" = 1 ];then
+        cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime;return 1; }
+    else cf_runtime_prepare || return 1;fi
     if ! mkdir -m 700 "$CF_RUNTIME/lock" 2>/dev/null; then
         cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" || { cf_fail unsafe_lock; return 1; }
         cf_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/lock/pid") || { cf_fail unsafe_lock; return 1; }
@@ -260,7 +274,22 @@ cf_ssh_guard() {
 cf_write_policy() {
     cf_temp=$CF_RUNTIME/.candidate.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || { cf_fail unsafe_temporary; return 1; }
-    printf '%s\n' "$CF_POLICY" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_STATE" || { cf_fail state_write_failed; return 1; }
+    cf_runtime_device=$(stat -c %d "$CF_RUNTIME") || { cf_fail cross_filesystem_state;return 1; }
+    cf_state_device=$(stat -c %d "$CF_DIR") || { cf_fail cross_filesystem_state;return 1; }
+    [ "$cf_runtime_device" = "$cf_state_device" ] || { cf_fail cross_filesystem_state;return 1; }
+    cf_rpc_checkpoint before_write
+    printf '%s\n' "$CF_POLICY" > "$cf_temp" || { cf_fail state_write_failed;return 1; }
+    cf_rpc_checkpoint during_write
+    if [ -n "$CF_METADATA" ];then
+        printf '%s\n' "$CF_METADATA" >> "$cf_temp" || { cf_fail state_write_failed;return 1; }
+    fi
+    chmod 600 "$cf_temp" || { cf_fail state_write_failed;return 1; }
+    cf_rpc_checkpoint after_write
+    cf_backend sync || { cf_fail state_write_failed;return 1; }
+    cf_rpc_checkpoint before_rename
+    mv -f "$cf_temp" "$CF_STATE" || { cf_fail state_write_failed;return 1; }
+    cf_rpc_checkpoint after_rename
+    cf_backend sync || { cf_fail state_write_failed;return 1; }
     CF_DIGEST=$(printf '%s\n' "$CF_POLICY" | sha256sum | awk '{print $1}')
 }
 cf_person_exists() { printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$1" '$1=="P"&&$2==p{yes=1}END{exit !yes}'; }
@@ -320,11 +349,19 @@ cf_sync_stage() {
     if [ "$cf_input_size" -gt 65536 ];then cf_input_cleanup;cf_fail policy_too_large;return 1;fi
     cf_ascii_size=$(tr -cd '\11\12\15\40-\176' < "$CF_INPUT_DIR/input" | wc -c)
     [ "$cf_ascii_size" = "$cf_input_size" ] || { cf_input_cleanup;cf_fail invalid_policy_bytes;return 1; }
-    cf_parsed=$(awk -f "$CF_LIB/json.awk" "$CF_INPUT_DIR/input")
+    cf_parsed=$(awk -v rpc="${1:-0}" -f "$CF_LIB/json.awk" "$CF_INPUT_DIR/input")
     cf_rc=$?
     cf_input_cleanup
     [ "$cf_rc" = 0 ] || { cf_fail invalid_policy;return 1; }
+    if [ "${1:-0}" = 1 ];then
+        CF_REQUEST_GENERATION=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $2}')
+        CF_REQUEST_ID=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $3}')
+        CF_BASE_REVISION=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $4}')
+        CF_BASE_DIGEST=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $5}')
+        cf_parsed=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1!="Q"')
+    fi
     CF_STAGED_POLICY=$(printf '%s\n' "$cf_parsed" | cf_canonical)
+    CF_NEXT_DIGEST=$(printf '%s\n' "$CF_STAGED_POLICY" | sha256sum | awk '{print $1} ')
 }
 cf_sync_read() {
     cf_new=$CF_STAGED_POLICY
@@ -336,10 +373,10 @@ cf_sync_read() {
 cf_check() {
     cf_missing=
     cf_timeout_available || cf_missing=timeout
-    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mv rm rmdir wc cmp cp tr id dirname env; do
+    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mv rm rmdir wc cmp cp tr id dirname env sync cat; do
         command -v "$cf_dep" >/dev/null 2>&1 || cf_missing="$cf_missing $cf_dep"
     done
-    for cf_dep in iptables ip6tables ipset uci conntrack ip fw3; do
+    for cf_dep in iptables ip6tables ipset uci conntrack ip fw3 sync; do
         cf_backend_available "$cf_dep" || cf_missing="$cf_missing $cf_dep"
     done
     if [ -n "$cf_missing" ]; then printf '%s\n' '{"ok":false,"errors":["missing_dependencies"]}'; return 1; fi
@@ -408,6 +445,7 @@ cf_busy_result() {
 cf_main() {
     cf_action=${1-}
     case $cf_action in
+        rpc-sync|rpc-status) cf_rpc_main "$@";return $?;;
         check) [ "$#" = 1 ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_check;return $?;;
         status) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_status;return 0;;
         pause) if [ "$#" = 2 ]; then cf_until=0;elif [ "$#" = 4 ] && [ "$3" = --until ];then cf_until=$4;else cf_action=invalid;fi;;
@@ -429,6 +467,7 @@ cf_main() {
         pause) cf_pause_edit "$2" "$cf_until" || { cf_status;return 1; };;
         resume) cf_resume_edit "$2" || { cf_status;return 1; };;
     esac
+    if ! cf_backend_available sync;then cf_fail missing_dependencies;cf_status;return 1;fi
     if ! cf_policy_safe || ! cf_ssh_guard; then cf_status;return 1;fi
     if [ "$cf_action" = remove-fw ];then
         cf_remove_fw || { cf_error_record;cf_status;return 1; }
@@ -436,7 +475,12 @@ cf_main() {
     fi
     # Validate capabilities and foreign-object ownership BEFORE accepting a new revision.
     if ! cf_preflight; then cf_status;return 1;fi
-    case $cf_action in sync|pause|resume) cf_write_policy || { cf_error_record;cf_status;return 1; };;esac
+    case $cf_action in sync|pause|resume)
+        if [ -n "$CF_METADATA" ];then
+            CF_CURRENT=-
+            CF_METADATA=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' 'BEGIN{OFS="\t"}$1=="C"{$2="-"}{print}')
+        fi
+        cf_write_policy || { cf_error_record;cf_status;return 1; };;esac
     if ! cf_apply;then cf_error_record;cf_status;return 1;fi
     cf_status
 }

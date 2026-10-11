@@ -51,7 +51,7 @@ class RouterFixture:
             "failures": [], "delays": [], "reload_include": True,
             "native_witness": True}))
         for command in ("ipset", "iptables", "ip6tables", "iptables-save", "ip6tables-save",
-                        "conntrack", "uci", "ip", "jsonfilter", "fw3", "firewall"):
+                        "conntrack", "uci", "ip", "jsonfilter", "fw3", "firewall", "sync"):
             wrapper = self.bin / command
             wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " "
                                + shlex.quote(str(REPO / "tests/fixtures/backend.py")) + " "

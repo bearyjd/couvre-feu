@@ -1,7 +1,8 @@
 export const SOURCE = 'synthetic-fake-router' as const;
 export type Provenance = {
-    source: typeof SOURCE;
+    source: typeof SOURCE | 'real-router-integration';
     routerCompatibilityVerified: false;
+    integrationScope?: string;
 };
 export const provenance: Provenance = {
     source: SOURCE, routerCompatibilityVerified: false
@@ -30,6 +31,9 @@ export interface OperationDTO extends Provenance {
     updatedAt: number;
     error: string | null;
     confirmedAt: number | null;
+    currentHealthy?: boolean;
+    accepted?: boolean;
+    dispatch?: 'awaiting_operator_dispatch' | 'consumed' | 'uncertain' | 'resolved';
 }
 export interface PersonDTO {
     id: string;
@@ -60,6 +64,7 @@ export interface PeopleDTO extends Provenance {
     statusAgeSeconds: number | null;
     lastSuccessfulConfirmationAt: number | null;
     errors: string[];
+    packetAcceptance?: 'unmeasured';
 }
 export interface OperationResult extends Provenance {
     operation: OperationDTO;

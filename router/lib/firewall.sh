@@ -135,7 +135,7 @@ cf_hook_args() {
     if [ "$1" = cf_fwd ];then printf '%s\n' '-m comment --comment cf:v1';else printf '%s\n' '-i br-lan -m comment --comment cf:v1';fi
 }
 cf_preflight() {
-    for cf_dep in iptables ip6tables ipset uci conntrack ip fw3;do
+    for cf_dep in iptables ip6tables ipset uci conntrack ip fw3 sync;do
         cf_backend_available "$cf_dep" || { cf_fail missing_dependencies;return 1; }
     done
     cf_network || return 1
@@ -172,7 +172,7 @@ cf_preflight() {
     done
     cf_reference_guard || return 1
     cf_address_refresh || return 1
-    case ${cf_action-} in pause|sync)
+    case ${cf_action-} in pause|sync|rpc-sync)
         [ "$CF_ADDRESS_OK" = true ] || { cf_fail incomplete_address_coverage;return 1; };;
     esac
     cf_preflight_plan=$(cf_plan) || { cf_fail unsafe_address_attribution;return 1; }
@@ -432,12 +432,14 @@ EOF
     cf_confirm_apply
 }
 cf_confirm_apply() {
+    cf_rpc_checkpoint before_confirmation
     cf_temp=$CF_RUNTIME/.snapshot.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
     cf_snapshot > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/firewall.snapshot" || { cf_fail snapshot_failed;return 1; }
     cf_temp=$CF_RUNTIME/.confirmed.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
     printf '%s %s %s\n' "$CF_REVISION" "$CF_DIGEST" "$(cf_effective_digest)" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/confirmed" || { cf_fail confirmation_failed;return 1; }
+    cf_rpc_checkpoint after_confirmation
     [ ! -e "$CF_RUNTIME/error" ] || { cf_safe_file "$CF_RUNTIME/error" && rm -f "$CF_RUNTIME/error"; } || return 1
     if [ -e "$CF_RUNTIME/firewall.intent" ] || [ -L "$CF_RUNTIME/firewall.intent" ];then
         cf_safe_file "$CF_RUNTIME/firewall.intent" && rm -f "$CF_RUNTIME/firewall.intent" || return 1

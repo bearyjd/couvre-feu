@@ -7,6 +7,9 @@
   "engines": { "node": "26.8.1", "npm": "11.19.0" },
   "scripts": {
     "demo:start": "node service/src/main.ts",
+    "integration:start": "node service/src/integration-main.ts",
+    "integration:bootstrap": "node service/src/integration-bootstrap.ts",
+    "integration:dispatch": "node service/src/integration-dispatch.ts",
     "demo:router": "node demo-router/src/main.ts",
     "demo:bootstrap": "node service/src/bootstrap.ts",
     "demo:scenario": "node demo-router/src/scenario-cli.ts",

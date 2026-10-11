@@ -7,7 +7,8 @@ permissions:
 jobs:
   fixtures:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Recovery, core and RPC crash/race fixtures use isolated Python backends.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Install CI-only ash and lint tools

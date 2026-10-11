@@ -5,6 +5,12 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 LC_ALL=C
 export LC_ALL
+cf_rpc_only=0
+case $# in
+    0);;
+    1)[ "$1" = --rpc-only ] || exit 2;cf_rpc_only=1;;
+    *)exit 2;;
+esac
 cf_ssh_command=${SSH_ORIGINAL_COMMAND-}
 cf_ssh_target=/usr/sbin/cfctl
 # The grammar fixture may invoke only a marked private-root executable.
@@ -25,7 +31,18 @@ IFS=' '
 set -- $cf_ssh_command
 [ "$#" -ge 2 ] && [ "$1" = cfctl ] || exit 2
 shift
+if [ "$cf_rpc_only" = 1 ];then
+    case $1 in rpc-sync|rpc-status);;*)exit 2;;esac
+fi
 case $1 in
+    rpc-sync) [ "$#" = 1 ] || exit 2;;
+    rpc-status)
+        [ "$#" = 2 ] || [ "$#" = 3 ] || exit 2
+        [ "$2" = --json ] || exit 2
+        if [ "$#" = 3 ];then
+            case $3 in ''|-|*[!a-z0-9_-]*)exit 2;;esac
+            [ "${#3}" -le 64 ] || exit 2
+        fi;;
     status) [ "$#" = 2 ] && [ "$2" = --json ] || exit 2;;
     sync|expire|apply-fw) [ "$#" = 1 ] || exit 2;;
     pause)

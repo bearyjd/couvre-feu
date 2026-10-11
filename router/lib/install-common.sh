@@ -44,10 +44,17 @@ if [ -e "$DONE" ]; then
     fi
     BACKUP=$RECOVERY
 fi
-FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state'
+FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state'
+# The optional scope file is journaled only for explicit scoped activation.
+# Recovery derives inventory from its existing journal, never environment input.
+SCOPED_INSTALL=0
+for install_arg in "$@";do [ "$install_arg" != --rpc-allow ] || SCOPED_INSTALL=1;done
+if [ -e "$BACKUP/etc_couvrefeu_rpc-allowed.after" ] || [ "$SCOPED_INSTALL" = 1 ];then
+    FILES="$FILES etc/couvrefeu/rpc-allowed"
+fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
-for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd; do
+for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
     command -v "$dep" >/dev/null 2>&1 || fail "missing dependency: $dep"
 done
 

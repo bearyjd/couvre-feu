@@ -1,0 +1,60 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, symlinkSync, unlinkSync, existsSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { once } from 'node:events';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { integrationConfig } from '../src/integration-config.ts';
+import { IntegrationStore } from '../src/integration-db.ts';
+import { Store } from '../src/db.ts';
+import { testConfig } from './fixtures/integration.ts';
+
+test('private manifest validates explicit real bindings, pinned public keys and agent; rejects unsafe or fictional mode', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cf-private-config-test-')), sample = testConfig(dir), socket = createServer();
+    socket.listen(sample.router.agentSocket); await once(socket, 'listening'); chmodSync(sample.router.agentSocket, 0o600);
+    const data = Buffer.concat([Buffer.from([0,0,0,11]), Buffer.from('ssh-ed25519'), Buffer.from([0,0,0,32]), Buffer.alloc(32, 1)]), blob = data.toString('base64'), fp = 'SHA256:' + createHash('sha256').update(data).digest('base64').replace(/=+$/, '');
+    writeFileSync(sample.router.knownHosts, `192.168.1.1 ssh-ed25519 ${blob}\n`, {mode: 0o600});
+    writeFileSync(sample.router.publicIdentity, `ssh-ed25519 ${blob} test-public-key\n`, {mode: 0o600});
+    const {origin: _o, host: _h, manifestDigest: _m, targetDigest: _t, provenance: _p, ...manifest} = sample;
+    manifest.router.hostFingerprint = fp; manifest.router.publicKeyFingerprint = fp;
+    const path = join(dir, 'manifest.json');
+    const save = (value: unknown) => writeFileSync(path, JSON.stringify(value), {mode: 0o600});
+    try {
+        save(manifest); const c = integrationConfig(path);
+        assert.equal(c.provenance.source, 'real-router-integration'); assert.equal(c.provenance.routerCompatibilityVerified, false);
+        assert.deepEqual(c.accounts.map(a => a.id), ['operator', 'parent']); assert.equal(c.router.generation, manifest.router.generation);
+        for (const changed of [{...manifest, mode: 'demo'}, {...manifest, protectedMacs: [manifest.person.device.mac]}, {...manifest, router: {...manifest.router, generation: undefined}}, {...manifest, router: {...manifest.router, host: 'evil.example'}}, {...manifest, accounts: [{...manifest.accounts[0], personIds: ['other']}]}, {...manifest, enrollment: {...manifest.enrollment, people: [{id: 'pilot', macs: ['02:aa:bb:cc:dd:ee']}]}}]) { save(changed); assert.throws(() => integrationConfig(path)); }
+        save(manifest); chmodSync(path, 0o644); assert.throws(() => integrationConfig(path), /unsafe_private_path/); chmodSync(path, 0o600);
+        const link = join(dir, 'link.json'); symlinkSync(path, link); assert.throws(() => integrationConfig(link), /unsafe_private_path/);
+        writeFileSync(sample.router.knownHosts, `192.168.1.1 ssh-ed25519 ${blob}\n192.168.1.2 ssh-ed25519 ${blob}\n`); assert.throws(() => integrationConfig(path), /invalid_pinned_host_key/);
+        writeFileSync(sample.router.knownHosts, `192.168.1.1 ssh-ed25519 ${blob}\n`);
+        writeFileSync(sample.router.publicIdentity, '-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n'); assert.throws(() => integrationConfig(path), /invalid_public_identity/);
+    } finally { socket.close(); await once(socket, 'close'); rmSync(dir, {recursive: true, force: true}); }
+});
+test('integration and demo DBs refuse cross-mode reuse or changed installation/manifest identities', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cf-private-db-test-')), c = testConfig(dir), store = new IntegrationStore(c);
+    try {
+        store.close();
+        assert.throws(() => new Store(join(dir, 'integration.sqlite')), /integration_database_forbidden/);
+        assert.throws(() => new IntegrationStore({...c, manifestDigest: 'e'.repeat(64)}), /integration_database_identity_mismatch/);
+        assert.throws(() => new IntegrationStore({...c, router: {...c.router, generation: 'e'.repeat(64)}}), /integration_database_identity_mismatch/);
+        const restored = new IntegrationStore(c); assert.equal(restored.integrationState().dispatch_stopped, 1); restored.close();
+        const otherDir = join(dir, 'foreign');
+        const foreign = new Store(join(otherDir, 'integration.sqlite')); foreign.close();
+        assert.throws(() => new IntegrationStore({...c, dataDir: otherDir}), /demo_database_forbidden/);
+    } finally { rmSync(dir, {recursive: true, force: true}); }
+});
+test('dangling DB, WAL, SHM and rollback-journal symlinks are rejected before SQLite creates any outside target', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cf-private-symlink-test-')), dataDir = join(dir, 'data'); mkdirSync(dataDir, {mode: 0o700});
+    try {
+        for (const suffix of ['', '-wal', '-shm', '-journal']) {
+            const target = join(dir, `unexpected${suffix}.sqlite`), link = join(dataDir, `integration.sqlite${suffix}`);
+            symlinkSync(target, link);
+            assert.throws(() => new IntegrationStore(testConfig(dataDir)), /unsafe_private_path/);
+            assert.equal(existsSync(target), false, suffix || 'main DB'); assert.equal(existsSync(join(dataDir, 'integration.sqlite')), false);
+            unlinkSync(link);
+        }
+    } finally { rmSync(dir, {recursive: true, force: true}); }
+});
