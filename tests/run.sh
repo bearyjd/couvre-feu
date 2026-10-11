@@ -12,6 +12,7 @@ is_shell() {
 }
 printf '%s\n' 'Evidence: isolated fixtures only; packet and live-router gates pending.'
 python3 tests/test-install.py
+python3 tests/test-platform-integration.py
 python3 tests/test-client-probe.py
 
 if command -v shellcheck >/dev/null 2>&1; then

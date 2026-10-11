@@ -1,6 +1,8 @@
 # shellcheck shell=sh
+# shellcheck disable=SC2034,SC1091
 # Shared installation/recovery helpers. POSIX sh / OpenWrt ash.
 set -eu
+case "$0" in */install-common.sh) printf 'couvre-feu: executable journal helper refused\n' >&2; exit 2;; esac
 umask 077
 
 fail() { printf '%s\n' "couvre-feu: $*" >&2; exit 1; }
@@ -27,7 +29,9 @@ if ! { [ -d "$recovery_parent" ] && [ ! -L "$recovery_parent" ]; }; then
 fi
 [ "$(stat -c %u "$recovery_parent")" = "$(id -u)" ] || fail 'unsafe recovery parent owner'
 recovery_parent_mode=$(stat -c %a "$recovery_parent")
-[ "$((0$recovery_parent_mode & 022))" = 0 ] || fail 'unsafe writable recovery parent'
+[ "$((0$recovery_parent_mode & 022))" = 0 ] || {
+    [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] && [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] && [ "$recovery_parent" = /etc ] && [ "$(stat -c '%u:%g:%a' "$recovery_parent")" = 0:0:775 ]
+} || fail 'unsafe writable recovery parent'
 # A recovery journal and its completion record are fixed, private paths.
 for recovery_path in "$RECOVERY" "$DONE"; do
     [ ! -L "$recovery_path" ] || fail 'recovery path is a symlink'
@@ -48,10 +52,20 @@ FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/stat
 # The optional scope file is journaled only for explicit scoped activation.
 # Recovery derives inventory from its existing journal, never environment input.
 SCOPED_INSTALL=0
-for install_arg in "$@";do [ "$install_arg" != --rpc-allow ] || SCOPED_INSTALL=1;done
+# Installer options are parsed before bootstrap; recover their explicit value.
+# Runtime/recovery inventory still comes exclusively from existing journals.
+case "$0" in */install.sh) [ -z "${RPC_ALLOW:-}" ] || SCOPED_INSTALL=1;; esac
 if [ -e "$BACKUP/etc_couvrefeu_rpc-allowed.after" ] || [ "$SCOPED_INSTALL" = 1 ];then
     FILES="$FILES etc/couvrefeu/rpc-allowed"
 fi
+# Legacy inventory comes solely from the validated original journal shape.
+PROFILE_INVENTORY=0
+if [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; then PROFILE_INVENTORY=1
+elif [ -e "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then PROFILE_INVENTORY=1
+elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1; fi
+if [ "$PROFILE_INVENTORY" = 1 ]; then
+    FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile"
+elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
 for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
@@ -60,16 +74,29 @@ done
 
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then LOCK=$ROOT/.couvrefeu-install.lock
 else LOCK=/tmp/couvrefeu-install.lock; fi
-mkdir "$LOCK" 2>/dev/null || fail 'another install/recovery transaction is running'
-chmod 700 "$LOCK"
-printf '%s\n' "$$" > "$LOCK/pid"
-INSTALL_TOKEN=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')
-printf '%s\n' "$INSTALL_TOKEN" > "$LOCK/token"
+INSTALL_LOCK_OWNED=0
+if [ "${CF_PLATFORM_NESTED:-0}" = 1 ] && [ -d "$LOCK" ]; then
+    platform_private "$LOCK" 700
+    platform_private "$LOCK/pid" 600
+    platform_private "$LOCK/token" 600
+    printf '%s\n' "$$" | cmp -s - "$LOCK/pid" || fail 'nested install lock owner mismatch'
+    printf '%s\n' "${INSTALL_TOKEN:-}" | cmp -s - "$LOCK/token" || fail 'nested install lock token mismatch'
+else
+    mkdir -m 700 "$LOCK" 2>/dev/null || fail 'another install/recovery transaction is running'
+    INSTALL_LOCK_OWNED=1
+    printf '%s\n' "$$" > "$LOCK/pid"
+    INSTALL_TOKEN=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')
+    printf '%s\n' "$INSTALL_TOKEN" > "$LOCK/token"
+fi
 unlock_install() {
+    [ "$INSTALL_LOCK_OWNED" = 1 ] || return 0
+    printf '%s\n' "$$" | cmp -s - "$LOCK/pid" || fail 'installation lock owner mismatch'
+    printf '%s\n' "$INSTALL_TOKEN" | cmp -s - "$LOCK/token" || fail 'installation lock token mismatch'
     rm -f "$LOCK/pid" "$LOCK/token"
     rmdir "$LOCK" 2>/dev/null || :
+    INSTALL_LOCK_OWNED=0
 }
-trap unlock_install 0
+trap 'unlock_install; platform_lock_release' 0
 trap 'exit 1' 1 2 15
 
 # Every core mutation checks the global lock before and after obtaining its
@@ -86,7 +113,7 @@ if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then
                 fail 'unsafe core owner'
             fi
             owner=$(awk 'NR==1 {print; exit}' "$BASE/runtime/lock/pid")
-            if [ "$owner" != "${PPID:-}" ] || ! kill -0 "$owner" 2>/dev/null; then fail 'journal caller does not own the core lock'; fi;;
+            if [ "$owner" != "${CF_PLATFORM_CALLER_PID:-${PPID:-}}" ] || ! kill -0 "$owner" 2>/dev/null; then fail 'journal caller does not own the core lock'; fi;;
         *) fail 'core operation is running; no installation/recovery changes made';;
     esac
 fi
@@ -190,6 +217,14 @@ journal_preflight() {
     fi
     allowed_entries='ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next firewall.pending etc_config_firewall.staged.couvrefeu-tmp'
     record_entries='ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next'
+    # DONE proves full exact restoration has already succeeded. Its authenticated
+    # cleanup-only whitelist survives deletion of the optional scope .after;
+    # restoration inventory and its full preflight remain journal-derived.
+    if [ "${1:-}" = cleanup ]; then
+        platform_valid_done "$DONE" || fail 'unsafe cleanup completion record'
+        allowed_entries="$allowed_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.original etc_couvrefeu_rpc-allowed.staged etc_couvrefeu_rpc-allowed.mtime"
+        record_entries="$record_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.mtime"
+    fi
     for rel in $FILES; do
         k=$(key "$rel")
         allowed_entries="$allowed_entries $k.before $k.after $k.original $k.staged $k.mtime"
@@ -349,25 +384,29 @@ fixture_tools() {
 live_tools() {
     [ "${CF_TEST_MODE:-0}" != 1 ] || [ "${CF_TEST_INSTALL_KERNEL:-0}" = 1 ]
 }
-installed_core() {
+installed_core() (
+    [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] || fail 'missing transaction admission'
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         fixture_tools
-        fixture_busybox=
-        case ${CF_TEST_SHELL:-} in
-            'busybox ash')fixture_busybox=$(command -v busybox) || fail 'BusyBox test shell unavailable';;
-            /tmp/*/busybox\ ash)
-                fixture_busybox=${CF_TEST_SHELL% ash}
-                if [ ! -f "$fixture_busybox" ] || [ -L "$fixture_busybox" ] || [ ! -x "$fixture_busybox" ]; then
-                    fail 'BusyBox test shell unavailable'
-                fi;;
-        esac
-        if [ -n "$fixture_busybox" ];then
-            CF_INSTALL_TOKEN=$INSTALL_TOKEN "$fixture_busybox" ash "$ROOT/usr/sbin/cfctl" "$1"
-            return $?
+        # Existing inert filesystem fixtures emulate the core call boundary.
+        # An actual kernel fixture omits this double and runs verified code.
+        if [ -e "$CF_BACKEND_DIR/core" ] || [ -L "$CF_BACKEND_DIR/core" ]; then
+            [ -f "$CF_BACKEND_DIR/core" ] && [ ! -L "$CF_BACKEND_DIR/core" ] && [ -x "$CF_BACKEND_DIR/core" ] || fail 'unsafe fixture core backend'
+            CF_INSTALL_TOKEN=$INSTALL_TOKEN "$CF_BACKEND_DIR/core" "$@"
+            exit $?
         fi
     fi
-    CF_INSTALL_TOKEN=$INSTALL_TOKEN "$ROOT/usr/sbin/cfctl" "$1"
-}
+    [ -n "${CF_PLATFORM_LIB:-}" ] || fail 'missing verified release library'
+    platform_verify_modules "$CF_PLATFORM_LIB"
+    CF_LOCAL_TEST=${CF_TEST_MODE:-0} CF_BASE=$ROOT CF_LIB=$CF_PLATFORM_LIB
+    CF_INSTALL_TOKEN=$INSTALL_TOKEN
+    CF_PLATFORM_LOCKED=0
+    # Isolate core's runtime traps; the outer transaction owns admission.
+    . "$CF_LIB/core.sh"
+    . "$CF_LIB/rpc.sh"
+    . "$CF_LIB/firewall.sh"
+    cf_main "$@"
+)
 reload_firewall() {
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         fixture_tools

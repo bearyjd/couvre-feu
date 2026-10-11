@@ -1,7 +1,30 @@
 #!/bin/sh
+# shellcheck disable=SC2034,SC1090,SC1091
 # Restore exact original files only after a complete drift preflight.
 set -eu
-HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# BEGIN authenticated bootstrap boundary
+if [ "${CF_TEST_MODE:-0}" != 1 ]; then PATH=/usr/sbin:/usr/bin:/sbin:/bin; fi
+LC_ALL=C
+export PATH LC_ALL
+umask 077
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+    printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
+    exit 2
+fi
+unset CF_PLATFORM_ADMITTED CF_PLATFORM_LOCKED CF_PLATFORM_NESTED CF_RELEASE_ID CF_PLATFORM_PROFILE CF_VENDOR_PROFILE CF_RELEASE_MODULES CF_PLATFORM_CALLER_PID CF_PLATFORM_OWNER CF_PLATFORM_LIB vp_profile
+CF_BOOTSTRAP_PIN=49f8e00f1461079bb511391571e8666da3dbedb9b5fb57cdc4748a0d8bf27690
+platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
+[ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
+platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
+[ "${platform_bootstrap_digest%% *}" = "$CF_BOOTSTRAP_PIN" ] || exit 2
+# shellcheck disable=SC1091
+. "$platform_bootstrap_path"
+# END authenticated bootstrap boundary
+platform_entry_root_validate
+platform_admit runtime "${CF_ROOT:-}" "$HERE/lib"
+[ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
+[ "${CF_TEST_MODE:-0}" = 1 ] || [ "$HERE" = "/etc/.couvrefeu-release-$CF_RELEASE_ID" ] || platform_fail external_recovery_release_required
 # shellcheck disable=SC1091
 . "$HERE/lib/install-common.sh"
 [ "$#" = 0 ] || fail 'usage: uninstall.sh'
@@ -9,15 +32,24 @@ safe_paths
 # Final cleanup has its own private completion record: removing the journal
 # can be interrupted without losing the fact that every restoration succeeded.
 finish_cleanup() {
-    valid_marker "$DONE" 2 || fail 'unsafe/legacy recovery completion record; preserved'
+    CLEANUP_COUNT=0
+    platform_valid_done "$DONE" || fail 'unsafe/legacy recovery completion record; preserved'
     if [ -e "$BACKUP" ]; then
         journal_preflight cleanup
         for entry in "$BACKUP"/* "$BACKUP"/.[!.]* "$BACKUP"/..?*; do
             [ -e "$entry" ] || continue
             rm -f "$entry"
+            CLEANUP_COUNT=$((CLEANUP_COUNT + 1))
+            if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER:-0}" = "$CLEANUP_COUNT" ]; then fail 'injected cleanup interruption'; fi
         done
         rmdir "$BACKUP" || fail 'recovery cleanup incomplete; completion record retained'
     fi
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CLEANUP_FAIL_AT:-}" = journal ]; then fail 'injected after journal removal'; fi
+    unlock_install
+    platform_lock_release
+    trap - 0 1 2 15
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CLEANUP_FAIL_AT:-}" = 'done' ]; then fail 'injected before DONE removal'; fi
+    # Last filesystem operation: the binding survives journal and lock cleanup.
     rm -f "$DONE"
 }
 if [ -e "$DONE" ]; then
@@ -105,6 +137,11 @@ for rel in $FILES; do
     fi
 done
 [ -f "$BACKUP/restored" ] || phase restored 2
-mv "$BACKUP/restored" "$DONE"
+if [ -f "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then
+    platform_publish_done
+else
+    [ "$CF_PLATFORM_PROFILE" = strict ] || fail 'vendor legacy completion refused'
+    mv "$BACKUP/restored" "$DONE"
+fi
 finish_cleanup
 printf '%s\n' 'Original files restored; Couvre-feu installation removed.'

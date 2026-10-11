@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Native ash integration fixtures. No root writes, vendor payload or live router.
+
+Vendor adapter fixtures substitute only the pinned payload/attestation boundary,
+inside an independently generated private module. Exact helper behavior remains
+covered by its unchanged 135 cases; these fixtures measure admission call counts,
+serialization and cleanup ordering, not actual platform trust or router latency.
+"""
+import hashlib
+import json
+import importlib.util
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import tempfile
+import tarfile
+import sys
+import unittest
+
+REPO = Path(__file__).resolve().parents[1]
+BB = shutil.which('busybox')
+if not BB and not os.environ.get('CF_TEST_SHELL'):
+    raise SystemExit('Native BusyBox ash required: set CF_TEST_SHELL to its absolute binary and ash')
+SHELL = shlex.split(os.environ.get('CF_TEST_SHELL', (BB or '') + ' ash'))
+PROFILE = 'gl-xe3000-4.8.3-logd-011-v1'
+spec = importlib.util.spec_from_file_location('install_fixtures', REPO / 'tests/test-install.py')
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+
+
+class StrictEntryTests(unittest.TestCase):
+    def setUp(self):
+        self.expected_profile = 'strict'
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-platform-entry-')
+        self.root = Path(self.tmp.name)
+        self.env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root))
+        for key in ['SSH_CONNECTION', 'SSH_CLIENT', 'LD_LIBRARY_PATH', 'LD_PRELOAD', 'LD_AUDIT']:
+            self.env.pop(key, None)
+        self.source = self.root / 'release'
+        shutil.copytree(REPO / 'router', self.source)
+        self.backend = self.root / 'backend'
+        self.backend.mkdir(mode=0o700)
+        (self.backend / '.couvrefeu-test-backend').touch()
+        for name in ['iptables', 'ip6tables', 'ipset', 'uci', 'conntrack', 'ip', 'fw3', 'sync']:
+            p = self.backend / name
+            p.write_text('#!/bin/sh\nexit 0\n')
+            p.chmod(0o700)
+        self.env['CF_BACKEND_DIR'] = str(self.backend)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_entry(self, name='install.sh', args=(), env=None):
+        return subprocess.run(SHELL + [str(self.source / name), *args], env=env or self.env, capture_output=True, text=True)
+
+    def install(self):
+        result = self.run_entry(args=['--protect', '02:00:00:00:00:01', '--activate'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_strict_first_install_uses_verified_source_modules(self):
+        self.assertFalse((self.root / 'usr/lib/couvrefeu').exists())
+        self.install()
+        self.assertEqual((self.root / 'etc/couvrefeu/platform-profile').read_bytes(), b'strict\n')
+        self.assertIn(str('platform-bootstrap.sh'), (self.root / 'etc/couvrefeu/backup/usr_lib_couvrefeu_platform-bootstrap.sh.after').name)
+        self.assertIn('/etc/.couvrefeu-release-', (self.root / 'etc/sysupgrade.conf').read_text())
+        result = self.run_entry('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / 'etc/couvrefeu').exists())
+        self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
+
+    def test_actual_scoped_activation_preserves_scope_inventory_and_restoration(self):
+        args=['--protect','02:00:00:00:00:aa','--rpc-allow','02:00:00:00:00:01','--activate']
+        result=self.run_entry(args=args)
+        self.assertEqual(result.returncode,0,result.stderr+result.stdout)
+        private=self.root/'etc/couvrefeu'
+        self.assertEqual((private/'rpc-allowed').read_bytes(),b'02:00:00:00:00:01\n')
+        self.assertTrue((private/'backup/etc_couvrefeu_rpc-allowed.after').exists())
+        self.assertIn(b'X\t1\nG\t',(private/'state').read_bytes())
+        result=self.run_entry('uninstall.sh')
+        self.assertEqual(result.returncode,0,result.stderr+result.stdout)
+        self.assertFalse(private.exists())
+
+    def test_environment_cannot_supply_admission_or_pins(self):
+        for key in ['CF_PLATFORM_ADMITTED', 'CF_PLATFORM_PROFILE', 'CF_PLATFORM_LOCKED', 'CF_PLATFORM_NESTED', 'CF_PLATFORM_CALLER_PID', 'CF_PLATFORM_OWNER', 'CF_PLATFORM_LIB', 'CF_RELEASE_ID', 'CF_RELEASE_MODULES', 'CF_VENDOR_PROFILE', 'vp_profile', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT']:
+            with self.subTest(key=key):
+                result = self.run_entry(args=['--protect', '02:00:00:00:00:01', '--activate'], env=dict(self.env, **{key:'injected'}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / 'etc/couvrefeu').exists())
+
+    def test_fixture_flags_refuse_real_root_before_platform_bootstrap(self):
+        # A copied and freshly pinned inert bootstrap records any entry into the
+        # vendor payload boundary. Invalid fixture flags must precede that call.
+        marker = self.root / 'bootstrap-entered'
+        bootstrap = self.source / 'lib/platform-bootstrap.sh'
+        source = bootstrap.read_text()
+        start = source.index('platform_bootstrap_vendor() {')
+        stop = source.index('platform_verify_modules()', start)
+        source = source[:start] + f'platform_bootstrap_vendor() {{ touch "{marker}"; exit 99; }}\n' + source[stop:]
+        bootstrap.write_text(source)
+        compiler = (REPO / 'tools/freeze-router-release.py').read_text().replace("router = Path(__file__).resolve().parents[1] / 'router'", 'router = Path(' + repr(str(self.source)) + ')')
+        subprocess.run(['python3', '-c', compiler], check=True, capture_output=True)
+        for mode, root in [('1', '/'), ('1', '/tmp'), ('2', str(self.root)), ('0', str(self.root))]:
+            for name in ['install.sh', 'uninstall.sh']:
+                args = ['--platform-profile', PROFILE] if name == 'install.sh' else []
+                result = self.run_entry(name, args=args, env=dict(self.env, CF_TEST_MODE=mode, CF_ROOT=root))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(marker.exists())
+
+    def test_substituted_source_refuses_before_managed_changes(self):
+        (self.source / 'lib/core.sh').write_text('exit 0\n')
+        result = self.run_entry(args=['--protect', '02:00:00:00:00:01', '--activate'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'etc/couvrefeu').exists())
+
+    def test_unknown_duplicate_and_changed_selection_refuse(self):
+        for args in [['--platform-profile', 'unknown'], ['--platform-profile', 'strict', '--platform-profile', 'strict']]:
+            self.assertNotEqual(self.run_entry(args=args).returncode, 0)
+        self.install()
+        profile = self.root / 'etc/couvrefeu/platform-profile'
+        for content in [b'strict\n\n', b'strict\x00\n', b'strict\n'+b'\n'*1048576, b'strict\n'+b'\x00'*1048576, (PROFILE+'\n').encode()]:
+            profile.write_bytes(content)
+            self.assertNotEqual(self.run_entry('uninstall.sh').returncode, 0)
+            self.assertTrue((self.root / 'etc/couvrefeu/backup').exists())
+
+    def test_private_profile_metadata_refuses(self):
+        self.install()
+        profile = self.root / 'etc/couvrefeu/platform-profile'
+        profile.chmod(0o640)
+        self.assertNotEqual(self.run_entry('uninstall.sh').returncode, 0)
+        self.assertTrue((self.root / 'etc/couvrefeu/backup').exists())
+
+    def test_completion_fifo_and_symlink_fifo_refuse_before_attestation(self):
+        done = self.root / '.couvrefeu-recovery.done'
+        fifo = self.root / 'completion-pipe'
+        os.mkfifo(fifo, 0o600)
+        for symlink in [False, True]:
+            with self.subTest(symlink=symlink):
+                if symlink: done.symlink_to(fifo)
+                else: os.mkfifo(done, 0o600)
+                result = subprocess.run(SHELL+[str(self.source/'uninstall.sh')],
+                    env=self.env, capture_output=True, text=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('regular_file', result.stderr)
+                self.assertFalse((self.root/'.couvrefeu-install.lock').exists())
+                self.assertTrue(done.is_symlink() or done.exists())
+                done.unlink()
+
+    def test_scoped_done3_survives_each_cleanup_delete_and_restores_exact_original(self):
+        private = self.root/'etc/couvrefeu'
+        private.mkdir(parents=True, mode=0o700)
+        scope = private/'rpc-allowed'
+        scope.write_bytes(b'02:00:00:00:00:09\n'); scope.chmod(0o600)
+        original = fixtures.exact_signature(scope)
+        args=['--protect','02:00:00:00:00:aa','--rpc-allow','02:00:00:00:00:01','--activate']
+        # Reuse the complete deletion-boundary proof with actual scoped install.
+        def scoped_install():
+            result=self.run_entry(args=args)
+            self.assertEqual(result.returncode,0,result.stderr+result.stdout)
+        self.install=scoped_install
+        # The original private directory remains after exact restoration.
+        self._cleanup_boundary_proof(expect_base=True)
+        self.assertEqual(scope.read_bytes(), b'02:00:00:00:00:09\n')
+        self.assertEqual(fixtures.exact_signature(scope), original)
+
+    def test_done_binding_survives_every_cleanup_boundary(self):
+        self._cleanup_boundary_proof()
+
+    def _cleanup_boundary_proof(self, expect_base=False):
+        # These are exact restoration transactions with actual source modules.
+        # Every deletion position includes staged profile and both new helpers.
+        self.install()
+        result = self.run_entry('uninstall.sh', env=dict(self.env, CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER='1'))
+        self.assertNotEqual(result.returncode, 0)
+        done = self.root / '.couvrefeu-recovery.done'
+        self.assertTrue(done.exists())
+        self.assertEqual(done.read_text().splitlines()[:2], ['3', self.expected_profile])
+        self.assertEqual(done.stat().st_mode & 0o777, 0o600)
+        recovery = self.root / '.couvrefeu-recovery'
+        # Resume the actual cleanup once per surviving entry. DONE must survive
+        # deletion of the helper/profile records and the final journal removal.
+        while recovery.exists() and list(recovery.iterdir()):
+            previous = len(list(recovery.iterdir()))
+            result = self.run_entry('uninstall.sh', env=dict(self.env, CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER='1'))
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(done.exists())
+            self.assertLess(len(list(recovery.iterdir())), previous, result.stderr)
+        result = self.run_entry('uninstall.sh', env=dict(self.env, CF_TEST_UNINSTALL_CLEANUP_FAIL_AT='journal'))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(recovery.exists())
+        self.assertTrue(done.exists())
+        result = self.run_entry('uninstall.sh', env=dict(self.env, CF_TEST_UNINSTALL_CLEANUP_FAIL_AT='done'))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(done.exists())
+        self.assertFalse((self.root / '.couvrefeu-install.lock').exists())
+        self.assertEqual(self.run_entry('uninstall.sh').returncode, 0)
+        self.assertFalse(done.exists())
+        self.assertEqual((self.root / 'etc/couvrefeu').exists(), expect_base)
+
+    def test_completion_profile_and_release_conflict_refuse(self):
+        self.install()
+        self.run_entry('uninstall.sh', env=dict(self.env, CF_TEST_UNINSTALL_CLEANUP_FAIL_AT='journal'))
+        done = self.root / '.couvrefeu-recovery.done'
+        lines = done.read_text().splitlines()
+        for tail in [b'\n'*1048576,b'\x00'*1048576]:
+            done.write_bytes(('\n'.join(lines)+'\n').encode()+tail)
+            self.assertNotEqual(self.run_entry('uninstall.sh').returncode,0)
+            self.assertTrue(done.exists())
+        for replacement in [['3', PROFILE, lines[2]], ['3', 'strict', '0'*64], ['2', 'strict', lines[2]]]:
+            done.write_text('\n'.join(replacement)+'\n')
+            self.assertNotEqual(self.run_entry('uninstall.sh').returncode, 0)
+            self.assertTrue(done.exists())
+
+
+class VendorRecoveryTests(unittest.TestCase):
+    # Same actual uninstall/restoration/cleanup code, with an explicitly private
+    # inert platform boundary. This also proves selection after profile removal.
+    tearDown = StrictEntryTests.tearDown
+    run_entry = StrictEntryTests.run_entry
+    test_done_binding_survives_every_cleanup_boundary = StrictEntryTests.test_done_binding_survives_every_cleanup_boundary
+    _cleanup_boundary_proof = StrictEntryTests._cleanup_boundary_proof
+    test_completion_fifo_and_symlink_fifo_refuse_before_attestation = StrictEntryTests.test_completion_fifo_and_symlink_fifo_refuse_before_attestation
+
+    def setUp(self):
+        StrictEntryTests.setUp(self)
+        self.expected_profile = PROFILE
+        tmp = self.root / 'tmp'
+        tmp.mkdir(mode=0o1777); tmp.chmod(0o1777)
+        bootstrap = self.source / 'lib/platform-bootstrap.sh'
+        source = bootstrap.read_text()
+        start = source.index('platform_bootstrap_vendor() {')
+        stop = source.index('platform_verify_modules()', start)
+        source = source[:start] + 'platform_bootstrap_vendor() { :; }\n' + source[stop:]
+        source = source.replace('/tmp/couvrefeu-platform.lock', str(tmp / 'couvrefeu-platform.lock'))
+        source = source.replace("'%u:%g:%a' /tmp)", "'%u:%g:%a' " + str(tmp) + ')').replace('0:0:1777', f'{os.getuid()}:{os.getgid()}:1777')
+        source = source.replace('        vp_transaction_check >/dev/null', '        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
+        bootstrap.write_text(source)
+        compiler = (REPO / 'tools/freeze-router-release.py').read_text()
+        compiler = compiler.replace("router = Path(__file__).resolve().parents[1] / 'router'", 'router = Path(' + repr(str(self.source)) + ')')
+        result = subprocess.run(['python3', '-c', compiler], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def install(self):
+        result = self.run_entry(args=['--platform-profile', PROFILE, '--protect', '02:00:00:00:00:01', '--activate'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ActivatedLegacyRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(REPO / 'tests/fixtures'))
+        from harness import RouterFixture, PROTECTED
+        self.fixture = RouterFixture()
+        self.root = self.fixture.root
+        private = self.root / 'etc/couvrefeu'
+        (private/'state').unlink(); (private/'protected').unlink(); private.rmdir()
+        self.firewall = self.root / 'etc/config/firewall'
+        self.original = fixtures.exact_signature(self.firewall)
+        self.current = self.root / 'immutable-current-release'
+        shutil.copytree(REPO/'router', self.current)
+        self.current.chmod(0o700); (self.current/'lib').chmod(0o700)
+        self.fixture.env['CF_TEST_INSTALL_KERNEL'] = '1'
+        options=['--activate','--protect',PROTECTED]
+        if self._testMethodName == 'test_scoped_legacy_done2_survives_each_cleanup_delete':
+            options += ['--rpc-allow','02:00:00:00:00:01']
+        result = self.command('install.sh', *options)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertTrue(self.fixture.backend()['sets'], 'owned kernel objects must exist')
+        backup = private/'backup'
+        archive = REPO/'tests/fixtures/legacy-router-5c45e3e.tar.gz'
+        manifest = json.loads((REPO/'tests/fixtures/legacy-router-5c45e3e.json').read_text())
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), manifest['archiveSHA256'])
+        with tarfile.open(archive) as tar:
+            members=tar.getmembers()
+            self.assertEqual({m.name for m in members}, set(manifest['files']))
+            for member in members:
+                self.assertTrue(member.isfile())
+                content=tar.extractfile(member).read()
+                self.assertEqual(hashlib.sha256(content).hexdigest(),manifest['files'][member.name])
+                if member.name in ['install.sh','uninstall.sh']: continue
+                rel='usr/lib/couvrefeu/'+member.name[4:] if member.name.startswith('lib/') else 'usr/sbin/'+member.name
+                installed=self.root/rel
+                installed.write_bytes(content); installed.chmod(member.mode)
+                key=rel.replace('/','_')
+                staged=backup/(key+'.staged')
+                shutil.copy2(installed,staged)
+                (backup/(key+'.after')).write_text(fixtures.signature(staged)+'\n')
+                (backup/(key+'.after')).chmod(0o600)
+        for rel in ['usr/lib/couvrefeu/platform-bootstrap.sh','usr/lib/couvrefeu/vendor-platform.sh','etc/couvrefeu/platform-profile']:
+            (self.root/rel).unlink()
+            for suffix in ['before','after','mtime','staged','original']:
+                path=backup/(rel.replace('/','_')+'.'+suffix)
+                if path.exists(): path.unlink()
+        self.assertNotEqual((self.root/'usr/lib/couvrefeu/core.sh').read_bytes(),(self.current/'lib/core.sh').read_bytes())
+        self.assertNotEqual((self.root/'usr/lib/couvrefeu/firewall.sh').read_bytes(),(self.current/'lib/firewall.sh').read_bytes())
+        self.assertFalse((private/'platform-profile').exists())
+
+    def tearDown(self): self.fixture.close()
+
+    def command(self, name, *args):
+        return subprocess.run(SHELL+[str(self.current/name),*args], env=self.fixture.env, capture_output=True, text=True, timeout=90)
+
+    def test_activated_old_modules_restore_exactly_using_current_external_release(self):
+        result=self.command('uninstall.sh')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(fixtures.exact_signature(self.firewall),self.original)
+        self.assertEqual(self.fixture.backend()['sets'],{})
+        self.assertFalse((self.root/'etc/couvrefeu').exists())
+        self.assertFalse((self.root/'usr/lib/couvrefeu').exists())
+        self.assertFalse((self.root/'.couvrefeu-recovery.done').exists())
+        self.assertTrue((self.current/'lib/core.sh').exists())
+
+    def test_scoped_legacy_done2_survives_each_cleanup_delete(self):
+        self.fixture.env['CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER']='1'
+        result=self.command('uninstall.sh')
+        self.assertNotEqual(result.returncode,0,result.stderr)
+        done=self.root/'.couvrefeu-recovery.done'
+        self.assertEqual(done.read_bytes(),b'2\n')
+        recovery=self.root/'.couvrefeu-recovery'
+        while recovery.exists() and list(recovery.iterdir()):
+            count=len(list(recovery.iterdir()))
+            result=self.command('uninstall.sh')
+            self.assertNotEqual(result.returncode,0,result.stderr)
+            self.assertLess(len(list(recovery.iterdir())),count,result.stderr)
+            self.assertEqual(done.read_bytes(),b'2\n')
+        self.fixture.env.pop('CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER')
+        result=self.command('uninstall.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(fixtures.exact_signature(self.firewall),self.original)
+        self.assertEqual(self.fixture.backend()['sets'],{})
+        self.assertFalse(done.exists())
+        self.assertFalse((self.root/'etc/couvrefeu').exists())
+
+    def test_installed_old_module_drift_refuses_preserving_journal_and_kernel(self):
+        installed=self.root/'usr/lib/couvrefeu/core.sh'
+        installed.write_bytes(installed.read_bytes()+b'# drift\n')
+        before=self.fixture.backend()
+        result=self.command('uninstall.sh')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.fixture.backend(),before)
+        self.assertTrue((self.root/'etc/couvrefeu/backup/ready').exists())
+
+    def test_invalid_legacy_journal_refuses_before_owned_mutation(self):
+        record=self.root/'etc/couvrefeu/backup/usr_lib_couvrefeu_core.sh.after'
+        record.write_text('invalid\n')
+        before=self.fixture.backend()
+        result=self.command('uninstall.sh')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.fixture.backend(),before)
+        self.assertTrue((self.root/'etc/couvrefeu/backup/ready').exists())
+
+    def test_foreign_owned_chain_content_refuses_preserving_evidence(self):
+        state=self.fixture.backend()
+        slot=self.fixture.slot()
+        state['tables']['iptables']['filter'][f'cf2_{slot}_f'].append(['-j','ACCEPT'])
+        self.fixture.update_backend(tables=state['tables'])
+        before=self.fixture.backend()
+        result=self.command('uninstall.sh')
+        self.assertNotEqual(result.returncode,0)
+        after=self.fixture.backend()
+        self.assertEqual(after['tables'],before['tables'])
+        self.assertEqual(after['sets'],before['sets'])
+        self.assertTrue((self.root/'etc/couvrefeu/backup/ready').exists())
+
+
+class VendorAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-platform-native-')
+        self.root = Path(self.tmp.name)
+        self.lib = self.root / 'lib'
+        self.lib.mkdir(mode=0o700)
+        shutil.copytree(REPO / 'router/lib', self.lib, dirs_exist_ok=True)
+        (self.root / 'tmp').mkdir(mode=0o1777)
+        (self.root / 'tmp').chmod(0o1777)
+        self.calls = self.root / 'calls'
+        self.adapter = self.root / 'independent-adapter.sh'
+        source = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        # Explicit fixture boundary changes are private to this copied adapter.
+        # Production has no root/path/payload/attestation override variable.
+        source = source.replace('/tmp/couvrefeu-platform.lock', str(self.root/'tmp/couvrefeu-platform.lock'))
+        source = source.replace("'%u:%g:%a' /tmp)", "'%u:%g:%a' " + str(self.root / 'tmp') + ")").replace('0:0:1777', f'{os.getuid()}:{os.getgid()}:1777')
+        source = source.replace('. "$1/vendor-platform.sh"', '. "$1/fixture-vendor-platform.sh"')
+        fixture_helper = self.lib / 'fixture-vendor-platform.sh'
+        fixture_helper.write_text(f'. "{self.lib}/vendor-platform.sh"; vp_transaction_check() {{ printf "complete-two-pass-boundary\\n" >> "{self.calls}"; }}\n')
+        fixture_helper.chmod(0o600)
+        self.adapter.write_text(source)
+        self.setup = f'umask 077; . "{self.adapter}"; platform_bootstrap_vendor() {{ :; }}; CF_TEST_MODE=1; CF_ROOT="{self.root}"; platform_entry_root_validate; '
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_shell(self, body):
+        return subprocess.run(SHELL + ['-c', self.setup + body], capture_output=True, text=True)
+
+    def admit(self):
+        return f'platform_admit {PROFILE} "{self.root}" "{self.lib}"; '
+
+    def test_one_attestation_nested_reuse_and_fresh_external_call(self):
+        result = self.run_shell(self.admit() + f'(CF_PLATFORM_LOCKED=0; platform_verify_modules "{self.lib}"); (CF_PLATFORM_LOCKED=0; platform_verify_modules "{self.lib}"); platform_lock_release')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+        result = self.run_shell(self.admit() + 'platform_lock_release')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_actual_installed_core_subshell_reuses_one_admission(self):
+        installed = self.root / 'usr/lib/couvrefeu'
+        shutil.copytree(REPO / 'router/lib', installed)
+        installed.chmod(0o700)
+        backend = self.root / 'backend'
+        backend.mkdir(mode=0o700); (backend / '.couvrefeu-test-backend').touch()
+        for name in ['iptables', 'ip6tables', 'ipset', 'uci', 'conntrack', 'ip', 'fw3', 'sync']:
+            path = backend / name; path.write_text('#!/bin/sh\nexit 0\n'); path.chmod(0o700)
+        body = self.admit() + f'CF_ROOT="{self.root}"; CF_BACKEND_DIR="{backend}"; . "{self.lib}/install-common.sh"; installed_core check; unlock_install; platform_lock_release'
+        result = self.run_shell(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+        self.assertFalse((self.root/'tmp/couvrefeu-platform.lock').exists())
+        self.assertFalse((self.root/'.couvrefeu-install.lock').exists())
+
+    def test_contention_refuses_without_attestation_or_policy_mutation(self):
+        lock = self.root / 'tmp/couvrefeu-platform.lock'
+        lock.mkdir(mode=0o700)
+        (lock / 'pid').write_text(str(os.getpid())+'\n')
+        (lock / 'pid').chmod(0o600)
+        result = self.run_shell(self.admit())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.calls.exists())
+        self.assertTrue(lock.exists())
+
+    def test_failed_attestation_releases_owned_lock(self):
+        result = self.run_shell('platform_attest_vendor() { return 2; }; ' + self.admit())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root/'tmp/couvrefeu-platform.lock').exists())
+
+    def test_dead_owner_recovery_and_foreign_partial_refusal(self):
+        lock = self.root / 'tmp/couvrefeu-platform.lock'
+        lock.mkdir(mode=0o700)
+        result = self.run_shell('platform_lock_recover')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(lock.exists())
+        (lock / 'pid').write_text('2147483647\n'); (lock / 'pid').chmod(0o600)
+        (lock / 'foreign').touch()
+        self.assertNotEqual(self.run_shell('platform_lock_recover').returncode, 0)
+        (lock / 'foreign').unlink()
+        self.assertEqual(self.run_shell('platform_lock_recover').returncode, 0)
+        self.assertFalse(lock.exists())
+
+    def test_late_selection_drift_refuses_and_releases_lock(self):
+        base = self.root / 'etc/couvrefeu'
+        backup = base / 'backup'
+        backup.mkdir(parents=True, mode=0o700); base.chmod(0o700)
+        content = (PROFILE+'\n').encode()
+        for path in [base / 'platform-profile', backup / 'etc_couvrefeu_platform-profile.staged']:
+            path.write_bytes(content); path.chmod(0o600)
+        after = backup / 'etc_couvrefeu_platform-profile.after'
+        after.write_text(hashlib.sha256(content).hexdigest()+f':600:{os.getuid()}:{os.getgid()}\n'); after.chmod(0o600)
+        fixture_helper = self.lib / 'fixture-vendor-platform.sh'
+        fixture_helper.write_text(f'. "{self.lib}/vendor-platform.sh"; vp_transaction_check() {{ printf "strict\\n" > "{base}/platform-profile"; }}\n')
+        fixture_helper.chmod(0o600)
+        result = self.run_shell(self.admit())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root/'tmp/couvrefeu-platform.lock').exists())
+
+    def test_forged_reload_token_never_grants_admission(self):
+        runtime = self.root / 'etc/couvrefeu/runtime/lock'
+        runtime.mkdir(parents=True, mode=0o700)
+        for name, content in [('pid', str(os.getpid())), ('reload', 'a'*64)]:
+            p=runtime/name;p.write_text(content+'\n');p.chmod(0o600)
+        body = f'CF_BASE="{self.root}"; CF_LIB="{self.lib}"; . "{self.lib}/core.sh"; CF_RELOAD_TOKEN=forged; if cf_reentrant_include; then exit 99; fi; [ "$CF_PLATFORM_ADMITTED" = 0 ]; CF_RELOAD_TOKEN={"a"*64}; cf_reentrant_include; [ "$CF_PLATFORM_ADMITTED" = 0 ]'
+        result = self.run_shell(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"deferred":true', result.stdout)
+        self.assertFalse(self.calls.exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

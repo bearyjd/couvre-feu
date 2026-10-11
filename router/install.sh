@@ -1,16 +1,22 @@
 #!/bin/sh
+# shellcheck disable=SC2034,SC1090,SC1091
 # Default: validate/stage only. Installation requires explicit --activate.
 set -eu
 set -f
-HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck disable=SC1091
-. "$HERE/lib/install-common.sh"
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 ACTIVATE=0
 PROTECTED=
 RPC_ALLOW=
 SOURCE=$HERE
+PLATFORM_SELECTION=strict
+PLATFORM_OPTION=0
+fail() { printf 'couvre-feu: %s\n' "$*" >&2; exit 2; }
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --platform-profile)
+            [ "$#" -ge 2 ] && [ "$PLATFORM_OPTION" = 0 ] || fail 'one --platform-profile required'
+            case "$2" in strict|gl-xe3000-4.8.3-logd-011-v1) ;; *) fail 'unknown platform profile';; esac
+            PLATFORM_SELECTION=$2; PLATFORM_OPTION=1; shift 2;;
         --activate) ACTIVATE=1; shift;;
         --protect)
             [ "$#" -ge 2 ] || fail '--protect requires a canonical MAC'
@@ -28,6 +34,35 @@ while [ "$#" -gt 0 ]; do
         *) fail 'usage: install.sh [--activate] [--protect aa:bb:cc:dd:ee:ff] [--source-dir DIR]';;
     esac
 done
+# BEGIN authenticated bootstrap boundary
+if [ "${CF_TEST_MODE:-0}" != 1 ]; then PATH=/usr/sbin:/usr/bin:/sbin:/bin; fi
+LC_ALL=C
+export PATH LC_ALL
+umask 077
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+    printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
+    exit 2
+fi
+unset CF_PLATFORM_ADMITTED CF_PLATFORM_LOCKED CF_PLATFORM_NESTED CF_RELEASE_ID CF_PLATFORM_PROFILE CF_VENDOR_PROFILE CF_RELEASE_MODULES CF_PLATFORM_CALLER_PID CF_PLATFORM_OWNER CF_PLATFORM_LIB vp_profile
+CF_BOOTSTRAP_PIN=49f8e00f1461079bb511391571e8666da3dbedb9b5fb57cdc4748a0d8bf27690
+platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
+[ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
+platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
+[ "${platform_bootstrap_digest%% *}" = "$CF_BOOTSTRAP_PIN" ] || exit 2
+# shellcheck disable=SC1091
+. "$platform_bootstrap_path"
+# END authenticated bootstrap boundary
+platform_entry_root_validate
+platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
+[ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
+if [ "${CF_TEST_MODE:-0}" = 1 ]; then
+    case "$SOURCE" in "$CF_ROOT"/*|"$HERE") ;; *) fail 'fixture source outside isolated root';; esac
+    [ "$(CDPATH='' cd -- "$SOURCE" && pwd -P)" = "$SOURCE" ] || fail 'fixture source must be canonical'
+else
+    [ "$SOURCE" = "$HERE" ] || fail 'source must equal the verified release directory'
+fi
+# shellcheck disable=SC1091
+. "$HERE/lib/install-common.sh"
 safe_paths
 if ! { [ "$BACKUP" != "$RECOVERY" ] && [ ! -e "$DONE" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
@@ -35,7 +70,7 @@ fi
 if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
 fi
-for file in cfctl cfctl-ssh lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh; do
+for file in cfctl cfctl-ssh lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh; do
     if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
         fail "missing/unsafe source: $file"
     fi
@@ -91,11 +126,12 @@ fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
 else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
 cleanup() {
-    for file in restore-probe cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron; do rm -f "$STAGE/$file"; done
+    for file in restore-probe cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
     unlock_install
+    platform_lock_release
 }
 trap cleanup 0
 if [ -e "$BASE/protected" ]; then
@@ -115,6 +151,8 @@ chmod 755 "$STAGE/include"
 if [ -e "$BASE/state" ]; then cp -p "$BASE/state" "$STAGE/state"
 else printf 'V\t1\nR\t0\n' > "$STAGE/state"; fi
 chmod 600 "$STAGE/state"
+printf '%s\n' "$CF_PLATFORM_PROFILE" > "$STAGE/platform-profile"
+chmod 600 "$STAGE/platform-profile"
 if [ -n "$RPC_ALLOW" ];then
     printf '%s\n' "$RPC_ALLOW" > "$STAGE/rpc-allowed"
     valid_protection "$STAGE/rpc-allowed" || fail '--rpc-allow requires a canonical unicast MAC'
@@ -174,6 +212,7 @@ if [ -e "$BACKUP" ]; then
 else
     printf '\nconfig include '\''couvrefeu'\''\n\toption type '\''script'\''\n\toption path '\''/etc/firewall.couvrefeu'\''\n\toption reload '\''1'\''\n' >> "$STAGE/firewall"
     printf '\n/etc/couvrefeu\n/usr/sbin/cfctl\n/usr/sbin/cfctl-ssh\n/usr/lib/couvrefeu\n/etc/firewall.couvrefeu\n/etc/crontabs/root\n' >> "$STAGE/sysupgrade"
+    printf '\n/etc/.couvrefeu-release-%s\n' "$CF_RELEASE_ID" >> "$STAGE/sysupgrade"
     printf '\n* * * * * /usr/sbin/cfctl expire\n' >> "$STAGE/cron"
     chmod 600 "$STAGE/cron"
     if [ "$ACTIVATE" = 0 ]; then
@@ -182,7 +221,12 @@ else
     fi
 fi
 # Mandatory read-only backend gate occurs before any managed file changes.
-sh "$SOURCE/cfctl" check || fail 'core dependency/capability gate failed'
+(
+    CF_LOCAL_TEST=${CF_TEST_MODE:-0} CF_BASE=$ROOT CF_LIB=$SOURCE/lib
+    . "$SOURCE/lib/core.sh"
+    cf_check
+) || fail 'core dependency/capability gate failed'
+if [ "${CF_TEST_MODE:-0}" != 1 ]; then platform_recovery_prepare "$HERE"; fi
 if [ ! -e "$BACKUP" ]; then
     # Validate the native UCI configuration from the staging directory.
     mkdir "$STAGE/.delta"
@@ -215,6 +259,9 @@ if [ ! -e "$BACKUP" ]; then
         mtime "$ROOT/$rel" > "$BACKUP/$k.mtime" || fail "precise original mtime unavailable: $rel"
         if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.original"; fi
         case "$rel" in
+            usr/lib/couvrefeu/platform-bootstrap.sh) staged=lib/platform-bootstrap.sh;;
+            usr/lib/couvrefeu/vendor-platform.sh) staged=lib/vendor-platform.sh;;
+            etc/couvrefeu/platform-profile) staged=platform-profile;;
             usr/lib/couvrefeu/core.sh) staged=lib/core.sh;;
             usr/lib/couvrefeu/rpc.sh) staged=lib/rpc.sh;;
             usr/lib/couvrefeu/state.awk) staged=lib/state.awk;;
