@@ -457,7 +457,7 @@ cf_main() {
     if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
     if [ "$cf_action" = apply-fw ] && cf_reentrant_include; then return 0;fi
     if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock || ! cf_policy_safe; then cf_status;return 1;fi
-    if [ "$cf_action" = sync ] && ! cf_sync_stage;then cf_status;return 1;fi
+    if [ "$cf_action" = sync ] && ! cf_sync_stage 0;then cf_status;return 1;fi
     if ! cf_lock;then cf_busy_result;return 1;fi
     if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
     # A different operation may have committed between the first read and mkdir.

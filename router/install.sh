@@ -18,7 +18,9 @@ while [ "$#" -gt 0 ]; do
 "
             shift 2;;
         --rpc-allow)
-            [ "$#" -ge 2 ] && [ -z "$RPC_ALLOW" ] || fail '--rpc-allow requires one canonical MAC'
+            if [ "$#" -lt 2 ] || [ -n "$RPC_ALLOW" ];then
+                fail '--rpc-allow requires one canonical MAC'
+            fi
             RPC_ALLOW=$2;shift 2;;
         --source-dir)
             [ "$#" -ge 2 ] || fail '--source-dir requires a directory'

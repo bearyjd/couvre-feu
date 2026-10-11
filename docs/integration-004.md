@@ -1,6 +1,9 @@
 # One-device integration runbook
 
-Status: **implemented source runbook; independent final review and live gates pending**. No command
+Status: **implemented source runbook; target acceptance pending**. Independently
+reviewed release identity is recorded in [PR #3](https://github.com/bearyjd/couvre-feu/pull/3);
+consult its [checks](https://github.com/bearyjd/couvre-feu/pull/3/checks) for final exact-head CI.
+No command
 in this runbook authorizes a live connection or mutation. Every live batch requires
 approval of its exact script, hash, target, admitted MAC, protected identities,
 effects, bounds and rollback. [PRP-004](prp/PRP-004-router-integration.md) defines

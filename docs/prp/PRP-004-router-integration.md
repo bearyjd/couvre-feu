@@ -1,6 +1,9 @@
 # PRP-004 — one-device router integration
 
-Status: **implemented source contract; independent final review and target acceptance pending**.
+Status: **implemented source contract; target acceptance pending**. The independently
+reviewed release identity and final source/check evidence are recorded in
+[PR #3](https://github.com/bearyjd/couvre-feu/pull/3) and its
+[checks](https://github.com/bearyjd/couvre-feu/pull/3/checks).
 This extends [PRP-003](PRP-003-policy-service.md) with a separate integration
 entry point. The fictional, loopback demo keeps its existing defaults.
 Read [integration-004](../integration-004.md) for operation and

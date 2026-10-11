@@ -1,12 +1,19 @@
 # Integration acceptance 004
 
-Status: **implemented source; author checks recorded, final independent gates pending**.
-Author evidence reports 70 service/schema scenarios, 15 browser scenarios,
-43 installer fixtures and four offline client-probe tests passing. Typecheck passed;
-the final rollback-journal guard additionally passed three focused configuration tests.
-The broad 73-core/36-RPC run is still running. Genuine BusyBox ash/awk/timeout,
-independent final review and exact-head CI remain pending. These host fixtures and
-local wire/parser agreement establish no target compatibility or packet acceptance.
+Status: **implemented source; target acceptance pending**.
+
+## Initial source checkpoint
+
+At `d070ccf`, independent code/security review approved source. The verifier passed
+typecheck, 70 service/schema scenarios, 15 browser scenarios, 43 installer fixtures
+and four offline client-probe tests. The author additionally recorded three focused
+rollback-journal configuration checks. Full 73-core/36-RPC completion and genuine
+BusyBox ash/awk/timeout acceptance were not established at this checkpoint.
+[PR #3](https://github.com/bearyjd/couvre-feu/pull/3) records the independently reviewed
+release identity and final evidence; its [checks](https://github.com/bearyjd/couvre-feu/pull/3/checks)
+are authoritative for final exact-head CI. This checkpoint is not a claim about
+later revisions or future checks. Host fixtures and local wire/parser agreement
+establish no target compatibility or packet acceptance.
 No assistant target command ran this session; inspection awaits explicit approval.
 
 ## Local checks

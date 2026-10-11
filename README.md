@@ -60,7 +60,7 @@ sh tests/acceptance.sh --fixtures
 
 The runner executes installer recovery fixtures, offline probe fixtures, core/RPC fixtures and available shell checks. Fixtures use private marked roots below `/tmp/couvre-feu-*`, with simulated router tools. They do not prove packet forwarding, stream cutoff, DNS behavior, target ash/awk compatibility or firmware persistence. The acceptance script defaults to read-only local prerequisites; `--fixtures` runs local fixtures, while `--installed` is a separately approved read-only router invocation.
 
-Current author evidence: 70 service/schema tests, 15 browser tests, 43 installer fixtures and four offline probe tests passed. The full core/RPC run is still in progress; genuine BusyBox checks, independent final review and exact-head CI remain pending. See [acceptance-004](docs/acceptance-004.md) for limits. The [merged baseline checks](https://github.com/bearyjd/couvre-feu/pull/2/checks) concern the earlier source only.
+At the initial integration source checkpoint `d070ccf`, independent code/security review approved source, and verifier checks passed typecheck, 70 service/schema tests, 15 browser tests, 43 installer fixtures and four offline probe tests. This checkpoint does not record completed full core/RPC or genuine BusyBox acceptance. See [acceptance-004](docs/acceptance-004.md) for limits; [PR #3](https://github.com/bearyjd/couvre-feu/pull/3) records the release identity and independent evidence, and its [checks](https://github.com/bearyjd/couvre-feu/pull/3/checks) are authoritative for final exact-head CI. Source review and fixture results do not establish target or packet acceptance.
 
 ## Installation boundary
 
