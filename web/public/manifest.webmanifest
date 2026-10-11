@@ -1,0 +1,11 @@
+{
+  "name": "Couvre-feu synthetic demo",
+  "short_name": "Couvre-feu",
+  "description": "Local fictional parent-control prototype. Fake router only.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f1e8",
+  "theme_color": "#172a3a",
+  "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+}

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#172a3a">
+    <meta name="description" content="Fictional, local Couvre-feu parent-control prototype.">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <title>Couvre-feu · synthetic demo</title>
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+    <div class="demo-banner"><strong>Synthetic demo</strong><span>Fictional people · fake router · target compatibility unverified</span></div>
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="Couvre-feu home"><span aria-hidden="true" class="brand-mark">c/f</span><span>Couvre-feu<small>A little room for offline time</small></span></a>
+      <div id="account-actions"></div>
+    </header>
+    <main id="main" tabindex="-1">
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <section id="auth-view" class="auth-layout" aria-labelledby="welcome-title">
+        <div class="intro"><p class="eyebrow">Local prototype / 002</p><h1 id="welcome-title">Make space<br>for the moment.</h1><p>See each person’s manual pause and schedule, then make a deliberate change.</p><div class="honesty-note"><span aria-hidden="true">○</span><p>This demo changes a fake router. It does not control a household connection.</p></div></div>
+        <div class="sign-in-panel">
+          <h2>Your passkey, your permissions.</h2><p>Sign in to the fictional account bound to your passkey.</p>
+          <button id="sign-in" class="button primary" type="button">Sign in with a passkey <span aria-hidden="true">↗</span></button>
+          <div class="rule-label">First visit?</div>
+          <form id="enroll-form">
+            <label for="enrollment-token">One-use enrollment token</label>
+            <p id="token-help" class="field-help">Use the token from the local demo bootstrap. It already identifies your fictional account.</p>
+            <input id="enrollment-token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="token-help" required maxlength="256">
+            <button id="enroll" class="button secondary" type="submit">Create a demo passkey</button>
+          </form>
+          <p class="fine-print">Passkeys require a supported browser and secure context. This local prototype uses localhost.</p>
+        </div>
+      </section>
+      <section id="status-view" aria-labelledby="people-title" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Your people</p><h1 id="people-title">Time, with intention.</h1><p id="account-context"></p></div><button id="refresh" class="button secondary" type="button">Refresh status</button></div>
+        <div id="connection" class="connection" role="status"></div>
+        <div id="people" class="people-list"></div>
+        <section class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No activity collectors or screen-time measurements are included.</p></section>
+        <p class="source-footnote">Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.</p>
+      </section>
+      <noscript><p class="notice">JavaScript is required for passkey sign-in and status. No controls can run without it.</p></noscript>
+    </main>
+    <footer><span>Couvre-feu</span><span>Local, fictional prototype · <a href="https://github.com/bearyjd/couvre-feu">Source</a> · <a href="https://github.com/bearyjd/couvre-feu/blob/main/LICENSE">AGPL-3.0</a></span></footer>
+  </body>
+</html>

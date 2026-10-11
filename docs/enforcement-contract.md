@@ -1,6 +1,6 @@
 # Enforcement contract — router core v1
 
-This describes the current router implementation, not completed packet acceptance. The original [PRP-001](prp/PRP-001-enforcement-core.md) is preserved; its corrected implementation choices are explicit below. No service/PWA is included. [Acceptance gates](acceptance-001.md) govern target runtime, packet behavior and separately approved live actions.
+This describes the current router implementation, not completed packet acceptance. The original [PRP-001](prp/PRP-001-enforcement-core.md) is preserved; its corrected implementation choices are explicit below. The local fake-router service and PWA are specified separately in [PRP-003](prp/PRP-003-policy-service.md) and [PRP-002](prp/PRP-002-parent-pwa.md). [Acceptance gates](acceptance-001.md) govern target runtime, packet behavior and separately approved live actions.
 
 ## Commands and confirmation
 

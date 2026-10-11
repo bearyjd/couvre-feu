@@ -1,12 +1,14 @@
-# Proposed policy service contract — future work
+# Production policy service seam — future integration
 
-This is a design seam, not implemented endpoints or deployed service. [PRP-001](prp/PRP-001-enforcement-core.md) retains router enforcement; PRP-002 remains the parent PWA. A future PRP-003 would specify the service separately. This router-core PR contains no service or PWA code.
+This records the planned real-router and deployment boundary. [PRP-001](prp/PRP-001-enforcement-core.md) retains router enforcement. The local fictional-data prototype is specified in [PRP-003](prp/PRP-003-policy-service.md), with its parent app in [PRP-002](prp/PRP-002-parent-pwa.md); it has no working production-router transport. The proposal below does not authorize SSH, deployment or household enrollment.
 
 Proposed deployment: TypeScript on Atlas, SQLite, Podman, loopback listener and Tailscale private HTTPS. Choose a stable hostname before passkey enrollment, preserve RP ID/origin in recovery, and validate origin/challenge/user verification server-side. Tailscale reachability is not application authentication; forwarded/tailnet identity claims are untrusted unless independently authenticated and bound to the request. Require passkeys and server-enforced roles, with JD admin and Bryn parent. No auth shortcut is authorized. [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve), [WebAuthn](https://www.w3.org/TR/webauthn-2/).
 
 ## Router boundary
 
-Use a dedicated restricted SSH key with the wrapper grammar in `router/cfctl-ssh`. Serialize mutations, send bounded JSON on stdin, never construct a shell from user text, and require observed confirmation. `remove-fw` is internal recovery and outside the wrapper allowlist. Installer/key deployment and target runtime tests require separate approval.
+A future real-router adapter must use a dedicated restricted SSH key with the wrapper grammar in `router/cfctl-ssh`. Serialize mutations, send bounded JSON on stdin, never construct a shell from user text, and require observed confirmation. `remove-fw` is internal recovery and outside the wrapper allowlist. Installer/key deployment and target runtime tests require separate approval.
+
+The local fake transport compares the observed base policy transactionally before applying a higher revision. The current router command protocol does not provide that equivalent atomic base-policy precondition or a fake transport's operation-ID witness. A real adapter needs a reviewed concurrency and confirmation design before live writes; a prior status read alone cannot rule out an intervening router-local change.
 
 Version 1 desired state has required `version`, `revision`, `people`, `pauses`, `schedules` and optional `doh`. People have `id` and disjoint canonical `macs`; pauses have `person` and `until` (0 indefinite, otherwise absolute epoch); schedules have `person`, `id`, `weekdays`, `start`, `stop`; DoH has `ipv4`/`ipv6` address arrays. See the [README example](../README.md). No bonus field or endpoint is supported.
 

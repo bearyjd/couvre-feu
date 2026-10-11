@@ -1,0 +1,397 @@
+import { createPasskey, getPasskey } from './auth-client.js';
+import { actorScope, clearStatusCache, saveStatus, readStatus, needsServerLogout, setServerLogoutNeeded, broadcastLogout, broadcastScope, LOGOUT_EVENT, LOGOUT_REQUIRED, SCOPE_EVENT } from './status-cache.js';
+
+const $ = (selector) => document.querySelector(selector);
+const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+const now = () => Math.floor(Date.now() / 1000);
+const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
+const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+const FRESH_SECONDS = 30;
+const state = {
+  session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
+  busy: false, needsRefresh: true, refreshing: false, localUnknown: false, operation: null,
+  generation: 0, renderKey: '', logoutRequired: needsServerLogout(), durations: new Map(),
+  authController: null,
+};
+
+class APIError extends Error {
+  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
+}
+
+async function api(path, { method = 'GET', body, headers = {}, signal } = {}) {
+  const response = await fetch(path, {
+    method, credentials: 'same-origin', cache: 'no-store', headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12000)]) : AbortSignal.timeout(12000),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new APIError(response.status, result.error?.code ?? 'request_failed', result.error?.message ?? 'The request could not be completed.');
+  return result;
+}
+
+function announce(message, error = false) {
+  $('#notice').textContent = message;
+  $('#notice').hidden = !message;
+  $('#notice').classList.toggle('error', error);
+}
+
+function actor() { return state.session?.actor ?? state.snapshotActor; }
+function age() { return state.people?.observedAt ? Math.max(0, now() - state.people.observedAt) : Infinity; }
+function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
+function canControl() {
+  return Boolean(state.session && state.people && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh && !unsettled() && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now());
+}
+
+function resetView() {
+  state.generation++;
+  state.authController?.abort(); state.authController = null;
+  state.session = null; state.snapshotActor = null; state.snapshotExpiresAt = null; state.people = null; state.savedAt = null;
+  state.operation = null; state.localUnknown = false; state.needsRefresh = true; state.renderKey = '';
+  state.busy = false; state.refreshing = false; state.durations.clear();
+  clearStatusCache();
+  render();
+}
+
+function showCachedStatus() {
+  const snapshot = readStatus();
+  if (!snapshot) return false;
+  state.snapshotActor = snapshot.actor; state.people = snapshot.status; state.savedAt = snapshot.savedAt;
+  state.snapshotExpiresAt = snapshot.sessionExpiresAt;
+  state.session = null; state.needsRefresh = true;
+  render();
+  return true;
+}
+
+function acceptSession(session) {
+  const previous = actor() ?? readStatus()?.actor;
+  if (previous && actorScope(previous) !== actorScope(session.actor)) {
+    clearStatusCache();
+    state.people = null; state.operation = null; state.localUnknown = false; state.renderKey = '';
+  }
+  state.session = session;
+  state.snapshotActor = null;
+  state.snapshotExpiresAt = null;
+  broadcastScope(actorScope(session.actor));
+}
+
+async function completePendingLogout() {
+  if (!state.logoutRequired && !needsServerLogout()) return;
+  try {
+    const session = await api('/auth/session');
+    await api('/auth/logout', { method: 'POST', body: {}, headers: { 'X-CSRF-Token': session.csrfToken } });
+  } catch (error) { if (!(error instanceof APIError && error.status === 401)) throw error; }
+  state.logoutRequired = false;
+  setServerLogoutNeeded(false);
+}
+
+async function refresh({ quiet = false } = {}) {
+  if (state.refreshing || state.busy || state.logoutRequired && state.offline) return false;
+  if (state.offline || !navigator.onLine) { state.offline = true; state.needsRefresh = true; render(); return false; }
+  const generation = state.generation;
+  state.refreshing = true;
+  renderConnection(); renderControlState(); renderAuthControls();
+  try {
+    await completePendingLogout();
+    const session = await api('/auth/session');
+    if (generation !== state.generation) return false;
+    acceptSession(session);
+    // Invalidate old permissions immediately, before receiving new status.
+    render();
+    const people = await api('/people');
+    if (generation !== state.generation) return false;
+    state.people = people; state.savedAt = now(); state.offline = false; state.needsRefresh = false;
+    const latest = state.operation && people.people.find((person) => person.id === state.operation.personId)?.latestOperation;
+    if (latest?.id === state.operation?.id) state.operation = latest;
+    // An uncertain response is resolved only through a fresh server observation.
+    state.localUnknown = people.people.some((person) => person.status === 'unknown');
+    saveStatus(state.session, people);
+    if (!quiet) announce('Status refreshed. Review the current manual pause and schedule before making a change.');
+    return true;
+  } catch (error) {
+    state.needsRefresh = true;
+    if (error instanceof APIError && [401, 403].includes(error.status)) {
+      const hadStatus = Boolean(actor());
+      resetView();
+      if (hadStatus || !quiet) announce('Your session or permissions changed. Sign in again to see permitted status.', true);
+    } else {
+      state.offline = !navigator.onLine || !(error instanceof APIError);
+      if (!state.people && state.offline) showCachedStatus();
+      if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
+    }
+    return false;
+  } finally {
+    if (generation === state.generation) { state.refreshing = false; render(); }
+  }
+}
+
+async function authenticate(kind, token) {
+  if (state.busy) return;
+  clearStatusCache();
+  state.busy = true; renderAuthControls();
+  announce(kind === 'register' ? 'Create a passkey with your browser. The token fixes the account and permissions.' : 'Confirm your passkey in the browser.');
+  const generation = state.generation;
+  const controller = new AbortController();
+  state.authController = controller;
+  try {
+    await completePendingLogout();
+    if (generation !== state.generation || controller.signal.aborted) return;
+    const start = await api(`/auth/${kind}/options`, { method: 'POST', body: kind === 'register' ? { token } : {}, signal: controller.signal });
+    token = undefined;
+    if (generation !== state.generation || controller.signal.aborted) return;
+    const response = kind === 'register' ? await createPasskey(start.options, controller.signal) : await getPasskey(start.options, controller.signal);
+    if (generation !== state.generation || controller.signal.aborted) return;
+    const session = await api(`/auth/${kind}/verify`, { method: 'POST', body: { challengeId: start.challengeId, response }, signal: controller.signal });
+    if (generation !== state.generation) return;
+    acceptSession(session);
+    state.busy = false;
+    await refresh({ quiet: true });
+    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. All status is fictional.`);
+  } catch (error) {
+    if (generation !== state.generation) return;
+    const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.' : error.message;
+    announce(message || 'Passkey sign-in could not be completed.', true);
+  } finally {
+    token = undefined;
+    if (state.authController === controller) state.authController = null;
+    if (generation === state.generation) { state.busy = false; render(); }
+  }
+}
+
+async function logout() {
+  const csrfToken = state.session?.csrfToken;
+  const offline = state.offline || !navigator.onLine;
+  state.logoutRequired = true;
+  setServerLogoutNeeded(true);
+  broadcastLogout();
+  resetView();
+  announce('Local status cleared. Signing out of the server…');
+  if (offline) {
+    announce('Local status cleared. You are offline; server sign-out is still required and will run when the connection returns.');
+    return;
+  }
+  try {
+    if (csrfToken) await api('/auth/logout', { method: 'POST', body: {}, headers: { 'X-CSRF-Token': csrfToken } });
+    else await completePendingLogout();
+    state.logoutRequired = false; setServerLogoutNeeded(false);
+    announce('Signed out. Local status has been cleared.');
+  } catch {
+    announce('Local status cleared. Server sign-out could not be confirmed; it will be completed before the next sign-in.', true);
+  }
+}
+
+async function mutate(personId, action) {
+  if (!canControl()) return;
+  const beforeRevision = state.people.revisionToken;
+  const beforeScope = actorScope(state.session.actor);
+  const requestedDuration = state.durations.get(personId) ?? '0';
+  const generation = state.generation;
+  // Fresh reads are part of this click, never an automatic mutation retry.
+  const refreshed = await refresh({ quiet: true });
+  if (!refreshed || generation !== state.generation || !canControl()) return;
+  if (beforeRevision !== state.people.revisionToken || beforeScope !== actorScope(state.session.actor)) {
+    announce('The revision or your permissions changed. Status has been refreshed; review it and choose the action again.', true);
+    return;
+  }
+  state.busy = true;
+  renderControlState();
+  announce(`Sending ${action === 'resume' ? 'resume' : 'manual pause'} request. A request is not confirmation.`);
+  try {
+    const until = requestedDuration === '0' ? 0 : now() + Number(requestedDuration);
+    const result = await api(`/people/${encodeURIComponent(personId)}/${action}`, {
+      method: 'POST', body: action === 'pause' ? { until } : {},
+      headers: { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken },
+    });
+    if (generation !== state.generation) return;
+    state.operation = result.operation;
+    const person = state.people.people.find((entry) => entry.id === personId);
+    if (person) { person.latestOperation = result.operation; person.status = result.operation.state; }
+    announce(operationText(result.operation));
+    state.busy = false;
+    render();
+    if (['pending', 'unknown'].includes(result.operation.state)) void followOperation(result.operation.id, generation);
+    else await refresh({ quiet: true });
+  } catch (error) {
+    if (generation !== state.generation) return;
+    state.needsRefresh = true;
+    if (error instanceof APIError && error.status === 409) {
+      announce('Revision conflict. No retry was sent. Refresh status, review the change, then choose the action again.', true);
+    } else if (error instanceof APIError && [401, 403].includes(error.status)) {
+      resetView();
+      announce('This action is not authorized. Sign in again; local status has been cleared.', true);
+    } else if (error instanceof APIError) {
+      announce(`The request failed: ${error.message} Refresh status before another action.`, true);
+    } else {
+      state.localUnknown = true;
+      state.offline = !navigator.onLine;
+      announce('Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
+    }
+  } finally {
+    if (generation === state.generation) { state.busy = false; render(); }
+  }
+}
+
+function operationText(operation) {
+  const verb = operation.action === 'resume' ? 'Resume' : 'Pause';
+  return ({
+    pending: `${verb} pending. Waiting for healthy fake-router confirmation.`,
+    confirmed: `${verb} confirmed by the fake router. ${operation.action === 'resume' ? 'An active schedule can still block access.' : 'Real packet behavior remains unverified.'}`,
+    failed: `${verb} failed. The fake router reported an explicit failure. Refresh status before another action.`,
+    unknown: `${verb} outcome unknown. No sufficient confirmation was observed. The action may have applied; no automatic retry will run.`,
+    conflict: `${verb} conflict. Refresh status and review the current revision before another action.`,
+  })[operation.state] ?? 'Operation status unavailable.';
+}
+
+async function followOperation(id, generation) {
+  // Read-only polling; mutations are never replayed. Unknown can reconcile later.
+  while (generation === state.generation && state.operation?.id === id && ['pending', 'unknown'].includes(state.operation.state)) {
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    if (generation !== state.generation || state.offline || !navigator.onLine) return;
+    try {
+      const operation = await api(`/operations/${encodeURIComponent(id)}`);
+      if (generation !== state.generation) return;
+      state.operation = operation;
+      const person = state.people?.people.find((entry) => entry.id === operation.personId);
+      if (person) { person.latestOperation = operation; person.status = operation.state; }
+      announce(operationText(operation), ['failed', 'unknown', 'conflict'].includes(operation.state));
+      render();
+      if (operation.state === 'unknown') { state.needsRefresh = true; renderControlState(); return; }
+      if (operation.state !== 'pending') {
+        state.needsRefresh = operation.state !== 'confirmed';
+        await refresh({ quiet: true });
+        return;
+      }
+    } catch (error) {
+      if (generation !== state.generation) return;
+      if (error instanceof APIError && [401, 403, 404].includes(error.status)) {
+        resetView(); announce('Operation access changed. Sign in again to refresh permitted status.', true);
+      } else {
+        state.needsRefresh = true; state.localUnknown = true; state.offline = !navigator.onLine || !(error instanceof APIError);
+        announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true); render();
+      }
+      return;
+    }
+  }
+}
+
+function renderAuthControls() {
+  for (const selector of ['#sign-in', '#enroll', '#enrollment-token']) $(selector).disabled = state.busy || state.refreshing || state.offline;
+}
+
+function renderControlState() {
+  const enabled = canControl();
+  for (const button of document.querySelectorAll('[data-control]')) button.disabled = !enabled;
+  for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
+  $('#refresh').disabled = state.busy || state.refreshing || state.offline;
+}
+
+function renderConnection() {
+  if (!state.people) return;
+  const stale = age() > FRESH_SECONDS || state.needsRefresh;
+  const diagnosticsOpen = $('#connection details')?.open;
+  const status = state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : 'Connected · current synthetic observation';
+  $('#connection').className = `connection${state.offline ? ' offline' : stale ? ' stale' : ''}`;
+  $('#connection').innerHTML = `<strong>${escape(status)}</strong>Observed ${escape(time(state.people.observedAt))} · <span data-age>${Number.isFinite(age()) ? escape(duration(age())) + ' ago' : 'age unavailable'}</span>${state.savedAt ? ` · cached ${escape(time(state.savedAt))}` : ''}<details class="diagnostics" ${diagnosticsOpen ? 'open' : ''}><summary>Advanced demo status</summary><p>Service desired ${escape(state.people.serviceDesiredRevision)} · router desired ${escape(state.people.routerDesiredRevision ?? 'unknown')} · router confirmed ${escape(state.people.routerConfirmedRevision ?? 'unconfirmed')}${state.people.errors.length ? `<br>Observation errors: ${escape(state.people.errors.join(', '))}` : ''}<br>Source: synthetic fake router · target compatibility unverified</p></details>`;
+}
+
+function renderPeople() {
+  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown]);
+  if (renderKey === state.renderKey) return;
+  const focused = document.activeElement?.dataset?.focusKey;
+  const openDetails = new Set([...document.querySelectorAll('[data-details-key][open]')].map((element) => element.dataset.detailsKey));
+  state.renderKey = renderKey;
+  $('#people').innerHTML = state.people.people.map((person) => {
+    const id = escape(person.id);
+    const label = escape(person.name);
+    const manual = person.manualPause;
+    const effectiveManual = person.effectiveManualPause;
+    const operation = person.latestOperation;
+    const personStatus = state.localUnknown || person.observationHealth !== 'healthy' && person.status === 'confirmed' ? 'unknown' : person.status;
+    const choices = [['0', 'Until I resume'], ['60', '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
+    return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
+      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">Fictional person · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
+      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd>${person.scheduleBlocked ? 'Schedule currently blocks access' : 'No active schedule block'}<span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
+      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}</li>`).join('') : '<li>No assigned devices</li>'}</ul>
+      <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="Resume ${label} manual pause">Resume</button></div>
+      ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
+      <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy synthetic confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
+    </article>`;
+  }).join('') || '<p>No people are assigned to this account.</p>';
+  if (focused) document.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus();
+  renderControlState();
+  tick();
+}
+
+function render() {
+  const hasStatus = Boolean(state.people && actor());
+  $('#auth-view').hidden = hasStatus;
+  $('#status-view').hidden = !hasStatus;
+  const account = actor();
+  const accountKey = account ? `${account.id}:${account.role}` : '';
+  if ($('#account-actions').dataset.accountKey !== accountKey) {
+    $('#account-actions').dataset.accountKey = accountKey;
+    $('#account-actions').innerHTML = account ? `<div class="account-actions"><span class="account-name">${escape(account.displayName)} · ${escape(account.role)}</span><button id="logout" class="button secondary" type="button">Sign out</button></div>` : '';
+    $('#logout')?.addEventListener('click', () => void logout());
+  }
+  if (hasStatus) {
+    $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted fictional people`;
+    renderConnection(); renderPeople(); renderControlState();
+  }
+  renderAuthControls();
+}
+
+function tick() {
+  const currentAge = age();
+  for (const label of document.querySelectorAll('[data-age]')) label.textContent = Number.isFinite(currentAge) ? `${duration(currentAge)} ago` : 'age unavailable';
+  for (const label of document.querySelectorAll('[data-until]')) {
+    const remaining = Number(label.dataset.until) - now();
+    label.textContent = remaining > 0 ? `${duration(remaining)} until the expiry time; router observation remains authoritative.` : 'Expiry time reached. Waiting for a fresh router observation; this countdown cannot confirm expiry.';
+  }
+  if (state.people && currentAge > FRESH_SECONDS && !state.needsRefresh) { state.needsRefresh = true; renderConnection(); }
+  if (state.session && state.session.expiresAt <= now()) { resetView(); announce('Your session expired. Sign in again; local status was cleared.', true); }
+  if (state.snapshotExpiresAt && state.snapshotExpiresAt <= now()) { resetView(); announce('The cached session expired. Local status was cleared; reconnect and sign in again.', true); }
+  renderControlState();
+}
+
+$('#sign-in').addEventListener('click', () => void authenticate('login'));
+$('#enroll-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const token = $('#enrollment-token').value.trim();
+  $('#enrollment-token').value = '';
+  if (token) void authenticate('register', token);
+});
+$('#refresh').addEventListener('click', () => void refresh());
+$('#people').addEventListener('change', (event) => {
+  if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);
+});
+$('#people').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-control]');
+  if (button && !button.disabled) void mutate(button.dataset.personId, button.dataset.control);
+});
+window.addEventListener('offline', () => { state.offline = true; state.needsRefresh = true; render(); announce('Offline. Last observed status is read-only; no control requests will be queued.'); });
+window.addEventListener('online', async () => {
+  state.offline = false; state.needsRefresh = true; render();
+  if (state.logoutRequired || needsServerLogout()) {
+    try { await completePendingLogout(); announce('Server sign-out completed. Sign in again to refresh permitted status.'); }
+    catch { announce('Server sign-out is still unconfirmed. Local status remains cleared.', true); }
+  } else await refresh();
+});
+window.addEventListener('storage', (event) => {
+  if (event.key === LOGOUT_EVENT) {
+    state.logoutRequired = needsServerLogout(); resetView();
+    announce('Signed out in another tab. Local status has been cleared.');
+  } else if (event.key === SCOPE_EVENT && actor() && event.newValue !== actorScope(actor())) {
+    resetView();
+    announce('Account or permissions changed in another tab. Sign in again to refresh permitted status.');
+  } else if (event.key === LOGOUT_REQUIRED && event.newValue === null) {
+    state.logoutRequired = false;
+  }
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.session && !state.busy) void refresh({ quiet: true }); });
+setInterval(tick, 1000);
+setInterval(() => { if (state.session && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh) void refresh({ quiet: true }); }, 10000);
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { /* Online UI remains usable; offline installation is not claimed. */ });
+render();
+if (state.offline) {
+  showCachedStatus();
+  announce(state.people ? 'Offline read-only snapshot. Sign-in and control requests are unavailable.' : 'Offline. No permitted status snapshot is available.');
+} else void refresh({ quiet: true });
