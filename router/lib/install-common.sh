@@ -314,7 +314,9 @@ installed_core() {
             'busybox ash')fixture_busybox=$(command -v busybox) || fail 'BusyBox test shell unavailable';;
             /tmp/*/busybox\ ash)
                 fixture_busybox=${CF_TEST_SHELL% ash}
-                [ -f "$fixture_busybox" ] && [ ! -L "$fixture_busybox" ] && [ -x "$fixture_busybox" ] || fail 'BusyBox test shell unavailable';;
+                if [ ! -f "$fixture_busybox" ] || [ -L "$fixture_busybox" ] || [ ! -x "$fixture_busybox" ]; then
+                    fail 'BusyBox test shell unavailable'
+                fi;;
         esac
         if [ -n "$fixture_busybox" ];then
             CF_INSTALL_TOKEN=$INSTALL_TOKEN "$fixture_busybox" ash "$ROOT/usr/sbin/cfctl" "$1"
