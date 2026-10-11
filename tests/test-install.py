@@ -24,6 +24,17 @@ def signature(path):
     return f'{hashlib.sha256(path.read_bytes()).hexdigest()}:{st.st_mode & 0o7777:o}:{st.st_uid}:{st.st_gid}'
 
 
+def mtime(path):
+    if not path.exists():
+        return 'absent'
+    seconds, fraction = divmod(path.stat().st_mtime_ns, 1_000_000_000)
+    return f'{seconds}:{fraction:09d}'
+
+
+def exact_signature(path):
+    return f'{signature(path)}:{mtime(path)}'
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-install-')
@@ -47,7 +58,7 @@ class RecoveryTests(unittest.TestCase):
                 result[str(p.relative_to(self.root))] = (
                     os.readlink(p).encode(), f'symlink:{st.st_mode}:{st.st_uid}:{st.st_gid}')
             elif p.is_file():
-                result[str(p.relative_to(self.root))] = (p.read_bytes(), signature(p))
+                result[str(p.relative_to(self.root))] = (p.read_bytes(), exact_signature(p))
         return result
 
     def make_journal(self, absent=False, partial=False):
@@ -58,7 +69,7 @@ class RecoveryTests(unittest.TestCase):
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(f'original-{i}\n\x00 exact bytes\n'.encode())
                 p.chmod(0o640 if i % 2 else 0o700)
-                originals[rel] = (p.read_bytes(), signature(p))
+                originals[rel] = (p.read_bytes(), exact_signature(p))
         modes = {rel: (f'{(self.root / rel).stat().st_mode & 0o7777:o}'
                        if (self.root / rel).exists() else 'absent') for rel in DIRS}
         backup = self.root / 'etc/couvrefeu/backup'
@@ -71,6 +82,7 @@ class RecoveryTests(unittest.TestCase):
             k = rel.replace('/', '_')
             before = signature(p)
             (backup / (k + '.before')).write_text(before + '\n')
+            (backup / (k + '.mtime')).write_text(mtime(p) + '\n')
             if before != 'absent':
                 shutil.copy2(p, backup / (k + '.original'))
             staged = backup / (k + '.staged')
@@ -211,7 +223,7 @@ esac
         self.assertEqual(self.snapshot(), before)
         self.assertFalse((self.root / 'etc').exists())
 
-    def test_install_restore_original_configuration_and_modes(self):
+    def test_install_restore_original_configuration_modes_and_mtimes(self):
         originals = {'etc/config/firewall': b"config zone 'wan'\n option input 'DROP'\n",
                      'etc/sysupgrade.conf': b'# exact no terminal newline',
                      'etc/crontabs/root': b'5 * * * * vendor-check\n',
@@ -222,6 +234,7 @@ esac
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(content)
             p.chmod(0o640)
+            os.utime(p, ns=(1_234_567_890_123_456_789, 1_234_567_890_123_456_789))
         (self.root / 'etc/couvrefeu').chmod(0o750)
         before = self.snapshot()
         result = self.install('--activate')
@@ -234,6 +247,181 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual((self.root / 'etc/couvrefeu').stat().st_mode & 0o777, 0o750)
+
+    def test_mtime_only_changes_restore_exact_originals(self):
+        # An original helper with identical installed bytes and metadata used
+        # to be skipped even though installation changed its timestamp.
+        target = self.root / 'usr/lib/couvrefeu/core.sh'
+        target.parent.mkdir(parents=True)
+        target.write_text(':\n')
+        target.chmod(0o644)
+        stamp = 1_234_567_890_123_456_789
+        os.utime(target, ns=(stamp, stamp))
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(signature(target), signature(self.source / 'lib/core.sh'))
+        os.utime(target, ns=(stamp + 999, stamp + 999))
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(target.stat().st_mtime_ns, stamp)
+
+    def test_actual_installer_restores_original_absence(self):
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / 'etc/config/firewall').exists())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / 'etc').exists())
+        self.assertFalse((self.root / 'usr').exists())
+
+    def install_copy_tool(self, truncate=False):
+        wrapper = self.root / 'bin/cp'
+        real_copy = shutil.which('cp')
+        wrapper.write_text('#!/usr/bin/env python3\n'
+                           'import os, subprocess, sys\n'
+                           'from pathlib import Path\n'
+                           f'result = subprocess.run([{real_copy!r}, *sys.argv[1:]])\n'
+                           'if result.returncode: sys.exit(result.returncode)\n'
+                           'destination = Path(sys.argv[-1])\n'
+                           'if destination.is_file() and (destination.name == "restore-probe" or destination.name.endswith(".couvrefeu-tmp")):\n'
+                           + ('    st = destination.stat()\n    seconds = st.st_mtime_ns // 1_000_000_000\n    os.utime(destination, ns=(seconds * 1_000_000_000, seconds * 1_000_000_000))\n' if truncate else '    pass\n'))
+        wrapper.chmod(0o700)
+        self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
+
+    def test_fractional_original_copy_refuses_before_activation(self):
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        stamp = 1_234_567_890_123_456_789
+        os.utime(target, ns=(stamp, stamp))
+        self.install_copy_tool(truncate=True)
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cannot preserve exact original', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / 'etc/couvrefeu/backup').exists())
+
+    def test_restore_truncation_retains_journal_and_retries(self):
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        target.chmod(0o640)
+        stamp = 1_234_567_890_123_456_789
+        os.utime(target, ns=(stamp, stamp))
+        original = exact_signature(target)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = exact_signature(target)
+        self.install_copy_tool(truncate=True)
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('exact original copy failed', result.stderr)
+        self.assertEqual(exact_signature(target), installed)
+        backup = self.root / '.couvrefeu-recovery'
+        self.assertTrue((backup / 'etc_config_firewall.original').exists())
+        self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), original)
+        self.assertFalse((backup / 'restored').exists())
+        self.install_copy_tool()
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(exact_signature(target), original)
+        self.assertFalse(backup.exists())
+
+    def test_native_busybox_cp_actual_timestamp_capability(self):
+        shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        busybox = os.environ.get('CF_TEST_BUSYBOX_CP') or (shell[0] if len(shell) == 2 and shell[1] == 'ash' else shutil.which('busybox'))
+        if not busybox or subprocess.run([busybox, 'cp', '--help'], capture_output=True).returncode == 127:
+            self.skipTest('native BusyBox cp unavailable; capability remains unproved')
+        wrapper = self.root / 'bin/cp'
+        wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(busybox) + ' cp "$@"\n')
+        wrapper.chmod(0o700)
+        self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        target.chmod(0o640)
+        for stamp, supported in ((1_234_567_890_123_456_789, False), (1_234_567_890_000_000_000, True)):
+            with self.subTest(nanoseconds=stamp):
+                os.utime(target, ns=(stamp, stamp))
+                before = self.snapshot()
+                result = self.install('--activate')
+                if not supported:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('cannot preserve exact original', result.stderr)
+                    self.assertEqual(self.snapshot(), before)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                result = self.run_script('uninstall.sh')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(target.stat().st_mtime_ns, stamp)
+
+    def test_original_backup_mtime_corruption_refuses_all_restoration(self):
+        backup = self.root / 'etc/couvrefeu/backup'
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        original = backup / 'etc_config_firewall.original'
+        stamp = original.stat().st_mtime_ns + 1
+        os.utime(original, ns=(stamp, stamp))
+        before = self.snapshot()
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('corrupt original backup mtime', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_missing_original_timestamp_record_preserves_installation(self):
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / 'etc/couvrefeu/backup/etc_config_firewall.mtime').unlink()
+        before = self.snapshot()
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing/invalid original mtime record', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_stat_without_fractional_reporting_refuses_activation(self):
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        real_stat = shutil.which('stat')
+        wrapper = self.root / 'bin/stat'
+        wrapper.write_text('#!/bin/sh\n'
+                           'if [ "$1" = -c ] && [ "$2" = "%Y %y" ]; then\n'
+                           '    printf "%s\\n" "1234567890 2009-02-13 23:31:30 +0000"; exit 0\n'
+                           'fi\nexec ' + shlex.quote(real_stat) + ' "$@"\n')
+        wrapper.chmod(0o700)
+        self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('precise original mtime unavailable', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_stat_valid_output_with_failure_refuses_activation(self):
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        real_stat = shutil.which('stat')
+        wrapper = self.root / 'bin/stat'
+        wrapper.write_text('#!/bin/sh\n'
+                           'if [ "$1" = -c ] && [ "$2" = "%Y %y" ]; then\n'
+                           + '    ' + shlex.quote(real_stat) + ' "$@"; exit 7\n'
+                           'fi\nexec ' + shlex.quote(real_stat) + ' "$@"\n')
+        wrapper.chmod(0o700)
+        self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('precise original mtime unavailable', result.stderr)
+        self.assertEqual(self.snapshot(), before)
 
     def test_activation_gate_failure_leaves_originals(self):
         self.env['CF_TEST_CHECK_FAIL'] = '1'
@@ -574,6 +762,76 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / 'tool-log').read_text().splitlines(),
                          ['apply-fw', 'remove-fw', 'reload'])
+
+    def test_legacy_completion_after_truncated_restore_is_preserved(self):
+        busybox = os.environ.get('CF_TEST_BUSYBOX_CP') or shutil.which('busybox')
+        if not busybox or subprocess.run([busybox, 'cp', '--help'], capture_output=True).returncode == 127:
+            self.skipTest('native BusyBox cp unavailable; legacy fractional replay unproved')
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        target.chmod(0o640)
+        stamp = 1_234_567_890_123_456_789
+        os.utime(target, ns=(stamp, stamp))
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backup = self.root / 'etc/couvrefeu/backup'
+        # Reenact the independently reproduced historical terminal state:
+        # native cp -p restores original bytes/mode/owners with lost fractions;
+        # the legacy journal has no timestamp records and trusts DONE=1.
+        for rel in FILES:
+            key = rel.replace('/', '_')
+            original = backup / (key + '.original')
+            destination = self.root / rel
+            if original.exists():
+                copy = subprocess.run([busybox, 'cp', '-p', str(original), str(destination)], capture_output=True)
+                self.assertEqual(copy.returncode, 0, copy.stderr)
+            else:
+                destination.unlink()
+            (backup / (key + '.mtime')).unlink()
+        self.assertEqual(target.stat().st_mtime_ns, stamp // 1_000_000_000 * 1_000_000_000)
+        recovery = self.root / '.couvrefeu-recovery'
+        backup.rename(recovery)
+        for rel in sorted(DIRS, key=lambda rel: rel.count('/'), reverse=True):
+            mode = (recovery / ('dir_' + rel.replace('/', '_'))).read_text().strip()
+            directory = self.root / rel
+            if mode == 'absent':
+                directory.rmdir()
+            else:
+                directory.chmod(int(mode, 8))
+        done = self.root / '.couvrefeu-recovery.done'
+        done.write_text('1\n')
+        done.chmod(0o600)
+        before = self.snapshot()
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('legacy recovery completion record', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(recovery.is_dir())
+
+    def test_exact_completion_partial_cleanup_retries_without_timestamp_records(self):
+        target = self.root / 'etc/config/firewall'
+        target.parent.mkdir(parents=True)
+        target.write_text("config zone 'wan'\n")
+        stamp = 1_234_567_890_123_456_789
+        os.utime(target, ns=(stamp, stamp))
+        original = exact_signature(target)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recovery = self.root / '.couvrefeu-recovery'
+        self.tool_failure('rm', recovery / 'etc_config_firewall.mtime')
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        done = self.root / '.couvrefeu-recovery.done'
+        self.assertEqual(done.read_text(), '2\n')
+        self.assertFalse((recovery / 'etc_config_firewall.before').exists())
+        self.assertEqual(exact_signature(target), original)
+        (self.root / 'fail-tool').unlink()
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(exact_signature(target), original)
+        self.assertFalse(recovery.exists())
+        self.assertFalse(done.exists())
 
     def test_every_file_interruption_retries_after_removed_helpers(self):
         for count in range(1, len(FILES) + 1):
