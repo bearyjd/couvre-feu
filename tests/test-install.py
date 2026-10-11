@@ -251,6 +251,8 @@ esac
     def test_mtime_only_changes_restore_exact_originals(self):
         # An original helper with identical installed bytes and metadata used
         # to be skipped even though installation changed its timestamp.
+        # Match the declared installed helper mode independently of umask.
+        (self.source / 'lib/core.sh').chmod(0o644)
         target = self.root / 'usr/lib/couvrefeu/core.sh'
         target.parent.mkdir(parents=True)
         target.write_text(':\n')
