@@ -106,8 +106,11 @@ cf_rpc_main() {
     [ "$CF_BASE_REVISION" = "$CF_REVISION" ] && [ "$CF_BASE_DIGEST" = "$CF_DIGEST" ] || { cf_fail policy_conflict;cf_rpc_response;return 1; }
     [ "$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="O"{n++}END{print n+0}')" -lt 128 ] || { cf_fail receipt_capacity;cf_rpc_response;return 1; }
     cf_backend_available sync || { cf_fail missing_dependencies;cf_rpc_response;return 1; }
+    CF_OLD_POLICY=$CF_POLICY
+    CF_OLD_DIGEST=$CF_DIGEST
     CF_POLICY=$CF_STAGED_POLICY
     cf_policy_safe && cf_ssh_guard && cf_preflight || { cf_rpc_response;return 1; }
+    cf_transition_prepare || { cf_error_record;cf_rpc_response;return 1; }
     CF_REVISION=$((CF_BASE_REVISION + 1));CF_DIGEST=$CF_NEXT_DIGEST;CF_CURRENT=$CF_REQUEST_ID
     CF_METADATA=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_CURRENT" 'BEGIN{OFS="\t"}$1=="C"{$2=id}{print}')
     CF_METADATA="$CF_METADATA

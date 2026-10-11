@@ -174,11 +174,21 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(len(self.f.mutation_calls()), count)
 
     def test_apply_failure_retains_receipt_and_replay_never_recovers(self):
-        self.f.update_backend(failures=[{'command': 'ip6tables', 'contains': ['-A'], 'remaining': 1}])
         request = self.request()
-        result = self.f.run('rpc-sync', document=request)
-        self.assertNotEqual(result.returncode, 0)
-        failed = json.loads(result.stdout)
+        child = self.stopped(request, 'after_rename')
+        try:
+            self.f.update_backend(failures=[{'command': 'ip6tables', 'contains': ['-A'], 'remaining': 1}])
+            child.send_signal(signal.SIGCONT)
+            stdout, stderr = child.communicate(timeout=60)
+            self.assertNotEqual(child.returncode, 0, stdout + stderr)
+            self.assertEqual(self.f.backend()['failures'][0]['remaining'], 0)
+            failed = json.loads(stdout)
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.communicate(timeout=10)
         self.assertEqual(failed['receipt']['acceptedRevision'], 1)
         self.assertFalse(failed['status']['ok'])
         before = self.f.durable_snapshot()
@@ -209,6 +219,7 @@ class RpcTests(unittest.TestCase):
                 self.reject(self.request())
 
     def test_sync_failure_before_rename_retains_old_authority(self):
+        mutations = len(self.f.mutation_calls())
         self.f.update_backend(failures=[{'command': 'sync', 'remaining': 1}])
         result = self.f.run('rpc-sync', document=self.request())
         self.assertNotEqual(result.returncode, 0)
@@ -216,22 +227,125 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(observed['acceptedPolicy']['revision'], 0)
         self.assertIsNone(observed['receipt'])
         self.assertFalse(observed['status']['ok'])
-        self.assertEqual(self.f.mutation_calls(), [])
+        self.assertEqual(len(self.f.mutation_calls()), mutations)
 
     def test_sync_failure_after_rename_retains_receipt_without_apply(self):
-        self.f.update_backend(failures=[{'command': 'sync', 'skip': 1, 'remaining': 1}])
+        old_policy = scoped_policy()
+        old_policy['pauses'] = [{'person': 'alice', 'until': 0}]
+        old_policy['schedules'] = [{'person': 'alice', 'id': 'night', 'weekdays': ['Mon', 'Tue'],
+                                    'start': '22:00', 'stop': '06:00'}]
+        self.accept(self.request(identifier='old_operation', document=old_policy))
+        self.base = self.observe()
+        old_backend = self.f.backend()
+        old_confirmed = (self.f.root / 'etc/couvrefeu/runtime/confirmed').read_bytes()
+        old_firewall = (self.f.root / 'etc/config/firewall').read_bytes()
         request = self.request()
-        result = self.f.run('rpc-sync', document=request)
-        self.assertNotEqual(result.returncode, 0)
+        revision = request['expected_revision'] + 1
+        baseline_mutations = len(self.f.mutation_calls())
+
+        def fragments(arguments):
+            # Compare complete argument fragments independently of iptables'
+            # option ordering; preserve values bound to their option.
+            result = []
+            index = 0
+            while index < len(arguments):
+                negate = arguments[index] == '!'
+                if negate:
+                    index += 1
+                option = arguments[index]
+                size = 3 if option == '--match-set' else 1 if option == '--kerneltz' else 2
+                fragment = tuple(arguments[index:index + size])
+                if negate:
+                    fragment = ('!', *fragment)
+                if fragment not in (('-m', 'tcp'), ('-m', 'udp')):
+                    result.append(fragment)
+                index += size
+            return sorted(result)
+
+        def assert_inactive_staging(staged):
+            intent = (self.f.root / 'etc/couvrefeu/runtime/firewall.intent').read_text().splitlines()
+            self.assertIn('PHASE staged', intent)
+            self.assertIn('RECEIPT op_1', intent)
+            self.assertIn('GENERATION ' + request['generation'], intent)
+            slot = next(line.split()[1] for line in intent if line.startswith('SLOT '))
+            prefix = 'cf2_' + slot + '_'
+            expected_sets = {}
+            expected_chains = {}
+            for line in intent:
+                fields = line.split()
+                if fields[:2] == ['AFTER', 'SETDEF'] and fields[2].startswith(prefix):
+                    expected_sets[fields[2]] = {'type': fields[3], 'family': fields[4], 'members': []}
+                elif fields[:2] == ['AFTER', 'SET'] and fields[2].startswith(prefix):
+                    expected_sets[fields[2]]['members'].append(fields[3])
+                elif fields[:2] == ['AFTER', 'RULE'] and fields[4].startswith(prefix):
+                    key = ('iptables' if fields[2] == '4' else 'ip6tables', fields[3], fields[4])
+                    expected_chains.setdefault(key, [])
+                    if fields[5] == '-A':
+                        expected_chains[key].append(fragments(fields[7:]))
+            self.assertTrue(expected_sets)
+            self.assertTrue(expected_chains)
+            actual_chains = {}
+            for family, tables in staged['tables'].items():
+                for table, chains in tables.items():
+                    old_chains = old_backend['tables'][family][table]
+                    for name, body in old_chains.items():
+                        self.assertEqual(chains[name], body, 'old active rules/hooks/guards must remain unchanged')
+                        self.assertFalse(any(token.startswith(prefix) for row in body for token in row),
+                                         'the candidate must not be reachable from old rules')
+                    for name, body in chains.items():
+                        if name not in old_chains:
+                            self.assertTrue(name.startswith(prefix), 'only recorded candidate chains may be added')
+                            actual_chains[(family, table, name)] = [fragments(row) for row in body]
+            self.assertEqual(actual_chains, expected_chains)
+            for name, value in old_backend['sets'].items():
+                self.assertEqual(staged['sets'][name], value, 'old active set contents must remain unchanged')
+            actual_sets = {name: {'type': value['type'], 'family': value.get('family', 'inet'),
+                                  'members': sorted(value['members'])}
+                           for name, value in staged['sets'].items() if name not in old_backend['sets']}
+            for value in expected_sets.values():
+                value['members'].sort()
+            self.assertEqual(actual_sets, expected_sets)
+            self.assertEqual(staged['uci'], old_backend['uci'])
+            self.assertEqual(staged.get('conntrack_deletions', []), old_backend.get('conntrack_deletions', []))
+            self.assertEqual((self.f.root / 'etc/config/firewall').read_bytes(), old_firewall)
+            self.assertEqual((self.f.root / 'etc/couvrefeu/runtime/confirmed').read_bytes(), old_confirmed)
+
+        # With stable addresses, prepare may durably stage an unreachable slot.
+        # Arm the fault at the policy rename boundary, after prior journal syncs.
+        child = self.stopped(request, 'after_rename')
+        try:
+            state = (self.f.root / 'etc/couvrefeu/state').read_text().splitlines()
+            self.assertIn('R\t' + str(revision), state)
+            self.assertTrue(any(line.startswith('O\top_1\t') for line in state))
+            assert_inactive_staging(self.f.backend())
+            checkpoint_mutations = len(self.f.mutation_calls())
+            self.assertGreater(checkpoint_mutations, baseline_mutations)
+            barriers = sum(call['command'] == 'sync' for call in self.f.calls())
+            self.f.update_backend(failures=[{'command': 'sync', 'remaining': 1}])
+            child.send_signal(signal.SIGCONT)
+            stdout, stderr = child.communicate(timeout=60)
+            self.assertNotEqual(child.returncode, 0, stdout + stderr)
+            self.assertEqual(self.f.backend()['failures'][0]['remaining'], 0)
+            self.assertEqual(sum(call['command'] == 'sync' for call in self.f.calls()), barriers + 1)
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.communicate(timeout=10)
         observed = self.observe('op_1')
-        self.assertEqual(observed['acceptedPolicy']['revision'], 1)
+        self.assertEqual(observed['acceptedPolicy']['revision'], revision)
         self.assertEqual(observed['receipt']['operationId'], 'op_1')
         self.assertFalse(observed['status']['ok'])
-        self.assertEqual(self.f.mutation_calls(), [])
+        self.assertEqual(len(self.f.mutation_calls()), checkpoint_mutations)
+        assert_inactive_staging(self.f.backend())
         before = self.f.durable_snapshot()
-        self.accept(request)
+        replay = self.accept(request)
+        self.assertFalse(replay['status']['ok'])
+        self.assertEqual(replay['receipt'], observed['receipt'])
         self.assertEqual(self.f.durable_snapshot(), before)
-        self.assertEqual(self.f.mutation_calls(), [])
+        self.assertEqual(len(self.f.mutation_calls()), checkpoint_mutations)
+        assert_inactive_staging(self.f.backend())
 
     def test_missing_receipt_is_not_fabricated(self):
         self.assertIsNone(self.observe('not_yet')['receipt'])
@@ -436,13 +550,15 @@ class RpcTests(unittest.TestCase):
         marker.unlink(missing_ok=True)
         env = dict(self.f.env, CF_TEST_RPC_STOP=checkpoint)
         child = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'rpc-sync'],
-                                 env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                 env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, start_new_session=True)
         child.stdin.write(json.dumps(request));child.stdin.close();child.stdin = None
         deadline = time.monotonic() + 60
         while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
             time.sleep(.05)
         if not marker.exists():
-            child.kill();stdout, stderr = child.communicate()
+            os.killpg(child.pid, signal.SIGKILL)
+            stdout, stderr = child.communicate(timeout=10)
             self.fail('checkpoint not reached: ' + stdout + stderr)
         return child
 

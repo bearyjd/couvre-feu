@@ -34,8 +34,12 @@ else
     CF_LIB=/usr/lib/couvrefeu
     if [ "$(id -u)" != 0 ]; then printf '%s\n' '{"ok":false,"errors":["root_required"]}'; exit 2; fi
 fi
-if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_AWK-}" = "busybox awk" ]; then
-    CF_BUSYBOX=$(command -v busybox) || exit 2
+if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_AWK-}" ]; then
+    case $CF_TEST_AWK in
+        'busybox awk')CF_BUSYBOX=$(command -v busybox) || exit 2;;
+        /tmp/*/busybox\ awk)CF_BUSYBOX=${CF_TEST_AWK% awk};[ -f "$CF_BUSYBOX" ] && [ ! -L "$CF_BUSYBOX" ] && [ -x "$CF_BUSYBOX" ] || exit 2;;
+        *)exit 2;;
+    esac
     awk() { "$CF_BUSYBOX" awk "$@"; }
 fi
 . "$CF_LIB/core.sh"

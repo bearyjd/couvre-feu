@@ -101,7 +101,7 @@ function canon6(s,    a,b,n,i,j,k,t,m,beg,len,out) {
     return out
 }
 function clock(p,    s,h,m) {s=text(p);if(s!~/^[0-9][0-9]:[0-9][0-9]$/)bad("clock format");h=substr(s,1,2)+0;m=substr(s,4,2)+0;if(h>23||m>59)bad("clock range");return s}
-function validate(root,    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s) {
+function validate(root,    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s,sep) {
     object(root,"version revision people pauses schedules doh","version revision people pauses schedules")
     if(integer(root "/version",1)!=1)bad("version")
     rev=integer(root "/revision",2147483647)
@@ -122,7 +122,7 @@ function validate(root,    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s) {
         start=clock(p "/start");stop=clock(p "/stop");if(start==stop)bad("empty schedule")
         q=p "/weekdays";array(q,7);if(!count[q])bad("empty weekdays");days=""
         for(j=0;j<count[q];j++) {d=text(q "/" j);if(index(",Mon,Tue,Wed,Thu,Fri,Sat,Sun,","," d ",")==0 || weekday[p "/" d]++)bad("weekday")}
-        n=split("Mon Tue Wed Thu Fri Sat Sun",a," ");for(j=1;j<=n;j++)if(weekday[p "/" a[j]])days=days (days==""?"":",") a[j]
+        n=split("Mon Tue Wed Thu Fri Sat Sun",a," ");for(j=1;j<=n;j++)if(weekday[p "/" a[j]]){sep="";if(days!="")sep=",";days=days sep a[j]}
         expanded+=personmac[id]*(start>stop&&stop!="00:00"?2:1);if(expanded>256)bad("expanded schedule limit")
         out[++outn]="S\t" id "\t" sid "\t" days "\t" start "\t" stop
     }

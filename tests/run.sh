@@ -37,6 +37,5 @@ find router tests -type f | {
 if ! command -v busybox >/dev/null 2>&1; then
     printf '%s\n' 'PENDING: BusyBox ash runtime; host sh syntax alone is not ash proof.'
 fi
-python3 tests/test-core.py
-python3 tests/test-rpc.py
+python3 tests/run-fixtures.py
 printf '%s\n' 'PASS: fixture and available static checks. Real fw3/packet/live tests remain pending.'

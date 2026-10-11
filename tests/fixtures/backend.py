@@ -41,6 +41,12 @@ def main():
         except (KeyError, ValueError, IndexError) as error:
             print(f"unsupported fixture call {command} {args!r}: {error}", file=sys.stderr)
             return 97
+        mutating = (command in ("iptables", "ip6tables") and any(x in args for x in ("-A", "-I", "-R", "-D", "-N", "-F", "-X"))
+                    or command == "ipset" and args[0] in ("create", "add", "destroy", "flush")
+                    or command == "conntrack" or command in ("fw3", "firewall") and "reload" in args)
+        if result == 0 and mutating and state.get("capture_effects"):
+            state.setdefault("effects", []).append({"command": command, "argv": args,
+                "tables": json.loads(json.dumps(state["tables"])), "sets": json.loads(json.dumps(state["sets"]))})
         state_path.write_text(json.dumps(state))
         if output:
             print(output)
@@ -66,6 +72,9 @@ def dispatch(command, args, state):
         if "-D" not in args:
             raise ValueError("only conntrack deletion is modeled")
         state.setdefault("conntrack_deletions", []).append(args)
+        direction = "src" if "-s" in args else "dst"
+        address = args[args.index("-s" if direction == "src" else "-d") + 1]
+        state["flows"] = [flow for flow in state.get("flows", []) if flow[direction] != address]
         return 0, ""
     if command == "ip":
         family = 6 if "-6" in args else 4
@@ -123,16 +132,31 @@ def reload_firewall(state):
     for family in state["tables"].values():
         for table in family.values():
             for chain in list(table):
-                if chain.startswith(("CF_", "cf_")):
+                if state.get("full_restart") and chain.startswith(("CF_", "cf_", "cf2_")):
                     del table[chain]
                 else:
                     table[chain] = [rule for rule in table[chain]
-                                    if not ("-j" in rule and rule[rule.index("-j") + 1].startswith(("CF_", "cf_")))]
+                                    if not ("--comment" in rule and rule[rule.index("--comment") + 1].startswith("!fw3:") or state.get("full_restart") and "-j" in rule and rule[rule.index("-j") + 1].startswith(("CF_", "cf_", "cf2_")))]
         family["filter"]["zone_lan_forward"] = [list(row) for row in native] if state.get("native_witness") else []
         family["filter"]["zone_wan_dest_REJECT"] = [["-o", device, "-j", "reject"]
                                                     for device in state.get("wan_devices", ["eth0"])]
         family["filter"]["reject"] = [["-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"],
                                         ["-j", "REJECT"]]
+    # External loss during selective native reload must fence every switch.
+    drift = state.get("reload_guard_drift")
+    if drift:
+        for family in state["tables"].values():
+            for chain in family["filter"]:
+                if chain.startswith("cf2_") and chain.endswith("_g"):
+                    if drift == "body":
+                        family["filter"][chain] = []
+                    elif drift == "missing":
+                        del family["filter"][chain]
+                        break
+        if drift == "union":
+            for name, value in state["sets"].items():
+                if name.startswith("cf2_") and name.endswith("_u"):
+                    value["members"] = []
 
 
 def ipset(args, state):
@@ -177,6 +201,11 @@ def ipset(args, state):
     elif op in ("destroy", "-X"):
         if name not in sets:
             return (0 if tolerate_exists else 1), ""
+        if any("--match-set" in row and any(row[i] == "--match-set" and row[i + 1] == name for i in range(len(row) - 1))
+               for family in state["tables"].values() for table in family.values() for rows in table.values() for row in rows):
+            return 1, "referenced set"
+        if any(value["type"] == "list:set" and name in value["members"] for value in sets.values()):
+            return 1, "referenced set"
         sets.pop(name, None)
     elif op == "swap":
         sets[name], sets[args[2]] = sets[args[2]], sets[name]
@@ -229,11 +258,19 @@ def iptables(command, args, state):
         if operation == "-I" and rule and rule[0].isdigit():
             index, rule = int(rule[0]) - 1, rule[1:]
         chains[chain].insert(index, rule)
+    elif operation == "-R":
+        index, rule = int(rule[0]) - 1, rule[1:]
+        if chain not in chains or index < 0 or index >= len(chains[chain]):
+            return 1, ""
+        chains[chain][index] = rule
     elif operation in ("-C", "-D"):
-        if chain not in chains or rule not in chains[chain]:
+        if chain not in chains:
+            return 1, ""
+        found = next((row for row in chains[chain] if rule_identity(row) == rule_identity(rule)), None)
+        if found is None:
             return 1, ""
         if operation == "-D":
-            chains[chain].remove(rule)
+            chains[chain].remove(found)
     elif operation in ("-S", "-L"):
         if chain and chain not in chains:
             return 1, ""
@@ -248,6 +285,31 @@ def iptables(command, args, state):
     else:
         raise ValueError("unknown iptables operation")
     return 0, ""
+
+
+def rule_identity(row):
+    """iptables compares parsed selectors, including equivalent option order."""
+    parts, i, negate = [], 0, ""
+    while i < len(row):
+        token = row[i]
+        if token == "!":
+            negate = "!"
+            i += 1
+            continue
+        size = 1 if token in ("--kerneltz", "--contiguous") else 3 if token == "--match-set" else 2
+        fragment = row[i:i + size]
+        i += size
+        if fragment == ["-m", "tcp"] or fragment == ["-m", "udp"]:
+            continue
+        if len(fragment) > 1 and token in ("--mac-source",):
+            fragment[1] = fragment[1].lower()
+        if token == "--reject-with" and fragment[1] in ("icmp-port-unreachable", "icmp6-port-unreachable"):
+            continue
+        if token in ("-s", "-d") and len(fragment) > 1:
+            fragment[1] = fragment[1].removesuffix("/128" if ":" in fragment[1] else "/32")
+        parts.append(tuple([negate] + fragment))
+        negate = ""
+    return tuple(sorted(parts))
 
 
 def serialize_rule(row, canonical, command):

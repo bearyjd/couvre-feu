@@ -79,12 +79,12 @@ cf_state_json() {
     $1=="V"{if(NF!=2||v++)bad();version=$2;next}
     $1=="R"{if(NF!=2||r++)bad();revision=$2;next}
     $1=="P"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[-0-9a-f:]+$/)bad();person[$2]=1;if($3!="-"){mac[$2]=mac[$2] (mac[$2]==""?"":",") "\"" $3 "\""}next}
-    $1=="A"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[0-9]+$/)bad();pauses=pauses (pauses==""?"":",") "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
-    $1=="S"{if(NF!=6||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[a-z][a-z0-9_]*$/||$4!~/^[A-Za-z,]+$/||$5!~/^[0-9:]+$/||$6!~/^[0-9:]+$/)bad();n=split($4,a,",");days="";for(i=1;i<=n;i++)days=days (i==1?"":",") "\"" a[i] "\"";sched=sched (sched==""?"":",") "{\"person\":\"" $2 "\",\"id\":\"" $3 "\",\"weekdays\":[" days "],\"start\":\"" $5 "\",\"stop\":\"" $6 "\"}";next}
-    $1=="D4"{if(NF!=2||$2!~/^[0-9.]+$/)bad();d4=d4 (d4==""?"":",") "\"" $2 "\"";next}
-    $1=="D6"{if(NF!=2||$2!~/^[0-9a-f:]+$/)bad();d6=d6 (d6==""?"":",") "\"" $2 "\"";next}
+    $1=="A"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[0-9]+$/)bad();sep="";if(pauses!="")sep=",";pauses=pauses sep "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
+    $1=="S"{if(NF!=6||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[a-z][a-z0-9_]*$/||$4!~/^[A-Za-z,]+$/||$5!~/^[0-9:]+$/||$6!~/^[0-9:]+$/)bad();n=split($4,a,",");days="";for(i=1;i<=n;i++){sep="";if(i!=1)sep=",";days=days sep "\"" a[i] "\""}sep="";if(sched!="")sep=",";sched=sched sep "{\"person\":\"" $2 "\",\"id\":\"" $3 "\",\"weekdays\":[" days "],\"start\":\"" $5 "\",\"stop\":\"" $6 "\"}";next}
+    $1=="D4"{if(NF!=2||$2!~/^[0-9.]+$/)bad();sep="";if(d4!="")sep=",";d4=d4 sep "\"" $2 "\"";next}
+    $1=="D6"{if(NF!=2||$2!~/^[0-9a-f:]+$/)bad();sep="";if(d6!="")sep=",";d6=d6 sep "\"" $2 "\"";next}
     {bad()}
-    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person)people=people (people==""?"":",") "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}";print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "],\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
+    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person){sep="";if(people!="")sep=",";people=people sep "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}"}print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "],\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
 }
 cf_state_load() {
     cf_safe_file "$CF_STATE" || { cf_fail unsafe_state_file; return 1; }
@@ -310,8 +310,12 @@ cf_resume_edit() {
     CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&$2==p{next}{print}' | cf_canonical)
 }
 cf_timeout_available() {
-    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_TIMEOUT-}" = 'busybox timeout' ];then
-        CF_TIMEOUT=$(command -v busybox) || { cf_fail missing_input_deadline_dependency;return 1; }
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_TIMEOUT-}" ];then
+        case $CF_TEST_TIMEOUT in
+            'busybox timeout')CF_TIMEOUT=$(command -v busybox) || { cf_fail missing_input_deadline_dependency;return 1; };;
+            /tmp/*/busybox\ timeout)CF_TIMEOUT=${CF_TEST_TIMEOUT% timeout};[ -f "$CF_TIMEOUT" ] && [ ! -L "$CF_TIMEOUT" ] && [ -x "$CF_TIMEOUT" ] || { cf_fail missing_input_deadline_dependency;return 1; };;
+            *)cf_fail missing_input_deadline_dependency;return 1;;
+        esac
         CF_TIMEOUT_BUSYBOX=1
         return 0
     fi
@@ -408,10 +412,11 @@ cf_status() {
     [ "$cf_ok" = false ] || cf_policy_safe || cf_ok=false
     cf_kids_json='[]';cf_paused_json='[]'
     if [ "$cf_ok" = true ]; then
+        cf_slot_load
         cf_address_refresh || cf_ok=false
         CF_EXPECTED=$(cf_plan) || cf_ok=false
-        cf_observed_kids=$(cf_set_members cf_kids) || { cf_ok=false;cf_fail observed_set_read_failed; }
-        cf_observed_paused=$(cf_set_members cf_paused) || { cf_ok=false;cf_fail observed_set_read_failed; }
+        cf_observed_kids=$(cf_set_members "cf2_${CF_SLOT}_k") || { cf_ok=false;cf_fail observed_set_read_failed; }
+        cf_observed_paused=$(cf_set_members "cf2_${CF_SLOT}_p") || { cf_ok=false;cf_fail observed_set_read_failed; }
         cf_kids_json=$(printf '%s\n' "$cf_observed_kids" | cf_json_strings)
         cf_paused_json=$(printf '%s\n' "$cf_observed_paused" | cf_json_strings)
         cf_verify || { cf_ok=false;cf_drift=true;[ -n "$CF_ERROR" ] || cf_fail observed_verification_failed; }
@@ -462,6 +467,8 @@ cf_main() {
     if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
     # A different operation may have committed between the first read and mkdir.
     if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock || ! cf_policy_safe;then cf_status;return 1;fi
+    CF_OLD_POLICY=$CF_POLICY
+    CF_OLD_DIGEST=$CF_DIGEST
     case $cf_action in
         sync) cf_sync_read || { cf_status;return 1; };;
         pause) cf_pause_edit "$2" "$cf_until" || { cf_status;return 1; };;
@@ -474,7 +481,10 @@ cf_main() {
         printf '{"ok":true,"removed":true,"zeroOwnedMutations":%s,"errors":[]}\n' "${CF_ZERO_OWNED:-false}";return 0
     fi
     # Validate capabilities and foreign-object ownership BEFORE accepting a new revision.
+    if ! cf_preflight_baseline_prepare;then cf_status;return 1;fi
     if ! cf_preflight; then cf_status;return 1;fi
+    if ! cf_preflight_baseline_clear;then cf_status;return 1;fi
+    if ! cf_transition_prepare;then cf_error_record;cf_status;return 1;fi
     case $cf_action in sync|pause|resume)
         if [ -n "$CF_METADATA" ];then
             CF_CURRENT=-
