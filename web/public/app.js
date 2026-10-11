@@ -147,7 +147,7 @@ async function authenticate(kind, token) {
     acceptSession(session);
     state.busy = false;
     await refresh({ quiet: true });
-    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
+    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
   } catch (error) {
     if (generation !== state.generation) return;
     const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.' : error.message;
@@ -235,7 +235,7 @@ async function mutate(personId, action) {
 function operationText(operation) {
   const verb = operation.action === 'resume' ? 'Resume' : 'Pause';
   if (isReal()) return ({
-    pending: `${verb} pending. Waiting for an exact operator-approved router invocation.`,
+    pending: operation.dispatch === 'awaiting_automatic_dispatch' ? `${verb} pending. Waiting for automatic router confirmation.` : operation.dispatch === 'consumed' ? `${verb} pending. Waiting for the router receipt.` : `${verb} pending. Waiting for an exact operator-approved router invocation.`,
     confirmed: `${verb} confirmed by a fresh router receipt and current runtime observation. Packet behavior remains unmeasured.`,
     failed: `${verb} was not delivered. Review the operation details before another deliberate action.`,
     unknown: `${verb} outcome unknown. A historical receipt or local timeout cannot establish current enforcement. No retry is authorized.`,

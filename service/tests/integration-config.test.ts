@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { integrationConfig } from '../src/integration-config.ts';
+import { integrationConfig, privateHTTPSOrigin } from '../src/integration-config.ts';
 import { IntegrationStore } from '../src/integration-db.ts';
 import { Store } from '../src/db.ts';
 import { testConfig } from './fixtures/integration.ts';
@@ -23,6 +23,11 @@ test('private manifest validates explicit real bindings, pinned public keys and 
     const save = (value: unknown) => writeFileSync(path, JSON.stringify(value), {mode: 0o600});
     try {
         save(manifest); const c = integrationConfig(path);
+        assert.equal(c.dispatch, undefined);
+        save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
+        const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
+        for (const dispatch of [{enabled: 'true', pollSeconds: 2, maxBackoffSeconds: 60}, {enabled: true, pollSeconds: 0, maxBackoffSeconds: 60}, {enabled: true, pollSeconds: 2, maxBackoffSeconds: 301}, {enabled: true, pollSeconds: 10, maxBackoffSeconds: 2}, {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60, bypass: true}]) { save({...manifest, dispatch}); assert.throws(() => integrationConfig(path)); }
+        save(manifest);
         assert.equal(c.provenance.source, 'real-router-integration'); assert.equal(c.provenance.routerCompatibilityVerified, false);
         assert.deepEqual(c.accounts.map(a => a.id), ['operator', 'parent']); assert.equal(c.router.generation, manifest.router.generation);
         for (const changed of [{...manifest, mode: 'demo'}, {...manifest, protectedMacs: [manifest.person.device.mac]}, {...manifest, router: {...manifest.router, generation: undefined}}, {...manifest, router: {...manifest.router, host: 'evil.example'}}, {...manifest, accounts: [{...manifest.accounts[0], personIds: ['other']}]}, {...manifest, enrollment: {...manifest.enrollment, people: [{id: 'pilot', macs: ['02:aa:bb:cc:dd:ee']}]}}]) { save(changed); assert.throws(() => integrationConfig(path)); }
@@ -32,6 +37,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         writeFileSync(sample.router.knownHosts, `192.168.1.1 ssh-ed25519 ${blob}\n`);
         writeFileSync(sample.router.publicIdentity, '-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n'); assert.throws(() => integrationConfig(path), /invalid_public_identity/);
     } finally { socket.close(); await once(socket, 'close'); rmSync(dir, {recursive: true, force: true}); }
+});
+test('private HTTPS origin is exact, hostname-bound and rejects credentials, path, query and insecure alternatives', () => {
+    assert.equal(privateHTTPSOrigin('https://parent.example.test'), 'https://parent.example.test');
+    for (const value of ['http://parent.example.test', 'https://127.0.0.1', 'https://localhost', 'https://parent.example.test/', 'https://parent.example.test/path', 'https://parent.example.test?query', 'https://user@parent.example.test', 'https://parent.example.test#fragment', 'https://PARENT.example.test', 'https://parent.example.test:443', null]) assert.throws(() => privateHTTPSOrigin(value));
 });
 test('integration and demo DBs refuse cross-mode reuse or changed installation/manifest identities', () => {
     const dir = mkdtempSync(join(tmpdir(), 'cf-private-db-test-')), c = testConfig(dir), store = new IntegrationStore(c);

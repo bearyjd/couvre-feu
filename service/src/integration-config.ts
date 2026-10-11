@@ -10,6 +10,8 @@ import type { Role, Provenance } from '../../shared/src/contracts.ts';
 
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
+    origin?: string;
+    dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
     router: {host: string; user: 'root'; port: 22; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
     person: {id: string; name: string; device: {id: string; label: string; mac: string}};
     protectedMacs: string[];
@@ -66,7 +68,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -87,11 +89,27 @@ export function integrationConfig(path: string): IntegrationConfig {
     });
     if (new Set(accounts.map(a => a.id)).size !== accounts.length || !accounts.some(a => a.role === 'admin')) bad('admin_account_required');
     const enrollment = normalizePolicy(m.enrollment, protectedMacs);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment};
+    const origin = m.origin === undefined ? `http://localhost:${m.port}` : privateHTTPSOrigin(m.origin);
+    let dispatch: IntegrationManifest['dispatch'];
+    if (m.dispatch !== undefined) {
+        const settings = object(m.dispatch, ['enabled', 'pollSeconds', 'maxBackoffSeconds']);
+        const pollSeconds = integer(settings.pollSeconds), maxBackoffSeconds = integer(settings.maxBackoffSeconds);
+        if (typeof settings.enabled !== 'boolean' || pollSeconds < 2 || pollSeconds > 15 || maxBackoffSeconds < pollSeconds || maxBackoffSeconds > 300) bad('invalid_dispatch_bounds');
+        dispatch = {enabled: settings.enabled as boolean, pollSeconds, maxBackoffSeconds};
+    }
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort()}));
-    return {...manifest, origin: `http://localhost:${manifest.port}`, host: `localhost:${manifest.port}`, manifestDigest: sha256(raw), targetDigest, provenance: {source: 'real-router-integration', routerCompatibilityVerified: false, integrationScope: sha256(`${targetDigest}\n${sha256(raw)}`)}};
+    return {...manifest, origin, host: new URL(origin).host, manifestDigest: sha256(raw), targetDigest, provenance: {source: 'real-router-integration', routerCompatibilityVerified: false, integrationScope: sha256(`${targetDigest}\n${sha256(raw)}`)}};
+}
+/** The TLS proxy owns the private network boundary; this service only binds loopback. */
+export function privateHTTPSOrigin(value: unknown): string {
+    if (typeof value !== 'string') bad('invalid_private_https_origin');
+    let url: URL;
+    try { url = new URL(value as string); } catch { return bad('invalid_private_https_origin'); }
+    if (url.protocol !== 'https:' || url.origin !== value || url.username || url.password || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/.test(url.hostname) || url.hostname.length > 253) bad('invalid_private_https_origin');
+    return url.origin;
 }
 export function validatePilotPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'person' | 'protectedMacs'>, allowEmpty = true): void {
     normalizePolicy(policy, config.protectedMacs);

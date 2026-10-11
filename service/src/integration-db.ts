@@ -11,6 +11,7 @@ export interface IntegrationState {
     generation: string; dispatch_epoch: number; dispatch_stopped: number; active_operation_id: string | null;
     observation_sequence: number; observation_error: string | null;
 }
+export const AUTOMATIC_READ_RETENTION = 64;
 export class IntegrationStore extends Store {
     readonly config: IntegrationConfig;
     constructor(config: IntegrationConfig) {
@@ -45,6 +46,19 @@ export class IntegrationStore extends Store {
                 });
             } catch (initializationError) { this.close(); throw initializationError; }
         }
+        // Separate additive state keeps existing manifest-bound databases readable.
+        this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_dispatch (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL,
+            owner_token TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+        ) STRICT`);
+        this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_read_polls (
+            sequence INTEGER PRIMARY KEY, batch_id TEXT NOT NULL UNIQUE REFERENCES dispatch_batches(id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS automatic_read_summary (
+            kind TEXT PRIMARY KEY CHECK(kind IN ('observe','receipt')), dispatch_count INTEGER NOT NULL,
+            dispatched_at INTEGER NOT NULL, completed_at INTEGER, outcome TEXT NOT NULL
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS dispatch_live_claims ON dispatch_steps(state,lease_until)`);
         // Startup never releases an uncertain claim or starts dispatch.
     }
     integrationState(): IntegrationState { return this.get<IntegrationState>('SELECT * FROM integration_state WHERE singleton=1')!; }
@@ -56,10 +70,27 @@ export class IntegrationStore extends Store {
     stopDispatch(now = Math.floor(Date.now() / 1000)): void {
         this.transaction(() => {
             this.run('UPDATE integration_state SET dispatch_stopped=1,dispatch_epoch=dispatch_epoch+1 WHERE singleton=1');
+            this.run('UPDATE automatic_dispatch SET enabled=0 WHERE singleton=1');
+            this.run("INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES('operator','dispatch_revoked',?,'local_fence_only')", now);
             this.run("UPDATE dispatch_batches SET state='revoked' WHERE state='running'");
             this.run("UPDATE dispatch_steps SET state='uncertain' WHERE state='consumed'");
             this.run("UPDATE operations SET state='unknown',error='dispatch_stopped_remote_outcome_unknown',updated_at=? WHERE id=(SELECT active_operation_id FROM integration_state WHERE singleton=1) AND state IN ('pending','unknown') AND id IN (SELECT operation_id FROM operation_rpc WHERE attempt_count>0)", now);
             this.run("UPDATE operation_rpc SET phase='uncertain' WHERE phase='claimed'");
+            this.pruneAutomaticReads();
         });
+    }
+    /** Only marked automatic reads can be compacted; maintenance and every write remain. */
+    pruneAutomaticReads(): void {
+        if (!this.db.isTransaction) throw new Error('read_retention_requires_transaction');
+        const old = this.all<{batch_id: string}>(`SELECT p.batch_id FROM automatic_read_polls p
+            JOIN dispatch_steps s ON s.batch_id=p.batch_id AND s.ordinal=1
+            WHERE s.kind IN ('observe','receipt') AND s.state<>'consumed'
+            ORDER BY p.sequence DESC LIMIT -1 OFFSET ?`, AUTOMATIC_READ_RETENTION);
+        for (const row of old) {
+            // No consumed callback survives this selection; do not remove its fence witness.
+            this.run('DELETE FROM dispatch_steps WHERE batch_id=?', row.batch_id);
+            this.run('DELETE FROM automatic_read_polls WHERE batch_id=?', row.batch_id);
+            this.run('DELETE FROM dispatch_batches WHERE id=?', row.batch_id);
+        }
     }
 }

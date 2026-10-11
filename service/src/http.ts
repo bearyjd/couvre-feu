@@ -68,6 +68,8 @@ function send(response: ServerResponse, status: number, value: unknown) {
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'>;
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
     const provenance = auth.provenance;
+    const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
+    const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     const server = createServer(async (request, response) => {
         response.setHeader('Cache-Control', 'no-store');
         response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -94,10 +96,10 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
                 const [name, type] = STATIC[path];
                 let data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
-                    data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!));
+                    data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
                 if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v1'", `'cf-shell-integration-${provenance.integrationScope}'`));
-                if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', 'Private one-device router pilot. Operator-approved dispatch only.'));
+                if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
                 return;
@@ -110,7 +112,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
                 const payload = await body(request);
                 if (path.startsWith('/auth/') && path !== '/auth/logout') {
                     const browserToken = /^[A-Za-z0-9_-]{43}$/.test(jar.cf_browser ?? '') ? jar.cf_browser : randomBytes(32).toString('base64url');
-                    response.setHeader('Set-Cookie', `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
+                    response.setHeader('Set-Cookie', `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`);
                     if (path === '/auth/register/options') {
                         send(response, 200, await auth.registrationOptions(payload, browserToken));
                         return;
@@ -121,14 +123,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
                     }
                     if (path === '/auth/register/verify' || path === '/auth/login/verify') {
                         const result = path === '/auth/register/verify' ? await auth.registrationVerify(payload, browserToken, sessionToken) : await auth.loginVerify(payload, browserToken, sessionToken);
-                        response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`]);
+                        response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`]);
                         send(response, 200, result.dto);
                         return;
                     }
                 }
                 if (path === '/auth/logout') {
                     object(payload, []);
-                    response.setHeader('Set-Cookie', 'cf_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+                    response.setHeader('Set-Cookie', `cf_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`);
                     auth.logoutRequest(sessionToken, jar.cf_browser, request.headers['x-csrf-token']);
                     send(response, 200, {
                         ...provenance, loggedOut: true
@@ -189,14 +191,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
     server.maxHeadersCount = 40;
     return server;
 }
-function integrationHTML(html: string, scope: string): string {
+function integrationHTML(html: string, scope: string, automatic: boolean): string {
     if (!/^[a-f0-9]{64}$/.test(scope)) throw new Error('invalid_integration_scope');
-    return html.replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}">`)
+    return html.replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}" data-automatic-dispatch="${automatic}">`)
         .replace('Fictional, local Couvre-feu parent-control prototype.', 'Private one-device Couvre-feu router integration.')
         .replace('Couvre-feu · synthetic demo', 'Couvre-feu · private router integration')
-        .replace('<strong>Synthetic demo</strong><span>Fictional people · fake router · target compatibility unverified</span>', '<strong>Private router integration</strong><span>One test device · operator approval required · packet behavior unverified</span>')
+        .replace('<strong>Synthetic demo</strong><span>Fictional people · fake router · target compatibility unverified</span>', `<strong>Private router integration</strong><span>One test device · ${automatic ? 'owner-enabled automatic dispatch' : 'operator approval required'} · packet behavior unverified</span>`)
         .replace('Local prototype / 002', 'Private one-device pilot')
-        .replace('This demo changes a fake router. It does not control a household connection.', 'Requests wait for an operator-approved router invocation. Router observations and packet measurements are separate.')
+        .replace('This demo changes a fake router. It does not control a household connection.', automatic ? 'Authenticated requests dispatch automatically while the owner authorization is active. Unknown outcomes remain blocked for review.' : 'Requests wait for an operator-approved router invocation. Router observations and packet measurements are separate.')
         .replace('Sign in to the fictional account bound to your passkey.', 'Sign in to the private account bound to your passkey.')
         .replace('Use the token from the local demo bootstrap. It already identifies your fictional account.', 'Use the token from the private integration bootstrap. It fixes your account and permissions.')
         .replace('Create a demo passkey', 'Create a passkey')

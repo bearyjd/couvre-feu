@@ -33,7 +33,7 @@ export interface OperationDTO extends Provenance {
     confirmedAt: number | null;
     currentHealthy?: boolean;
     accepted?: boolean;
-    dispatch?: 'awaiting_operator_dispatch' | 'consumed' | 'uncertain' | 'resolved';
+    dispatch?: 'awaiting_operator_dispatch' | 'awaiting_automatic_dispatch' | 'consumed' | 'uncertain' | 'resolved';
 }
 export interface PersonDTO {
     id: string;
