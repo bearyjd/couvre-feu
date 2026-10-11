@@ -9,7 +9,7 @@ safe_paths
 # Final cleanup has its own private completion record: removing the journal
 # can be interrupted without losing the fact that every restoration succeeded.
 finish_cleanup() {
-    valid_marker "$DONE" || fail 'unsafe recovery completion record'
+    valid_marker "$DONE" 2 || fail 'unsafe/legacy recovery completion record; preserved'
     if [ -e "$BACKUP" ]; then
         journal_preflight cleanup
         for entry in "$BACKUP"/* "$BACKUP"/.[!.]* "$BACKUP"/..?*; do
@@ -71,9 +71,10 @@ if [ ! -f "$BACKUP/restored" ]; then
     for rel in $FILES; do
         k=$(key "$rel")
         before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
-        if [ "$(signature "$ROOT/$rel")" != "$before" ]; then
+        original_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")
+        if [ "$(signature "$ROOT/$rel")" != "$before" ] || ! exact_mtime "$ROOT/$rel" "$original_mtime"; then
             if [ "$before" = absent ]; then rm -f "$ROOT/$rel"
-            else atomic_copy "$BACKUP/$k.original" "$ROOT/$rel"; fi
+            else atomic_copy "$BACKUP/$k.original" "$ROOT/$rel" "$original_mtime"; fi
         fi
         # Validated abandoned install rename sources are installation owned.
         if [ -e "$ROOT/$rel.couvrefeu-tmp" ]; then rm -f "$ROOT/$rel.couvrefeu-tmp"; fi
@@ -92,8 +93,18 @@ if [ ! -f "$BACKUP/restored" ]; then
             fi
         else chmod "$mode" "$ROOT/$rel"; fi
     done
-    phase restored
 fi
+# Do not retire the journal on a copy tool success alone. Every original
+# must still match exact bytes, mode, owner/group, timestamp or absence.
+for rel in $FILES; do
+    k=$(key "$rel")
+    before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
+    original_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")
+    if ! { [ "$(signature "$ROOT/$rel")" = "$before" ] && exact_mtime "$ROOT/$rel" "$original_mtime"; }; then
+        fail "exact restoration incomplete: $rel; journal retained"
+    fi
+done
+[ -f "$BACKUP/restored" ] || phase restored 2
 mv "$BACKUP/restored" "$DONE"
 finish_cleanup
 printf '%s\n' 'Original files restored; Couvre-feu installation removed.'

@@ -91,7 +91,7 @@ fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
 else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
 cleanup() {
-    for file in cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron; do rm -f "$STAGE/$file"; done
+    for file in restore-probe cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron; do rm -f "$STAGE/$file"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
@@ -187,6 +187,19 @@ if [ ! -e "$BACKUP" ]; then
     # Validate the native UCI configuration from the staging directory.
     mkdir "$STAGE/.delta"
     backend uci -c "$STAGE" -t "$STAGE/.delta" show firewall >/dev/null || fail 'staged UCI firewall validation failed'
+    # Test the actual originals with the target copy implementation before any
+    # managed path changes. BusyBox cp -p may truncate fractional timestamps;
+    # integer originals remain supported, fractional originals then refuse.
+    for rel in $FILES; do
+        original_mtime=$(mtime "$ROOT/$rel") || fail "precise original mtime unavailable: $rel"
+        if [ "$original_mtime" != absent ]; then
+            cp -p "$ROOT/$rel" "$STAGE/restore-probe"
+            if ! { [ "$(signature "$ROOT/$rel")" = "$(signature "$STAGE/restore-probe")" ] && exact_mtime "$STAGE/restore-probe" "$original_mtime"; }; then
+                fail "cannot preserve exact original metadata/mtime: $rel; no installation made"
+            fi
+            rm -f "$STAGE/restore-probe"
+        fi
+    done
     # Capture directory modes before creating anything in managed paths.
     for rel in $DIRS; do
         k=$(key "$rel")
@@ -199,6 +212,7 @@ if [ ! -e "$BACKUP" ]; then
     for rel in $FILES; do
         k=$(key "$rel")
         signature "$ROOT/$rel" > "$BACKUP/$k.before"
+        mtime "$ROOT/$rel" > "$BACKUP/$k.mtime" || fail "precise original mtime unavailable: $rel"
         if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.original"; fi
         case "$rel" in
             usr/lib/couvrefeu/core.sh) staged=lib/core.sh;;

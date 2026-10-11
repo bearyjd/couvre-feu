@@ -116,6 +116,33 @@ signature() {
         printf '%s\n' absent
     fi
 }
+# Numeric epoch plus the full fractional mtime; locale/time zone text is not
+# stored. A stat implementation without nanosecond reporting cannot prove
+# exact restoration and must refuse before creating an installation journal.
+mtime() {
+    if [ ! -e "$1" ]; then printf '%s\n' absent; return; fi
+    mtime_output=$(stat -c '%Y %y' "$1") || return 1
+    printf '%s\n' "$mtime_output" | awk '
+        NF==4 && $1 ~ /^-?[0-9]+$/ {
+            n=split($3,t,".")
+            if(n==2 && length(t[2])==9 && t[2] !~ /[^0-9]/) {
+                print $1 ":" t[2]; good=1
+            }
+        }
+        END {exit !good || NR!=1}
+    '
+}
+valid_mtime_record() {
+    awk -F: '
+        $0=="absent" {good=1; next}
+        NF==2 && $1 ~ /^-?[0-9]+$/ && length($2)==9 && $2 !~ /[^0-9]/ {good=1}
+        END {exit !good || NR!=1}
+    ' "$1"
+}
+exact_mtime() {
+    observed_mtime=$(mtime "$1") || fail "precise mtime unavailable: $1"
+    [ "$observed_mtime" = "$2" ]
+}
 key() { printf '%s' "$1" | sed 's|/|_|g'; }
 
 valid_protection() {
@@ -165,8 +192,8 @@ journal_preflight() {
     record_entries='ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next'
     for rel in $FILES; do
         k=$(key "$rel")
-        allowed_entries="$allowed_entries $k.before $k.after $k.original $k.staged"
-        record_entries="$record_entries $k.before $k.after"
+        allowed_entries="$allowed_entries $k.before $k.after $k.original $k.staged $k.mtime"
+        record_entries="$record_entries $k.before $k.after $k.mtime"
     done
     for rel in $DIRS; do
         k=$(key "$rel")
@@ -188,7 +215,9 @@ journal_preflight() {
     done
     for marker in ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next; do
         if [ -e "$BACKUP/$marker" ]; then
-            valid_marker "$BACKUP/$marker" || fail "invalid transaction marker: $marker"
+            marker_version=1
+            case "$marker" in restored|restored.next) marker_version=2;; esac
+            valid_marker "$BACKUP/$marker" "$marker_version" || fail "invalid transaction marker: $marker"
         fi
     done
     [ "${1:-}" != cleanup ] || return 0
@@ -214,7 +243,14 @@ preflight() {
             fail "missing manifest: $rel"
         fi
         if ! valid_signature_record "$BACKUP/$k.before" 1 || ! valid_signature_record "$BACKUP/$k.after" 0; then fail "invalid signature record: $rel"; fi
+        if ! valid_mtime_record "$BACKUP/$k.mtime"; then fail "missing/invalid original mtime record: $rel"; fi
         before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
+        original_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")
+        if [ "$before" = absent ]; then
+            [ "$original_mtime" = absent ] || fail "invalid absent mtime record: $rel"
+        else
+            [ "$original_mtime" != absent ] || fail "missing original mtime: $rel"
+        fi
         after=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.after")
         current=$(signature "$ROOT/$rel")
         tx_old='' tx_new=''
@@ -242,6 +278,7 @@ preflight() {
         fi
         if [ "$before" != absent ]; then
             [ "$(signature "$BACKUP/$k.original")" = "$before" ] || fail "corrupt original backup: $rel"
+            exact_mtime "$BACKUP/$k.original" "$original_mtime" || fail "corrupt original backup mtime: $rel"
         fi
         owned_temp "$ROOT/$rel" || fail "temporary path collision: $ROOT/$rel.couvrefeu-tmp"
         staged_sig=$(signature "$BACKUP/$k.staged")
@@ -251,10 +288,10 @@ preflight() {
 
 valid_marker() {
     [ -f "$1" ] && [ ! -L "$1" ] && [ "$(metadata "$1")" = "600:$(id -u):$(id -g)" ] &&
-        [ "$(stat -c %s "$1")" = 2 ] && [ "$(awk 'NR==1 {print}' "$1")" = 1 ]
+        [ "$(stat -c %s "$1")" = 2 ] && [ "$(awk 'NR==1 {print}' "$1")" = "${2:-1}" ]
 }
 phase() {
-    printf '%s\n' 1 > "$BACKUP/$1.next"
+    printf '%s\n' "${2:-1}" > "$BACKUP/$1.next"
     mv -f "$BACKUP/$1.next" "$BACKUP/$1"
 }
 # A leftover rename source is owned only when exact bytes AND metadata match
@@ -282,16 +319,22 @@ owned_temp() (
 )
 # Rename in the same directory; do not write through existing files.
 atomic_copy() (
-    src=$1 dst=$2 tmp=$2.couvrefeu-tmp
+    src=$1 dst=$2 tmp=$2.couvrefeu-tmp expected_mtime=${3:-}
     if [ -e "$tmp" ] || [ -L "$tmp" ]; then
         owned_temp "$dst" || fail "temporary path collision: $tmp"
-        if [ "$(signature "$tmp")" = "$(signature "$src")" ]; then
+        if [ "$(signature "$tmp")" = "$(signature "$src")" ] &&
+            { [ -z "$expected_mtime" ] || exact_mtime "$tmp" "$expected_mtime"; }; then
             mv -f "$tmp" "$dst"
             exit 0
         fi
         rm -f "$tmp"
     fi
     cp -p "$src" "$tmp"
+    if [ -n "$expected_mtime" ]; then
+        if ! { [ "$(signature "$tmp")" = "$(signature "$src")" ] && exact_mtime "$tmp" "$expected_mtime"; }; then
+            fail "exact original copy failed: $dst; journal retained"
+        fi
+    fi
     mv -f "$tmp" "$dst"
 )
 
