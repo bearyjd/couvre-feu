@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,80 @@ REPO = Path(__file__).resolve().parents[2]
 PROTECTED = "02:00:00:00:00:aa"
 KID = "02:00:00:00:00:01"
 OTHER_KID = "02:00:00:00:00:02"
+_changing_process_groups = 0
+_pending_lane_shutdown = False
+
+
+def _interrupt_lane(signum, frame):
+    # unittest rethrows KeyboardInterrupt, letting owned process finally blocks run.
+    global _pending_lane_shutdown
+    if _changing_process_groups:
+        _pending_lane_shutdown = True
+        return
+    raise KeyboardInterrupt("fixture lane shutdown")
+
+
+if os.environ.get("CF_TEST_LANE") == "1":
+    signal.signal(signal.SIGTERM, _interrupt_lane)
+
+
+def _terminate_owned_process(process):
+    # The owner may already have exited while a descendant still owns the group.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        return process.communicate(timeout=5)
+    except subprocess.TimeoutExpired as error:
+        # Escaped sessions are outside this group's guarantee; never hang draining.
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        process.wait(timeout=5)
+        return error.stdout, error.stderr
+
+
+def run_owned_process(command, *, timeout, input=None, interrupt_on_timeout=False, **kwargs):
+    """Bound work, terminate the owned group, and reap its owner on every exit."""
+    global _changing_process_groups
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    process = None
+    failure = None
+    try:
+        _changing_process_groups += 1
+        try:
+            process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        finally:
+            _changing_process_groups -= 1
+        if _pending_lane_shutdown:
+            raise KeyboardInterrupt("fixture lane shutdown")
+        stdout, stderr = process.communicate(input, timeout=timeout)
+    except BaseException as error:
+        failure = error
+        if process is not None and isinstance(error, subprocess.TimeoutExpired) and interrupt_on_timeout:
+            # Nested fixture sessions require their responsive Python owner to unwind.
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
+    finally:
+        if process is not None:
+            _changing_process_groups += 1
+            try:
+                captured_stdout, captured_stderr = _terminate_owned_process(process)
+                if isinstance(failure, subprocess.TimeoutExpired):
+                    # Match subprocess's bytes convention while retaining drained diagnostics.
+                    failure.stdout = captured_stdout.encode(process.encoding, process.errors or "strict") if isinstance(captured_stdout, str) else captured_stdout
+                    failure.stderr = captured_stderr.encode(process.encoding, process.errors or "strict") if isinstance(captured_stderr, str) else captured_stderr
+            finally:
+                _changing_process_groups -= 1
+        if _pending_lane_shutdown:
+            raise KeyboardInterrupt("fixture lane shutdown")
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def policy(revision=1):
@@ -97,9 +172,9 @@ class RouterFixture:
     def run(self, *args, document=None, raw=None, timeout=60, env=None):
         if document is not None:
             raw = json.dumps(document, separators=(",", ":"))
-        return subprocess.run(self.shell + [str(REPO / "router/cfctl"), *args],
-                              env=self.env if env is None else env, input=raw,
-                              capture_output=True, text=True, timeout=timeout)
+        return run_owned_process(self.shell + [str(REPO / "router/cfctl"), *args],
+                                 env=self.env if env is None else env, input=raw,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
 
     def slot(self):
         marker = self.root / "etc/couvrefeu/runtime/firewall.owned"
