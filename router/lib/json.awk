@@ -102,7 +102,7 @@ function canon6(s,    a,b,n,i,j,k,t,m,beg,len,out) {
 }
 function clock(p,    s,h,m) {s=text(p);if(s!~/^[0-9][0-9]:[0-9][0-9]$/)bad("clock format");h=substr(s,1,2)+0;m=substr(s,4,2)+0;if(h>23||m>59)bad("clock range");return s}
 function validate(root,    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s,sep) {
-    object(root,"version revision people pauses schedules doh","version revision people pauses schedules")
+    object(root,"version revision people pauses allowances schedules doh","version revision people pauses schedules")
     if(integer(root "/version",1)!=1)bad("version")
     rev=integer(root "/revision",2147483647)
     array(root "/people",64)
@@ -115,6 +115,8 @@ function validate(root,    i,j,p,q,id,m,sid,days,d,n,a,start,stop,u,s,sep) {
     }
     array(root "/pauses",64)
     for(i=0;i<count[root "/pauses"];i++) {p=root "/pauses/" i;object(p,"person until","person until");id=ident(p "/person");if(!person[id]||paused[id]++)bad("undefined/duplicate pause");u=integer(p "/until",2147483647);out[++outn]="A\t" id "\t" u}
+    # Optional allowances: one per known person, strictly positive bounded epoch. Router time horizon is checked at admission.
+    if(seen[root "/allowances"]) {array(root "/allowances",64);for(i=0;i<count[root "/allowances"];i++) {p=root "/allowances/" i;object(p,"person until","person until");id=ident(p "/person");if(!person[id]||allowed[id]++)bad("undefined/duplicate allowance");u=integer(p "/until",2147483647);if(u+0<1)bad("allowance until");out[++outn]="U\t" id "\t" u}}
     array(root "/schedules",256)
     for(i=0;i<count[root "/schedules"];i++) {
         p=root "/schedules/" i;object(p,"person id weekdays start stop","person id weekdays start stop");id=ident(p "/person");sid=ident(p "/id")

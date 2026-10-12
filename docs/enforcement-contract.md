@@ -12,7 +12,8 @@ Status fields:
 |---|---|
 | `ok` | Current observation agrees with accepted policy and runtime confirmation |
 | `desiredRevision`, `confirmedRevision` | Durable desired revision and runtime-confirmed revision; confirmation can be null |
-| `desiredPauses`, `effectivePauses` | Stored pause records versus unexpired manual pauses |
+| `desiredPauses`, `effectivePauses` | Stored pause records versus unexpired manual pauses (a pause stays effective while an allowance overrides it) |
+| `desiredAllowances`, `effectiveAllowances` | Stored allowance records versus honored allowances, with `until` and `remaining` seconds from the router expiry epoch |
 | `observed.kids`, `observed.paused` | Actual MAC set observations |
 | `drift`, `errors` | Mismatch, interrupted application, busy transaction or other uncertainty |
 | `capabilities.ipv6`, `.conntrack`, `.nativeKernelConfirmed` | Backend observations; no guarantee of end-to-end packet acceptance |
@@ -23,7 +24,7 @@ A successful dependency probe or native-rule witness cannot establish the five-s
 
 ## Desired JSON
 
-Required top-level fields are `version:1`, integer `revision`, `people`, `pauses`, `schedules`; optional `doh` requires both address arrays when present. Unknown/duplicate keys, invalid values and conflicting/shared MAC assignment are rejected. The [README](../README.md) provides a fictional example.
+Required top-level fields are `version:1`, integer `revision`, `people`, `pauses`, `schedules`; optional `allowances` is an array; optional `doh` requires both address arrays when present. Unknown/duplicate keys, invalid values and conflicting/shared MAC assignment are rejected. The [README](../README.md) provides a fictional example.
 
 | Entity | Fields and bounds |
 |---|---|
@@ -31,6 +32,7 @@ Required top-level fields are `version:1`, integer `revision`, `people`, `pauses
 | IDs | Lowercase ASCII letter first, then lowercase letters/digits/underscore; at most 32 characters |
 | MACs | Canonical lowercase colon-separated nonzero unicast addresses, unique across all people; empty person device list permitted |
 | Pauses | `person`, `until`; one per defined person, at most 64; 0 indefinite, otherwise absolute epoch |
+| Allowances | `person`, `until`; one per defined person, at most 64; `until` is a positive absolute epoch (1–2147483647). A newly staged allowance that has not expired must end at most 14400 s after router time |
 | Schedules | `person`, `id`, `weekdays`, `start`, `stop`; defined person, unique person/schedule ID, at most 256 input schedules |
 | Weekdays / clocks | Unique nonempty subset of Mon–Sun; `HH:MM` in 00:00–23:59; equal start/stop rejected |
 | Expanded windows | At most 256 total per-device native windows after cross-midnight expansion; input count alone is insufficient |
@@ -39,11 +41,22 @@ Required top-level fields are `version:1`, integer `revision`, `people`, `pauses
 
 The shipped strict POSIX awk parser accepts a bounded ASCII subset: strings/keys must contain no escapes, Unicode or control characters. Input is limited to 65536 bytes, depth 12, 8192 nodes and 128 characters/string. Sync stages and validates stdin before acquiring the mutation lock, using a ten-second read deadline (`timeout 10 dd ...`). A callable `/usr/bin/timeout` or `/bin/timeout` is a new required dependency; its availability and behavior on the actual router were not established by the spike. The explicit fixture hook `CF_TEST_TIMEOUT="busybox timeout"` exercises genuine BusyBox timeout when available; production uses only the trusted fixed paths. Host/CI timeout behavior cannot establish target compatibility. This deliberately excludes valid general-purpose JSON encodings; future clients must emit this subset, not assume arbitrary JSON serialization is compatible. Actual target ash/awk runtime remains a gate.
 
-Changed policy needs a newer revision; identical normalized same-revision sync is idempotent, and conflicting/stale revisions fail. Pause/resume advance the revision. Resume removes only manual pause; an active schedule still blocks. No bonus or Allow-until exists.
+Changed policy needs a newer revision; identical normalized same-revision sync is idempotent, and conflicting/stale revisions fail. Pause/resume advance the revision. Resume removes only manual pause; an active schedule still blocks. The router-local allowance below is the only temporary unblocking mechanism.
+
+## Allowances
+
+`"allowances":[{"person":"<id>","until":<epoch>}]` is optional. Without it, the state, JSON and digests are byte-identical to earlier releases.
+
+- **Semantics.** The allowance is honored while router expiry time is before `until`. During that time the person's pauses (indefinite or timed) and schedules are removed from the enforcement view: the paused set, owned `cf2_*` schedule rules and native `cf_sched_*` sections. They are not removed from policy. The person stays in `cf_kids`, so DNS redirection, the DoT/DoQ/DoH blocks and the LAN DNS input exception still apply exactly as for any unblocked child.
+- **Expiry.** Expiry works like timed-pause expiry. The minute cron `cfctl expire` sees the changed effective digest and reconstructs through the same transition path, without the service, within normal cron tolerance (about one minute). Expired allowance records are retained, like expired pauses. Expiry therefore never changes revision or policy digest, CAS bases stay valid, and an identical same-revision replay is idempotent and cannot resurrect the allowance. The highwater expiry epoch prevents a backward clock jump from re-honoring an expired allowance.
+- **Admission.** Admission uses the json.awk static bounds (unique known person, `until` ≥ 1) and, for local `sync` and `rpc-sync`, the router-time horizon: an unexpired allowance more than 14400 s ahead fails with `allowance_beyond_horizon`. Already-expired allowances are accepted and stay inert.
+- **Fail-safe.** An allowance is honored only when the epoch is a valid post-2020 clock and `now < until <= now + 14400`. Otherwise it is ignored and the person is blocked. With an invalid clock, mutating commands refuse and status reports `effectiveAllowances: []` with `ok:false`.
+- **Precedence.** At the router, an active allowance wins over pauses and schedules, including a later `cfctl pause`. The service decides precedence: for example, a new parent pause should clear the allowance in the same policy revision.
+- **Gap.** If the clock becomes invalid or cron stops after an allowance has been applied, no command can rebuild, and the last applied kernel state keeps the person unblocked until a valid-clock `expire` or `apply-fw`. Kernel-side `--datestop` expiry is not implemented.
 
 ## Durable state and safety
 
-One atomically replaced normalized TSV file, `/etc/couvrefeu/state`, stores version/revision, person-to-MAC ownership, manual pause metadata, schedules and DoH addresses. This replaces the PRP's raw MAC/expiry format. Record kinds are `V`, `R`, `P`, `A`, `S`, `D4`, `D6`; clients use JSON rather than editing TSV. Expired pause metadata can remain for replay equality, while effective membership excludes it.
+One atomically replaced normalized TSV file, `/etc/couvrefeu/state`, stores version/revision, person-to-MAC ownership, manual pause metadata, schedules and DoH addresses. This replaces the PRP's raw MAC/expiry format. Record kinds are `V`, `R`, `P`, `A`, `U` (allowance), `S`, `D4`, `D6`; clients use JSON rather than editing TSV. Expired pause metadata can remain for replay equality, while effective membership excludes it.
 
 Persisted protection, serialized mutation locks, confirmation/error records, firewall snapshots/intents and expiry high-water are auxiliary runtime/recovery data. Clock values before 2020 are rejected; expiry uses the greater of current clock and persisted high-water to resist resurrection after backward jumps. Minute cron re-evaluates policy without a service; clock/cron health and target boundary latency remain acceptance conditions. BusyBox crond (1.33) rescans `/etc/crontabs` only when the directory's whole-second mtime changes, on `cron.update`, or hourly, so a temporary crontab and its rename in one second can stay unseen for up to an hour. After every crontab change install and uninstall therefore run `/etc/init.d/cron reload`. Under the OpenWrt 21.02 procd script this registers each crontab's md5: it restarts crond only when a crontab changed, starts a crond that is not running (the script never starts crond while `/etc/crontabs` is empty), and stops crond when `/etc/crontabs` is empty again. Its exit status is not evidence, and a non-procd script answers unknown actions with `help` (exit 0), so install proves the instance through procd itself (`ubus call service list '{"name":"cron"}'` with `jsonfilter -e '@.cron.instances[*].running'` reporting `true`) and otherwise fails without reporting success. Before the first protected write, install refuses with `no installation made` unless `/etc/init.d/cron` is an executable procd script (`USE_PROCD=1`) and `/etc/init.d/cron enabled` succeeds: a crond that does not start at boot would stop minute expiry after a reboot. The init script, `ubus` and `jsonfilter` run under `env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C`. Uninstall signals after verified exact restoration and only warns on failure. Uninstall's reload compares the restored crontabs against the md5 procd recorded at its last reload, not against the table crond actually loaded. If they diverge (for example, an install whose reload failed after crond's own mtime rescan had already loaded the installed table), restoring bytes that match procd's record leaves crond running with the stale `cfctl expire` entry until its next rescan, at most an hour. The impact is low: uninstall has already removed `/usr/sbin/cfctl`, so that entry fails to execute and changes nothing. `cron.update` is not used: it is consumed only by a running crond, and a left-over file would be an unjournaled entry in a managed directory.
 

@@ -109,7 +109,7 @@ cf_rpc_main() {
     CF_OLD_POLICY=$CF_POLICY
     CF_OLD_DIGEST=$CF_DIGEST
     CF_POLICY=$CF_STAGED_POLICY
-    cf_policy_safe && cf_ssh_guard && cf_preflight || { cf_rpc_response;return 1; }
+    cf_allowance_admissible && cf_policy_safe && cf_ssh_guard && cf_preflight || { cf_rpc_response;return 1; }
     platform_deadline_check
     cf_transition_prepare || { cf_error_record;cf_rpc_response;return 1; }
     CF_REVISION=$((CF_BASE_REVISION + 1));CF_DIGEST=$CF_NEXT_DIGEST;CF_CURRENT=$CF_REQUEST_ID

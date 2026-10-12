@@ -173,6 +173,63 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(self.f.durable_snapshot(), before)
         self.assertEqual(len(self.f.mutation_calls()), count)
 
+    def allowance_policy(self, until, revision=1):
+        p = scoped_policy(revision)
+        p['pauses'] = [{'person': 'alice', 'until': 0}]
+        p['allowances'] = [{'person': 'alice', 'until': until}]
+        return p
+
+    def test_rpc_allowance_is_reported_and_expires_locally_with_idempotent_replay(self):
+        self.assertNotIn('allowances', self.base['acceptedPolicy'])
+        self.assertEqual(self.base['status']['desiredAllowances'], [])
+        self.assertEqual(self.base['status']['effectiveAllowances'], [])
+        now = int(self.f.env['CF_NOW'])
+        request = self.request(document=self.allowance_policy(now + 60))
+        result = self.accept(request)
+        self.assertTrue(result['receipt']['current'])
+        self.assertEqual(result['acceptedPolicy']['allowances'], [{'person': 'alice', 'until': now + 60}])
+        self.assertEqual(result['status']['effectiveAllowances'], [{'person': 'alice', 'until': now + 60, 'remaining': 60}])
+        self.assertEqual(result['status']['effectivePauses'], [{'person': 'alice', 'until': 0}])
+        self.assertEqual(result['status']['observed']['paused'], [])
+        # The service is absent: only the minute cron runs after the deadline.
+        self.f.env['CF_NOW'] = str(now + 61)
+        expired = self.f.run('expire')
+        self.assertEqual(expired.returncode, 0, expired.stdout + expired.stderr)
+        observed = self.observe()
+        self.assertEqual(observed['policyDigest'], result['policyDigest'])
+        self.assertEqual(observed['status']['effectiveAllowances'], [])
+        self.assertEqual(observed['status']['observed']['paused'], [KID])
+        before = self.f.durable_snapshot()
+        count = len(self.f.mutation_calls())
+        replay = self.accept(request)
+        self.assertEqual(replay['receipt'], result['receipt'])
+        self.assertEqual(replay['status']['observed']['paused'], [KID])
+        self.assertEqual(self.f.durable_snapshot(), before)
+        self.assertEqual(len(self.f.mutation_calls()), count)
+
+    def test_rpc_allowance_beyond_router_horizon_or_unknown_person_rejected(self):
+        now = int(self.f.env['CF_NOW'])
+        self.reject(self.request(document=self.allowance_policy(now + 14401)), error='allowance_beyond_horizon')
+        p = scoped_policy()
+        p['allowances'] = [{'person': 'bob', 'until': now + 60}]
+        self.reject(self.request(document=p), error='invalid_policy')
+
+    def test_allowance_does_not_affect_exact_uninstall(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        original = self.f.durable_snapshot()
+        firewall = self.f.root / 'etc/config/firewall'
+        firewall_original = (firewall.read_bytes(), firewall.stat().st_mode & 0o777)
+        self.install(env=dict(self.f.env, CF_TEST_INSTALL_KERNEL='1'))
+        observed = self.observe()
+        document = self.allowance_policy(int(self.f.env['CF_NOW']) + 60, observed['acceptedPolicy']['revision'] + 1)
+        document['schedules'] = [{'person': 'alice', 'id': 'night', 'weekdays': ['Mon'], 'start': '22:00', 'stop': '06:30'}]
+        accepted = self.accept(self.request(base=observed, document=document))
+        self.assertTrue(accepted['status']['ok'], accepted)
+        result = self.script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.f.durable_snapshot(), original)
+        self.assertEqual((firewall.read_bytes(), firewall.stat().st_mode & 0o777), firewall_original)
+
     def test_apply_failure_retains_receipt_and_replay_never_recovers(self):
         request = self.request()
         child = self.stopped(request, 'after_rename')

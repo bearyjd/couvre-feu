@@ -75,6 +75,25 @@ cf_clock() {
         [ "$cf_highwater" -le "$CF_EXPIRY_NOW" ] || CF_EXPIRY_NOW=$cf_highwater
     fi
 }
+# Allowances: router-local temporary unblocking. Honored only with a valid
+# (post-2020, highwater-monotonic) clock and only within the admission horizon,
+# so an uncertain clock or out-of-bound record blocks (fails closed).
+CF_ALLOWANCE_HORIZON=14400
+cf_active_allowances() {
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" -v horizon="$CF_ALLOWANCE_HORIZON" '
+    BEGIN{valid=now~/^[1-9][0-9]*$/&&length(now)<=10&&now+0>=1577836800}
+    valid&&$1=="U"&&NF==3&&$3~/^[1-9][0-9]*$/&&length($3)<=10&&$3+0>now+0&&$3+0<=now+horizon{print $2 "\t" $3 "\t" ($3-now)}'
+}
+# Enforcement view of the policy: an active allowance overrides (never deletes)
+# the person's pauses and schedules, so they re-apply when it expires.
+cf_enforced_policy() {
+    cf_ep_allowed=$(cf_active_allowances | awk -F '\t' '{print $1}')
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v allowed="$cf_ep_allowed" 'BEGIN{n=split(allowed,a,"\n");for(i=1;i<=n;i++)if(a[i]!="")skip[a[i]]=1}($1=="A"||$1=="S")&&skip[$2]{next}{print}'
+}
+cf_allowance_admissible() {
+    # Newly staged policy only; retained expired allowances stay inert for replay equality.
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" -v horizon="$CF_ALLOWANCE_HORIZON" '$1=="U"&&$3+0>now+0&&$3+0>now+horizon{exit 1}' || { cf_fail allowance_beyond_horizon;return 1; }
+}
 cf_protected_valid() {
     cf_safe_file "$CF_PROTECTED" && [ -s "$CF_PROTECTED" ] || { cf_fail unsafe_protected_file; return 1; }
     awk 'length($0)!=17 {exit 1} {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00" || seen[$0]++)exit 1}' "$CF_PROTECTED" || { cf_fail invalid_protected_mac; return 1; }
@@ -88,11 +107,12 @@ cf_state_json() {
     $1=="R"{if(NF!=2||r++)bad();revision=$2;next}
     $1=="P"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[-0-9a-f:]+$/)bad();person[$2]=1;if($3!="-"){mac[$2]=mac[$2] (mac[$2]==""?"":",") "\"" $3 "\""}next}
     $1=="A"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[0-9]+$/)bad();sep="";if(pauses!="")sep=",";pauses=pauses sep "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
+    $1=="U"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[1-9][0-9]*$/)bad();sep="";if(allow!="")sep=",";allow=allow sep "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
     $1=="S"{if(NF!=6||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[a-z][a-z0-9_]*$/||$4!~/^[A-Za-z,]+$/||$5!~/^[0-9:]+$/||$6!~/^[0-9:]+$/)bad();n=split($4,a,",");days="";for(i=1;i<=n;i++){sep="";if(i!=1)sep=",";days=days sep "\"" a[i] "\""}sep="";if(sched!="")sep=",";sched=sched sep "{\"person\":\"" $2 "\",\"id\":\"" $3 "\",\"weekdays\":[" days "],\"start\":\"" $5 "\",\"stop\":\"" $6 "\"}";next}
     $1=="D4"{if(NF!=2||$2!~/^[0-9.]+$/)bad();sep="";if(d4!="")sep=",";d4=d4 sep "\"" $2 "\"";next}
     $1=="D6"{if(NF!=2||$2!~/^[0-9a-f:]+$/)bad();sep="";if(d6!="")sep=",";d6=d6 sep "\"" $2 "\"";next}
     {bad()}
-    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person){sep="";if(people!="")sep=",";people=people sep "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}"}print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "],\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
+    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person){sep="";if(people!="")sep=",";people=people sep "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}"}print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "]" (allow==""?"":",\"allowances\":[" allow "]") ",\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
 }
 cf_state_load() {
     cf_safe_file "$CF_STATE" || { cf_fail unsafe_state_file; return 1; }
@@ -392,6 +412,7 @@ cf_sync_read() {
     [ "$cf_new_rev" -ge "$CF_REVISION" ] || { cf_fail stale_revision;return 1; }
     if [ "$cf_new_rev" = "$CF_REVISION" ] && [ "$cf_new" != "$CF_POLICY" ];then cf_fail conflicting_revision;return 1;fi
     CF_POLICY=$cf_new;CF_REVISION=$cf_new_rev
+    cf_allowance_admissible
 }
 cf_check() {
     cf_missing=
@@ -427,7 +448,7 @@ cf_status() {
     CF_REVISION=0; CF_POLICY=; CF_DIGEST=
     cf_control_dirs || cf_ok=false
     cf_state_load || cf_ok=false
-    cf_clock || cf_ok=false
+    cf_clock || { cf_ok=false;CF_EXPIRY_NOW=;unset CF_PREPARED_EPOCH; }
     cf_protected_valid || cf_ok=false
     [ "$cf_ok" = false ] || cf_policy_safe || cf_ok=false
     cf_kids_json='[]';cf_paused_json='[]'
@@ -458,14 +479,16 @@ cf_status() {
     [ -z "$cf_status_error" ] || { CF_ERROR=$cf_status_error;cf_ok=false; }
     cf_desired=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' 'BEGIN{printf "["}$1=="A"{printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
     cf_effective=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" 'BEGIN{printf "["}$1=="A"&&($3==0||$3>now){printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
+    cf_desired_allow=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' 'BEGIN{printf "["}$1=="U"{printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
+    cf_effective_allow=$(cf_active_allowances | awk -F '\t' 'BEGIN{printf "["}{printf "%s{\"person\":\"%s\",\"until\":%s,\"remaining\":%s}",sep,$1,$2,$3;sep=","}END{print "]"}')
     cf_errors='[]'
     if [ -n "$CF_ERROR" ]; then cf_errors=$(printf '%s\n' "$CF_ERROR" | cf_json_strings); fi
-    printf '{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,"nativeKernelConfirmed":%s,"addressCoverageComplete":%s,"routerCompatibilityVerified":false},"errors":%s}\n' "$cf_ok" "$CF_REVISION" "$cf_confirmed" "$cf_desired" "$cf_effective" "$cf_kids_json" "$cf_paused_json" "$cf_drift" "${CF_IPV6_OK:-false}" "${CF_CONNTRACK_OK:-false}" "${CF_NATIVE_OK:-false}" "${CF_ADDRESS_OK:-false}" "$cf_errors"
+    printf '{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,"desiredAllowances":%s,"effectiveAllowances":%s,"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,"nativeKernelConfirmed":%s,"addressCoverageComplete":%s,"routerCompatibilityVerified":false},"errors":%s}\n' "$cf_ok" "$CF_REVISION" "$cf_confirmed" "$cf_desired" "$cf_effective" "$cf_desired_allow" "$cf_effective_allow" "$cf_kids_json" "$cf_paused_json" "$cf_drift" "${CF_IPV6_OK:-false}" "${CF_CONNTRACK_OK:-false}" "${CF_NATIVE_OK:-false}" "${CF_ADDRESS_OK:-false}" "$cf_errors"
     [ "$cf_ok" = true ]
 }
 cf_json_strings() { awk 'BEGIN{printf "["}NF{gsub(/\\/,"\\\\");gsub(/"/,"\\\"");gsub(/[[:cntrl:]]/,"?");printf "%s\"%s\"",sep,$0;sep=","}END{print "]"}'; }
 cf_busy_result() {
-    printf '{"ok":false,"desiredRevision":%s,"confirmedRevision":null,"desiredPauses":[],"effectivePauses":[],"observed":{"kids":[],"paused":[]},"drift":true,"capabilities":{"ipv6":false,"conntrack":false,"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":["%s"]}\n' "${CF_REVISION:-0}" "${CF_ERROR:-locked}"
+    printf '{"ok":false,"desiredRevision":%s,"confirmedRevision":null,"desiredPauses":[],"effectivePauses":[],"desiredAllowances":[],"effectiveAllowances":[],"observed":{"kids":[],"paused":[]},"drift":true,"capabilities":{"ipv6":false,"conntrack":false,"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":["%s"]}\n' "${CF_REVISION:-0}" "${CF_ERROR:-locked}"
 }
 cf_main() {
     platform_deadline_check

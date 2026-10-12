@@ -21,7 +21,7 @@ cf_network() {
     {for(i=1;i<NF;i++)if($i=="inet6"){split($(i+1),a,"/");if(valid(a[1])&&a[1]!="::1"&&a[1]!="::")print a[1]}}' | sort -u)
 }
 cf_schedule_specs() {
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' '
+    cf_enforced_policy | awk -F '\t' '
     function secs(t,a){split(t,a,":");return (a[1]+0)*3600+(a[2]+0)*60}
     function clock(s){return sprintf("%02d:%02d:%02d",int(s/3600),int(s/60)%60,s%60)}
     function rotate(days,a,n,i,j,d,out,mark,sep){n=split(days,a,",");split("Mon Tue Wed Thu Fri Sat Sun",d," ");for(i=1;i<=n;i++)for(j=1;j<=7;j++)if(a[i]==d[j])mark[j%7+1]=1;for(j=1;j<=7;j++)if(mark[j]){sep="";if(out!="")sep=",";out=out sep d[j]}return out}
@@ -73,7 +73,7 @@ cf_policy_plan() {
     done
 }
 cf_effective_macs() {
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" '$1=="P"&&$3!="-"{mac[$2]=mac[$2] " " $3}$1=="A"&&($3==0||$3>now){paused[$2]=1}END{for(p in paused){n=split(mac[p],a," ");for(i=1;i<=n;i++)if(a[i]!="")print a[i]}}' | sort -u
+    cf_enforced_policy | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" '$1=="P"&&$3!="-"{mac[$2]=mac[$2] " " $3}$1=="A"&&($3==0||$3>now){paused[$2]=1}END{for(p in paused){n=split(mac[p],a," ");for(i=1;i<=n;i++)if(a[i]!="")print a[i]}}' | sort -u
 }
 cf_kids() { printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="P"&&$3!="-"{print $3}' | sort -u; }
 cf_desired_set() {

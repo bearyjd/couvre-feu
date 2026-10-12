@@ -90,11 +90,11 @@ These are reference commands for a future approved installation; no live command
 
 | Command | Behavior |
 |---|---|
-| `cfctl status --json` | Desired/confirmed revision, effective pauses, observed sets, drift, capabilities and errors |
+| `cfctl status --json` | Desired/confirmed revision, effective pauses and allowances, observed sets, drift, capabilities and errors |
 | `cfctl pause child` | Indefinite manual pause for all assigned MACs |
 | `cfctl pause child --until 1800000000` | Manual pause ending at an absolute Unix epoch |
 | `cfctl resume child` | Remove manual pause; an active schedule can still block |
-| `cfctl expire` | Router-local expiry and policy reconstruction, normally from minute cron |
+| `cfctl expire` | Router-local pause/allowance expiry and policy reconstruction, normally from minute cron |
 | `cfctl sync` | Read bounded desired JSON from stdin; apply and return observed status |
 | `cfctl rpc-status --json [operation_id]` | Read accepted policy, installation generation, receipt and current runtime witness |
 | `cfctl rpc-sync` | Exact generation/revision/digest CAS envelope from stdin; persist acceptance receipt, then apply |
@@ -126,5 +126,7 @@ Before cutover, a temporary guard for the union of old and new children is attac
 Fixtures record the modeled ruleset after every mutating command and assert the expected blocking at each step, including injected staging and switch failures and changed child sets. They prove ordering in a model, not real-kernel atomicity, concurrent GL tooling, fw3 selective-reload preservation or acceleration behavior on the target. A full firewall restart or reboot removes hooks and tables and remains degraded reconstruction with no continuity claim.
 
 Production activation remains blocked pending explicit design acceptance and actual integration evidence; local fixture passes do not remove this gate.
+
+Allowances (`"allowances":[{"person":"child","until":<epoch>}]`, optional, one per person) temporarily unblock a person: while router time is before `until`, that person's manual/timed pauses and schedules are overridden but not deleted, so they re-apply when the minute cron's `cfctl expire` reconstructs enforcement after the deadline. No service involvement is needed. A new allowance must end within 4 hours (14400 s) of router time. With an invalid clock no allowance is honored. Extra-time and time-request features (PR #22, PR #29) should grant an allowance rather than unpausing and relying on the service to re-pause. Precedence, such as a new parent pause clearing an allowance, is the service's job; at the router an active allowance wins. See the [allowance contract](docs/enforcement-contract.md#allowances).
 
 Timed pauses expire through router cron even if the service is absent; normal cron tolerance is about one minute after expiry, subject to clock/cron health. Firmware file preservation is configured, but actual upgrade compatibility and enforcement recovery are unverified. This package has no production-readiness claim.
