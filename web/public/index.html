@@ -8,6 +8,7 @@
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/schedule-editor.css">
     <title>Couvre-feu · synthetic demo</title>
     <script type="module" src="/app.js"></script>
   </head>
@@ -39,6 +40,7 @@
         <div class="section-heading"><div><p class="eyebrow">Your people</p><h1 id="people-title">Time, with intention.</h1><p id="account-context"></p></div><button id="refresh" class="button secondary" type="button">Refresh status</button></div>
         <div id="connection" class="connection" role="status"></div>
         <div id="people" class="people-list"></div>
+        <section id="schedule-editor" class="schedule-editor" aria-labelledby="schedules-title" hidden></section>
         <section id="operational-alerts" class="alert-panel" aria-labelledby="alerts-title" hidden>
           <h2 id="alerts-title">Recent alerts in this browser</h2>
           <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>

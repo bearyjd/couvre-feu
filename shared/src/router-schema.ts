@@ -77,7 +77,7 @@ export function mac(value: unknown): string {
     }
     return value as string;
 }
-function clock(value: unknown): string {
+export function clock(value: unknown): string {
     if (typeof value !== 'string' || !/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/.test(value)) {
         bad('invalid_clock');
     }

@@ -2,12 +2,14 @@ import { deviceEvidence } from './device-evidence.ts';
 import { operationalAlerts } from './operational-alerts.ts';
 import { randomUUID } from 'node:crypto';
 import { digest } from './auth.ts';
-import type { Actor, OperationDTO, OperationState, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
+import type { Actor, OperationAction, OperationDTO, OperationState, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
 import { provenance } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
 import { integer, normalizePolicy, policyJSON, MAX_INTEGER, healthyConfirmation, scheduleBlocked, effectivePauses } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
+import { applyScheduleChange, parseScheduleChange } from '../../shared/src/schedule-edit.ts';
+import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
 import type { FakeRouter, RouterObservation } from '../../demo-router/src/router.ts';
 import { FICTIONAL_PEOPLE, PROTECTED_MACS } from './fixtures.ts';
 import type { Store } from './db.ts';
@@ -22,7 +24,7 @@ interface OperationRow {
     id: string;
     actor_id: string;
     person_id: string;
-    action: 'pause' | 'resume';
+    action: OperationAction;
     revision: number;
     state: OperationState;
     payload_json: string;
@@ -145,21 +147,54 @@ export class PolicyService {
             this.applyOperation(op);
         }
     }
-    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {
-        status: number;
-        result: OperationResult;
-    } {
-        this.authorize(actor, person);
-        const body = object(input, action === 'pause' ? ['until'] : []), until = action === 'pause' ? integer(body.until) : null;
+    private writeHeaders(precondition: string | undefined, key: string | undefined): [string, string] {
         if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) {
             throw new AppError(400, 'idempotency_key_required');
         }
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) {
             throw new AppError(428, 'revision_precondition_required');
         }
+        return [precondition, key];
+    }
+    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {
+        status: number;
+        result: OperationResult;
+    } {
+        this.authorize(actor, person);
+        const body = object(input, action === 'pause' ? ['until'] : []), until = action === 'pause' ? integer(body.until) : null;
+        const [token, idempotencyKey] = this.writeHeaders(precondition, key);
         const request = JSON.stringify({
-            person, action, until, precondition
+            person, action, until, precondition: token
         });
+        return this.submit(actor, person, action, request, token, idempotencyKey, () => {
+            if (until !== null && until !== 0 && until <= this.now()) {
+                throw new AppError(400, 'pause_expiry_must_be_future');
+            }
+        }, observed => ({
+            pauses: [...observed.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{
+                        person, until: until!
+                    }] : [])]
+        }));
+    }
+    /** Weekly schedule create/edit/delete through the same revision-CAS and durable-intent path as pauses. */
+    scheduleMutate(actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined): {
+        status: number;
+        result: OperationResult;
+    } {
+        this.authorize(actor, person);
+        const change = parseScheduleChange(action, input, scheduleId);
+        const [token, idempotencyKey] = this.writeHeaders(precondition, key);
+        const request = JSON.stringify({
+            person, action, schedule: change.action === 'schedule_delete' ? { id: change.id } : change.window, precondition: token
+        });
+        return this.submit(actor, person, action, request, token, idempotencyKey, () => { }, observed => ({
+            schedules: applyScheduleChange(observed.schedules, person, change)
+        }));
+    }
+    private submit(actor: Actor, person: string, action: OperationAction, request: string, precondition: string, key: string, preflight: () => void, change: (observed: RouterPolicy) => Partial<Pick<RouterPolicy, 'pauses' | 'schedules'>>): {
+        status: number;
+        result: OperationResult;
+    } {
         const prior = this.store.get<OperationRow>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
         if (prior) {
             if (prior.request_json !== request) {
@@ -168,9 +203,7 @@ export class PolicyService {
             this.reconcile();
             return this.result(this.store.get<OperationRow>('SELECT * FROM operations WHERE id=?', prior.id)!);
         }
-        if (until !== null && until !== 0 && until <= this.now()) {
-            throw new AppError(400, 'pause_expiry_must_be_future');
-        }
+        preflight();
         let observation: RouterObservation;
         try {
             observation = this.observe();
@@ -198,9 +231,7 @@ export class PolicyService {
                 throw new AppError(409, 'revision_exhausted');
             }
             const policy: RouterPolicy = normalizePolicy({
-                ...observation.policy, revision, pauses: [...observation.policy.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{
-                            person, until: until!
-                        }] : [])]
+                ...observation.policy, revision, ...change(observation.policy)
             }, PROTECTED_MACS);
             const id = randomUUID(), now = this.now(), payload = policyJSON(policy);
             this.store.run('INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,\'pending\',?,?,?,?,?,?)', id, actor.id, person, action, revision, payload, policyJSON(observation.policy), request, key, now, now);
@@ -237,7 +268,8 @@ export class PolicyService {
                             policy: observation?.policy ?? null, status: observation?.status ?? null, readError: this.lastReadError !== null})
                     })), manualPause: policy.pauses.find(pause => pause.person === p.id) ?? null,
                     effectiveManualPause: effectivePauses(policy, now).find(pause => pause.person === p.id) ?? null, scheduleBlocked: schedule,
-                    scheduleExplanation: schedule ? 'The fictional UTC school-night schedule still blocks access. Resume clears only the manual pause.' : 'No fictional UTC schedule window is active.',
+                    schedules: policy.schedules.filter(s => s.person === p.id).map(({ id, weekdays, start, stop }) => ({ id, weekdays, start, stop })), schedulesEditable: true,
+                    scheduleExplanation: schedule ? 'A fictional UTC schedule window still blocks access. Resume clears only the manual pause.' : 'No fictional UTC schedule window is active.',
                     observationHealth: this.lastReadError ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: this.lastReadError ? 'unknown' : row?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: operation,
                     operationalAlerts: operationalAlerts({source: 'synthetic-policy', now: this.now(), sourceObservedAt: observation?.routerTime ?? null, serviceReceivedAt: null,
                         generationMatches: true, readError: this.lastReadError !== null, healthy, drift: observation?.status.drift === true,

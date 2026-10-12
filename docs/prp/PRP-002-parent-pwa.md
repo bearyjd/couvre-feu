@@ -16,6 +16,8 @@ The UI consumes the shared session, people and operation DTOs. Pause submits an 
 
 Logout, account/scope changes and unauthorized refresh cancel outstanding passkey requests and authentication fetches. Generation guards prevent an old authentication continuation from sending verification after the view was reset. The service independently binds challenges/sessions to a browser episode and cancels that episode on logout; browser cancellation alone does not replace server revocation.
 
+The schedule editor (`web/public/schedule-editor.js`) lists each assigned person's weekly windows and adds, edits or deletes one with the same fresh-status, `If-Match`, idempotency and CSRF discipline as pause. It validates bounds client-side for feedback, previews cross-midnight windows in plain language (for example Mon 22:00 → Tue 06:30), explains overlaps, and treats the server as authoritative. A stale revision cancels the click, reloads the schedules and keeps the draft for a new deliberate save. It is hidden where the installation does not permit schedule edits.
+
 Pending acceptance is shown until the exact operation becomes confirmed. Failed, unknown and conflict states remain distinct; an unknown result does not promise that the action failed or succeeded. Repeated controls are disabled during pending work and whenever status is offline, stale, conflicted or unrefreshed.
 
 ## Offline and shared-browser behavior

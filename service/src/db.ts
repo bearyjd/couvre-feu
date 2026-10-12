@@ -6,7 +6,7 @@ export class Store {
     readonly db: DatabaseSync;
     constructor(path: string, migrationSQL?: string, internalMode?: 'integration') {
         const migrations = migrationSQL === undefined
-            ? ['001.sql', '002.sql'].map(name => {
+            ? (internalMode === 'integration' ? ['001.sql', '002.sql'] : ['001.sql', '002.sql', '003.sql']).map(name => {
                 const sql = readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8');
                 // CAS allocates base+1. An explicitly never-delivered intent cannot reserve that router revision.
                 return internalMode === 'integration' && name === '001.sql' ? sql.replace('revision INTEGER NOT NULL UNIQUE', 'revision INTEGER NOT NULL') : sql;
