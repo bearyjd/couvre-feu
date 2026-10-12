@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Native ash integration fixtures. No root writes, vendor payload or live router.
 
-Vendor adapter fixtures substitute only the pinned payload/attestation boundary,
-inside an independently generated private module. Exact helper behavior remains
-covered by its unchanged 135 cases; these fixtures measure admission call counts,
-serialization and cleanup ordering, not actual platform trust or router latency.
+Vendor adapter fixtures substitute the pinned payload/attestation boundary,
+inside an independently generated private module. Direct native helper fixtures
+also cover bounded comm parsing and credential classification. Other adapter
+fixtures measure admission call counts, serialization and cleanup ordering;
+none establish actual platform trust or router latency.
 """
 import hashlib
 import json
@@ -472,6 +473,85 @@ class VendorAdmissionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"deferred":true', result.stdout)
         self.assertFalse(self.calls.exists())
+
+
+class VendorCommParserTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-vendor-comm-')
+        self.comm = Path(self.tmp.name) / 'comm'
+        self.helper = REPO / 'router/lib/vendor-platform.sh'
+        self.harness = '''set -eu
+fail() { printf 'REFUSE=%s\n' "$1" >&2; exit 2; }
+''' + 'awk() { ' + shlex.quote(SHELL[0]) + ''' awk "$@"; }
+. "$1"
+'''
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def parse(self, value, setup=''):
+        self.comm.write_bytes(value)
+        return subprocess.run(SHELL + ['-c', self.harness + setup + '\nvp_comm "$2"',
+                                       'comm-fixture', str(self.helper), str(self.comm)],
+                              capture_output=True, timeout=10)
+
+    def test_actual_workqueue_descriptions_remain_complete(self):
+        names = ['kworker/1:2-rcu_gp', 'kworker/1:1-events', 'kworker/0:3-events',
+                 'kworker/u4:2-events_power_efficient', 'kworker/0:0-events',
+                 'kworker/1:2H-events_highpri', 'kworker/0:1+events',
+                 'kworker/0:0H-events_highpri', 'kworker/0:1H-events_highpri',
+                 'kworker/u4:1-events_power_efficient', 'kworker/u4:0-events_power_efficient']
+        for name in names:
+            with self.subTest(name=name):
+                result = self.parse((name + '\n').encode())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, (name + '\n').encode())
+
+    def test_linux_proc_name_bound_preserves_complete_records(self):
+        for count in [15, 16, 63]:
+            with self.subTest(count=count):
+                value = b'a' * count + b'\n'
+                result = self.parse(value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, value)
+        for value in [b'a' * 64 + b'\n', b'a' * 66, b'a' + b'\n' * 64]:
+            with self.subTest(value=value):
+                result = self.parse(value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+
+    def test_malformed_names_and_failed_producers_refuse(self):
+        for value in [b'', b'\n', b'two\nrecords\n', b'a\x00b\n', b'a\x01b\n',
+                      b'a\rb\n', b'a\x7fb\n', b'CF008_DD_END=0\n',
+                      b'name\nCF008_READ_END=0\n']:
+            with self.subTest(value=value):
+                result = self.parse(value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+        for setup, producer in [
+                ('timeout() { [ "$1:$2:$3:$4" = "-s:KILL:6:dd" ] || return 99; printf "logd\\n"; return 7; };',
+                 'timeout -s KILL 6 dd if="$2" bs=1 count=65'),
+                ('tr() { cat; return 7; };', 'printf "logd\\n" | tr "\\000" "\\001"')]:
+            with self.subTest(setup=setup):
+                control = subprocess.run(SHELL + ['-c', self.harness + setup + '\n' + producer,
+                                                  'producer-fixture', str(self.helper), str(self.comm)],
+                                         capture_output=True, timeout=10)
+                self.assertEqual(control.returncode, 7)
+                self.assertEqual(control.stdout, b'logd\n')
+                result = self.parse(b'logd\n', setup)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+
+    def test_long_name_does_not_authorize_nonroot_gid_zero(self):
+        command = self.harness + '''
+creds='1 7,7,7,7 0,0,0,0 none 1'
+comm='kworker/u4:2-events_power_efficient'
+vp_classify
+'''
+        result = subprocess.run(SHELL + ['-c', command, 'classification-fixture', str(self.helper)],
+                                capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'REFUSE=unknown_nonroot_gid0', result.stderr)
 
 
 if __name__ == '__main__':

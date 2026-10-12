@@ -110,13 +110,15 @@ vp_credentials() {
         printf "%d %s %s %s %s\n",group0&&nonroot,uids,gids,(groups==""?"none":groups),parent}'
 }
 vp_comm() {
+    # Linux proc_task_name uses a 64-byte buffer for workqueue descriptions;
+    # admit its bounded 63-byte name without changing credential admission.
     # shellcheck disable=SC2016
     vp_read_body "$1" 65 | awk '
     /^CF008_DD_END=/ {if($0!="CF008_DD_END=0" || dd_footer++) bad=1;next}
     /^CF008_READ_END=/ {if($0!="CF008_READ_END=0" || footer++ || dd_footer!=1) bad=1;next}
     {if(footer||dd_footer)bad=1;bytes+=length($0)+1
      if(bytes>65 || $0~/[\001-\010\013-\037\177]/) bad=1
-     if($0!="") {if(records++ || length($0)>15)bad=1;value=$0}}
+     if($0!="") {if(records++ || length($0)>63)bad=1;value=$0}}
     END {if(bad||footer!=1||records!=1)exit 2;print value}'
 }
 vp_starttime() {

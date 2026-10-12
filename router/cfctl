@@ -53,7 +53,7 @@ if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_AD
     cf_bootstrap_refuse
 fi
 unset CF_PLATFORM_ADMITTED CF_PLATFORM_LOCKED CF_PLATFORM_NESTED CF_RELEASE_ID CF_PLATFORM_PROFILE CF_VENDOR_PROFILE CF_RELEASE_MODULES CF_PLATFORM_CALLER_PID CF_PLATFORM_OWNER CF_PLATFORM_LIB vp_profile
-CF_BOOTSTRAP_PIN=49f8e00f1461079bb511391571e8666da3dbedb9b5fb57cdc4748a0d8bf27690
+CF_BOOTSTRAP_PIN=bf93a1d753df799b313693d5c16a7e60740e476388b8ae2008fa0a03eab291fc
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || cf_bootstrap_refuse
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
