@@ -49,6 +49,23 @@ function scheduleLabel(person) {
   const blocked = isReal() && (state.offline || state.localUnknown || age() > FRESH_SECONDS || person.observationHealth !== 'healthy' || !deadlineValid) ? null : person.scheduleBlocked;
   return blocked === null ? 'Schedule state unknown' : blocked ? 'Schedule currently blocks access' : 'No active schedule block';
 }
+function deviceEvidenceLabel(device) {
+  const evidence = device.evidence, source = isReal() ? 'Router' : 'Demo';
+  const expectedSource = isReal() ? 'router-policy' : 'synthetic-policy';
+  const epoch = value => Number.isSafeInteger(value) && value >= 1577836800;
+  const basis = state.scheduleClockBasis, wall = Date.now() / 1000;
+  const elapsed = basis ? Math.max(0, performance.now() / 1000 - basis.started) : 0;
+  const expected = basis ? basis.wall + elapsed : wall;
+  const clockValid = !basis || Math.abs(wall - expected) <= 1;
+  const timestampValid = evidence && evidence.source === expectedSource && epoch(evidence.sourceObservedAt) && evidence.sourceObservedAt <= wall &&
+    (isReal() ? epoch(evidence.serviceReceivedAt) && evidence.serviceReceivedAt <= wall : evidence.serviceReceivedAt === null);
+  const deadline = timestampValid ? Math.min(evidence.sourceObservedAt, evidence.serviceReceivedAt ?? evidence.sourceObservedAt) + FRESH_SECONDS + 1 : null;
+  const known = timestampValid && clockValid && evidence.freshUntil === deadline && ['fresh', 'stale'].includes(evidence.freshness) && ['included', 'not-included'].includes(evidence.enrollment);
+  const historical = state.offline || evidence?.freshness === 'stale' || wall >= deadline || expected >= deadline;
+  const enrollment = known ? `${historical ? 'Last observed' : 'Observed'} enrollment: ${evidence.enrollment === 'included' ? 'included' : 'not included'}${historical ? ' · historical' : ''}` : 'Enrollment unknown';
+  const observed = timestampValid ? ` · observed ${time(evidence.sourceObservedAt)} · ${duration(Math.max(0, Math.floor(Math.max(wall, expected) - evidence.sourceObservedAt)))} ago` : '';
+  return `${source} · ${enrollment}${observed} · Activity unavailable`;
+}
 function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
 function canControl() {
   return Boolean(state.session && state.people && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh && !unsettled() && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now());
@@ -333,7 +350,7 @@ function renderPeople() {
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
       <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
       <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
-      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}</li>`).join('') : '<li>No assigned devices</li>'}</ul>
+      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="Resume ${label} manual pause">Resume</button></div>
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
       <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy ${isReal() ? 'router' : 'synthetic'} confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
@@ -358,6 +375,11 @@ function render() {
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
     renderConnection(); renderPeople(); renderControlState();
+  } else {
+    $('#people').replaceChildren();
+    $('#connection').replaceChildren();
+    $('#account-context').textContent = '';
+    state.renderKey = '';
   }
   renderAuthControls();
 }
@@ -367,6 +389,11 @@ function tick() {
   for (const label of document.querySelectorAll('[data-schedule-state]')) {
     const person = state.people?.people.find(person => person.id === label.dataset.scheduleState);
     if (person) label.textContent = scheduleLabel(person);
+  }
+  for (const label of document.querySelectorAll('[data-device-evidence]')) {
+    const person = state.people?.people.find(person => person.id === label.closest('[data-person]')?.dataset.person);
+    const device = person?.devices.find(device => device.id === label.dataset.deviceEvidence);
+    if (device) label.textContent = deviceEvidenceLabel(device);
   }
   for (const label of document.querySelectorAll('[data-age]')) label.textContent = Number.isFinite(currentAge) ? `${duration(currentAge)} ago` : 'age unavailable';
   for (const label of document.querySelectorAll('[data-until]')) {
