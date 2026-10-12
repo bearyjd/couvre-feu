@@ -21,6 +21,12 @@ export function clearStatusCache() {
   } catch { /* Storage can be unavailable; in-memory status is cleared by the caller. */ }
 }
 
+function cacheEvidence(evidence, source) {
+  if (!evidence || evidence.source !== (source === 'real-router-integration' ? 'router-policy' : 'synthetic-policy')) return undefined;
+  const {source: evidenceSource, sourceObservedAt, serviceReceivedAt, freshUntil, freshness, enrollment} = evidence;
+  return {source: evidenceSource, sourceObservedAt, serviceReceivedAt, freshUntil, freshness, enrollment};
+}
+
 export function saveStatus(session, status) {
   const actor = session.actor;
   if (typeof actor.permissionVersion !== 'string') return;
@@ -33,7 +39,7 @@ export function saveStatus(session, status) {
     // Explicit field selection keeps CSRF, session cookies and auth responses out.
     const permitted = new Set(actor.personIds);
     const people = status.people.filter((person) => permitted.has(person.id)).map((person) => ({
-      id: person.id, name: person.name, devices: person.devices.map(({ id, label }) => ({ id, label })),
+      id: person.id, name: person.name, devices: person.devices.map(({ id, label, evidence }) => ({ id, label, evidence: cacheEvidence(evidence, status.source) })),
       manualPause: person.manualPause, effectiveManualPause: person.effectiveManualPause,
       observationHealth: person.observationHealth, scheduleBlocked: person.scheduleBlocked,
       scheduleExplanation: person.scheduleExplanation, status: person.status,

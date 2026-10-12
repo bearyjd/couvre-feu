@@ -1,3 +1,4 @@
+import { deviceEvidence } from './device-evidence.ts';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
@@ -99,7 +100,10 @@ export class IntegrationPolicy {
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
         if (!enrolled) errors.push('pilot_device_not_enrolled');
         if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
-        return {...this.store.config.provenance, packetAcceptance: 'unmeasured', people: actor.personIds.includes(p.id) ? [{id: p.id, name: p.name, devices: [{id: p.device.id, label: p.device.label}],
+        return {...this.store.config.provenance, packetAcceptance: 'unmeasured', people: actor.personIds.includes(p.id) ? [{id: p.id, name: p.name, devices: [{id: p.device.id, label: p.device.label, evidence: deviceEvidence({source: 'router-policy', now: this.now(),
+            sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: p.id, mac: p.device.mac, configuredMacs: [p.device.mac],
+            policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length),
+            generationMatches: o?.generation === this.store.config.router.generation})}],
             manualPause: o?.acceptedPolicy.pauses.find(a => a.person === p.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === p.id) ?? null,
             ...integrationScheduleState(enrolled ? o!.acceptedPolicy : this.store.config.enrollment, this.store.config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1),
             observationHealth: info.observation_error ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: dto?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: dto}] : [],

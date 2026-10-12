@@ -130,3 +130,63 @@ test('a frozen real schedule response expires at its calibration deadline while 
     await expect(heading).toHaveText('Schedule state unknown');
 });
 });
+
+
+test.describe('assigned device enrollment evidence', () => {
+    test.use({serviceWorkers: 'block'});
+    test('frozen evidence expires after exactly 30 seconds and cached offline history keeps aging', async ({page, demo}) => {
+        const scope = '5'.repeat(64), now = Math.floor(Date.now() / 1000);
+        const provenance = {source: 'real-router-integration', integrationScope: scope, routerCompatibilityVerified: false};
+        const actor = {id: 'device_parent', displayName: 'Device fixture parent', role: 'parent', personIds: ['pilot'], permissionVersion: '1'};
+        const evidence = {source: 'router-policy', sourceObservedAt: now, serviceReceivedAt: now, freshUntil: now + 31, freshness: 'fresh', enrollment: 'included', mac: 'DO_NOT_CACHE', rawMembership: ['DO_NOT_CACHE']};
+        const person = {id: 'pilot', name: 'Device fixture person', devices: [{id: 'phone', label: 'Fixture phone', evidence}], manualPause: null, effectiveManualPause: null, scheduleBlocked: false,
+            scheduleExplanation: 'No fixture schedule.', observationHealth: 'healthy', status: 'confirmed', latestOperation: null};
+        const status = {...provenance, packetAcceptance: 'unmeasured', people: [person], serviceDesiredRevision: 0, routerDesiredRevision: 0, routerConfirmedRevision: 0,
+            revisionToken: '"s0-r0-' + 'a'.repeat(64) + '"', observedAt: now, statusAgeSeconds: 0, lastSuccessfulConfirmationAt: now, errors: []};
+        await page.clock.install({time: new Date((now - 1) * 1000)}); await page.clock.pauseAt(new Date(now * 1000));
+        await page.route(demo.origin + '/', async route => {
+            const response = await route.fetch();
+            await route.fulfill({response, body: (await response.text()).replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}">`)});
+        });
+        await page.route('**/auth/session', route => route.fulfill({json: {...provenance, actor, csrfToken: 'fixture_only', expiresAt: now + 600}}));
+        await page.route('**/people', route => route.fulfill({json: status}));
+        await page.goto(demo.origin);
+        const label = page.locator('[data-device-evidence="phone"]');
+        await expect(label).toContainText('Router · Observed enrollment: included');
+        await expect(label).toContainText('Activity unavailable');
+        const cached = await page.evaluate(() => localStorage.getItem(localStorage.getItem('cf-status-active:v1')!)!);
+        expect(cached).not.toContain('DO_NOT_CACHE'); expect(JSON.parse(cached).status.people[0].devices[0].evidence.freshUntil).toBe(now + 31);
+        await page.screenshot({path: '/tmp/couvre-feu-device-freshness-005-ui.png', fullPage: true});
+        await page.clock.fastForward(30000); await expect(label).toContainText('Observed enrollment: included'); await expect(label).not.toContainText('historical');
+        await page.clock.fastForward(1000); await expect(label).toContainText('Last observed enrollment: included · historical');
+        await page.addInitScript(() => Object.defineProperty(navigator, 'onLine', {get: () => false}));
+        await page.reload(); await expect(page.locator('#connection')).toContainText('Offline');
+        await expect(label).toContainText('historical'); await expect(page.locator('[data-control="resume"]')).toBeDisabled();
+        await page.clock.fastForward(20000); await expect(label).toContainText('51s ago');
+        await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {key: 'cf-scope-event:v1', newValue: 'changed'})));
+        await expect(label).toBeHidden();
+        expect(await page.evaluate(() => localStorage.getItem('cf-status-active:v1'))).toBeNull();
+    });
+    test('legacy, wrong source, future time and a changed browser clock render enrollment unknown', async ({page, demo}) => {
+        const now = Math.floor(Date.now() / 1000);
+        const provenance = {source: 'synthetic-fake-router', routerCompatibilityVerified: false};
+        const actor = {id: 'legacy_parent', displayName: 'Legacy fixture', role: 'parent', personIds: ['alex'], permissionVersion: '1'};
+        const device: {id: string; label: string; evidence?: Record<string, unknown>} = {id: 'phone', label: 'Legacy phone'};
+        await page.clock.install({time: new Date((now - 1) * 1000)}); await page.clock.pauseAt(new Date(now * 1000));
+        await page.route('**/auth/session', route => route.fulfill({json: {...provenance, actor, csrfToken: 'fixture_only', expiresAt: now + 600}}));
+        await page.route('**/people', route => route.fulfill({json: {...provenance, people: [{id: 'alex', name: 'Legacy fixture person', devices: [device], manualPause: null, effectiveManualPause: null,
+            scheduleBlocked: false, scheduleExplanation: 'Fixture.', observationHealth: 'healthy', status: 'confirmed', latestOperation: null}], serviceDesiredRevision: 0, routerDesiredRevision: 0,
+            routerConfirmedRevision: 0, revisionToken: 'fixture', observedAt: now, statusAgeSeconds: 0, lastSuccessfulConfirmationAt: now, errors: []}}));
+        await page.goto(demo.origin); const label = page.locator('[data-device-evidence="phone"]');
+        await expect(label).toContainText('Demo · Enrollment unknown');
+        device.evidence = {source: 'router-policy', sourceObservedAt: now, serviceReceivedAt: now, freshUntil: now + 31, freshness: 'fresh', enrollment: 'included'};
+        await page.getByRole('button', {name: 'Refresh status'}).click(); await expect(label).toContainText('Enrollment unknown');
+        const cached = await page.evaluate(() => JSON.parse(localStorage.getItem(localStorage.getItem('cf-status-active:v1')!)!).status.people[0].devices[0]);
+        expect(cached.evidence).toBeUndefined();
+        device.evidence = {...device.evidence, source: 'synthetic-policy', serviceReceivedAt: null, sourceObservedAt: now + 1, freshUntil: now + 32};
+        await page.getByRole('button', {name: 'Refresh status'}).click(); await expect(label).toContainText('Enrollment unknown');
+        device.evidence = {...device.evidence, sourceObservedAt: now, freshUntil: now + 31};
+        await page.getByRole('button', {name: 'Refresh status'}).click(); await expect(label).toContainText('Observed enrollment: included');
+        await page.clock.setSystemTime(new Date((now - 60) * 1000)); await page.clock.fastForward(1000); await expect(label).toContainText('Enrollment unknown');
+    });
+});

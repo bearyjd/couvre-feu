@@ -611,3 +611,18 @@ test('creating a fake client without its independent engine cannot fabricate a f
         assert.equal(people.revisionToken, null); assert.equal(people.people[0].observationHealth, 'unreachable');
     } finally { store.close(); router.close(); rmSync(dir, { recursive: true }); }
 });
+
+
+test('demo enrollment evidence stays assigned, has no receipt clock, and a failed read retains only unknown history', () => {
+    const f = fixture();
+    try {
+        const first = f.policy.people(parent);
+        assert.deepEqual(first.people.map(person => person.id), ['alex']);
+        const e = first.people[0].devices[0].evidence!;
+        assert.equal(e.source, 'synthetic-policy'); assert.equal(e.serviceReceivedAt, null); assert.equal(e.enrollment, 'included');
+        f.router.scenario('unreachable');
+        const failed = f.policy.people(parent).people[0].devices[0].evidence!;
+        assert.equal(failed.enrollment, 'unknown'); assert.equal(failed.sourceObservedAt, e.sourceObservedAt);
+        assert.deepEqual(f.policy.people({...parent, personIds: []}).people, []);
+    } finally {f.close();}
+});

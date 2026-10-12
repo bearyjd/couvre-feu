@@ -35,13 +35,25 @@ export interface OperationDTO extends Provenance {
     accepted?: boolean;
     dispatch?: 'awaiting_operator_dispatch' | 'awaiting_automatic_dispatch' | 'consumed' | 'uncertain' | 'resolved';
 }
+export interface DeviceEvidenceDTO {
+    source: 'synthetic-policy' | 'router-policy';
+    sourceObservedAt: number | null;
+    serviceReceivedAt: number | null;
+    /** Exclusive epoch deadline; observations remain fresh at age exactly 30 seconds. */
+    freshUntil: number | null;
+    freshness: 'fresh' | 'stale' | 'unknown';
+    enrollment: 'included' | 'not-included' | 'unknown';
+}
+export interface AssignedDeviceDTO {
+    id: string;
+    label: string;
+    /** Policy enrollment evidence only, never network presence or activity. */
+    evidence?: DeviceEvidenceDTO;
+}
 export interface PersonDTO {
     id: string;
     name: string;
-    devices: {
-        id: string;
-        label: string;
-    }[];
+    devices: AssignedDeviceDTO[];
     manualPause: {
         until: number;
     } | null;

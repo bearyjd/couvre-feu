@@ -1,3 +1,4 @@
+import { deviceEvidence } from './device-evidence.ts';
 import { randomUUID } from 'node:crypto';
 import { digest } from './auth.ts';
 import type { Actor, OperationDTO, OperationState, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
@@ -229,7 +230,9 @@ export class PolicyService {
                 const row = this.store.get<OperationRow>('SELECT * FROM operations WHERE person_id=? ORDER BY revision DESC LIMIT 1', p.id), schedule = scheduleBlocked(policy, p.id, now);
                 return {
                     id: p.id, name: p.name, devices: p.devices.map(d => ({
-                        id: d.id, label: d.label
+                        id: d.id, label: d.label, evidence: deviceEvidence({source: 'synthetic-policy', now: this.now(), sourceObservedAt: observation?.routerTime ?? null,
+                            serviceReceivedAt: null, personId: p.id, mac: d.mac, configuredMacs: p.devices.map(device => device.mac),
+                            policy: observation?.policy ?? null, status: observation?.status ?? null, readError: this.lastReadError !== null})
                     })), manualPause: policy.pauses.find(pause => pause.person === p.id) ?? null,
                     effectiveManualPause: effectivePauses(policy, now).find(pause => pause.person === p.id) ?? null, scheduleBlocked: schedule,
                     scheduleExplanation: schedule ? 'The fictional UTC school-night schedule still blocks access. Resume clears only the manual pause.' : 'No fictional UTC schedule window is active.',
