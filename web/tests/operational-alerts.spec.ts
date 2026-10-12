@@ -91,22 +91,47 @@ test('an offline stale tab cannot reopen recovery; a later evaluated read error 
     await page.clock.install({time: new Date((fixture.at - 1) * 1000)}); await page.clock.pauseAt(new Date(fixture.at * 1000));
     await page.goto(demo.origin); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
     const staleTab = await page.context().newPage();
-    await staleTab.clock.install({time: new Date((fixture.at - 1) * 1000)}); await staleTab.clock.pauseAt(new Date(fixture.at * 1000));
     await staleTab.goto(demo.origin); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
     await staleTab.evaluate(() => window.dispatchEvent(new Event('offline')));
-    await staleTab.clock.fastForward(2000); await page.clock.fastForward(2000);
+    await page.clock.fastForward(2000);
     fixture.healthy(fixture.at + 2); await page.getByRole('button', {name: 'Refresh status'}).click();
     await expect(page.locator('#alert-feed .recovered')).toHaveCount(1);
     await expect(staleTab.locator('#alert-feed .recovered')).toHaveCount(1);
     await staleTab.clock.fastForward(1000);
     await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
     await expect(staleTab.locator('#alert-feed .recovered')).toHaveCount(1);
-    await page.clock.fastForward(2000); await staleTab.clock.fastForward(1000);
+    await page.clock.fastForward(1000);
     fixture.fail(fixture.at + 4); // Source stays at the last successful t+2 observation.
     await staleTab.evaluate(() => window.dispatchEvent(new Event('online')));
     await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(2);
     await expect(staleTab.locator('#alert-feed .recovered')).toHaveCount(1);
     await expect(page.locator('#alert-feed .alert-row')).toHaveCount(2);
     await staleTab.clock.fastForward(1000); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(2);
+    await staleTab.close();
+});
+
+test('healthy observations with no prior incident keep old offline snapshots from fabricating stale alerts', async ({page, demo}) => {
+    const fixture = await alertFixture(page.context(), demo.origin); fixture.healthy(fixture.at + 2);
+    await page.clock.install({time: new Date((fixture.at + 1) * 1000)}); await page.clock.pauseAt(new Date((fixture.at + 2) * 1000));
+    await page.goto(demo.origin); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(0);
+    const staleTab = await page.context().newPage();
+    await staleTab.goto(demo.origin); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(0);
+    await staleTab.evaluate(() => window.dispatchEvent(new Event('offline')));
+    fixture.healthy(fixture.at + 20); await page.clock.fastForward(18000);
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect.poll(() => page.evaluate(() => {
+        const key = localStorage.getItem('cf-status-active:v1')!;
+        return JSON.parse(localStorage.getItem(key)!).status.people[0].operationalAlerts.sourceObservedAt;
+    })).toBe(fixture.at + 20);
+    await staleTab.clock.fastForward(13000); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(0);
+    const witnesses = await staleTab.evaluate(() => {
+        const key = Object.keys(localStorage).find(value => value.startsWith('cf-alerts:v1:'))!;
+        return JSON.parse(localStorage.getItem(key)!).witnesses;
+    });
+    expect(witnesses).toHaveLength(1); expect(witnesses[0].sourceObservedAt).toBe(fixture.at + 20);
+    await page.clock.fastForward(18000);
+    await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
+    await expect(page.locator('#alert-feed')).toContainText('Router status observation is stale.');
+    await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
     await staleTab.close();
 });

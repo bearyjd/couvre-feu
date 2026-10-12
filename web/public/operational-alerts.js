@@ -53,9 +53,11 @@ function sanitizeRecord(value) {
       value.lastNoticedAt < value.firstNoticedAt || !nullableEpoch(value.sourceObservedAt) || !nullableEpoch(value.serviceReceivedAt) ||
       !epoch(value.failureEvaluatedAt) || !nullableEpoch(value.recoveryEvaluatedAt) || !nullableEpoch(value.witnessObservedAt) || !nullableEpoch(value.witnessReceivedAt) ||
       !nullableEpoch(value.recoveredAt) || value.recoveredAt !== null && value.recoveredAt < value.firstNoticedAt) return null;
+  const clockCeiling = Math.max(value.lastNoticedAt, value.recoveredAt ?? 0);
   return {personId: value.personId, ...condition, occurrence: value.occurrence, firstNoticedAt: value.firstNoticedAt, lastNoticedAt: value.lastNoticedAt,
     sourceObservedAt: value.sourceObservedAt, serviceReceivedAt: value.serviceReceivedAt, failureEvaluatedAt: value.failureEvaluatedAt,
-    recoveryEvaluatedAt: value.recoveryEvaluatedAt, witnessObservedAt: value.witnessObservedAt, witnessReceivedAt: value.witnessReceivedAt, recoveredAt: value.recoveredAt};
+    recoveryEvaluatedAt: value.recoveryEvaluatedAt, witnessObservedAt: value.witnessObservedAt <= clockCeiling ? value.witnessObservedAt : null,
+    witnessReceivedAt: value.witnessReceivedAt <= clockCeiling ? value.witnessReceivedAt : null, recoveredAt: value.recoveredAt};
 }
 
 function bounded(records, now, permitted) {
@@ -80,10 +82,27 @@ function bounded(records, now, permitted) {
   return result;
 }
 
+/** Clock barriers only: never used to establish current health or recover an episode. */
+function boundedWitnesses(values, now, permitted, source) {
+  const floors = new Map();
+  for (const value of values) {
+    if (!value || !personId(value.personId) || !permitted.has(value.personId) || !epoch(value.sourceObservedAt) || !epoch(value.evaluatedAt) ||
+        value.evaluatedAt > now || value.evaluatedAt <= now - DAY || value.sourceObservedAt > value.evaluatedAt ||
+        (source === 'real-router-integration' ? !epoch(value.serviceReceivedAt) || value.serviceReceivedAt > value.evaluatedAt : value.serviceReceivedAt !== null) ||
+        !nullableEpoch(value.healthyEvaluatedAt) || value.healthyEvaluatedAt !== null && value.healthyEvaluatedAt > value.evaluatedAt) continue;
+    const previous = floors.get(value.personId);
+    floors.set(value.personId, {personId: value.personId, sourceObservedAt: Math.max(previous?.sourceObservedAt ?? 0, value.sourceObservedAt),
+      serviceReceivedAt: Math.max(previous?.serviceReceivedAt ?? 0, value.serviceReceivedAt ?? 0) || null,
+      evaluatedAt: Math.max(previous?.evaluatedAt ?? 0, value.evaluatedAt),
+      healthyEvaluatedAt: Math.max(previous?.healthyEvaluatedAt ?? 0, value.healthyEvaluatedAt !== null && value.healthyEvaluatedAt > now - DAY ? value.healthyEvaluatedAt : 0) || null});
+  }
+  return [...floors.values()].sort((a, b) => b.evaluatedAt - a.evaluatedAt || a.personId.localeCompare(b.personId)).slice(0, MAX_RECORDS);
+}
+
 /** State is bound to an authenticated scope and expiry, never CSRF or cookie values. */
 export function createAlertJournal(storage = globalThis.localStorage) {
-  let scope = null, permitted = new Set(), expiresAt = null, records = [], hideRecovery = false, lastClock = 0;
-  const dropMemory = () => { scope = null; records = []; permitted = new Set(); expiresAt = null; hideRecovery = false; lastClock = 0; };
+  let scope = null, source = null, installation = null, permitted = new Set(), expiresAt = null, records = [], witnesses = [], hideRecovery = false, lastClock = 0;
+  const dropMemory = () => { scope = null; source = null; installation = null; records = []; witnesses = []; permitted = new Set(); expiresAt = null; hideRecovery = false; lastClock = 0; };
   const read = (binding = false) => {
     try {
       const active = storage.getItem(ACTIVE);
@@ -93,14 +112,16 @@ export function createAlertJournal(storage = globalThis.localStorage) {
       const value = JSON.parse(raw);
       if (value.scope === scope && value.expiresAt === expiresAt && Array.isArray(value.records) && value.records.length <= MAX_RECORDS) {
         records = [...records, ...value.records]; hideRecovery = value.hideRecovery === true;
+        if (Array.isArray(value.witnesses) && value.witnesses.length <= MAX_RECORDS) witnesses = [...witnesses, ...value.witnesses];
       }
     } catch { /* Denied or malformed storage leaves the bounded in-memory journal usable. */ }
   };
   const write = now => {
     if (!scope) return;
     records = bounded(records, now, permitted);
-    let payload = JSON.stringify({scope, expiresAt, hideRecovery, records});
-    while (records.length && new TextEncoder().encode(payload).byteLength > MAX_BYTES) { records.pop(); payload = JSON.stringify({scope, expiresAt, hideRecovery, records}); }
+    witnesses = boundedWitnesses(witnesses, now, permitted, source);
+    let payload = JSON.stringify({scope, expiresAt, hideRecovery, records, witnesses});
+    while (records.length && new TextEncoder().encode(payload).byteLength > MAX_BYTES) { records.pop(); payload = JSON.stringify({scope, expiresAt, hideRecovery, records, witnesses}); }
     try { storage.setItem(ALERT_PREFIX + scope, payload); storage.setItem(ACTIVE, scope); } catch { /* Memory only when storage is unavailable. */ }
   };
   const clear = () => {
@@ -113,6 +134,7 @@ export function createAlertJournal(storage = globalThis.localStorage) {
   return {
     clear,
     isBound() { return scope !== null; },
+    latestWitness(person) { const witness = witnesses.find(value => value.personId === person); return witness ? {...witness} : null; },
     storageChanged(key, value) {
       if (scope && (key === ACTIVE && value !== scope || key === ALERT_PREFIX + scope && value === null)) {
         dropMemory();
@@ -124,53 +146,67 @@ export function createAlertJournal(storage = globalThis.localStorage) {
       if (scope !== next) {
         if (scope !== null) clear();
         try { if (storage.getItem(ACTIVE) !== next) clear(); } catch { /* Memory only. */ }
-        scope = next; expiresAt = session.expiresAt; permitted = new Set(session.actor.personIds); read(true);
+        scope = next; source = status.source; installation = status.integrationScope ?? null; expiresAt = session.expiresAt; permitted = new Set(session.actor.personIds); read(true);
       }
       lastClock = Math.max(lastClock, now); write(lastClock); return true;
     },
     ingest(status, now, canRecover = false) {
-      if (!scope) return;
+      if (!scope || status.source !== source || (status.integrationScope ?? null) !== installation) return;
       if (now < lastClock) { read(); write(lastClock); return; }
       lastClock = now;
       if (expiresAt <= now) { clear(); return; }
       read(); records = bounded(records, now, permitted);
+      witnesses = boundedWitnesses(witnesses, now, permitted, source);
       for (const person of status.people ?? []) {
         if (!permitted.has(person.id)) continue;
         const evidence = cacheAlertEvidence(person.operationalAlerts, status.source);
         if (!evidence) continue;
         const {sourceObservedAt: observed, serviceReceivedAt: received} = evidence;
+        const validObserved = epoch(observed) && observed <= now && observed <= evidence.evaluatedAt ? observed : 0;
+        const validReceived = epoch(received) && received <= now && received <= evidence.evaluatedAt ? received : 0;
         const clocks = epoch(observed) && observed <= now && (evidence.source === 'synthetic-policy' ? received === null : epoch(received) && received <= now);
         const deadline = clocks ? Math.min(observed, received ?? observed) + 31 : null;
-        const fresh = clocks && evidence.freshUntil === deadline && evidence.freshness === 'fresh' && now < deadline && evidence.evaluatedAt <= now && evidence.evaluatedAt >= observed;
-        const conditions = [...evidence.conditions];
+        const fresh = clocks && evidence.freshUntil === deadline && evidence.freshness === 'fresh' && now < deadline && evidence.evaluatedAt <= now && evidence.evaluatedAt >= observed && evidence.evaluatedAt >= (received ?? 0);
+        const latest = witnesses.find(value => value.personId === person.id);
+        const acceptedLive = canRecover && fresh && (!latest || observed >= latest.sourceObservedAt &&
+          (evidence.source === 'synthetic-policy' || received >= latest.serviceReceivedAt) && evidence.evaluatedAt >= latest.evaluatedAt);
+        if (acceptedLive) {
+          witnesses.push({personId: person.id, sourceObservedAt: observed, serviceReceivedAt: received, evaluatedAt: evidence.evaluatedAt,
+            healthyEvaluatedAt: evidence.healthy ? evidence.evaluatedAt : null});
+          witnesses = boundedWitnesses(witnesses, now, permitted, source);
+        }
+        const floor = witnesses.find(value => value.personId === person.id);
+        const conditions = evidence.conditions.filter(condition => condition.code !== 'observed-drift' || fresh);
         const localStale = deadline !== null && now >= deadline && !conditions.some(value => value.code.startsWith('observation-'));
         if (localStale) conditions.push({code: 'observation-stale'});
         for (const condition of conditions) {
           const key = baseKey({...condition, personId: person.id});
           const related = records.filter(record => baseKey(record) === key);
           const personRecords = records.filter(record => record.personId === person.id);
-          const recoveryEvaluation = Math.max(0, ...personRecords.map(record => record.recoveryEvaluatedAt ?? 0));
-          const witnessObservedAt = Math.max(observed ?? 0, ...personRecords.map(record => record.witnessObservedAt ?? 0)) || null;
-          const witnessReceivedAt = Math.max(received ?? 0, ...personRecords.map(record => record.witnessReceivedAt ?? 0)) || null;
+          const recoveryEvaluation = Math.max(0, ...personRecords.map(record => record.recoveryEvaluatedAt ?? 0),
+            condition.code.startsWith('observation-') || condition.code === 'observed-drift' ? floor?.healthyEvaluatedAt ?? 0 : 0);
+          const witnessObservedAt = Math.max(validObserved, floor?.sourceObservedAt ?? 0, ...personRecords.map(record => record.witnessObservedAt ?? 0)) || null;
+          const witnessReceivedAt = Math.max(validReceived, floor?.serviceReceivedAt ?? 0, ...personRecords.map(record => record.witnessReceivedAt ?? 0)) || null;
           const failureEvaluation = localStale && condition.code === 'observation-stale' ? now : evidence.evaluatedAt;
           // Cached/ticking failure copy cannot start another episode after a newer recovery.
           // Expiry of the latest witness can; expiry of an older tab's witness cannot.
           if (failureEvaluation > now || failureEvaluation <= recoveryEvaluation ||
-              localStale && condition.code === 'observation-stale' && observed < (witnessObservedAt ?? 0)) continue;
+              (condition.code === 'observation-stale' || condition.code === 'observed-drift') &&
+              (observed < (witnessObservedAt ?? 0) || evidence.source === 'router-policy' && received < (witnessReceivedAt ?? 0))) continue;
           const open = records.find(record => record.recoveredAt === null && baseKey(record) === key);
           if (open) {
             open.lastNoticedAt = Math.max(open.lastNoticedAt, now);
             open.failureEvaluatedAt = Math.max(open.failureEvaluatedAt, failureEvaluation);
             open.witnessObservedAt = witnessObservedAt; open.witnessReceivedAt = witnessReceivedAt;
-            open.sourceObservedAt = Math.max(open.sourceObservedAt ?? 0, observed ?? 0) || null;
-            open.serviceReceivedAt = Math.max(open.serviceReceivedAt ?? 0, received ?? 0) || null;
+            open.sourceObservedAt = Math.max(open.sourceObservedAt ?? 0, validObserved) || null;
+            open.serviceReceivedAt = Math.max(open.serviceReceivedAt ?? 0, validReceived) || null;
           } else {
             const occurrence = Math.max(0, ...related.map(record => record.occurrence)) + 1;
-            records.push({personId: person.id, ...condition, occurrence, firstNoticedAt: now, lastNoticedAt: now, sourceObservedAt: observed, serviceReceivedAt: received,
+            records.push({personId: person.id, ...condition, occurrence, firstNoticedAt: now, lastNoticedAt: now, sourceObservedAt: validObserved || null, serviceReceivedAt: validReceived || null,
               failureEvaluatedAt: failureEvaluation, recoveryEvaluatedAt: null, witnessObservedAt, witnessReceivedAt, recoveredAt: null});
           }
         }
-        if (!canRecover || !fresh || !evidence.healthy) continue;
+        if (!acceptedLive || !evidence.healthy) continue;
         for (const record of records) {
           if (record.personId !== person.id || record.recoveredAt !== null || conditions.some(condition => baseKey({...condition, personId: person.id}) === baseKey(record)) ||
               evidence.evaluatedAt < record.failureEvaluatedAt || observed <= (record.witnessObservedAt ?? 0) ||

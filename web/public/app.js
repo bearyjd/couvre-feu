@@ -380,15 +380,21 @@ function renderAlerts() {
   const sameCondition = (record, condition) => record.code === condition.code && (record.operationId ?? null) === (condition.operationId ?? null) && (record.pauseUntil ?? null) === (condition.pauseUntil ?? null);
   const currentRows = state.offline || !alertJournal.isBound() ? '' : state.people.people.filter(person => actor().personIds.includes(person.id)).flatMap(person => {
     const evidence = cacheAlertEvidence(person.operationalAlerts, state.people.source);
+    const witness = alertJournal.latestWitness(person.id);
     const recoveredEvaluation = Math.max(0, ...all.records.filter(record => record.personId === person.id).map(record => record.recoveryEvaluatedAt ?? 0));
     if (!evidence || evidence.evaluatedAt > now() || evidence.evaluatedAt < recoveredEvaluation) return [];
-    return evidence.conditions.filter(condition => !all.records.some(record => record.personId === person.id && record.recoveredAt === null && sameCondition(record, condition)))
+    return evidence.conditions.filter(condition => !(condition.code.startsWith('observation-') || condition.code === 'observed-drift') || evidence.evaluatedAt >= (witness?.healthyEvaluatedAt ?? 0))
+      .filter(condition => condition.code !== 'observed-drift' || evidence.freshness === 'fresh' && evidence.freshUntil > now())
+      .filter(condition => !['observation-stale', 'observed-drift'].includes(condition.code) || !witness || evidence.sourceObservedAt >= witness.sourceObservedAt &&
+        (evidence.source === 'synthetic-policy' || evidence.serviceReceivedAt >= witness.serviceReceivedAt))
+      .filter(condition => !all.records.some(record => record.personId === person.id && record.recoveredAt === null && sameCondition(record, condition)))
       .map(condition => `<li class="alert-row alert-current"><strong>${escape(person.name)} · Current response verification warning</strong><p>${escape(alertText(condition.code))}</p><small>Response evaluated ${escape(time(evidence.evaluatedAt))} · source observed ${escape(time(evidence.sourceObservedAt))}</small></li>`);
   }).join('');
   const rows = currentRows + view.records.map(record => {
     const person = state.people.people.find(person => person.id === record.personId);
     if (!person) return '';
     const current = !state.offline && (person.operationalAlerts?.conditions.some(condition => condition.code === record.code &&
+      (condition.code !== 'observed-drift' || person.operationalAlerts.freshness === 'fresh' && person.operationalAlerts.freshUntil > now()) &&
       (condition.operationId ?? null) === (record.operationId ?? null) && (condition.pauseUntil ?? null) === (record.pauseUntil ?? null)) ||
       record.code === 'observation-stale' && person.operationalAlerts?.freshUntil !== null && person.operationalAlerts?.freshUntil <= now());
     const label = record.recoveredAt !== null ? 'Recovered with a newer router witness' : state.offline ? 'Historical warning · unresolved' : current ? 'Current verification warning' : 'Earlier warning · unresolved';

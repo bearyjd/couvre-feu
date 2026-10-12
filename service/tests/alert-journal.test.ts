@@ -69,6 +69,52 @@ test('stale tab and offline replay cannot reopen recovered episodes; later read 
     assert.equal(reload.view(t + 7).records.filter((record: any) => record.recoveredAt === null).length, 0);
 });
 
+test('every live verified observation persists a floor, with or without prior incidents, across reloads and both clocks', () => {
+    for (const priorIncident of [false, true]) {
+        const {journal: first, storage} = fixture(), staleTab = createAlertJournal(storage);
+        staleTab.bind(session, status(), t);
+        if (priorIncident) first.ingest(status(unavailable(t)), t, true);
+        first.ingest(status(evidence(t + 2)), t + 2, true);
+        first.ingest(status(evidence(t + 20)), t + 20, true);
+        first.ingest(status(evidence(t + 2, {evaluatedAt: t + 30})), t + 30, true); // A live older witness cannot roll back the floor.
+        assert.equal(first.latestWitness('pilot').sourceObservedAt, t + 20); assert.equal(first.latestWitness('pilot').evaluatedAt, t + 20);
+        staleTab.ingest(status(evidence(t + 2)), t + 33, false);
+        assert.equal(staleTab.view(t + 33).records.length, priorIncident ? 1 : 0);
+        const reload = createAlertJournal(storage); reload.bind(session, status(), t + 33);
+        reload.ingest(status(evidence(t + 20, {serviceReceivedAt: t + 2, freshUntil: t + 33})), t + 33, false);
+        assert.equal(reload.view(t + 33).records.length, priorIncident ? 1 : 0); // Equal router time, older receipt.
+        reload.ingest(status(evidence(t + 40)), t + 40, false); // Cached/offline newer clocks cannot advance the floor.
+        reload.ingest(status(evidence(t + 20)), t + 51, false);
+        assert.equal(reload.view(t + 51).records.length, priorIncident ? 2 : 1);
+        assert.equal(reload.view(t + 51).records.filter((record: any) => record.recoveredAt === null).length, 1);
+        first.ingest(status(evidence(t + 52)), t + 52, true);
+        assert.equal(first.view(t + 52).records.filter((record: any) => record.recoveredAt === null).length, 0);
+    }
+});
+
+test('a different source or installation cannot provide witnesses or recover scoped episodes', () => {
+    const {journal} = fixture(); journal.ingest(status(unavailable(t)), t, true);
+    const otherSource = {...status(evidence(t + 2, {source: 'synthetic-policy', serviceReceivedAt: null})), source: 'synthetic-fake-router'};
+    journal.ingest(otherSource, t + 2, true);
+    journal.ingest({...status(evidence(t + 3)), integrationScope: 'b'.repeat(64)}, t + 3, true);
+    assert.equal(journal.view(t + 3).records[0].recoveredAt, null);
+    journal.ingest(status(evidence(t + 4)), t + 4, true);
+    assert.equal(journal.view(t + 4).records[0].recoveredAt, t + 4);
+});
+
+test('unknown future clocks cannot poison barriers or substitute for a subsequent live verified witness', () => {
+    const {journal} = fixture();
+    journal.ingest(status(unavailable(t)), t, true);
+    journal.ingest(status(unavailable(t + 1)), t + 1, true);
+    const invalid = unavailable(t + 1); Object.assign(invalid, {sourceObservedAt: t + 100, serviceReceivedAt: t + 100, freshUntil: t + 131});
+    journal.ingest(status(invalid), t + 1, true);
+    assert.equal(journal.latestWitness('pilot'), null);
+    journal.ingest(status(evidence(t + 2)), t + 2, false);
+    assert.equal(journal.view(t + 2).records[0].recoveredAt, null);
+    journal.ingest(status(evidence(t + 3)), t + 3, true);
+    assert.equal(journal.view(t + 3).records[0].recoveredAt, t + 3);
+});
+
 test('only exact fresh confirmation can recover a historical request, never latest-operation change', () => {
     const {journal} = fixture();
     const warning = evidence(t, {healthy: false, conditions: [{code: 'control-verification-unavailable', operationId: id}]});
@@ -157,4 +203,14 @@ test('journal bounds 50 records, 64 KiB, 24 hours and session expiry while denie
     const malformed = fixture();
     for (const key of malformed.storage.values.keys()) if (key.startsWith(ALERT_PREFIX)) malformed.storage.setItem(key, '{broken');
     const fresh = createAlertJournal(malformed.storage); fresh.bind(session, status(), t); assert.deepEqual(fresh.view(t).records, []);
+    const boundedFloorStorage = new MemoryStorage(), boundedFloors = createAlertJournal(boundedFloorStorage);
+    const floorSession = {...session, expiresAt: t + 200000, actor: {...actor, personIds: Array.from({length: 55}, (_, index) => `child_${index}`)}};
+    boundedFloors.bind(floorSession, status(), t);
+    boundedFloors.ingest({...status(), people: floorSession.actor.personIds.map(id => ({id, operationalAlerts: evidence(t)}))}, t, true);
+    const floorKey = [...boundedFloorStorage.values.keys()].find(key => key.startsWith(ALERT_PREFIX))!;
+    const floorPayload = JSON.parse(boundedFloorStorage.getItem(floorKey)!);
+    assert.equal(floorPayload.witnesses.length, 50); assert.equal(floorPayload.records.length, 0); assert.ok(Buffer.byteLength(JSON.stringify(floorPayload)) <= 65536);
+    const retainedId = floorPayload.witnesses[0].personId;
+    assert.ok(boundedFloors.latestWitness(retainedId)); boundedFloors.view(t + 86400); assert.equal(boundedFloors.latestWitness(retainedId), null);
+    boundedFloors.clear(); assert.equal(boundedFloorStorage.length, 0);
 });
