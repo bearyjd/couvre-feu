@@ -1362,7 +1362,8 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         # the legacy journal has no timestamp records and trusts DONE=1.
         adapter_files = ('usr/lib/couvrefeu/platform-bootstrap.sh',
                          'usr/lib/couvrefeu/vendor-platform.sh',
-                         'etc/couvrefeu/platform-profile')
+                         'etc/couvrefeu/platform-profile',
+                         'usr/lib/couvrefeu/activity.sh')
         for rel in FILES + adapter_files:
             key = rel.replace('/', '_')
             original = backup / (key + '.original')
