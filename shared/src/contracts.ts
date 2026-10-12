@@ -50,6 +50,25 @@ export interface AssignedDeviceDTO {
     /** Policy enrollment evidence only, never network presence or activity. */
     evidence?: DeviceEvidenceDTO;
 }
+export type OperationalAlertCode = 'observation-unavailable' | 'observation-stale' | 'control-verification-unavailable' | 'observed-drift' | 'pause-expiry-unverified';
+export interface OperationalAlertSignalDTO {
+    code: OperationalAlertCode;
+    operationId?: string;
+    pauseUntil?: number;
+}
+/** Existing router policy witnesses only. Evaluation time is not failure onset. */
+export interface OperationalAlertEvidenceDTO {
+    source: DeviceEvidenceDTO['source'];
+    evaluatedAt: number;
+    sourceObservedAt: number | null;
+    serviceReceivedAt: number | null;
+    freshUntil: number | null;
+    freshness: 'fresh' | 'stale' | 'unknown';
+    healthy: boolean;
+    confirmedOperationId: string | null;
+    expiryVerifiedThrough: number | null;
+    conditions: OperationalAlertSignalDTO[];
+}
 export interface PersonDTO {
     id: string;
     name: string;
@@ -71,6 +90,7 @@ export interface PersonDTO {
     observationHealth: 'healthy' | 'unconfirmed' | 'unreachable';
     status: OperationState;
     latestOperation: OperationDTO | null;
+    operationalAlerts?: OperationalAlertEvidenceDTO;
 }
 export interface PeopleDTO extends Provenance {
     people: PersonDTO[];

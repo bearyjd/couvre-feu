@@ -61,6 +61,11 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
         assert.equal(f.router.calls.length, 0);
         if (automatic) await automatic.tick(); else await f.observe();
         const people = await request('/people'); assert.equal(people.body.people[0].name, 'Explicit test person'); assert.equal(people.body.packetAcceptance, 'unmeasured');
+        assert.equal(people.body.people[0].operationalAlerts.source, 'router-policy');
+        assert.equal(people.body.people[0].operationalAlerts.healthy, true);
+        assert.deepEqual(people.body.people[0].operationalAlerts.conditions, []);
+        assert.ok(!JSON.stringify(people.body.people[0].operationalAlerts).includes(f.config.person.device.mac));
+        assert.ok(!JSON.stringify(people.body.people[0].operationalAlerts).includes(f.config.protectedMacs[0]));
         const headers = {'If-Match': people.body.revisionToken, 'Idempotency-Key': 'http_private_intent_1234'};
         assert.equal((await request('/people/pilot/pause', {until: 0}, {...headers, 'X-CSRF-Token': 'wrong'})).status, 403);
         const result = await request('/people/pilot/pause', {until: 0}, headers); assert.equal(result.status, 202); assert.equal(result.body.operation.dispatch, enabled ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');

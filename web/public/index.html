@@ -39,6 +39,12 @@
         <div class="section-heading"><div><p class="eyebrow">Your people</p><h1 id="people-title">Time, with intention.</h1><p id="account-context"></p></div><button id="refresh" class="button secondary" type="button">Refresh status</button></div>
         <div id="connection" class="connection" role="status"></div>
         <div id="people" class="people-list"></div>
+        <section id="operational-alerts" class="alert-panel" aria-labelledby="alerts-title" hidden>
+          <h2 id="alerts-title">Recent alerts in this browser</h2>
+          <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>
+          <label class="alert-preference"><input id="hide-recovery" type="checkbox"> Hide recovery history</label>
+          <ul id="alert-feed" aria-label="Recent operational alerts" aria-live="polite"></ul>
+        </section>
         <section class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No activity collectors or screen-time measurements are included.</p></section>
         <p class="source-footnote">Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.</p>
       </section>
