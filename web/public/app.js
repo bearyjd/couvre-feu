@@ -375,6 +375,11 @@ function render() {
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
     renderConnection(); renderPeople(); renderControlState();
+  } else {
+    $('#people').replaceChildren();
+    $('#connection').replaceChildren();
+    $('#account-context').textContent = '';
+    state.renderKey = '';
   }
   renderAuthControls();
 }
