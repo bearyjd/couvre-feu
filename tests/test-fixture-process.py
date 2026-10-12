@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -324,6 +325,10 @@ finally:
                         body += f"        self.assertFalse({fail and filename == 'test-core.py' and index == 0!r})\n"
                     body += "if __name__ == '__main__': unittest.main()\n"
                     (root / "tests" / filename).write_text(body)
+                for relative in runner.SOURCE_FILES:
+                    destination = root / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(REPO / relative, destination)
                 logs = root / "logs"
                 def make_logs(**kwargs):
                     logs.mkdir()
@@ -333,7 +338,7 @@ finally:
                 def pool(**kwargs):
                     self.assertEqual(kwargs['max_workers'], workers)
                     return real_pool(**kwargs)
-                with patch.dict(os.environ, CF_TEST_WORKERS=str(workers)), patch.object(runner, "ThreadPoolExecutor", pool), patch.object(runner, "REPO", root), patch.object(runner.tempfile, "mkdtemp", make_logs), contextlib.redirect_stdout(output):
+                with patch.object(runner, 'source_revision', return_value='f'*40), patch.dict(os.environ, CF_TEST_WORKERS=str(workers)), patch.object(runner, "ThreadPoolExecutor", pool), patch.object(runner, "REPO", root), patch.object(runner.tempfile, "mkdtemp", make_logs), contextlib.redirect_stdout(output):
                     self.assertEqual(runner.main(), 1 if fail else 0)
                 self.assertEqual(len((root / "executed").read_text().splitlines()), 16)
                 self.assertEqual(len(set((root / "executed").read_text().splitlines())), 16)
@@ -344,6 +349,77 @@ finally:
                 if fail:
                     self.assertIn("FAIL: test-core.py", output.getvalue())
                     self.assertIn("Private fixture failure logs retained:", output.getvalue())
+
+        # Run every miniature shard through the same CLI/plan/receipt protocol
+        # as CI, then attack omissions, duplicates, source drift and selectors.
+        with tempfile.TemporaryDirectory(prefix="couvre-feu-matrix-", dir="/tmp") as directory:
+            root = Path(directory)
+            for relative in runner.SOURCE_FILES:
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPO / relative, destination)
+            for filename in runner.SUITES:
+                body = "import unittest\nfrom pathlib import Path\nclass Cases(unittest.TestCase):\n"
+                for index in range(4):
+                    body += f"    def test_{index}(self):\n        with Path({str(root / 'executed')!r}).open('a') as stream: stream.write({(filename + ':' + str(index) + chr(10))!r})\n"
+                body += "if __name__ == '__main__': unittest.main()\n"
+                (root / 'tests' / filename).write_text(body)
+            plan_path = root / 'plan.json'
+            receipts = root / 'receipts'
+            receipts.mkdir()
+            with patch.object(runner, 'source_revision', return_value='f'*40), patch.object(runner, 'REPO', root), patch.dict(os.environ, CF_TEST_WORKERS='1'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(runner.main(['--write-plan', str(plan_path)]), 0)
+                plan = json.loads(plan_path.read_text())
+                self.assertEqual(len(plan['shards']), 16)
+                for shard in plan['shards']:
+                    receipt = receipts / f"{shard['suite']}.{shard['partition']}.json"
+                    self.assertEqual(runner.main(['--shard', shard['suite'], '--partition', str(shard['partition']),
+                                                  '--plan', str(plan_path), '--receipt', str(receipt)]), 0)
+                executed = (root / 'executed').read_text().splitlines()
+                self.assertEqual(len(executed), 16)
+                self.assertEqual(len(set(executed)), 16)
+                verify = ['--verify-receipts', str(receipts), '--plan', str(plan_path)]
+                self.assertEqual(runner.main(verify), 0)
+                entries = sorted(receipts.iterdir())
+                entry = entries[0]
+                original = entry.read_text()
+                entry.unlink()
+                self.assertEqual(runner.main(verify), 2, 'missing shard accepted')
+                entry.write_text(original)
+                entries[1].write_text(original)
+                self.assertEqual(runner.main(verify), 2, 'duplicate shard accepted')
+                # Restore receipts from exact expected identities for each attack.
+                for shard in plan['shards']:
+                    (receipts / f"{shard['suite']}.{shard['partition']}.json").write_text(json.dumps(runner.receipt_for(plan, shard, 0)))
+                for field, value in [('cases', []), ('count', 0), ('status', 124), ('status', False),
+                                     ('suite', 'unknown.py'), ('partition', True), ('planSHA256', '0'*64)]:
+                    changed = json.loads(original)
+                    changed[field] = value
+                    entry.write_text(json.dumps(changed))
+                    self.assertEqual(runner.main(verify), 2, f'invalid receipt accepted: {field}={value!r}')
+                entry.write_text('{"suite":"test-core.py","suite":"test-rpc.py"}')
+                self.assertEqual(runner.main(verify), 2, 'duplicate JSON key accepted')
+                entry.write_text(original)
+                wrong_commit = dict(plan, revision='0'*40)
+                plan_path.write_text(json.dumps(wrong_commit))
+                self.assertEqual(runner.main(verify), 2, 'wrong commit accepted')
+                plan_path.write_text(json.dumps(plan))
+                invalid = [[], ['--write-plan', ''], ['--verify-receipts', ''], ['--plan', ''], ['--receipt', ''], ['--shard', 'unknown.py'], ['--shard', ''], ['--partition', '0'],
+                           ['--shard', 'test-core.py', '--partition', '4'],
+                           ['--shard', 'test-core.py', '--partition', '01'],
+                           ['--shard', 'test-core.py', '--partition', '0']]
+                with patch.object(runner, 'run_lane') as launch:
+                    for args in invalid[1:]:
+                        self.assertEqual(runner.main(args), 2)
+                    damaged = dict(plan, shards=[])
+                    plan_path.write_text(json.dumps(damaged))
+                    self.assertEqual(runner.main(['--shard', 'test-core.py', '--partition', '0',
+                                                  '--plan', str(plan_path), '--receipt', str(root/'new.json')]), 2)
+                    plan_path.write_text(json.dumps(plan))
+                    source = root / 'tests/test-core.py'
+                    source.write_text(source.read_text() + '# source drift\n')
+                    self.assertEqual(runner.main(verify), 2)
+                    launch.assert_not_called()
 
     def test_worker_configuration_is_bounded_and_invalid_input_runs_no_cases(self):
         with patch.dict(os.environ):

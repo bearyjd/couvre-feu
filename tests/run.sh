@@ -5,6 +5,11 @@ PYTHONDONTWRITEBYTECODE=1
 export PYTHONDONTWRITEBYTECODE
 REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPO"
+case "${1:-}" in
+    '') [ "$#" = 0 ] || { printf 'usage: tests/run.sh [--preflight-only]\n' >&2; exit 2; }; preflight_only=0;;
+    --preflight-only) [ "$#" = 1 ] || { printf 'usage: tests/run.sh [--preflight-only]\n' >&2; exit 2; }; preflight_only=1;;
+    *) printf 'usage: tests/run.sh [--preflight-only]\n' >&2; exit 2;;
+esac
 is_shell() {
     case "$1" in *.sh) return 0;; esac
     case "$(head -n 1 "$1")" in '#!'*sh*) return 0;; esac
@@ -45,6 +50,10 @@ find router tests -type f | {
 }
 if ! command -v busybox >/dev/null 2>&1; then
     printf '%s\n' 'PENDING: BusyBox ash runtime; host sh syntax alone is not ash proof.'
+fi
+if [ "$preflight_only" = 1 ]; then
+    printf '%s\n' 'PASS: installer recovery, adapter, probe and static preflight; runtime shards follow.'
+    exit 0
 fi
 python3 tests/run-fixtures.py
 printf '%s\n' 'PASS: fixture and available static checks. Real fw3/packet/live tests remain pending.'
