@@ -626,3 +626,38 @@ test('demo enrollment evidence stays assigned, has no receipt clock, and a faile
         assert.deepEqual(f.policy.people({...parent, personIds: []}).people, []);
     } finally {f.close();}
 });
+for (const minutes of [15, 30, 60]) {
+    test(`quick ${minutes}-minute pause preset is a bounded timed pause that End now removes, and parent scope is unchanged`, () => {
+        const f = fixture();
+        try {
+            const until = f.now() + minutes * 60;
+            const pause = f.policy.mutate(parent, 'alex', 'pause', {
+                until
+            }, f.token(), randomUUID());
+            assert.equal(pause.status, 202);
+            f.advance(1);
+            f.policy.reconcile();
+            assert.equal(f.policy.operation(parent, pause.result.operation.id).state, 'confirmed');
+            const active = f.policy.people(parent).people[0];
+            assert.equal(active.effectiveManualPause?.until, until);
+            assert.equal(f.router.observe().status.effectivePauses.length, 1);
+            // A parent cannot target an unassigned child with a preset.
+            assert.throws(() => f.policy.mutate(parent, 'blair', 'pause', {
+                until
+            }, f.token(), randomUUID()));
+            const end = f.policy.mutate(parent, 'alex', 'resume', {}, f.token(), randomUUID());
+            f.advance(1);
+            f.policy.reconcile();
+            assert.equal(f.policy.operation(parent, end.result.operation.id).state, 'confirmed');
+            const ended = f.policy.people(parent).people[0];
+            assert.equal(ended.effectiveManualPause, null);
+            assert.equal(f.router.observe().status.effectivePauses.length, 0);
+            // End now clears only the manual pause; the active schedule block remains.
+            assert.equal(ended.scheduleBlocked, true);
+            assert.match(ended.scheduleExplanation, /Resume clears only/);
+        }
+        finally {
+            f.close();
+        }
+    });
+}

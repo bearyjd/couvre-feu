@@ -273,3 +273,21 @@ for (const stage of ['options', 'verify'] as const) {
     await signedPage.close();
   });
 }
+
+test('quick pause presets show remaining time, End now removes the pause, and extra time is explained as unavailable', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await expect(page.getByRole('button', { name: /^Pause Alex \(fictional\) for \d+ minutes$/ })).toHaveText(['Pause 15 min', 'Pause 30 min', 'Pause 60 min']);
+  await expect(page.getByRole('button', { name: 'Extra time 15 / 30 / 60 min' })).toBeDisabled();
+  await expect(page.locator('[data-extra-time="alex"]')).toContainText('no allowance concept');
+  await page.getByRole('button', { name: 'Pause Alex (fictional) for 30 minutes', exact: true }).click();
+  await expect(page.locator('.operation')).toContainText('Pause confirmed');
+  await expect(page.locator('[data-remaining]')).toHaveText(/^(29|30)m \d+s$/);
+  const pauses = demo.router.observe().status.effectivePauses;
+  expect(pauses).toHaveLength(1);
+  expect(pauses[0].until - Math.floor(Date.now() / 1000)).toBeGreaterThan(29 * 60 - 30);
+  await page.screenshot({ path: '/tmp/couvre-feu-quick-pause.png', fullPage: true });
+  await page.getByRole('button', { name: 'End Alex (fictional) timed pause now', exact: true }).click();
+  await expect(page.locator('.operation')).toContainText('Resume confirmed');
+  expect(demo.router.observe().status.effectivePauses).toHaveLength(0);
+  await expect(page.locator('[data-remaining]')).toHaveCount(0);
+});

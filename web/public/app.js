@@ -223,11 +223,11 @@ async function logout() {
   }
 }
 
-async function mutate(personId, action) {
+async function mutate(personId, action, presetSeconds) {
   if (!canControl()) return;
   const beforeRevision = state.people.revisionToken;
   const beforeScope = actorScope(state.session.actor);
-  const requestedDuration = state.durations.get(personId) ?? '0';
+  const requestedDuration = presetSeconds ?? state.durations.get(personId) ?? '0';
   const generation = state.generation;
   // Fresh reads are part of this click, never an automatic mutation retry.
   const refreshed = await refresh({ quiet: true });
@@ -330,7 +330,7 @@ function renderAuthControls() {
 
 function renderControlState() {
   const enabled = canControl();
-  for (const button of document.querySelectorAll('[data-control]')) button.disabled = !enabled;
+  for (const button of document.querySelectorAll('[data-control], [data-quick-pause]')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   $('#refresh').disabled = state.busy || state.refreshing || state.offline;
 }
@@ -358,11 +358,15 @@ function renderPeople() {
     const operation = person.latestOperation;
     const personStatus = state.localUnknown || person.observationHealth !== 'healthy' && person.status === 'confirmed' ? 'unknown' : person.status;
     const choices = [['0', 'Until I resume'], ['60', isReal() ? '1 minute' : '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
+    const timedPause = effectiveManual && effectiveManual.until > 0;
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
       <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
       <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
       <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
-      <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="Resume ${label} manual pause">Resume</button></div>
+      <div class="quick-pauses" role="group" aria-label="Quick pause for ${label}">${[[900, '15'], [1800, '30'], [3600, '60']].map(([seconds, minutes]) => `<button class="button primary" type="button" data-quick-pause="${seconds}" data-person-id="${id}" data-focus-key="quick-${seconds}-${id}" aria-label="Pause ${label} for ${minutes} minutes">Pause ${minutes} min</button>`).join('')}</div>
+      ${timedPause ? `<p class="remaining" role="timer" aria-label="Time remaining on ${label} timed pause">Time left: <strong data-remaining="${effectiveManual.until}"></strong></p>` : ''}
+      <p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: the router policy has no allowance concept yet, so a schedule block cannot be lifted temporarily. Pausing and ending a pause work as shown.</span></p>
+      <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="${timedPause ? `End ${label} timed pause now` : `Resume ${label} manual pause`}">${timedPause ? 'End now' : 'Resume'}</button></div>
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
       <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy ${isReal() ? 'router' : 'synthetic'} confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
     </article>`;
@@ -442,6 +446,10 @@ function tick() {
     if (device) label.textContent = deviceEvidenceLabel(device);
   }
   for (const label of document.querySelectorAll('[data-age]')) label.textContent = Number.isFinite(currentAge) ? `${duration(currentAge)} ago` : 'age unavailable';
+  for (const label of document.querySelectorAll('[data-remaining]')) {
+    const remaining = Number(label.dataset.remaining) - now();
+    label.textContent = remaining > 0 ? duration(remaining) : 'expiry time reached, awaiting router observation';
+  }
   for (const label of document.querySelectorAll('[data-until]')) {
     const remaining = Number(label.dataset.until) - now();
     label.textContent = remaining > 0 ? `${duration(remaining)} until the expiry time; router observation remains authoritative.` : 'Expiry time reached. Waiting for a fresh router observation; this countdown cannot confirm expiry.';
@@ -466,8 +474,8 @@ $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);
 });
 $('#people').addEventListener('click', (event) => {
-  const button = event.target.closest('[data-control]');
-  if (button && !button.disabled) void mutate(button.dataset.personId, button.dataset.control);
+  const button = event.target.closest('[data-control], [data-quick-pause]');
+  if (button && !button.disabled) void mutate(button.dataset.personId, button.dataset.quickPause ? 'pause' : button.dataset.control, button.dataset.quickPause);
 });
 window.addEventListener('offline', () => { state.offline = true; state.needsRefresh = true; render(); announce('Offline. Last observed status is read-only; no control requests will be queued.'); });
 window.addEventListener('online', async () => {
