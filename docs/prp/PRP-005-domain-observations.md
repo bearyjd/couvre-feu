@@ -27,7 +27,7 @@ All router-side candidates see only traffic that crosses the router. The existin
 | | Source | Needs | Pros | Cons | Coverage |
 |---|---|---|---|---|---|
 | a | dnsmasq query logging (`log-queries`) | **dnsmasq config change** | Simplest; resolver already parses names; sees cache hits | **Forbidden today**: AGENTS.md and the contract say never change dnsmasq configuration. Logs go to syslog ring or a file, mixing adults' queries with kids' (privacy leak before filtering); restart or reload of the resolver on a shared GL device risks household DNS; GL firmware may overwrite config | Kids IPv4 redirected DNS, adults too (unfiltered at source) |
-| b | Passive capture of kids' redirected UDP/53 via a Couvre-feu-owned iptables `NFLOG` rule feeding a small reader | A rule in a `cf_`-owned chain; a reader process; NFLOG kernel module and reader tooling **(availability unverified)** | **No dnsmasq change.** Rule matches only the existing `cf_kids` set, so adult and unknown-MAC traffic never reaches the reader. Fits the existing owned-rule model, install and uninstall. Query names only, with packet range capped to the DNS header plus question (a few hundred bytes), so no payload beyond that | Adds a firewall rule and a long-lived process on a constrained router; rule ordering vs GL marks and flow offload needs testing; UDP only (TCP/53 gaps); parser must be hardened against malformed packets; EDNS/case randomization needs normalization | Kids' IPv4 plain DNS (redirected) and local IPv6 UDP/53 to the router if the rule is mirrored there |
+| b | Passive capture of kids' redirected UDP/53 via a Couvre-feu-owned iptables `NFLOG` rule feeding a small reader | One rule inside each generation's owned input chain (see [Attachment point](#attachment-point-for-option-b)); a reader process; `kmod-ipt-nflog`, `kmod-nfnetlink-log` and `ulogd` or a custom binary **(none verified present; package installation is currently blocked)** | **No dnsmasq change.** Rule matches only the generation's kids MAC set, so adult and unknown-MAC traffic never reaches the reader. Fits the existing owned-rule model, install and uninstall. Copied bytes bounded with `--nflog-size` and `--nflog-threshold` (DNS header plus question), so no payload beyond that | Adds a firewall rule and a long-lived process on a constrained router; BusyBox has no NFLOG reader, so a kernel module and userspace package (or a custom binary) must be added; rule ordering vs GL marks and flow offload needs testing; UDP only (TCP/53 gaps); parser must be hardened against malformed packets; EDNS/case randomization needs normalization | Kids' IPv4 plain DNS (redirected) and local IPv6 UDP/53 to the router if the rule is mirrored there |
 | c | conntrack plus reverse DNS | Read-only conntrack, PTR lookups | No new rule | **Weak.** Yields IPs, not names. PTR is mostly CDN or hosting names, wrong or absent; shared IPs defeat attribution; PTR lookups send child-correlated queries to a third party. Not recommended even as a fallback | Poor |
 | d | Companion apps (browser focus, app usage) | Per-platform apps, parent-owned enrollment | Sees through DoH/VPN/cellular; supports focus and attention evidence | Not built; per-platform entitlement and permission limits; self-reported and tamperable; large separate scope | Per device, off-network too |
 
@@ -35,14 +35,35 @@ All router-side candidates see only traffic that crosses the router. The existin
 
 **Option (b), as a measurement-first spike, with (d) as the complement later.** Rationale: (b) is the only router-side option that avoids the dnsmasq prohibition, scopes to children at the kernel match (before any software sees a packet), and reuses the owned-rule install, drift and uninstall model. (a) is rejected unless the owner explicitly lifts the dnsmasq rule, which this PRP does not request. (c) is rejected as inaccurate and leaky. If NFLOG or reader tooling cannot be shown to run safely on the target, the outcome is "not feasible on this router" and the work stops at (d) rather than reaching for (a).
 
+### Attachment point for option (b)
+
+Facts from the [enforcement contract](../enforcement-contract.md): IPv4 kids port 53 is DNATed to the LAN router address in `nat` PREROUTING (via the `cf_dns` dispatcher), followed by a kids-only UDP INPUT allowance in `filter` `cf_input`. Raw or mangle PREROUTING sees the **pre-DNAT** destination and would log queries aimed at external resolvers, which is not what is wanted. Therefore:
+
+- **Table and chain:** `filter` INPUT, reached through the `cf_input` dispatcher, post-DNAT, so every logged query is addressed to the router's own resolver.
+- **Position:** the `NFLOG` rule must come **before** the kids-only UDP/53 `ACCEPT`. NFLOG is non-terminating, but an earlier `ACCEPT` (or a GL leak drop that precedes it) would skip the rule entirely. The first measurement must verify ordering against GL marks.
+- **Match:** `-i br-lan -p udp --dport 53 -d <router LAN address>`, plus `-m set --match-set <kids MAC set> src`. The kids set is a `hash:mac` set, so `src` matches the source MAC and only enrolled children's assigned MACs are logged. Adults, protected identities and unknown MACs never match.
+- **Options:** `--nflog-group <n>`, `--nflog-size` and `--nflog-threshold` to bound copied bytes and batching. `--nflog-range` is not used; it is non-functional on the supported kernels.
+- **IPv6:** local kids UDP/53 to validated router IPv6 addresses gets a mirrored rule in the IPv6 input chain, only if the owner includes it (open question 9). Forwarded IPv6 external DNS is rejected today and is not observed.
+
+**Fit with the generation scheme.** The current design replaced the PRP-001 `cf_kids` set with immutable per-slot sets. Stable `cf_fwd`, `cf_input` and IPv4 `cf_dns` dispatchers jump to slot objects: filter chains `cf2_<slot>_f` and `cf2_<slot>_i` and MAC sets `cf2_<slot>_k`/`p` for slots `a` and `b`. The observation rule is therefore **not a standalone rule** on a stable chain:
+
+1. Each generation's input chain `cf2_<slot>_i` contains the `NFLOG` rule immediately before its UDP/53 `ACCEPT`, matching that slot's own `cf2_<slot>_k` set. The set is immutable, so there is no flush window where the rule matches nothing or everything.
+2. A policy change stages a complete inactive generation, including the observation rule. The existing guarded dispatcher switch then moves logging to the new slot with the rest of enforcement, so it follows slot switches and set membership changes with no extra transition step.
+3. Enabling or disabling collection for a child is a generation change (the rule is present or absent in the staged chain, with enrolled-child scoping from the same set), covered by the same digest, receipt and drift checks. Collection state is part of what the router confirms, never a side flag.
+4. During the transition guards (`cf2_<slot>_g`) the rule is simply absent; observations during a switch are recorded as a coverage gap, not inferred.
+5. Install, uninstall and recovery inventories must list the rule so that an uninstall removes it and a drift check detects its absence. The reader's group number is part of the inventory.
+
+The reader process is outside the firewall inventory; if it stops, the rule only drops copies into the netlink socket and enforcement is unchanged.
+
 ### What defeats it
 
 Router capture sees nothing when queries never cross the router as plain DNS:
 
 | Bypass | Effect | Note |
 |---|---|---|
-| DoH / DoT / DoQ to unlisted resolvers | Invisible | Known-address lists are partial and need a refresh owner; browser "secure DNS" can use new endpoints |
+| DoH / DoT / DoQ to unlisted resolvers | Invisible | Known-address lists are partial and need a refresh owner. Browser DoH defaults matter: Firefox enables DoH by default in some regions, Chrome and Edge upgrade to DoH when the system resolver is a known DoH-capable provider, and Safari/Apple devices can use encrypted DNS profiles. Android **Private DNS** (DoT, "Automatic") tries port 853 |
 | VPN, iCloud Private Relay, other relays | Invisible | Private Relay also hides names from the network |
+| Blocking Private Relay / Private DNS to force fallback | Visible again, with side effects | Networks can block these (Apple documents a DNS-based signal for Private Relay; Android Private DNS falls back or fails when port 853 is blocked). The existing DoT/DoQ blocks already do this for Android; forcing fallback can break apps or push a child onto cellular, which is invisible. Whether to force it is an owner decision, not part of this PRP
 | Cellular or other Wi-Fi | Invisible | Device off this network |
 | ECH, QUIC | Hides SNI, not DNS | Irrelevant to DNS capture but rules out an SNI fallback; DNS alone remains the signal |
 | Hardcoded resolver over TCP, DNS caching, hosts files | Gaps or undercount | A client cache hides repeat lookups; counts are lookups, not use |
@@ -54,16 +75,24 @@ Absence of an observation never means a child did not visit a site. Every output
 ## Data minimization
 
 - Reduce each query name to its **registrable domain (eTLD+1)** immediately in the reader, in memory. Full hostnames, subdomains, query types, client IPs and MACs are not stored. Reduction uses a versioned Public Suffix List snapshot shipped with the release; the PSL version is recorded with the data.
+- eTLD+1 rules, to be fixed by fixtures:
+  - **PSL private section:** proposal is to use the ICANN section only by default, so `alice.github.io` reduces to `github.io`. Using the private section would record per-user hosting subdomains (`*.github.io`, `*.blogspot.com`), which identify individual pages and are more revealing. Owner may choose otherwise (open question).
+  - **Case and IDN:** lowercase ASCII, compare and store in punycode (`xn--`) form; invalid labels, over-length names and malformed packets are dropped. Display conversion to Unicode happens only in the UI.
+  - **Dropped entirely:** IP literals, and `.arpa` reverse lookups (`in-addr.arpa`, `ip6.arpa`), which leak addresses; `.local`, `.lan`, `.home.arpa` and other special-use names; single-label names; names with no PSL match (never guess a suffix).
+  - Dropped lookups are not counted into any bucket other than an aggregate `dropped` counter without name or child detail.
 - Stored record: `(child_id, hour_bucket_utc, registrable_domain, count)`. Hourly buckets; no per-query timestamps.
 - Only enrolled children's assigned devices attribute to a `child_id`; others are dropped before counting.
 - Per-child, per-hour and global caps on distinct domains; overflow goes to a single `other` bucket count.
-- **Sensitive-category denylist (option to discuss):** a maintained list of categories (for example health, sexuality, mental health, religion, abuse support lines, crisis resources) whose domains are counted into one `sensitive` bucket without domain names, so a child's help-seeking is never exposed. Categories need a source and a refresh owner. See open questions.
+- **Sensitive-category denylist (proposal: on by default if any category mapping exists):** a maintained list of categories (for example health, sexuality, mental health, religion, abuse support lines, crisis resources). Matching lookups are **dropped entirely**: not stored, not counted, not bucketed. A `sensitive` bucket would still disclose help-seeking through its count and hour, so it is not the default. The tradeoff is that parents see a true-looking but incomplete picture; the UI must say that some categories are never recorded. Categories need a source and a refresh owner. See open question 3.
 - Optional later: a coarse category mapping from a local, offline list. No per-lookup third-party calls.
 
 ## Retention, control and transparency
 
 - **Retention:** 14 days default, hard-deleted by a daily job; owner may shorten, not exceed a bounded maximum (proposal: 30 days).
-- **Deletion on unenroll:** removing a child or device deletes that child's observations within one deletion pass, and stops attribution immediately.
+- **Deletion pass (defined):** a bounded transactional job that deletes rows older than the retention horizon (by bucket hour), and, on request, all rows for a child. After deleting it checkpoints and truncates the SQLite WAL (`wal_checkpoint(TRUNCATE)`) and then runs `VACUUM` or an incremental equivalent so freed pages do not retain domains. It records only counts and times in the audit log, never domains. A failed pass is retried and surfaced; retention is not considered met until it succeeds.
+- **Backups:** observations are excluded from general database backups, or backups carry the same horizon: any backup containing observations expires no later than the retention period plus a stated grace, and deletion for a child must also be applied to or invalidate those backups. If that cannot be guaranteed, observations live in a separate database file that is not backed up. Open question 11.
+- **Exports:** parent exports are generated on demand, not stored, are marked with the data window, and are the parent's responsibility once downloaded; the service keeps no copy and never emails them.
+- **Deletion on unenroll:** removing a child or device runs the deletion pass for that child promptly (target: same day), stops attribution immediately, and drops any unflushed router-side counters for that child.
 - **Parent export and delete:** an authenticated parent can export (JSON) and delete observations for assigned children, subject to existing permission boundaries; actions are audited without recording domains in the audit log.
 - **Child transparency:** enabling collection for a child requires showing that child an age-appropriate notice stating what is seen (the sites your devices look up, not what you do on them), who can see it, how long it is kept, and what is not collected (no passwords, messages, pages or photos). The notice text is versioned; the child's acknowledgement or the parent's record that it was shared is stored.
 - **Consent model:** off by default, enabled per child by an authorized parent, with a recorded notice version and timestamp. Enabling, disabling and the notice version are visible in the parent UI. Adults get no collection. Legal and school-managed-device considerations are an owner decision (see open questions).
@@ -84,9 +113,10 @@ Absence of an observation never means a child did not visit a site. Every output
 
 1. **Owner approval of this PRP**, including the dnsmasq decision (reject (a)), consent model, retention and denylist stance.
 2. **Fixture tests:** DNS packet parser and eTLD+1 reduction with malformed and adversarial inputs, bounds and overflow, deletion and retention jobs, scope exclusion of adults and unknown MACs. Fixtures do not establish real packet behavior.
-3. **Live read-only measurement with one consenting child device**, under per-invocation approval for each router command: confirm NFLOG availability, rule ordering with GL marks, memory and CPU headroom, and that adult DNS and enforcement are unaffected.
-4. **Accuracy check:** compare captured lookups with a known script of browsing on the test device; record undercount causes (cache, DoH, TCP) and publish the coverage statement.
-5. **UI with truthful labels:** lookups, coverage limits, freshness, consent state and child notice. Collection stays default OFF until this gate passes.
+3. **Package and tooling gate:** verify that `kmod-ipt-nflog`, `kmod-nfnetlink-log` and a reader (`ulogd` or a custom binary) exist for the exact firmware and can be installed and rolled back. Package installation is currently blocked (README, [spike-005](../spike-005.md)); without a firmware-compatible package, dependency and rollback plan this feature does not proceed.
+4. **Live read-only measurement with one consenting child device**, under per-invocation approval for each router command: confirm NFLOG availability, rule ordering in `cf2_<slot>_i` against the UDP/53 `ACCEPT` and GL marks, behavior across a slot switch, memory and CPU headroom, and that adult DNS and enforcement are unaffected.
+5. **Accuracy check:** compare captured lookups with a known script of browsing on the test device; record undercount causes (cache, DoH, TCP) and publish the coverage statement.
+6. **UI with truthful labels:** lookups, coverage limits, freshness, consent state and child notice. Collection stays default OFF until this gate passes.
 
 Any gate failure stops the work; the fallback is no collection.
 
@@ -94,7 +124,7 @@ Any gate failure stops the work; the fallback is no collection.
 
 1. Do you reject dnsmasq query logging (a) outright, or would you ever lift the dnsmasq rule for a narrow, reviewed change?
 2. Is a router-resident reader acceptable given the constrained device, or should this wait for a dedicated observer outside the router?
-3. Do you want the sensitive-category denylist, and who maintains it? Should sensitive domains be dropped entirely or counted as one `sensitive` bucket?
+3. Do you want the sensitive-category denylist, and who maintains it? Default is to drop sensitive lookups entirely (strongest privacy, but parents see an incomplete picture); a `sensitive` bucket count would still reveal help-seeking by count and hour. Which tradeoff do you accept?
 4. Is 14 days right, and is a 30-day cap acceptable?
 5. May a child see their own observations, and should older children be able to view what parents see?
 6. What is the consent and notice wording per age band, and is acknowledgement by the child required or is a parent record enough?
@@ -102,3 +132,6 @@ Any gate failure stops the work; the fallback is no collection.
 8. Who owns the PSL and the DoH/DoT endpoint list refresh?
 9. Should TCP/53 and local IPv6 UDP/53 be in scope for the first measurement, or only redirected IPv4 UDP/53?
 10. Should router-side counts be shown at all before companion evidence exists, given the visit/attention misreading risk?
+11. Do database backups include observations? If so, how do deletes and the retention horizon propagate to backups, or should observations live in an unbacked-up file?
+12. Use the PSL ICANN section only (proposed) or also the private section?
+13. Should the network force fallback from Private Relay or Android Private DNS, accepting breakage and cellular escape?
