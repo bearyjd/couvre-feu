@@ -107,6 +107,27 @@ vp_profile={PROFILE}
     def test_firmware_world_write_refuses_before_identity(self):
         (self.root/'etc/glversion').chmod(0o666)
         self.assertIn('metadata_special_or_world_write',self.run_helper().stderr)
+    def test_exact_group_writable_firmware_is_os_profile_only(self):
+        firmware=self.root/'etc/glversion';firmware.chmod(0o664)
+        # Actual metadata admission and firmware size/hash checks run; only the
+        # fixture's existing root-owner adapter substitutes the local UID/GID.
+        direct=f'\nvp_metadata "{firmware}";vp_os_firmware'
+        for profile in [PROFILE,'strict',platform.PROFILE,None]:
+            with self.subTest(profile=profile):
+                selector='unset vp_profile' if profile is None else 'vp_profile='+profile
+                result=subprocess.run(SHELL+['-c',self.setup+'\n'+selector+direct],capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode==0,profile==PROFILE,result.stderr)
+                if profile!=PROFILE:self.assertIn('unobserved_group_writable_path' if profile==platform.PROFILE else 'unsupported_vendor_profile',result.stderr)
+        result=self.run_helper();self.assertEqual(result.returncode,0,result.stderr)
+        firmware.write_text('4.8.4\n')
+        self.assertIn('firmware_identity_pin',self.run_helper().stderr)
+        firmware.write_text('4.8.3\n');firmware.chmod(0o666)
+        self.assertIn('metadata_special_or_world_write',self.run_helper().stderr)
+        firmware.chmod(0o664)
+        self.assertIn('metadata_owner',self.run_helper('stat_private() { printf "7:0:664\\n"; }').stderr)
+        other=self.root/'etc/unknown-firmware';other.write_text('4.8.3\n');other.chmod(0o664)
+        result=subprocess.run(SHELL+['-c',self.setup+f'\nvp_metadata "{other}"'],capture_output=True,text=True,timeout=10)
+        self.assertIn('unobserved_group_writable_path',result.stderr)
     def test_account_drift_and_provider_appearance_after_first_witness_refuse(self):
         # Rename only the fixture wrapper so the actual complete PID1 witness
         # runs before these controlled local changes.
