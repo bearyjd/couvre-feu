@@ -48,10 +48,10 @@ cfr_stop() {
 }
 
 # Invoked from the EXIT trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cfr_cleanup() {
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) return 0;; esac
-    [ -d "$CFR_STAGE" ] && [ ! -L "$CFR_STAGE" ] || return 0
+    if [ ! -d "$CFR_STAGE" ] || [ -L "$CFR_STAGE" ]; then return 0; fi
     if [ -f "$CFR_STAGE/manifest" ]; then
         while read -r cfr_sum cfr_mode cfr_path; do
             case "$cfr_path" in router/*) rm -f "$CFR_STAGE/$cfr_path";; esac
@@ -72,7 +72,7 @@ cfr_setup_paths() {
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         # Isolated fixtures only: production SSH runs under `env -i`.
         case "${CF_ROOT:-}" in /tmp/couvre-feu-*) ;; *) return 1;; esac
-        [ -d "$CF_ROOT" ] && [ ! -L "$CF_ROOT" ] || return 1
+        if [ ! -d "$CF_ROOT" ] || [ -L "$CF_ROOT" ]; then return 1; fi
         [ "$(CDPATH='' cd -- "$CF_ROOT" && pwd -P)" = "$CF_ROOT" ] || return 1
         CFR_FIXTURE=1
         CFR_ROOT=$CF_ROOT
@@ -151,7 +151,9 @@ cfr_identity() {
             [ "$cfr_live" != "$cfr_old" ] || cfr_refuse IDENTITY live_role_matches_protected_historical_mac
         done
     done
-    [ "$CFR_MGMT_MAC" != "$CFR_JD_MAC" ] && [ "$CFR_MGMT_MAC" != "$CFR_PENN_MAC" ] && [ "$CFR_JD_MAC" != "$CFR_PENN_MAC" ] || cfr_refuse IDENTITY duplicate_live_mac
+    if [ "$CFR_MGMT_MAC" = "$CFR_JD_MAC" ] || [ "$CFR_MGMT_MAC" = "$CFR_PENN_MAC" ] || [ "$CFR_JD_MAC" = "$CFR_PENN_MAC" ]; then
+        cfr_refuse IDENTITY duplicate_live_mac
+    fi
     [ -n "${SSH_CONNECTION:-}" ] || cfr_refuse IDENTITY ssh_connection_missing
     set -f
     # Deliberate token split of the sshd-provided value; globbing disabled.
@@ -161,7 +163,7 @@ cfr_identity() {
     [ "$#" = 4 ] || cfr_refuse IDENTITY ssh_connection_invalid
     [ "$1" = "$CFR_MGMT_IP" ] || cfr_refuse IDENTITY ssh_source_not_management
     ip -4 neigh show dev br-lan > "$CFR_STAGE/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
-    [ -f "$CFR_LEASES" ] && [ ! -L "$CFR_LEASES" ] || cfr_refuse IDENTITY leases_unavailable
+    if [ ! -f "$CFR_LEASES" ] || [ -L "$CFR_LEASES" ]; then cfr_refuse IDENTITY leases_unavailable; fi
     # The installer itself requires REACHABLE/PERMANENT for the SSH client.
     cfr_neighbor "$CFR_MGMT_IP" "$CFR_MGMT_MAC" REACHABLE "$CFR_STAGE/identity.neigh" || cfr_refuse IDENTITY management_neighbor_mismatch
     cfr_neighbor "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_LIVE_STATES" "$CFR_STAGE/identity.neigh" || cfr_refuse IDENTITY jd_adult_neighbor_mismatch
