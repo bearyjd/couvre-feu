@@ -40,6 +40,10 @@ vp_metadata() {
         /etc/passwd:0:0:664|/etc/group:0:0:664)
             # Reused008 account-source READ admission, not a mutation target.
             regular "$1";;
+        /etc/glversion:0:0:664)
+            [ "${vp_profile:-strict}" = gl-xe3000-4.8.3-os-trust-v1 ] || fail unobserved_group_writable_path
+            regular "$1"
+            [ "$(vp_hash_value "$1")" = 00454f29247de581cee62dc867a330c6fcdab32b36dccb02881779512425558b ] || fail firmware_identity_pin;;
         *) fail unobserved_group_writable_path;;
     esac
 }
