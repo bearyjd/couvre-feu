@@ -1,5 +1,6 @@
 import { createPasskey, getPasskey } from './auth-client.js';
 import { actorScope, clearStatusCache, saveStatus, readStatus, needsServerLogout, setServerLogoutNeeded, broadcastLogout, broadcastScope, LOGOUT_EVENT, LOGOUT_REQUIRED, SCOPE_EVENT } from './status-cache.js';
+import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -7,6 +8,9 @@ const now = () => Math.floor(Date.now() / 1000);
 const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
 const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 const FRESH_SECONDS = 30;
+let alertStorage;
+try { alertStorage = localStorage; } catch { alertStorage = null; }
+const alertJournal = createAlertJournal(alertStorage);
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
@@ -78,16 +82,18 @@ function resetView() {
   state.operation = null; state.localUnknown = false; state.needsRefresh = true; state.renderKey = '';
   state.busy = false; state.refreshing = false; state.durations.clear();
   clearStatusCache();
+  alertJournal.clear();
   render();
 }
 
 function showCachedStatus() {
   const snapshot = readStatus();
-  if (!snapshot) return false;
+  if (!snapshot) { alertJournal.clear(); return false; }
   state.snapshotActor = snapshot.actor; state.people = snapshot.status; state.savedAt = snapshot.savedAt;
   state.scheduleClockBasis = {wall: Date.now() / 1000, started: performance.now() / 1000};
   state.snapshotExpiresAt = snapshot.sessionExpiresAt;
   state.session = null; state.needsRefresh = true;
+  alertJournal.bind({source: snapshot.status.source, integrationScope: snapshot.status.integrationScope, actor: snapshot.actor, expiresAt: snapshot.sessionExpiresAt}, snapshot.status, now());
   render();
   return true;
 }
@@ -97,8 +103,10 @@ function acceptSession(session) {
   if (session.source !== (isReal() ? 'real-router-integration' : 'synthetic-fake-router') || (session.integrationScope ?? null) !== (document.documentElement.dataset.integrationScope ?? null)) throw new APIError(401, 'installation_scope_changed', 'The source or installation changed. Reload and sign in again.');
   if (previous && actorScope(previous) !== actorScope(session.actor)) {
     clearStatusCache();
+    alertJournal.clear();
     state.people = null; state.operation = null; state.localUnknown = false; state.renderKey = '';
   }
+  if (state.session && state.session.expiresAt !== session.expiresAt) alertJournal.clear();
   state.session = session;
   state.snapshotActor = null;
   state.snapshotExpiresAt = null;
@@ -138,6 +146,8 @@ async function refresh({ quiet = false } = {}) {
     // An uncertain response is resolved only through a fresh server observation.
     state.localUnknown = people.people.some((person) => person.status === 'unknown');
     saveStatus(state.session, people);
+    alertJournal.bind(state.session, people, now());
+    alertJournal.ingest(people, now(), !state.offline);
     if (!quiet) announce('Status refreshed. Review the current manual pause and schedule before making a change.');
     return true;
   } catch (error) {
@@ -160,6 +170,7 @@ async function refresh({ quiet = false } = {}) {
 async function authenticate(kind, token) {
   if (state.busy) return;
   clearStatusCache();
+  alertJournal.clear();
   state.busy = true; renderAuthControls();
   announce(kind === 'register' ? 'Create a passkey with your browser. The token fixes the account and permissions.' : 'Confirm your passkey in the browser.');
   const generation = state.generation;
@@ -361,6 +372,40 @@ function renderPeople() {
   tick();
 }
 
+function renderAlerts() {
+  const panel = $('#operational-alerts'), feed = $('#alert-feed');
+  if (!state.people || !actor()) { feed.replaceChildren(); panel.hidden = true; $('#hide-recovery').checked = false; return; }
+  const all = alertJournal.view(now(), true);
+  const view = {...all, records: all.records.filter(record => !all.hideRecovery || record.recoveredAt === null)};
+  const sameCondition = (record, condition) => record.code === condition.code && (record.operationId ?? null) === (condition.operationId ?? null) && (record.pauseUntil ?? null) === (condition.pauseUntil ?? null);
+  const currentRows = state.offline || !alertJournal.isBound() ? '' : state.people.people.filter(person => actor().personIds.includes(person.id)).flatMap(person => {
+    const evidence = cacheAlertEvidence(person.operationalAlerts, state.people.source);
+    const witness = alertJournal.latestWitness(person.id);
+    const recoveredEvaluation = Math.max(0, ...all.records.filter(record => record.personId === person.id).map(record => record.recoveryEvaluatedAt ?? 0));
+    if (!evidence || evidence.evaluatedAt > now() || evidence.evaluatedAt < recoveredEvaluation) return [];
+    return evidence.conditions.filter(condition => !(condition.code.startsWith('observation-') || condition.code === 'observed-drift') || evidence.evaluatedAt >= (witness?.healthyEvaluatedAt ?? 0))
+      .filter(condition => condition.code !== 'observed-drift' || evidence.freshness === 'fresh' && evidence.freshUntil > now())
+      .filter(condition => !['observation-stale', 'observed-drift'].includes(condition.code) || !witness || evidence.sourceObservedAt >= witness.sourceObservedAt &&
+        (evidence.source === 'synthetic-policy' || evidence.serviceReceivedAt >= witness.serviceReceivedAt))
+      .filter(condition => !all.records.some(record => record.personId === person.id && record.recoveredAt === null && sameCondition(record, condition)))
+      .map(condition => `<li class="alert-row alert-current"><strong>${escape(person.name)} · Current response verification warning</strong><p>${escape(alertText(condition.code))}</p><small>Response evaluated ${escape(time(evidence.evaluatedAt))} · source observed ${escape(time(evidence.sourceObservedAt))}</small></li>`);
+  }).join('');
+  const rows = currentRows + view.records.map(record => {
+    const person = state.people.people.find(person => person.id === record.personId);
+    if (!person) return '';
+    const current = !state.offline && (person.operationalAlerts?.conditions.some(condition => condition.code === record.code &&
+      (condition.code !== 'observed-drift' || person.operationalAlerts.freshness === 'fresh' && person.operationalAlerts.freshUntil > now()) &&
+      (condition.operationId ?? null) === (record.operationId ?? null) && (condition.pauseUntil ?? null) === (record.pauseUntil ?? null)) ||
+      record.code === 'observation-stale' && person.operationalAlerts?.freshUntil !== null && person.operationalAlerts?.freshUntil <= now());
+    const label = record.recoveredAt !== null ? 'Recovered with a newer router witness' : state.offline ? 'Historical warning · unresolved' : current ? 'Current verification warning' : 'Earlier warning · unresolved';
+    return `<li class="alert-row${record.recoveredAt !== null ? ' recovered' : ''}"><strong>${escape(person.name)} · ${escape(label)}</strong><p>${escape(alertText(record.code))}</p><small>First noticed ${escape(time(record.firstNoticedAt))} · source observed ${escape(time(record.sourceObservedAt))}${record.recoveredAt !== null ? ` · recovered ${escape(time(record.recoveredAt))}` : ''}${record.operationId ? '<br>This warning concerns the earlier identified request; current controls use the latest status above.' : ''}</small></li>`;
+  }).join('');
+  const html = rows || '<li class="fine-print">No retained alerts for this permitted session.</li>';
+  if (feed.innerHTML !== html) feed.innerHTML = html;
+  $('#hide-recovery').checked = view.hideRecovery;
+  panel.hidden = false;
+}
+
 function render() {
   const hasStatus = Boolean(state.people && actor());
   $('#auth-view').hidden = hasStatus;
@@ -382,6 +427,7 @@ function render() {
     state.renderKey = '';
   }
   renderAuthControls();
+  renderAlerts();
 }
 
 function tick() {
@@ -403,6 +449,7 @@ function tick() {
   if (state.people && currentAge > FRESH_SECONDS && !state.needsRefresh) { state.needsRefresh = true; renderConnection(); }
   if (state.session && state.session.expiresAt <= now()) { resetView(); announce('Your session expired. Sign in again; local status was cleared.', true); }
   if (state.snapshotExpiresAt && state.snapshotExpiresAt <= now()) { resetView(); announce('The cached session expired. Local status was cleared; reconnect and sign in again.', true); }
+  if (state.people && actor()) { alertJournal.ingest(state.people, now(), false); renderAlerts(); }
   renderControlState();
 }
 
@@ -414,6 +461,7 @@ $('#enroll-form').addEventListener('submit', (event) => {
   if (token) void authenticate('register', token);
 });
 $('#refresh').addEventListener('click', () => void refresh());
+$('#hide-recovery').addEventListener('change', event => { alertJournal.setHideRecovery(event.target.checked, now()); renderAlerts(); });
 $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);
 });
@@ -430,6 +478,10 @@ window.addEventListener('online', async () => {
   } else await refresh();
 });
 window.addEventListener('storage', (event) => {
+  if (event.key === ALERT_ACTIVE || event.key?.startsWith(ALERT_PREFIX)) {
+    alertJournal.storageChanged(event.key, event.newValue);
+    renderAlerts();
+  }
   if (event.key === LOGOUT_EVENT) {
     state.logoutRequired = needsServerLogout(); resetView();
     announce('Signed out in another tab. Local status has been cleared.');

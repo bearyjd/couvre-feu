@@ -1,4 +1,5 @@
 import { deviceEvidence } from './device-evidence.ts';
+import { operationalAlerts } from './operational-alerts.ts';
 import { randomUUID } from 'node:crypto';
 import { digest } from './auth.ts';
 import type { Actor, OperationDTO, OperationState, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
@@ -228,6 +229,7 @@ export class PolicyService {
         return {
             ...provenance, people: FICTIONAL_PEOPLE.filter(p => actor.personIds.includes(p.id)).map(p => {
                 const row = this.store.get<OperationRow>('SELECT * FROM operations WHERE person_id=? ORDER BY revision DESC LIMIT 1', p.id), schedule = scheduleBlocked(policy, p.id, now);
+                const operation = row ? this.dto(row) : null;
                 return {
                     id: p.id, name: p.name, devices: p.devices.map(d => ({
                         id: d.id, label: d.label, evidence: deviceEvidence({source: 'synthetic-policy', now: this.now(), sourceObservedAt: observation?.routerTime ?? null,
@@ -236,7 +238,12 @@ export class PolicyService {
                     })), manualPause: policy.pauses.find(pause => pause.person === p.id) ?? null,
                     effectiveManualPause: effectivePauses(policy, now).find(pause => pause.person === p.id) ?? null, scheduleBlocked: schedule,
                     scheduleExplanation: schedule ? 'The fictional UTC school-night schedule still blocks access. Resume clears only the manual pause.' : 'No fictional UTC schedule window is active.',
-                    observationHealth: this.lastReadError ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: this.lastReadError ? 'unknown' : row?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: row ? this.dto(row) : null
+                    observationHealth: this.lastReadError ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: this.lastReadError ? 'unknown' : row?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: operation,
+                    operationalAlerts: operationalAlerts({source: 'synthetic-policy', now: this.now(), sourceObservedAt: observation?.routerTime ?? null, serviceReceivedAt: null,
+                        generationMatches: true, readError: this.lastReadError !== null, healthy, drift: observation?.status.drift === true,
+                        pauseUntil: observation?.policy.pauses.find(pause => pause.person === p.id)?.until ?? null,
+                        expiredEffectivePause: Boolean(observation?.status.effectivePauses.some(pause => pause.person === p.id && pause.until > 0 && pause.until <= now)),
+                        operation, operationHealthy: Boolean(row && observation && observation.appliedOperationId === row.id && policyJSON(observation.policy) === row.payload_json && healthy)})
                 };
             }), serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: observation?.status.desiredRevision ?? null, revisionToken: !this.lastReadError && observation ? this.revisionToken(state.highwater, observation.policy) : null,
             routerConfirmedRevision: observation?.status.confirmedRevision ?? null, observedAt: state.observed_at, statusAgeSeconds: state.observed_at === null ? null : Math.max(0, this.now() - state.observed_at), lastSuccessfulConfirmationAt: state.last_confirmation_at,

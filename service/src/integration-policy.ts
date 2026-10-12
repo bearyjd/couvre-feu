@@ -1,4 +1,5 @@
 import { deviceEvidence } from './device-evidence.ts';
+import { operationalAlerts } from './operational-alerts.ts';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
@@ -106,7 +107,12 @@ export class IntegrationPolicy {
             generationMatches: o?.generation === this.store.config.router.generation})}],
             manualPause: o?.acceptedPolicy.pauses.find(a => a.person === p.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === p.id) ?? null,
             ...integrationScheduleState(enrolled ? o!.acceptedPolicy : this.store.config.enrollment, this.store.config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1),
-            observationHealth: info.observation_error ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: dto?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: dto}] : [],
+            observationHealth: info.observation_error ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: dto?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: dto,
+            operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
+                generationMatches: o?.generation === this.store.config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,
+                drift: o?.status.drift === true, pauseUntil: o?.acceptedPolicy.pauses.find(pause => pause.person === p.id)?.until ?? null,
+                expiredEffectivePause: Boolean(o?.status.effectivePauses.some(pause => pause.person === p.id && pause.until > 0 && pause.until <= (o?.routerTime ?? 0))),
+                operation: dto, operationHealthy: dto?.currentHealthy === true})}] : [],
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};

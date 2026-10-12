@@ -1,3 +1,5 @@
+import { cacheAlertEvidence } from './operational-alerts.js';
+
 const PREFIX = 'cf-status:v1:';
 const ACTIVE = 'cf-status-active:v1';
 export const LOGOUT_REQUIRED = 'cf-logout-required:v1';
@@ -45,6 +47,7 @@ export function saveStatus(session, status) {
       scheduleExplanation: person.scheduleExplanation, status: person.status,
       scheduleTimezone: person.scheduleTimezone, scheduleWitness: person.scheduleWitness, scheduleValidUntil: person.scheduleValidUntil, scheduleCheckedAt: person.scheduleCheckedAt,
       latestOperation: person.latestOperation,
+      operationalAlerts: cacheAlertEvidence(person.operationalAlerts, status.source),
     }));
     const snapshot = {
       actor: { id: actor.id, displayName: actor.displayName, role: actor.role, personIds: [...actor.personIds], permissionVersion: actor.permissionVersion },

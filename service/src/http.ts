@@ -15,6 +15,7 @@ const STATIC: Record<string, [
 ]> = {
     '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
     '/auth-client.js': ['auth-client.js', 'text/javascript; charset=utf-8'], '/status-cache.js': ['status-cache.js', 'text/javascript; charset=utf-8'],
+    '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -98,7 +99,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v1'", `'cf-shell-integration-${provenance.integrationScope}'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v2'", `'cf-shell-integration-${provenance.integrationScope}-v2'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
