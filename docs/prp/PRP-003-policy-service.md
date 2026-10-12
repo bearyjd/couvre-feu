@@ -4,7 +4,7 @@ Session 002 implements a fictional local vertical slice. The service uses `share
 
 ## Scope and isolation
 
-The runnable service binds `127.0.0.1`, accepts the exact configured `localhost` Host/origin, and uses fictional people Alex and Blair. Fictional JD is admin; fictional Bryn is parent assigned only Alex. People/device/schedule administration is seeded read-only. Usage, domains and app history are unavailable. There is no bonus/Allow-until route.
+The runnable service binds `127.0.0.1`, accepts the exact configured `localhost` Host/origin, and uses fictional people Alex and Blair. Fictional JD is admin; fictional Bryn is parent assigned only Alex. People and device administration is seeded read-only; assigned people's weekly schedules are editable through the policy-revision path below. Usage, domains and app history are unavailable. There is no bonus/Allow-until route.
 
 The only transport is a file-backed fake router. It contains no SSH client, credentials, router hostname or production transport. Production-target and authentication-bypass environment variables are rejected. Node's local HTTP and SQLite APIs are used directly; no general web framework is required. Real packet enforcement, actual router compatibility, stable private HTTPS, household account enrollment/recovery and deployment remain outside this milestone.
 
@@ -47,10 +47,15 @@ Restart/reconnect first observes the router. Pending/unknown operations may repl
 | `GET /operations/:id` | Assigned-person operation history; unauthorized IDs are not disclosed |
 | `POST /people/:id/pause` | `{until:0}` indefinitely, or future absolute epoch; token/key/CSRF required |
 | `POST /people/:id/resume` | `{}` removes only manual pause; active schedule can still block |
+| `POST /people/:id/schedules` | `{id,weekdays,start,stop}` adds a weekly window (cross-midnight allowed when stop is earlier than start); same token/key/CSRF as pause |
+| `POST /people/:id/schedules/:sid` | `{weekdays,start,stop}` replaces that window |
+| `POST /people/:id/schedules/:sid/delete` | `{}` removes that window |
 
 All timestamps are epoch seconds. The seeded fake schedule uses UTC explicitly. Every policy/operation/status result carries `source: synthetic-fake-router` and `routerCompatibilityVerified: false`. Shared DTOs are defined in `shared/src/contracts.ts`.
 
 Mutation HTTP 200 requires a fresh observation of the exact operation identity, exact normalized payload, desired/confirmed revision, `ok=true`, no drift/errors, both-family demo capability evidence, native/conntrack evidence, required address coverage and expected observed MAC sets. A matching revision alone cannot confirm. HTTP 202 includes the operation URL and means pending/unknown; 409 requires refresh and another deliberate action; explicit apply failure is 502. A historical confirmed operation remains historical when current health changes, but its replay cannot return mutation 200 without a fresh exact witness.
+
+Schedule routes are demo-only: the integration service answers 403 `schedule_editing_unavailable` because its schedules are owner-configured. They create `schedule_create`/`schedule_update`/`schedule_delete` operations through the same revision-CAS, one-operation-at-a-time and exact-confirmation path as pauses (service migration 003 widens the operation action check; integration databases are unchanged). Bounds come from `normalizePolicy`: id `^[a-z][a-z0-9_]{0,31}$`, at most 256 schedules, 7 unique weekdays, `HH:MM` start different from stop, and at most 256 expanded per-device native windows (a cross-midnight window counts twice per device). The contract does not forbid overlapping windows, so they are allowed; access is blocked while any window is active. Only assigned people can be edited (404 otherwise). Times follow the fake router's UTC clock.
 
 ## Acceptance and remaining gates
 

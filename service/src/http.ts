@@ -16,6 +16,7 @@ const STATIC: Record<string, [
     '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
     '/auth-client.js': ['auth-client.js', 'text/javascript; charset=utf-8'], '/status-cache.js': ['status-cache.js', 'text/javascript; charset=utf-8'],
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
+    '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -66,7 +67,7 @@ function send(response: ServerResponse, status: number, value: unknown) {
     });
     response.end(JSON.stringify(value));
 }
-type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'>;
+type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
@@ -143,6 +144,17 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
                 if (match) {
                     const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
+                const schedule = /^\/people\/([a-z][a-z0-9_]{0,31})\/schedules(?:\/([a-z][a-z0-9_]{0,31})(\/delete)?)?$/.exec(path);
+                if (schedule) {
+                    if (!policy.scheduleMutate) {
+                        throw new AppError(403, 'schedule_editing_unavailable', 'Schedules are owner-configured in this installation.');
+                    }
+                    const action = !schedule[2] ? 'schedule_create' : schedule[3] ? 'schedule_delete' : 'schedule_update';
+                    const result = await policy.scheduleMutate(session.dto.actor, schedule[1], action, payload, schedule[2], request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;

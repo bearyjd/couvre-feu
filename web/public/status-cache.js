@@ -45,6 +45,7 @@ export function saveStatus(session, status) {
       manualPause: person.manualPause, effectiveManualPause: person.effectiveManualPause,
       observationHealth: person.observationHealth, scheduleBlocked: person.scheduleBlocked,
       scheduleExplanation: person.scheduleExplanation, status: person.status,
+      schedules: person.schedules, schedulesEditable: person.schedulesEditable,
       scheduleTimezone: person.scheduleTimezone, scheduleWitness: person.scheduleWitness, scheduleValidUntil: person.scheduleValidUntil, scheduleCheckedAt: person.scheduleCheckedAt,
       latestOperation: person.latestOperation,
       operationalAlerts: cacheAlertEvidence(person.operationalAlerts, status.source),

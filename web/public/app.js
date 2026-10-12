@@ -1,5 +1,6 @@
 import { createPasskey, getPasskey } from './auth-client.js';
 import { actorScope, clearStatusCache, saveStatus, readStatus, needsServerLogout, setServerLogoutNeeded, broadcastLogout, broadcastScope, LOGOUT_EVENT, LOGOUT_REQUIRED, SCOPE_EVENT } from './status-cache.js';
+import { createScheduleEditor, actionVerb } from './schedule-editor.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -275,7 +276,7 @@ async function mutate(personId, action, presetSeconds) {
 }
 
 function operationText(operation) {
-  const verb = operation.action === 'resume' ? 'Resume' : 'Pause';
+  const verb = actionVerb(operation.action);
   if (isReal()) return ({
     pending: operation.dispatch === 'awaiting_automatic_dispatch' ? `${verb} pending. Waiting for automatic router confirmation.` : operation.dispatch === 'consumed' ? `${verb} pending. Waiting for the router receipt.` : `${verb} pending. Waiting for an exact operator-approved router invocation.`,
     confirmed: `${verb} confirmed by a fresh router receipt and current runtime observation. Packet behavior remains unmeasured.`,
@@ -333,6 +334,7 @@ function renderControlState() {
   for (const button of document.querySelectorAll('[data-control], [data-quick-pause]')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   $('#refresh').disabled = state.busy || state.refreshing || state.offline;
+  scheduleEditor.render();
 }
 
 function renderConnection() {
@@ -429,6 +431,7 @@ function render() {
     $('#connection').replaceChildren();
     $('#account-context').textContent = '';
     state.renderKey = '';
+    scheduleEditor.render();
   }
   renderAuthControls();
   renderAlerts();
@@ -460,6 +463,12 @@ function tick() {
   if (state.people && actor()) { alertJournal.ingest(state.people, now(), false); renderAlerts(); }
   renderControlState();
 }
+
+const scheduleEditor = createScheduleEditor({
+  root: $('#schedule-editor'), state, api, announce, canControl, refresh, render, operationText, followOperation,
+  setBusy: (value) => { state.busy = value; renderControlState(); },
+  unauthorized: () => { resetView(); announce('This action is not authorized. Sign in again; local status has been cleared.', true); },
+});
 
 $('#sign-in').addEventListener('click', () => void authenticate('login'));
 $('#enroll-form').addEventListener('submit', (event) => {

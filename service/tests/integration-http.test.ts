@@ -57,6 +57,7 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
         assert.equal(verified.body.actor.role, 'parent'); csrf = verified.body.csrfToken;
         assert.equal((await request('/devices')).status, 403);
         assert.equal((await request('/people', undefined, {'X-Cf-Actor': 'operator'})).status, 400);
+        assert.equal((await request('/people/other/schedules', {id: 'x', weekdays: ['Mon'], start: '22:00', stop: '06:30'}, {'If-Match': '"s0-r0-' + 'a'.repeat(64) + '"', 'Idempotency-Key': 'schedule_edit_denied_1'})).body.error.code, 'schedule_editing_unavailable');
         assert.equal((await request('/people/other/pause', {until: 0}, {'If-Match': '"s0-r0-' + 'a'.repeat(64) + '"', 'Idempotency-Key': 'wrong_person_123456'})).status, 404);
         assert.equal(f.router.calls.length, 0);
         if (automatic) await automatic.tick(); else await f.observe();

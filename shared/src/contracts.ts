@@ -20,11 +20,18 @@ export interface SessionDTO extends Provenance {
     csrfToken: string;
     expiresAt: number;
 }
+export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete';
+export interface ScheduleWindowDTO {
+    id: string;
+    weekdays: string[];
+    start: string;
+    stop: string;
+}
 export type OperationState = 'pending' | 'confirmed' | 'unknown' | 'failed' | 'conflict';
 export interface OperationDTO extends Provenance {
     id: string;
     personId: string;
-    action: 'pause' | 'resume';
+    action: OperationAction;
     revision: number;
     state: OperationState;
     createdAt: number;
@@ -81,6 +88,9 @@ export interface PersonDTO {
     } | null;
     scheduleBlocked: boolean | null;
     scheduleExplanation: string;
+    /** Weekly windows from the latest observed policy; present only where this installation allows editing them. */
+    schedules?: ScheduleWindowDTO[];
+    schedulesEditable?: boolean;
     scheduleTimezone?: string;
     scheduleWitness?: 'none' | 'unverified' | 'owner-reviewed-clock';
     /** Exclusive epoch deadline for a configured schedule claim; null means unknown. */
