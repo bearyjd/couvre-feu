@@ -1083,7 +1083,6 @@ $CF_SLOT" ] || return 1
 )
 cf_remove_fw() {
     CF_ZERO_OWNED=false
-    cf_activity_remove || return 1 # activity hook
     if ! cf_ownership_valid;then
         [ ! -e "$CF_RUNTIME/firewall.owned" ] && [ ! -L "$CF_RUNTIME/firewall.owned" ] || { cf_fail unsafe_ownership_record;return 1; }
         CF_ZERO_DESCRIPTOR=0
@@ -1097,6 +1096,7 @@ cf_remove_fw() {
             printf '%s\n' "$CF_TRANSITION" | awk '$1=="PHASE"&&$2=="staging"{stage=1}$1=="BEFORE"&&$2!="SCHEDULE"{bad=1}END{exit !stage||bad}' || { cf_fail unsafe_zero_owned_transition;return 1; }
             CF_ZERO_DESCRIPTOR=1
         fi
+        cf_activity_remove || return 1 # activity hook: after refusal checks, before zero proofs
         cf_rf_zero_files=$(cf_zero_owned_runtime) || { cf_fail unsafe_zero_owned_runtime;return 1; }
         if [ "$CF_ZERO_BASELINE" != 1 ];then cf_zero_owned_kernel || { cf_fail zero_owned_kernel_unproven;return 1; };fi
         while IFS= read -r cf_rf_file;do
@@ -1119,6 +1119,7 @@ EOZ
         fi
         cf_cleanup_begin || return 1
     fi
+    cf_activity_remove || return 1 # activity hook: only after drift refusal checks
     for cf_rf_f in 4 6;do cf_remove_one "$cf_rf_f" filter forwarding_rule cf_fwd && cf_remove_one "$cf_rf_f" filter input_rule cf_input || return 1;done
     cf_remove_one 4 nat prerouting_rule cf_dns || return 1
     cf_slot_delete a && cf_slot_delete b || return 1
