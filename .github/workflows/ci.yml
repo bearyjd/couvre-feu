@@ -5,25 +5,89 @@ on:
 permissions:
   contents: read
 jobs:
-  fixtures:
+  fixture_preflight:
     runs-on: ubuntu-latest
-    # Two concurrent backend lanes reduce CI contention; per-operation bounds stay fixed.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
-      - name: Recovery fixtures, shell checks, then core fixtures
+      - name: Installer recovery, adapter, probe and static checks first
         env:
           CF_TEST_SHELL: busybox ash
           CF_TEST_AWK: busybox awk
           CF_TEST_TIMEOUT: busybox timeout
-          CF_TEST_WORKERS: '2'
         run: |
           busybox 2>&1 | awk 'NR == 1 { print }'
-          sh tests/run.sh
-      - name: Record pending real integration and live gates
-        run: sh tests/acceptance.sh --preflight
+          sh tests/run.sh --preflight-only
+          sh tests/acceptance.sh --preflight
+          python3 tests/run-fixtures.py --write-plan "$RUNNER_TEMP/couvre-feu-plan.json"
+      - name: Publish complete source-bound partition plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-plan
+          path: ${{ runner.temp }}/couvre-feu-plan.json
+          if-no-files-found: error
+  fixture_shards:
+    needs: fixture_preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py]
+        partition: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CI-only ash runtime
+        run: sudo apt-get update && sudo apt-get install -y busybox
+      - uses: actions/download-artifact@v5
+        with:
+          name: fixture-plan
+          path: .ci-fixture-plan
+      - name: Run one existing bounded partition and record every case
+        env:
+          CF_TEST_SHELL: busybox ash
+          CF_TEST_AWK: busybox awk
+          CF_TEST_TIMEOUT: busybox timeout
+          CF_TEST_WORKERS: '1'
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/fixture-receipts"
+          python3 tests/run-fixtures.py --shard '${{ matrix.suite }}' --partition '${{ matrix.partition }}' --plan .ci-fixture-plan/couvre-feu-plan.json --receipt "$RUNNER_TEMP/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json"
+      - name: Publish unique shard coverage receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-receipt-${{ matrix.suite }}-${{ matrix.partition }}
+          path: ${{ runner.temp }}/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json
+          if-no-files-found: error
+  fixtures:
+    needs: [fixture_preflight, fixture_shards]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require successful preflight and every matrix job
+        env:
+          PREFLIGHT_RESULT: ${{ needs.fixture_preflight.result }}
+          MATRIX_RESULT: ${{ needs.fixture_shards.result }}
+        run: test "$PREFLIGHT_RESULT" = success && test "$MATRIX_RESULT" = success
+      - name: Install CI-only ash for identical discovery
+        run: sudo apt-get update && sudo apt-get install -y busybox
+      - uses: actions/download-artifact@v5
+        with:
+          name: fixture-plan
+          path: .ci-fixture-plan
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: fixture-receipt-*
+          merge-multiple: true
+          path: .ci-fixture-receipts
+      - name: Prove all 16 unique partitions match complete source discovery
+        env:
+          CF_TEST_SHELL: busybox ash
+        run: python3 tests/run-fixtures.py --verify-receipts .ci-fixture-receipts --plan .ci-fixture-plan/couvre-feu-plan.json
   local-demo:
     runs-on: ubuntu-latest
     timeout-minutes: 20

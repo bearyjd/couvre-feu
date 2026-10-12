@@ -1,0 +1,17 @@
+{
+  "commit": "5c45e3e6ad2a961281a1678bfea73de57d439bfe",
+  "archiveSHA256": "2d18e91d097da33e637713de1be80c8babf8c7d518be1409df87b192d66df5f8",
+  "files": {
+    "install.sh": "7a412adbb882db8f876ebf03f5f4a06fcef374761e22f533808f615b851dfd91",
+    "uninstall.sh": "24c0905e38cce5ae54f0af48c977de73eca8ee1fdedb4b54bfd2c9c09ae19edd",
+    "cfctl": "e5702df531e31a9b9ffb9d6710fe8be5e480d63228226ff172d75bbe8062421e",
+    "cfctl-ssh": "8fa7d00e782e535f2daf8472a791bca56bfb3a96cff3c74f4ce735e777a0b5f8",
+    "lib/core.sh": "a3df4c55b2875a36ac5cfafb8181905b4bea1acc01f04f43a416e26cacc9acc3",
+    "lib/rpc.sh": "8e24e1fffb85f2ebb59d3ff7cbee5c52d5602014a2f64d919ba55cb84167dd7c",
+    "lib/firewall.sh": "bfbe1330c57478e193b7810a11ca1b3d1d407bf3af608c2bc63019ea84148042",
+    "lib/install-common.sh": "735cd0197a21b8b2da91c47cd8aac0c814ac7bd7b3142e7cf5279842044d6576",
+    "lib/state.awk": "94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993",
+    "lib/rules.awk": "523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954",
+    "lib/json.awk": "81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d"
+  }
+}

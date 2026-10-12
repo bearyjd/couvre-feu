@@ -1,5 +1,5 @@
 #!/bin/sh
-# shellcheck disable=SC1091,SC2034
+# shellcheck disable=SC1090,SC1091,SC2034
 # Dynamic installed helpers share variables with this entry point.
 # Couvre-feu router entry point. POSIX ash; never run live from a test root.
 set -f
@@ -42,7 +42,44 @@ if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_AWK-}" ]; then
     esac
     awk() { "$CF_BUSYBOX" awk "$@"; }
 fi
+# BEGIN authenticated bootstrap boundary
+cf_bootstrap_refuse() { printf '%s\n' '{"ok":false,"errors":["platform_admission_refused"]}'; exit 2; }
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+umask 077
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+    printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
+    cf_bootstrap_refuse
+fi
+unset CF_PLATFORM_ADMITTED CF_PLATFORM_LOCKED CF_PLATFORM_NESTED CF_RELEASE_ID CF_PLATFORM_PROFILE CF_VENDOR_PROFILE CF_RELEASE_MODULES CF_PLATFORM_CALLER_PID CF_PLATFORM_OWNER CF_PLATFORM_LIB vp_profile
+CF_BOOTSTRAP_PIN=49f8e00f1461079bb511391571e8666da3dbedb9b5fb57cdc4748a0d8bf27690
+platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
+[ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || cf_bootstrap_refuse
+platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
+[ "${platform_bootstrap_digest%% *}" = "$CF_BOOTSTRAP_PIN" ] || cf_bootstrap_refuse
+# shellcheck disable=SC1091
+. "$platform_bootstrap_path"
+# END authenticated bootstrap boundary
+platform_entry_root_validate
+platform_choose runtime "$CF_BASE"
+if [ "$CF_PLATFORM_PROFILE" = "$CF_VENDOR_PROFILE" ]; then platform_bootstrap_vendor; fi
+if [ "$CF_LOCAL_TEST" != 1 ];then platform_private "$CF_LIB" 700; platform_private "$CF_LIB/platform-bootstrap.sh" 644; platform_verify_modules "$CF_LIB";fi
 . "$CF_LIB/core.sh"
+if [ "${1:-}" = apply-fw ] && cf_reentrant_include; then exit 0;fi
+if [ "${1:-}" = recover-platform-lock ] && [ "$#" = 1 ]; then
+    [ "$CF_PLATFORM_PROFILE" = "$CF_VENDOR_PROFILE" ] || platform_fail vendor_recovery_only
+    platform_attest_vendor "$CF_LIB"
+    platform_profile_validate
+    platform_lock_recover
+    printf '%s\n' '{"ok":true,"platformLockRecovered":true}'
+    exit 0
+fi
+platform_admit runtime "$CF_BASE" "$CF_LIB"
+trap 'platform_lock_release' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 . "$CF_LIB/rpc.sh"
 . "$CF_LIB/firewall.sh"
 cf_main "$@"

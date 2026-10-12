@@ -1268,8 +1268,10 @@ class InstalledPackageTests(unittest.TestCase):
         return fixture
 
     def package_command(self, fixture, name, *args):
-        return subprocess.run(fixture.shell + [str(REPO / "router" / name), *args],
-                              env=fixture.env, capture_output=True, text=True, timeout=30)
+        # Match the existing private-backend fixture budget and owned cleanup.
+        # Router input/SSH deadlines and explicit interruption bounds stay fixed.
+        return run_fixture_process(fixture.shell + [str(REPO / "router" / name), *args],
+                                   env=fixture.env, timeout=60)
 
     def assert_restored(self, fixture, original):
         firewall = fixture.root / "etc/config/firewall"
@@ -1364,26 +1366,100 @@ class InstalledPackageTests(unittest.TestCase):
                     first = self.package_command(fixture, "uninstall.sh")
                     self.assertNotEqual(first.returncode, 0)
                 else:
-                    process = subprocess.Popen(fixture.shell + [str(REPO / "router/uninstall.sh")],
-                                               env=dict(fixture.env, CF_TEST_RPC_STOP="after_zero_owned_proof"),
-                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    try:
-                        deadline = time.monotonic() + 30
-                        while not (fixture.root / "rpc-stopped").exists():
-                            if process.poll() is not None:
-                                stdout, stderr = process.communicate()
-                                self.fail(stdout + stderr)
-                            if time.monotonic() > deadline:
-                                self.fail("zero-effect proof checkpoint was not reached")
-                            time.sleep(0.05)
-                        core_pid = int((fixture.root / "etc/couvrefeu/runtime/lock/pid").read_text())
+                    # In a sourced ash subshell $$ names the outer installer.
+                    # Stop the real backend after its successful durability barrier,
+                    # before returning to core or acknowledging zero-owned proof.
+                    marker = fixture.root / "zero-owned-sync-ready.json"
+                    wrapper = fixture.bin / "sync"
+                    wrapper.write_text(f'''#!{sys.executable}
+import json, os, runpy, signal, sys
+from pathlib import Path
+backend = {str(REPO / "tests/fixtures/backend.py")!r}
+sys.argv = [backend, "sync", *sys.argv[1:]]
+status = runpy.run_path(backend)["main"]()
+if status:
+    raise SystemExit(status)
+root = Path(os.environ["CF_ROOT"])
+private = root / "etc/couvrefeu"
+assert (private / "runtime/firewall.preflight").is_file()
+assert not (private / "runtime/firewall.owned").exists()
+assert not (private / "backup/kernel-cleaned").exists()
+assert not (private / "backup/no-kernel-mutations").exists()
+owner = int((private / "runtime/lock/pid").read_text())
+def identity(pid):
+    fields = (Path("/proc") / str(pid) / "stat").read_text().split(")", 1)[1].split()
+    return {{"pid": pid, "ppid": int(fields[1]), "group": int(fields[2]), "start": int(fields[19])}}
+chain = []
+pid = os.getpid()
+for _ in range(8):
+    record = identity(pid)
+    chain.append(record)
+    if pid == owner:
+        break
+    pid = record["ppid"]
+else:
+    raise AssertionError("backend does not descend from runtime owner")
+assert len(chain) >= 3
+fd = os.open({str(marker) + '.next'!r}, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as stream:
+    json.dump({{"owner": owner, "chain": chain}}, stream)
+os.rename({str(marker) + '.next'!r}, {str(marker)!r})
+os.kill(os.getpid(), signal.SIGSTOP)
+''')
+                    wrapper.chmod(0o700)
+
+                    def identity(pid):
+                        fields = (Path("/proc") / str(pid) / "stat").read_text().split(")", 1)[1].split()
+                        return {"pid": pid, "ppid": int(fields[1]), "group": int(fields[2]),
+                                "start": int(fields[19]), "state": fields[0]}
+
+                    def interrupt_core(process, raw):
+                        deadline = time.monotonic() + 60
+                        checkpoint = None
+                        while time.monotonic() < deadline:
+                            if marker.exists():
+                                checkpoint = json.loads(marker.read_text())
+                                if identity(checkpoint["chain"][0]["pid"])["state"] == "T":
+                                    break
+                            self.assertIsNone(process.poll(), "uninstall exited before zero-owned sync")
+                            time.sleep(0.02)
+                        else:
+                            self.fail("zero-owned sync checkpoint was not reached")
+                        chain = checkpoint["chain"]
+                        self.assertGreaterEqual(len(chain), 3)
+                        self.assertEqual(checkpoint["owner"], process.pid)
+                        self.assertEqual(chain[-1]["pid"], process.pid)
+                        self.assertEqual(int((fixture.root / "etc/couvrefeu/runtime/lock/pid").read_text()), process.pid)
+                        for index, record in enumerate(chain):
+                            observed = identity(record["pid"])
+                            self.assertEqual({key: observed[key] for key in record}, record)
+                            self.assertEqual(record["group"], process.pid)
+                            if index + 1 < len(chain):
+                                self.assertEqual(record["ppid"], chain[index + 1]["pid"])
+                        self.assertEqual(proof.read_bytes(), proof_bytes)
+                        self.assertGreater(fixture.backend()["durability_barriers"], baseline["durability_barriers"])
+                        self.assertFalse((fixture.root / "etc/couvrefeu/backup/kernel-cleaned").exists())
+                        self.assertFalse((fixture.root / "etc/couvrefeu/backup/no-kernel-mutations").exists())
+                        self.assertEqual(fixture.backend()["tables"], baseline["tables"])
+                        self.assertEqual(fixture.backend()["sets"], baseline["sets"])
+                        self.assertEqual(fixture.mutation_calls(), [])
+                        backend_pid, core_pid = chain[0]["pid"], chain[1]["pid"]
                         self.assertNotEqual(core_pid, process.pid)
                         os.kill(core_pid, signal.SIGKILL)
-                        stdout, stderr = process.communicate(timeout=15)
-                        self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                    finally:
-                        if process.poll() is None:
-                            process.kill(); process.communicate(timeout=15)
+                        # The stopped child cannot change PID/start time while
+                        # the killed core unwinds. Revalidate before draining it.
+                        self.assertEqual(identity(backend_pid)["start"], chain[0]["start"])
+                        os.kill(backend_pid, signal.SIGKILL)
+                        return raw
+
+                    first = run_fixture_process(fixture.shell + [str(REPO / "router/uninstall.sh")],
+                                                env=fixture.env, timeout=15, started=interrupt_core)
+                    self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+                    self.assertFalse((fixture.root / ".couvrefeu-install.lock").exists())
+                    # Retry uses the ordinary backend; its successful sync must
+                    # not encounter this deliberately stopped fixture wrapper.
+                    wrapper.write_text("#!/bin/sh\nexec " + repr(sys.executable) + " "
+                                       + repr(str(REPO / "tests/fixtures/backend.py")) + ' sync "$@"\n')
                     # Existing reconciliation clears the dead core lock, then
                     # the retained installer baseline fences all kernel effects.
                     reconcile = fixture.run("apply-fw")

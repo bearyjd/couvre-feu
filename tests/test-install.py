@@ -107,6 +107,18 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), original)
 
+    def test_legacy_done2_only_retry_preserves_exact_originals(self):
+        original = self.make_journal()
+        self.env['CF_TEST_UNINSTALL_CLEANUP_FAIL_AT'] = 'journal'
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        done = self.root / '.couvrefeu-recovery.done'
+        self.assertEqual(done.read_bytes(), b'2\n')
+        self.env.pop('CF_TEST_UNINSTALL_CLEANUP_FAIL_AT')
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), original)
+
     def test_original_absence_restored(self):
         self.make_journal(absent=True)
         result = self.run_script('uninstall.sh')
@@ -178,9 +190,17 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), original)
 
 
+NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile')
+
+
 class InstallerTests(unittest.TestCase):
     """Complete staged/install/resume/uninstall transactions with fake sources."""
-    run_script = RecoveryTests.run_script
+    def run_script(self, name, *args):
+        if name == 'lib/install-common.sh':
+            lib = REPO / 'router/lib'
+            script = f'. "{lib}/platform-bootstrap.sh"; CF_PLATFORM_ADMITTED=1; . "{lib}/install-common.sh"'
+            return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), '-c', script, 'fixture-journal', *args], env=self.env, capture_output=True, text=True)
+        return RecoveryTests.run_script(self, name, *args)
     snapshot = RecoveryTests.snapshot
     tearDown = RecoveryTests.tearDown
 
@@ -200,7 +220,9 @@ esac
             (self.source / 'lib' / lib).write_text(':\n')
         for lib in ('json.awk', 'state.awk', 'rules.awk'):
             (self.source / 'lib' / lib).write_text('BEGIN {exit 0}\n')
-        shutil.copy2(REPO / 'router/lib/install-common.sh', self.source / 'lib/install-common.sh')
+        (self.source / 'lib/core.sh').write_text('cf_check() { [ "${CF_TEST_CHECK_FAIL:-0}" != 1 ]; }\n')
+        for lib in ('install-common.sh', 'platform-bootstrap.sh', 'vendor-platform.sh'):
+            shutil.copy2(REPO / 'router/lib' / lib, self.source / 'lib' / lib)
         backend = self.root / 'bin'
         backend.mkdir()
         (backend / '.couvrefeu-test-backend').touch()
@@ -684,6 +706,10 @@ apply-fw|remove-fw)
 *) exit 95;;
 esac
 ''')
+        (self.source / 'lib/core.sh').write_text('cf_check() { return 0; }\ncf_main() {\n    [ "$CF_INSTALL_TOKEN" = "$(cat "$CF_ROOT/.couvrefeu-install.lock/token")" ] || return 94\n    printf \'%s\\n\' "$1" >> "$CF_ROOT/tool-log"\n    [ "$1" != "${CF_TEST_CORE_FAIL:-}" ]\n}\n')
+        core = self.root / 'bin/core'
+        core.write_text('#!/bin/sh\n[ "$CF_INSTALL_TOKEN" = "$(cat "$CF_ROOT/.couvrefeu-install.lock/token")" ] || exit 94\nprintf \'%s\\n\' "$1" >> "$CF_ROOT/tool-log"\n[ "$1" != "${CF_TEST_CORE_FAIL:-}" ]\n')
+        core.chmod(0o700)
         tool = self.root / 'bin/firewall'
         tool.write_text('''#!/bin/sh
 set -eu
@@ -781,7 +807,10 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         # Reenact the independently reproduced historical terminal state:
         # native cp -p restores original bytes/mode/owners with lost fractions;
         # the legacy journal has no timestamp records and trusts DONE=1.
-        for rel in FILES:
+        adapter_files = ('usr/lib/couvrefeu/platform-bootstrap.sh',
+                         'usr/lib/couvrefeu/vendor-platform.sh',
+                         'etc/couvrefeu/platform-profile')
+        for rel in FILES + adapter_files:
             key = rel.replace('/', '_')
             original = backup / (key + '.original')
             destination = self.root / rel
@@ -791,6 +820,11 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
             else:
                 destination.unlink()
             (backup / (key + '.mtime')).unlink()
+        # A genuine pre-adapter journal has neither profile nor adapter entries.
+        # Remove those records after replaying their originally absent paths.
+        for rel in adapter_files:
+            for entry in backup.glob(rel.replace('/', '_') + '.*'):
+                entry.unlink()
         self.assertEqual(target.stat().st_mtime_ns, stamp // 1_000_000_000 * 1_000_000_000)
         recovery = self.root / '.couvrefeu-recovery'
         backup.rename(recovery)
@@ -807,7 +841,7 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         before = self.snapshot()
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('legacy recovery completion record', result.stderr)
+        self.assertIn('completion_binding', result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertTrue(recovery.is_dir())
 
@@ -825,7 +859,8 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
         done = self.root / '.couvrefeu-recovery.done'
-        self.assertEqual(done.read_text(), '2\n')
+        self.assertEqual(done.read_text().splitlines()[:2], ['3', 'strict'])
+        self.assertEqual(len(done.read_text().splitlines()[2]), 64)
         self.assertFalse((recovery / 'etc_config_firewall.before').exists())
         self.assertEqual(exact_signature(target), original)
         (self.root / 'fail-tool').unlink()
@@ -836,7 +871,7 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         self.assertFalse(done.exists())
 
     def test_every_file_interruption_retries_after_removed_helpers(self):
-        for count in range(1, len(FILES) + 1):
+        for count in range(1, len(NEW_FILES) + 1):
             with self.subTest(count=count):
                 self.production_tools()
                 result = self.install('--activate')

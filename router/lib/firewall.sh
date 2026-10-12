@@ -215,11 +215,11 @@ EOF
     if [ -e "$CF_DIR/backup/ready" ];then
         cf_install_helper=$CF_BASE/usr/lib/couvrefeu/install-common.sh
         [ -f "$cf_install_helper" ] && [ ! -L "$cf_install_helper" ] || { cf_fail missing_install_journal;return 1; }
-        sh "$cf_install_helper" firewall-prepare "$cf_stage/firewall" || { cf_fail native_journal_failed;return 1; }
+        cf_install_journal firewall-prepare "$cf_stage/firewall" || { cf_fail native_journal_failed;return 1; }
     fi
     mv -f "$cf_stage/firewall" "$CF_BASE/etc/config/firewall" || { cf_fail native_commit_failed;return 1; }
     rmdir "$cf_stage/.delta" && rmdir "$cf_stage" || return 1
-    if [ -e "$CF_DIR/backup/ready" ];then sh "$cf_install_helper" firewall-commit || { cf_fail native_journal_failed;return 1; };fi
+    if [ -e "$CF_DIR/backup/ready" ];then cf_install_journal firewall-commit || { cf_fail native_journal_failed;return 1; };fi
     CF_RELOAD_TOKEN=$(printf '%s\n' "$$:$CF_DIGEST:$CF_NOW_VALUE" | sha256sum | awk '{print $1}')
     printf '%s\n' "$CF_RELOAD_TOKEN" > "$CF_RUNTIME/lock/reload" || return 1
     export CF_RELOAD_TOKEN
@@ -1114,3 +1114,15 @@ EOZ
     [ "$cf_rf_remaining" = 'CLEANUP 1' ] || { cf_fail cleanup_incomplete;return 1; }
     rm -f "$CF_RUNTIME/firewall.owned" "$CF_RUNTIME/firewall.snapshot" "$CF_RUNTIME/confirmed" "$CF_RUNTIME/error" "$CF_RUNTIME/expiry" "$CF_RUNTIME/firewall.intent" "$CF_RUNTIME/firewall.cleanup" "$CF_RUNTIME/schedule.clock" && cf_backend sync
 }
+
+# Journal helper inherits shell-local admission in an isolated subshell. An
+# independently executed helper has no admission and cannot borrow these facts.
+cf_install_journal() (
+    [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] || exit 2
+    platform_verify_modules "$CF_LIB"
+    CF_PLATFORM_CALLER_PID=$$
+    CF_PLATFORM_NESTED=1
+    CF_PLATFORM_LOCKED=0
+    # shellcheck disable=SC1091
+    . "$CF_LIB/install-common.sh"
+)

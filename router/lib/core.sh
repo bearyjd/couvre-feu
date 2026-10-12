@@ -149,7 +149,10 @@ cf_control_dirs() {
     for cf_dir in "$CF_BASE/etc" "$CF_DIR";do
         [ -d "$cf_dir" ] && [ ! -L "$cf_dir" ] || { cf_fail unsafe_control_directory;return 1; }
         cf_dir_meta=$(stat -c '%u:%a' "$cf_dir") || return 1
-        case $cf_dir_meta in "$CF_OWNER:700"|"$CF_OWNER:755"|"$CF_OWNER:750") ;;*)cf_fail unsafe_control_directory;return 1;;esac
+        case $cf_dir_meta in "$CF_OWNER:700"|"$CF_OWNER:755"|"$CF_OWNER:750") ;;
+            "$CF_OWNER:775")
+                [ "$cf_dir" = /etc ] && [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] && [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] || { cf_fail unsafe_control_directory;return 1; };;
+            *)cf_fail unsafe_control_directory;return 1;;esac
     done
 }
 cf_lock() {
@@ -170,10 +173,10 @@ cf_lock() {
     fi
     printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
     CF_LOCKED=1
-    trap 'cf_unlock; exit 129' HUP
-    trap 'cf_unlock; exit 130' INT
-    trap 'cf_unlock; exit 143' TERM
-    trap 'cf_unlock' 0
+    trap 'cf_unlock; platform_lock_release; exit 129' HUP
+    trap 'cf_unlock; platform_lock_release; exit 130' INT
+    trap 'cf_unlock; platform_lock_release; exit 143' TERM
+    trap 'cf_unlock; platform_lock_release' 0
 }
 cf_unlock() {
     if [ "$CF_LOCKED" = 1 ]; then
