@@ -80,11 +80,15 @@ def dispatch(command, args, state):
         family = 6 if "-6" in args else 4
         if "neigh" in args or "neighbor" in args:
             selected = "dev" in args and args[args.index("dev") + 1] == "br-lan"
+            # `ip neigh show ADDRESS dev br-lan` selects one address, as ip does.
+            verb = next((i for i, arg in enumerate(args) if arg in ("show", "list")), None)
+            address = args[verb + 1] if verb is not None and verb + 1 < len(args) and args[verb + 1] != "dev" else None
             def neighbor_line(row):
                 device = row.get("dev", "br-lan")
                 interface = "" if selected and device == "br-lan" and not state.get("neighbor_explicit_dev") else " dev " + device
                 return f"{row['ip']}{interface} lladdr {row['mac']} {row.get('state', 'REACHABLE')}"
-            return 0, "\n".join(neighbor_line(row) for row in state.get("neighbors", []) if (":" in row["ip"]) == (family == 6))
+            return 0, "\n".join(neighbor_line(row) for row in state.get("neighbors", [])
+                                 if (":" in row["ip"]) == (family == 6) and address in (None, row["ip"]))
         if "addr" in args or "address" in args:
             return 0, "\n".join(state.get(f"addresses{family}", []))
         if "route" in args:
@@ -209,6 +213,8 @@ def ipset(args, state):
         sets.pop(name, None)
     elif op == "swap":
         sets[name], sets[args[2]] = sets[args[2]], sets[name]
+    elif op == "list" and name == "-n":
+        return 0, "\n".join(sets)
     elif op in ("list", "save", "-L"):
         if name and name not in sets:
             return 1, ""

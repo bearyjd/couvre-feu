@@ -34,6 +34,8 @@ npm run test:web
 
 Before unattended router maintenance, follow the [operator SSH agent guide](docs/runbooks/operator-ssh-agent.md).
 
+The scoped empty activation/uninstall rehearsal runs as one disclosed SSH session through `tools/live/first-rehearsal.py`; see the [live FIRST rehearsal runbook](docs/runbooks/live-first-rehearsal.md).
+
 Use the [integration runbook](docs/integration-004.md), [PRP-004](docs/prp/PRP-004-router-integration.md) and [acceptance record](docs/acceptance-004.md). This limited mode admits one explicitly bound person/device/network MAC, with protected adult/control identities and a separate owner-only manifest/database outside the source tree. It selects an agent-held public identity and pinned host record; it never reads a private key or seeds demo accounts. Startup does not enroll the router or invoke SSH.
 
 Replace the quoted placeholders with reviewed private absolute paths and account identifiers. The first commands are local; `execute` invokes SSH and requires approval of that exact prepared invocation first:
