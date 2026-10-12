@@ -264,6 +264,46 @@ exact_mtime() {{ fixture_tick=1400;return 0; }};atomic_copy {src} {dst} 1;printf
             r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
             self.assertEqual(dst.read_text(),'original');self.assertTrue(tmp.exists())
 
+    def test_resumed_done_publication_checks_after_final_validation(self):
+        text=self.bootstrap.read_text();start=text.index('platform_publish_done() {');stop=text.index('\n}',start)+2
+        fn=text[start:stop]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-done-') as folder:
+            done=Path(folder)/'done';pending=Path(str(done)+'.next')
+            for existing in [False,True]:
+                for profile,started,ok in [(PROFILE,0,False),('strict',0,True),(platform.PROFILE,0,True),(PROFILE,1,True)]:
+                    done.unlink(missing_ok=True);pending.unlink(missing_ok=True)
+                    if existing:pending.write_text('validated receipt');pending.chmod(0o600)
+                    body=f"""set -eu
+{fn}
+DONE={done};HERE=/unused;CF_RELEASE_ID=fixed;CF_PLATFORM_PROFILE={profile};CF_PLATFORM_INITIAL_WRITE={started};
+fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
+platform_external_closure() {{ fixture_tick=1400; }};platform_valid_done() {{ fixture_tick=1400; }};
+sync() {{ :; }};platform_publish_done;printf complete"""
+                    r=self.run_shell(body);self.assertEqual(r.returncode==0,ok,r.stderr)
+                    self.assertEqual(done.exists(),ok)
+                    if not ok:
+                        self.assertIn('admission_deadline',r.stderr);self.assertEqual(pending.exists(),existing)
+                        if existing:self.assertEqual(pending.read_text(),'validated receipt')
+
+    def test_resumed_reload_checks_after_fixture_tool_validation(self):
+        text=(REPO/'router/lib/install-common.sh').read_text();start=text.index('reload_firewall() {');stop=text.index('\n}',start)+2
+        fn=text[start:stop]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-reload-') as folder:
+            root=Path(folder);marker=root/'reloaded';backend=root/'firewall'
+            backend.write_text('#!/bin/sh\nprintf reloaded > '+shlex.quote(str(marker))+'\n');backend.chmod(0o700)
+            for profile,started,ok in [(PROFILE,0,False),('strict',0,True),(platform.PROFILE,0,True),(PROFILE,1,True)]:
+                marker.unlink(missing_ok=True)
+                body=f"""set -eu
+{fn}
+CF_TEST_MODE=1;CF_BACKEND_DIR={root};CF_PLATFORM_PROFILE={profile};CF_PLATFORM_INITIAL_WRITE={started};
+fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
+fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
+                r=self.run_shell(body);self.assertEqual(r.returncode==0,ok,r.stderr)
+                self.assertEqual(marker.exists(),ok)
+                if not ok:self.assertIn('admission_deadline',r.stderr)
+            # Production dispatch has the same immediate primitive boundary.
+            self.assertIn('else platform_initial_write; /etc/init.d/firewall reload; fi',fn)
+
 class OperationalFlowTests(unittest.TestCase):
     def test_native_complete_flows_record_latency_without_target_claim(self):
         # The genuine ash/router code uses the isolated JSON backend. Hardware

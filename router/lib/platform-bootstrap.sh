@@ -9,11 +9,11 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=44b82a7fddcaaf678c31a655b93dc1c2b84ff2d38e86654a35e2f8afa1e7bd2d
+CF_RELEASE_ID=7526126b8e4d513c5e97e844426df8bc7d634851f1b1477ad7abdcb2bf6185e8
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-CF_RELEASE_MODULES='core.sh:2b0c75bc7a13c657c9e140aeafdef9a53d845e9b884d557aadcd387e1809d051 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:c4c8e5d50ce56fd791cb0bc6176a29d172b09e7d93bf0b1d9042584a39b2819d install-common.sh:1531c0c42ef13128116c9800319f155fc6e499009fab6084254daac704d914ab state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:4194c515c707c16a9218b05af6f110677283aa377f5cd68de291f696f1d8b0b7'
+CF_RELEASE_MODULES='core.sh:2b0c75bc7a13c657c9e140aeafdef9a53d845e9b884d557aadcd387e1809d051 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:c4c8e5d50ce56fd791cb0bc6176a29d172b09e7d93bf0b1d9042584a39b2819d install-common.sh:dbd944810dbbee4e231af28ea5e435e954021c712f3f1167cd90705459019ce8 state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:4194c515c707c16a9218b05af6f110677283aa377f5cd68de291f696f1d8b0b7'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -344,8 +344,10 @@ platform_publish_done() {
     if [ -e "$DONE.next" ] || [ -L "$DONE.next" ]; then
         platform_valid_done "$DONE.next" || platform_fail completion_publication_collision
     else
+        platform_initial_write
         (set -C; printf '3\n%s\n%s\n' "$CF_PLATFORM_PROFILE" "$CF_RELEASE_ID" > "$DONE.next") || platform_fail completion_write
     fi
+    platform_initial_write
     chmod 600 "$DONE.next"
     sync
     mv "$DONE.next" "$DONE" || platform_fail completion_publish

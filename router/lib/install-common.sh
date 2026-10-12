@@ -418,8 +418,9 @@ reload_firewall() {
         if ! { [ -x "$CF_BACKEND_DIR/firewall" ] && [ ! -L "$CF_BACKEND_DIR/firewall" ]; }; then
             fail 'fixture firewall tool unavailable'
         fi
+        platform_initial_write
         "$CF_BACKEND_DIR/firewall" reload
-    else /etc/init.d/firewall reload; fi
+    else platform_initial_write; /etc/init.d/firewall reload; fi
 }
 
 # Runtime is newly owned by this installation; preexisting runtime is refused
