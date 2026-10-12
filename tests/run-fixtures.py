@@ -25,7 +25,8 @@ SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.
                 'router/cfctl', 'router/cfctl-ssh', 'router/lib/platform-bootstrap.sh',
                 'router/lib/vendor-platform.sh', 'router/lib/install-common.sh',
                 'router/lib/core.sh', 'router/lib/rpc.sh', 'router/lib/firewall.sh',
-                'router/lib/state.awk', 'router/lib/rules.awk', 'router/lib/json.awk')
+                'router/lib/state.awk', 'router/lib/rules.awk', 'router/lib/json.awk',
+                'router/lib/activity.sh')
 
 
 def cases(suite):

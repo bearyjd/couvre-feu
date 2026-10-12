@@ -76,7 +76,8 @@ def evaluate_fixture_chain(chains, chain, packet, sets, depth=0):
             matches = matches and (not valid if negate else valid)
             negate = False
             index += 2
-        if not matches:
+        if not matches or target is None:
+            # A matching target-less rule only updates counters, like iptables.
             continue
         if target == "RETURN":
             return None
@@ -1460,6 +1461,8 @@ class RestrictedCommandTests(unittest.TestCase):
                                   ("cfctl pause alice --until 1736204500", ["pause", "alice", "--until", "1736204500"]),
                                   ("cfctl resume alice", ["resume", "alice"]),
                                   ("cfctl expire", ["expire"]),
+                                  ("cfctl activity --json", ["activity", "--json"]),
+                                  ("cfctl rpc-activity --json", ["rpc-activity", "--json"]),
                                   ("cfctl apply-fw", ["apply-fw"])):
             with self.subTest(command=command):
                 result = self.run_wrapper(command)
@@ -1474,10 +1477,212 @@ class RestrictedCommandTests(unittest.TestCase):
                         "cfctl pause alice --until -1", "cfctl pause alice --until 01",
                         "cfctl pause alice --until 2147483648", "cfctl sync extra",
                         "cfctl remove-fw", "cfctl check", "cfctl bonus alice 60",
-                        "cfctl status --json --root /tmp", "cfctl resume ../../root"):
+                        "cfctl status --json --root /tmp", "cfctl resume ../../root",
+                        "cfctl activity", "cfctl activity --json extra", "cfctl rpc-activity --json op-1"):
             with self.subTest(command=command):
                 self.assertNotEqual(self.run_wrapper(command).returncode, 0)
                 self.assertFalse(self.wrapper_log.exists())
+
+
+ACTIVITY_KEYS = ["version", "router_epoch", "counter_epoch", "offload", "devices", "errors"]
+DEVICE_KEYS = ["person", "mac", "ip", "neighbor", "tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "blocked_packets"]
+
+
+class ActivityTests(unittest.TestCase):
+    """Counter fixtures model argv rules only; they prove no packet accounting."""
+
+    def setUp(self):
+        self.fixture = RouterFixture()
+
+    def tearDown(self):
+        self.fixture.close()
+
+    def sync(self, document):
+        # Explicit caller deadline: several applies per case on shared CI hosts.
+        result = self.fixture.run("sync", document=document, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIs(json.loads(result.stdout)["ok"], True, result.stdout)
+
+    def activity(self):
+        result = self.fixture.run("activity", "--json", timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        document = json.loads(result.stdout)
+        self.assertEqual(list(document), ACTIVITY_KEYS)
+        for device in document["devices"]:
+            self.assertEqual(list(device), DEVICE_KEYS)
+        return document
+
+    def set_counter(self, command, table, chain, predicate, packets, octets):
+        state = self.fixture.backend()
+        rows = [row for row in state["tables"][command][table][chain] if predicate(row)]
+        self.assertTrue(rows, (command, chain))
+        for row in rows:
+            state.setdefault("counters", {})[f"{command}|{table}|{chain}|" + json.dumps(row)] = [packets, octets]
+        self.fixture.state.write_text(json.dumps(state))
+
+    @staticmethod
+    def comment(row):
+        return row[row.index("--comment") + 1] if "--comment" in row else ""
+
+    def test_accounting_rules_cover_only_assigned_children_as_pure_counters(self):
+        neighbors = self.fixture.backend()["neighbors"] + [{"ip": "192.168.1.30", "mac": "02:00:00:00:00:99"}]
+        self.fixture.update_backend(neighbors=neighbors)
+        self.sync(policy())
+        state = self.fixture.backend()
+        for command in ("iptables", "ip6tables"):
+            mangle = state["tables"][command]["mangle"]
+            self.assertEqual(mangle["FORWARD"][0], ["-m", "comment", "--comment", "cfa/hook", "-j", "cf_acct"])
+            rows = mangle["cf_acct"]
+            self.assertTrue(self.comment(rows[0]).startswith("cfa/epoch/"))
+            for row in rows:
+                self.assertNotIn("-j", row)
+                self.assertNotIn("-g", row)
+            sources = {row[row.index("--mac-source") + 1] for row in rows if "--mac-source" in row}
+            self.assertEqual(sources, {KID, OTHER_KID})
+            destinations = {row[row.index("-d") + 1] for row in rows if "-d" in row}
+            self.assertEqual(destinations, {"192.168.1.20", "192.168.1.21", "192.168.1.22"} if command == "iptables" else set())
+            text = json.dumps(rows)
+            for forbidden in (PROTECTED, "02:00:00:00:00:99", "192.168.1.10", "192.168.1.30", "2001:db8::10"):
+                self.assertNotIn(forbidden, text)
+            for table, chains in state["tables"][command].items():
+                if table != "mangle":
+                    self.assertNotIn("cf_acct", json.dumps(chains))
+        before_files = self.fixture.durable_snapshot()
+        before_calls = len(self.fixture.mutation_calls())
+        document = self.activity()
+        self.assertEqual([device["mac"] for device in document["devices"]], [KID, OTHER_KID])
+        self.assertEqual(document["errors"], [])
+        # Read-only and lockless: a live mutation lock is reported, never awaited.
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        lock.mkdir(mode=0o700)
+        (lock / "pid").write_text(f"{os.getpid()}\n")
+        (lock / "pid").chmod(0o600)
+        busy = self.activity()
+        self.assertIn("operation_in_progress", busy["errors"])
+        self.assertEqual(len(self.fixture.mutation_calls()), before_calls)
+        (lock / "pid").unlink()
+        lock.rmdir()
+        self.assertEqual(self.fixture.durable_snapshot(), before_files)
+        self.assertFalse(any("-Z" in call["argv"] for call in self.fixture.calls()))
+        self.assertEqual(self.fixture.run("activity").returncode, 2)
+
+    def test_counters_parse_sum_and_sort_by_person_then_mac(self):
+        extra = "02:00:00:00:00:03"
+        neighbors = [dict(row, state="STALE") if row["mac"] == OTHER_KID else row for row in self.fixture.backend()["neighbors"]]
+        self.fixture.update_backend(neighbors=neighbors)
+        leases = self.fixture.root / "tmp/dhcp.leases"
+        leases.write_text(leases.read_text() + f"0 {extra} 192.168.1.23 fixture3 *\n")
+        document = policy()
+        document["people"] = [{"id": "zoe", "macs": [KID]}, {"id": "bob", "macs": [extra, OTHER_KID]}]
+        self.sync(document)
+        tx = lambda mac: lambda row: self.comment(row) == "cfa/tx/" + mac
+        rx = lambda mac, ip: lambda row: self.comment(row) == f"cfa/rx/{mac}/{ip}"
+        self.set_counter("iptables", "mangle", "cf_acct", tx(KID), 10, 5000000000)
+        self.set_counter("ip6tables", "mangle", "cf_acct", tx(KID), 2, 100)
+        self.set_counter("iptables", "mangle", "cf_acct", rx(KID, "192.168.1.20"), 3, 300)
+        self.set_counter("iptables", "mangle", "cf_acct", rx(KID, "192.168.1.21"), 4, 400)
+        self.set_counter("iptables", "mangle", "cf_acct", tx(OTHER_KID), 1, 64)
+        result = self.activity()
+        self.assertEqual(result["version"], 1)
+        self.assertEqual(result["router_epoch"], 1736204400)
+        self.assertEqual(result["offload"], "off")
+        self.assertEqual(result["errors"], [])
+        self.assertEqual([(d["person"], d["mac"]) for d in result["devices"]],
+                         [("bob", OTHER_KID), ("bob", extra), ("zoe", KID)])
+        bob, absent, zoe = result["devices"]
+        self.assertEqual(zoe, {"person": "zoe", "mac": KID, "ip": "192.168.1.20", "neighbor": "REACHABLE",
+                               "tx_bytes": 5000000100, "rx_bytes": 700, "tx_packets": 12, "rx_packets": 7,
+                               "blocked_packets": 0})
+        self.assertEqual((bob["ip"], bob["neighbor"], bob["tx_bytes"], bob["tx_packets"]), ("192.168.1.22", "STALE", 64, 1))
+        self.assertEqual((absent["ip"], absent["neighbor"], absent["tx_bytes"]), ("192.168.1.23", "ABSENT", 0))
+        firewall = self.fixture.root / "etc/config/firewall"
+        firewall.write_text("config defaults 'defaults'\n\toption input 'REJECT'\n\toption flow_offloading '1'\n")
+        self.assertEqual(self.activity()["offload"], "on")
+        firewall.write_text("config zone 'lan'\n\toption name 'lan'\n")
+        self.assertEqual(self.activity()["offload"], "unknown")
+
+    def test_output_is_bounded_to_256_devices(self):
+        lines = "".join(f"D\tp{index:03d}\t02:00:00:00:{index // 256:02x}:{index % 256:02x}\n" for index in range(300))
+        script = f'. "{REPO}/router/lib/activity.sh"; cf_activity_json 1736204400 off a ""'
+        result = subprocess.run(self.fixture.shell + ["-c", script], input=lines, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(len(document["devices"]), 256)
+        self.assertEqual(document["devices"][-1]["person"], "p255")
+        self.assertIn("devices_truncated", document["errors"])
+        self.assertIn("accounting_unavailable", document["errors"])
+        self.assertEqual(document["counter_epoch"], 0)
+
+    def test_blocked_hits_are_attributed_and_counters_never_change_verdicts(self):
+        document = policy()
+        document["people"][0]["macs"] = [KID]
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        self.sync(document)
+        chain = self.fixture.active_chain("f")
+        pause_set = self.fixture.active_set("p")
+        self.set_counter("iptables", "filter", chain, lambda row: pause_set in row, 5, 500)
+        self.set_counter("ip6tables", "filter", chain, lambda row: pause_set in row, 1, 60)
+        self.set_counter("iptables", "filter", chain, lambda row: "192.168.1.20" in row and "REJECT" in row, 2, 100)
+        result = self.activity()
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["devices"][0]["blocked_packets"], 8)
+        state = self.fixture.backend()
+        outbound = {"in": "br-lan", "out": "eth0", "src": "192.168.1.20", "dst": "198.51.100.1", "mac": KID,
+                    "protocol": "tcp", "dport": "443", "weekday": "Mon", "time": "12:00:00", "ctstate": "NEW"}
+        self.assertIsNone(evaluate_fixture_chain(state["tables"]["iptables"]["mangle"], "FORWARD", outbound, state["sets"]))
+        self.assertEqual(evaluate_fixture_chain(state["tables"]["iptables"]["filter"], "FORWARD", outbound, state["sets"]), "REJECT")
+        adult = dict(outbound, src="192.168.1.10", mac=PROTECTED)
+        self.assertNotIn(evaluate_fixture_chain(state["tables"]["iptables"]["filter"], "FORWARD", adult, state["sets"]), ("REJECT", "DROP"))
+
+    def test_counter_epoch_changes_whenever_counters_reset(self):
+        self.sync(policy())
+        first = self.activity()
+        self.assertGreater(first["counter_epoch"], 0)
+        self.set_counter("iptables", "mangle", "cf_acct", lambda row: self.comment(row) == "cfa/tx/" + KID, 7, 700)
+        mangle_calls = len([c for c in self.fixture.mutation_calls() if "mangle" in c["argv"]])
+        self.assertEqual(self.fixture.run("expire", timeout=180).returncode, 0)
+        self.assertEqual(len([c for c in self.fixture.mutation_calls() if "mangle" in c["argv"]]), mangle_calls)
+        unchanged = self.activity()
+        self.assertEqual(unchanged["counter_epoch"], first["counter_epoch"])
+        self.assertEqual(unchanged["devices"][0]["tx_packets"], 7)
+        # A generation swap recreates blocked-rule counters: restamp, keep byte rules.
+        paused = policy(2)
+        paused["pauses"] = [{"person": "alice", "until": 0}]
+        self.sync(paused)
+        swapped = self.activity()
+        self.assertGreater(swapped["counter_epoch"], unchanged["counter_epoch"])
+        self.assertEqual(swapped["devices"][0]["tx_packets"], 7)
+        self.assertEqual(swapped["errors"], [])
+        # Externally lost accounting is reported, then rebuilt with a newer epoch.
+        state = self.fixture.backend()
+        for command in ("iptables", "ip6tables"):
+            mangle = state["tables"][command]["mangle"]
+            mangle["FORWARD"] = []
+            del mangle["cf_acct"]
+        self.fixture.state.write_text(json.dumps(state))
+        lost = self.activity()
+        self.assertEqual(lost["counter_epoch"], 0)
+        self.assertIn("accounting_unavailable", lost["errors"])
+        self.assertIn("accounting_hook_missing", lost["errors"])
+        # The live stamp is gone and the clock is unchanged: the persisted generation still advances.
+        self.assertEqual(self.fixture.run("apply-fw", timeout=180).returncode, 0)
+        rebuilt = self.activity()
+        self.assertGreater(rebuilt["counter_epoch"], swapped["counter_epoch"])
+        epoch_file = self.fixture.root / "etc/couvrefeu/runtime/activity.epoch"
+        self.assertEqual(epoch_file.read_text().strip(), str(rebuilt["counter_epoch"]))
+        self.assertEqual(epoch_file.stat().st_mode & 0o777, 0o600)
+        # Repeated loss within the same second never reuses an epoch.
+        seen = {first["counter_epoch"], swapped["counter_epoch"], rebuilt["counter_epoch"]}
+        state = self.fixture.backend()
+        for command in ("iptables", "ip6tables"):
+            state["tables"][command]["mangle"] = {"FORWARD": []}
+        self.fixture.state.write_text(json.dumps(state))
+        self.assertEqual(self.fixture.run("apply-fw", timeout=180).returncode, 0)
+        again = self.activity()
+        self.assertNotIn(again["counter_epoch"], seen)
+        self.assertGreater(again["counter_epoch"], rebuilt["counter_epoch"])
+        self.assertEqual(rebuilt["devices"][0]["tx_packets"], 0)
+        self.assertEqual(rebuilt["errors"], [])
 
 
 class InstalledPackageTests(unittest.TestCase):
@@ -1522,6 +1727,24 @@ class InstalledPackageTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assert_restored(fixture, original)
         self.assertEqual(fixture.backend()["sets"], {})
+
+    def test_uninstall_removes_activity_accounting_in_both_families(self):
+        fixture = self.fresh_fixture()
+        install = self.package_command(fixture, "install.sh", "--activate", "--protect", PROTECTED)
+        self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+        for command in ("iptables", "ip6tables"):
+            mangle = fixture.backend()["tables"][command]["mangle"]
+            self.assertIn("cf_acct", mangle)
+            self.assertIn("cf_acct", json.dumps(mangle["FORWARD"]))
+        epoch_file = fixture.root / "etc/couvrefeu/runtime/activity.epoch"
+        self.assertTrue(epoch_file.is_file())
+        uninstall = self.package_command(fixture, "uninstall.sh")
+        self.assertEqual(uninstall.returncode, 0, uninstall.stdout + uninstall.stderr)
+        for command in ("iptables", "ip6tables"):
+            mangle = fixture.backend()["tables"][command]["mangle"]
+            self.assertNotIn("cf_acct", mangle)
+            self.assertNotIn("cf_acct", json.dumps(mangle))
+        self.assertFalse(epoch_file.exists())
 
     def test_failed_activation_without_owned_mutation_restores_and_preserves_foreign_chain(self):
         fixture = self.fresh_fixture()
@@ -1718,7 +1941,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             self.assertEqual(install.returncode, 0, install.stderr + install.stdout)
             installed = fixture.root / "usr/sbin/cfctl"
             self.assertEqual(installed.read_bytes(), (REPO / "router/cfctl").read_bytes())
-            for helper in ("core.sh", "firewall.sh", "json.awk", "rules.awk", "install-common.sh"):
+            for helper in ("core.sh", "firewall.sh", "json.awk", "rules.awk", "install-common.sh", "activity.sh"):
                 self.assertEqual((fixture.root / "usr/lib/couvrefeu" / helper).read_bytes(),
                                  (REPO / "router/lib" / helper).read_bytes())
 

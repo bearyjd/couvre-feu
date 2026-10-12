@@ -64,7 +64,7 @@ if [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; then PROFILE_INVENTORY=1
 elif [ -e "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then PROFILE_INVENTORY=1
 elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1; fi
 if [ "$PROFILE_INVENTORY" = 1 ]; then
-    FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile"
+    FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
@@ -574,6 +574,7 @@ installed_core() (
     . "$CF_LIB/core.sh"
     . "$CF_LIB/rpc.sh"
     . "$CF_LIB/firewall.sh"
+    . "$CF_LIB/activity.sh"
     platform_deadline_check
     cf_main "$@"
 )
@@ -669,7 +670,7 @@ runtime_preflight() {
                     fi
                 done
                 continue;;
-            confirmed|error|firewall.snapshot|firewall.owned|firewall.intent|firewall.preflight|firewall.cleanup|expiry|schedule.clock) ;;
+            confirmed|error|firewall.snapshot|firewall.owned|firewall.intent|firewall.preflight|firewall.cleanup|expiry|schedule.clock|activity.epoch) ;;
             .candidate.*|.protected.*|.fw.*|.input.*|.error.*|.confirmed.*|.snapshot.*|.expiry.*|.intent.*|.cleanup.*)
                 suffix=${name##*.}
                 case "$suffix" in ''|*[!0-9]*) fail "unowned runtime file: $name";; esac;;

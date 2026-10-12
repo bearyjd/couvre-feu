@@ -271,6 +271,9 @@ cf_confirm_apply() {
     fi
     cf_durable_record confirmed "$CF_REVISION $CF_DIGEST $(cf_effective_digest)" || return 1
     cf_rpc_checkpoint after_confirmation
+    # BEGIN activity hook: counters only, isolated in a subshell; failure is reported by `cfctl activity`.
+    (cf_activity_apply) || :
+    # END activity hook
     [ ! -e "$CF_RUNTIME/error" ] || { cf_safe_file "$CF_RUNTIME/error" && rm -f "$CF_RUNTIME/error"; } || return 1
     if [ -e "$CF_RUNTIME/firewall.intent" ] || [ -L "$CF_RUNTIME/firewall.intent" ];then
         cf_safe_file "$CF_RUNTIME/firewall.intent" && rm -f "$CF_RUNTIME/firewall.intent" || return 1
@@ -1038,7 +1041,7 @@ cf_zero_owned_kernel() {
     for cf_zk_f in 4 6;do
         for cf_zk_t in filter nat mangle raw;do
             cf_zk_rules=$(cf_table "$cf_zk_f" -t "$cf_zk_t" -S) || return 1
-            printf '%s\n' "$cf_zk_rules" | awk 'function owned(s){return s~/^(cf_fwd|cf_input|cf_dns|cf2_[ab]_[figd])$/}$1=="-N"&&owned($2){exit 1}$1=="-A"{if(owned($2))exit 1;for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&owned($(i+1))||$i=="--match-set"&&$(i+1)~/^(cf_kids|cf_paused|cf_doh|cf_doh6|cf2_[ab]_(k|p|d4|d6|u))$/)exit 1}' || return 1
+            printf '%s\n' "$cf_zk_rules" | awk 'function owned(s){return s~/^(cf_fwd|cf_input|cf_dns|cf_acct|cf2_[ab]_[figd])$/}$1=="-N"&&owned($2){exit 1}$1=="-A"{if(owned($2))exit 1;for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&owned($(i+1))||$i=="--match-set"&&$(i+1)~/^(cf_kids|cf_paused|cf_doh|cf_doh6|cf2_[ab]_(k|p|d4|d6|u))$/)exit 1}' || return 1
         done
     done
     cf_zk_sets=$(cf_backend ipset save) || return 1
@@ -1080,6 +1083,7 @@ $CF_SLOT" ] || return 1
 )
 cf_remove_fw() {
     CF_ZERO_OWNED=false
+    cf_activity_remove || return 1 # activity hook
     if ! cf_ownership_valid;then
         [ ! -e "$CF_RUNTIME/firewall.owned" ] && [ ! -L "$CF_RUNTIME/firewall.owned" ] || { cf_fail unsafe_ownership_record;return 1; }
         CF_ZERO_DESCRIPTOR=0
