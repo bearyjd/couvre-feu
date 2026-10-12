@@ -32,3 +32,41 @@ HTTP 200 means the requested revision was applied and confirmed by the router. H
 Audit authenticated actor, operation, desired revision, timestamp and sanitized router outcome. Enforce authorization on every route. A future reconcile loop may run on writes and every minute, with bounded retries and explicit drift/unreachable alerts. Offline PWA status is timestamped read-only cache; it cannot enqueue blind policy mutations. Reconnect refreshes before an explicit user action.
 
 Acceptance for a future service PR: passkey/role/session tests, stable-origin recovery, SQLite migration and backup restore, replay/idempotency/conflict tests, fake-router error tests, then separately approved real confirmation and deployment. Tailnet membership, a fake adapter and local fixtures cannot substitute for these gates.
+
+## Persisted parent alerts
+
+The demo service stores alerts in SQLite (`parent_alerts`, migration `003.sql`) and serves them to the parent PWA. Alerts describe policy and router evidence plus two input interfaces; they do not infer presence, content or intent. The integration build does not mount these routes yet.
+
+| Route | Behavior |
+|---|---|
+| `GET /alerts` | Newest 25 visible alerts plus `openCount` (unacknowledged) and `nextBefore` |
+| `GET /alerts/before/:id` | Next page of 25 below the cursor (the server rejects query strings, so the cursor is a path segment) |
+| `POST /alerts/:id/acknowledge` | `open` becomes `acknowledged`; idempotent; 409 `alert_resolved` once resolved; CSRF and origin checks as for other writes |
+
+Visibility is enforced on the server: a parent sees alerts for assigned people only; system alerts (no person) are visible only to admins. An alert outside the caller's scope is reported as `alert_not_found`.
+
+Rows: `id`, `person_id` (null for system), `kind`, `severity` (`info`/`warning`/`critical`), `created_at`, `first_seen`, `last_seen`, `count` (evaluation seconds in which the condition was seen), `state` (`open`/`acknowledged`/`resolved`), `acknowledged_at/by`, `resolved_at`, `details` (JSON, at most 1024 bytes: counts, windows, operation ids; never MACs, addresses, domains or router diagnostics). One unresolved row exists per (kind, person); an acknowledged alert stays deduplicated while its condition persists, and a recurrence after resolution is a new row. Resolved rows are deleted 90 days after `resolved_at`.
+
+### Rules (`service/src/alert-rules.ts`, pure functions)
+
+| Kind | Severity | Fires when | Clears when |
+|---|---|---|---|
+| `enforcement_unhealthy` | critical if drift, else warning | Fresh observation reports drift; or observation unavailable/stale/unreachable and older than 300 s (or never seen). A system alert fires when router status has errors or is older than 300 s | Condition absent in a later evaluation |
+| `sync_failed` | warning | Latest operation is `failed`/`conflict` and under 24 h old | Latest operation changes state |
+| `apply_pending_too_long` | warning | Latest operation `pending`/`unknown` for more than 120 s | Operation confirms or fails |
+| `possible_bypass` | critical | Sum of `txBytes + rxBytes` over deltas with `enforcementActive` exceeds 1 MiB for a person in one evaluation batch | A later batch for that person is clean, or 30 min pass without a breach |
+| `repeated_blocked_attempts` | info | Sum of `blockedPackets` is at least 100 | As above |
+| `time_request_pending` | info | Any pending request for the person | No pending request remains |
+
+The 1 MiB and 100-packet thresholds are heuristics: ARP, DHCP and keepalive leakage is far smaller, but a legitimate exempt device or a counter mismatch can still trip them. Alerts say "possible", not "proven".
+
+Input interfaces, supplied by separate changes (nothing here collects traffic or builds requests):
+
+- `ActivityDelta {person, mac, windowStart, windowEnd, txBytes, rxBytes, blockedPackets, enforcementActive}`: windows must be 1 to 3600 s long, end no more than 60 s in the future and no more than 1 h in the past; invalid deltas are ignored. `mac` is accepted but never stored.
+- `PendingTimeRequest {person, requestId, createdAt}`.
+
+Wire them with `new ParentAlerts(store, {people, activity, timeRequests})`; `main.ts` currently supplies only `people`. An input that is omitted or whose provider throws is "not evaluated": its alerts are left alone and never auto-resolved.
+
+### Gap: notification delivery beyond the app
+
+Alerts are visible only inside the PWA while open. Web Push is out of scope. Sketch: generate a VAPID key pair on the service (private key in an environment secret, never in the repo); `POST /push/subscriptions` stores each parent's browser `PushSubscription` (endpoint, keys) bound to the account and revoked on logout or permission change; on alert creation (not on every count increment) send an encrypted, content-free payload ("Couvre-feu: new alert") with the `web-push` protocol directly to the browser vendor's push service, the only third party involved, and have the service worker fetch the actual alert over the authenticated session when the notification is tapped. Open design points: quiet hours, per-severity opt-in, expired-subscription cleanup (HTTP 404/410), and the service needing outbound HTTPS to the push service even when its own listener is tailnet-only.

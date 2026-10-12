@@ -1,6 +1,6 @@
 // Only public, same-origin shell assets. No auth/API cache and no queued writes.
 const SHELL = 'cf-shell-v2';
-const ASSETS = ['/', '/styles.css', '/app.js', '/auth-client.js', '/status-cache.js', '/operational-alerts.js', '/schedule-editor.js', '/schedule-editor.css', '/manifest.webmanifest', '/icon.svg'];
+const ASSETS = ['/', '/styles.css', '/app.js', '/auth-client.js', '/status-cache.js', '/operational-alerts.js', '/parent-alerts.js', '/schedule-editor.js', '/schedule-editor.css', '/manifest.webmanifest', '/icon.svg'];
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(SHELL).then((cache) => cache.addAll(ASSETS)));
 });

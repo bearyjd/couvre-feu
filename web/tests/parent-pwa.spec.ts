@@ -128,6 +128,7 @@ test('offline shell is timestamped read-only, has no auth cache and reconnect re
 });
 
 test('offline clock-ahead countdown never fabricates router-confirmed expiry', async ({ page, context, demo }) => {
+  const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message));
   await enroll(page, demo);
   await page.getByLabel('Pause duration for Alex (fictional)').selectOption('60');
   await page.getByRole('button', { name: 'Pause Alex (fictional)', exact: true }).click();
@@ -139,6 +140,8 @@ test('offline clock-ahead countdown never fabricates router-confirmed expiry', a
   await expect(page.locator('.reasons dd').filter({ hasText: 'Expired in the latest observation' })).toHaveCount(0);
   await expect(page.getByText(/Paused until /).first()).toBeVisible();
   expect(demo.router.observe().status.effectivePauses).toHaveLength(1);
+  expect(errors).toEqual([]); // parent-alerts load/render must stay isolated while offline
+  await expect(page.locator('#parent-alerts')).toBeHidden();
 });
 
 test('offline logout clears status immediately and completes real server logout on reconnect', async ({ page, context, demo }) => {

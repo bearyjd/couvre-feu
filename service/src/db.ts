@@ -6,7 +6,7 @@ export class Store {
     readonly db: DatabaseSync;
     constructor(path: string, migrationSQL?: string, internalMode?: 'integration') {
         const migrations = migrationSQL === undefined
-            ? (internalMode === 'integration' ? ['001.sql', '002.sql'] : ['001.sql', '002.sql', '003.sql']).map(name => {
+            ? (internalMode === 'integration' ? ['001.sql', '002.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql']).map(name => {
                 const sql = readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8');
                 // CAS allocates base+1. An explicitly never-delivered intent cannot reserve that router revision.
                 return internalMode === 'integration' && name === '001.sql' ? sql.replace('revision INTEGER NOT NULL UNIQUE', 'revision INTEGER NOT NULL') : sql;
@@ -39,7 +39,7 @@ export class Store {
                 });
             }
             if (migrationSQL === undefined) {
-                const required = {
+                const required: Record<string, string> = {
                     accounts: 'id,display_name,role,person_ids,permission_version,active,webauthn_user_id',
                     credentials: 'id,account_id,public_key,counter,transports',
                     bootstrap_tokens: 'hash,account_id,expires_at,consumed',
@@ -50,6 +50,7 @@ export class Store {
                     operations: 'id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error,confirmed_at',
                     audit: 'id,actor_id,operation_id,action,revision,timestamp,outcome',
                 };
+                if (internalMode !== 'integration') required.parent_alerts = 'id,person_id,kind,severity,created_at,first_seen,last_seen,count,state,acknowledged_at,acknowledged_by,resolved_at,details'; // demo-only table; integration migrations stop at 002
                 try {
                     for (const [table, columns] of Object.entries(required)) this.db.prepare(`SELECT ${columns} FROM ${table} LIMIT 0`).all();
                 } catch { throw new Error('unsupported_database_schema'); }

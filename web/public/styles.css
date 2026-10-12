@@ -57,6 +57,36 @@
 .alert-row p {
   margin:8px 0
 }
+#parent-alert-feed {
+  list-style:none;
+  padding:0;
+  margin:20px 0 0
+}
+.alert-badge {
+  display:inline-block;
+  min-width:1.6em;
+  padding:2px 8px;
+  border-radius:999px;
+  background:var(--red);
+  color:#fff;
+  font-size:.8em;
+  text-align:center;
+  vertical-align:middle
+}
+.parent-alert.severity-critical {
+  border-color:var(--red);
+  background:var(--red-soft)
+}
+.parent-alert.severity-info {
+  border-color:var(--focus);
+  background:var(--surface)
+}
+.parent-alert small {
+  display:block
+}
+.parent-alert .button {
+  margin-top:10px
+}
 
 body {
   margin:0

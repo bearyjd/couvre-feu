@@ -1,6 +1,7 @@
 import { createPasskey, getPasskey } from './auth-client.js';
 import { actorScope, clearStatusCache, saveStatus, readStatus, needsServerLogout, setServerLogoutNeeded, broadcastLogout, broadcastScope, LOGOUT_EVENT, LOGOUT_REQUIRED, SCOPE_EVENT } from './status-cache.js';
 import { createScheduleEditor, actionVerb } from './schedule-editor.js';
+import { createParentAlerts } from './parent-alerts.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -12,6 +13,7 @@ const FRESH_SECONDS = 30;
 let alertStorage;
 try { alertStorage = localStorage; } catch { alertStorage = null; }
 const alertJournal = createAlertJournal(alertStorage);
+const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
@@ -149,6 +151,7 @@ async function refresh({ quiet = false } = {}) {
     saveStatus(state.session, people);
     alertJournal.bind(state.session, people, now());
     alertJournal.ingest(people, now(), !state.offline);
+    void parentAlerts.load();
     if (!quiet) announce('Status refreshed. Review the current manual pause and schedule before making a change.');
     return true;
   } catch (error) {
@@ -435,6 +438,7 @@ function render() {
   }
   renderAuthControls();
   renderAlerts();
+  parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
 }
 
 function tick() {

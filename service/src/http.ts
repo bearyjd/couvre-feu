@@ -9,6 +9,7 @@ import type { DemoConfig } from './config.ts';
 import { provenance } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object, parseJSON } from '../../shared/src/json.ts';
+import type { ParentAlerts } from './parent-alerts.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -17,6 +18,7 @@ const STATIC: Record<string, [
     '/auth-client.js': ['auth-client.js', 'text/javascript; charset=utf-8'], '/status-cache.js': ['status-cache.js', 'text/javascript; charset=utf-8'],
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
+    '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -68,7 +70,9 @@ function send(response: ServerResponse, status: number, value: unknown) {
     response.end(JSON.stringify(value));
 }
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
+type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
+const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI) {
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
@@ -159,6 +163,12 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
                     send(response, result.status, result.result);
                     return;
                 }
+                const acknowledge = /^\/alerts\/([0-9]+)\/acknowledge$/.exec(path);
+                if (acknowledge && alerts) {
+                    object(payload, []);
+                    send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]))});
+                    return;
+                }
                 throw new AppError(404, 'route_not_found');
             }
             if (request.method !== 'GET') {
@@ -175,6 +185,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig) {
             }
             if (path === '/devices') {
                 send(response, 200, await policy.devices(session.dto.actor));
+                return;
+            }
+            const page = /^\/alerts(?:\/before\/([0-9]+))?$/.exec(path);
+            if (page && alerts) {
+                send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]))});
                 return;
             }
             const operation = /^\/operations\/([0-9a-f-]{36})$/.exec(path);
