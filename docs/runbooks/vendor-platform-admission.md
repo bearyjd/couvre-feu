@@ -1,13 +1,14 @@
 # Explicit vendor admission and recovery
 
 A missing platform selector uses `strict`. The installer accepts one
-`--platform-profile strict|gl-xe3000-4.8.3-logd-011-v1`; runtime commands do not
+`--platform-profile strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1`;
+runtime commands do not
 accept a selector. `/etc/couvrefeu/platform-profile` is one exact LF-terminated
 line, root:root600 beneath700. It must agree with the private staged journal.
 Unknown, malformed, duplicate, changed or conflicting evidence refuses.
 
 The strict branch retains ordinary supported dependencies and strict metadata.
-It does not load vendor payloads or scan vendor processes. The vendor branch
+It does not load vendor payloads or scan vendor processes. The 011 vendor branch
 requires the approved012 helper bytes and exact libc/libgcc/stat/loader pins.
 The stat payload runs with a cleared environment and fixed library path; its
 numeric metadata results authenticate the source closure before other modules.
@@ -58,6 +59,59 @@ Do not remove prerequisite stat/od while any installation, recovery, DONE,
 publication-temporary, owned lock or external release path remains. The frozen
 private prerequisite012 package bodies are unchanged; a separately reviewed
 launcher/pre-removal guard must enforce this condition before rollback.
+
+## Explicit OS-trust profile
+
+`gl-xe3000-4.8.3-os-trust-v1` is a distinct, explicitly selected trust model.
+It never substitutes for `strict` or `gl-xe3000-4.8.3-logd-011-v1`, migrates an
+existing journal, or reinterprets an earlier refusal or UNKNOWN result. Its
+exact name remains bound in the installed marker, staged journal, DONE and
+external release. Empty install/uninstall restoration must pass before device
+enrollment; prerequisite and first-launch procedures require their own review.
+
+This profile trusts the router OS, root administration, privileged launchers,
+credential assignment, vendor logd, and every principal able to write the
+exceptional ancestry. A private child beneath a group-writable ancestor does
+not exclude replacement by those writers. Compromised trusted actors, including
+unobserved nonroot GID0 holders, can undermine policy, enforcement and recovery.
+Static pins and configured accounts are drift/baseline witnesses, not proof of
+writer exclusion, complete firmware provenance or all running process images.
+
+Fresh checks retain the pinned libc/libgcc/stat/loader and source closure,
+exact canonical type/owner/mode exceptions, measured `/etc/glversion` identity
+`4.8.3` plus LF, bounded account parsing and before/after metadata/size/digest
+checks, files-only NSS configuration and provider path/socket checks. Unique
+logd UID/GID514 and configured GID0 membership rules remain. The complete fixed
+PID1 root/procd credential, comm, starttime and image bracket remains; service
+file pins remain. There is no logd population discovery or global task census.
+`OS_TRUST_PROFILE_ATTESTED` states this distinction explicitly. The 011 census
+and its refusal for disappearance before classification remain unchanged.
+
+The new profile captures one validated `/proc/uptime` anchor before bootstrap
+and checks elapsed **centiseconds**, with an exclusive candidate cutoff of
+1300 centiseconds (13 seconds). Repeated admission and nested source loads do
+not reset the anchor. Guards run after blocking prerequisites, source/input
+and lock phases, before private policy, and immediately before the initial
+protected record/configuration/kernel write. Admission locks and scratch are
+owned temporary effects; refusal can release only those owned resources.
+After the first protected write, existing UNKNOWN and journal restoration
+rules own interruption. No arbitrary deadline abort is inserted mid-restore.
+
+This is a logical permission deadline. Bounded producers remain, but there is
+no hard syscall termination, scheduler-gap, atomic wall-time or remote-drain
+guarantee. A slow check that resumes after expiry cannot grant initial write
+permission. The existing ten-second input and fifteen-second host SSH budgets
+are unchanged; the nominal two-second reserve is **not production timing
+clearance**. Measure complete successful status/sync/expire, nested journal and
+reload, refusal/cancellation and slow-input flows on the target before live
+MVP use. If the reserve is insufficient, reduce the admission cutoff based on
+measurement; do not increase the SSH budget. Native fixture timings do not
+establish target latency, OS trust, packet behavior or production readiness.
+
+Authentication, protected management identities and self-lockout fences,
+installer scope, revision/generation/CAS, atomic desired state and receipts,
+drift/collision refusal and exact restoration remain mandatory. WAN, dnsmasq,
+offload and firmware are unchanged.
 
 Focused fixtures exercise native ash admission call counts, source and profile
 refusals, cleanup interruptions and exact strict/legacy restoration. Vendor

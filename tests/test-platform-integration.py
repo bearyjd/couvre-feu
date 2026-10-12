@@ -84,7 +84,7 @@ class StrictEntryTests(unittest.TestCase):
         self.assertFalse(private.exists())
 
     def test_environment_cannot_supply_admission_or_pins(self):
-        for key in ['CF_PLATFORM_ADMITTED', 'CF_PLATFORM_PROFILE', 'CF_PLATFORM_LOCKED', 'CF_PLATFORM_NESTED', 'CF_PLATFORM_CALLER_PID', 'CF_PLATFORM_OWNER', 'CF_PLATFORM_LIB', 'CF_RELEASE_ID', 'CF_RELEASE_MODULES', 'CF_VENDOR_PROFILE', 'vp_profile', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT']:
+        for key in ['CF_PLATFORM_ADMITTED', 'CF_PLATFORM_PROFILE', 'CF_PLATFORM_LOCKED', 'CF_PLATFORM_NESTED', 'CF_PLATFORM_CALLER_PID', 'CF_PLATFORM_OWNER', 'CF_PLATFORM_LIB', 'CF_RELEASE_ID', 'CF_RELEASE_MODULES', 'CF_VENDOR_PROFILE', 'CF_OS_TRUST_PROFILE', 'CF_PLATFORM_ENTRY_TICK', 'CF_PLATFORM_INITIAL_WRITE', 'vp_profile', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT']:
             with self.subTest(key=key):
                 result = self.run_entry(args=['--protect', '02:00:00:00:00:01', '--activate'], env=dict(self.env, **{key:'injected'}))
                 self.assertNotEqual(result.returncode, 0)

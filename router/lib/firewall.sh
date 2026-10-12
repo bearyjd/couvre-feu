@@ -406,6 +406,7 @@ cf_durable_record() {
     cf_dr_name=$1;cf_dr_data=$2;cf_dr_temp=$CF_RUNTIME/.intent.$$
     [ ! -e "$cf_dr_temp" ] && [ ! -L "$cf_dr_temp" ] || { cf_fail unsafe_temporary;return 1; }
     [ "${#cf_dr_data}" -le 524288 ] || { cf_fail transition_too_large;return 1; }
+    platform_initial_write
     printf '%s\n' "$cf_dr_data" > "$cf_dr_temp" && chmod 600 "$cf_dr_temp" && cf_backend sync && mv -f "$cf_dr_temp" "$CF_RUNTIME/$cf_dr_name" && cf_backend sync || { cf_fail transition_journal_failed;return 1; }
 }
 cf_boot_id() {
@@ -701,6 +702,7 @@ cf_build_sets() {
     done
 }
 cf_transition_prepare() {
+    platform_deadline_check
     cf_slot_load
     CF_EXPECTED=$(cf_plan) || return 1
     if [ ! -e "$CF_RUNTIME/firewall.intent" ] && [ ! -e "$CF_RUNTIME/error" ] && cf_safe_file "$CF_RUNTIME/confirmed" && cf_ownership_valid && cf_verify;then
@@ -1027,7 +1029,7 @@ KERNEL $cf_pb_kernel"
 }
 cf_preflight_baseline_clear() {
     [ ! -e "$CF_RUNTIME/firewall.preflight" ] && [ ! -L "$CF_RUNTIME/firewall.preflight" ] && return 0
-    cf_preflight_baseline_verify && rm -f "$CF_RUNTIME/firewall.preflight" && cf_backend sync || { cf_fail preflight_baseline_invalidation_failed;return 1; }
+    cf_preflight_baseline_verify && platform_initial_write && rm -f "$CF_RUNTIME/firewall.preflight" && cf_backend sync || { cf_fail preflight_baseline_invalidation_failed;return 1; }
 }
 cf_zero_owned_kernel() {
     # Absence of a marker is never evidence of absence of kernel effects.

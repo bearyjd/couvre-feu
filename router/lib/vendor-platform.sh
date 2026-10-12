@@ -25,7 +25,7 @@ vp_metadata() {
     [ "${#mode}" -le 4 ] && [ "${#mode}" -ge 3 ] || fail metadata_mode
     [ "$((0$mode & 07002))" = 0 ] || fail metadata_special_or_world_write
     [ "$((0$mode & 020))" != 0 ] || return 0
-    [ "${vp_profile:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] || fail unsupported_vendor_profile
+    case "${vp_profile:-strict}" in gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;; *) fail unsupported_vendor_profile;; esac
     # This private primitive is used inside a fresh transaction. Callers must
     # use vp_transaction_check, never retain its success as later permission.
     case "$1:$tuple" in
@@ -413,6 +413,45 @@ $pid:$tid:$first|$classification|$creds:$witness"
     done
     vp_budget
 }
+vp_os_firmware() {
+    regular /etc/glversion
+    vp_metadata /etc/glversion
+    firmware_meta=$(stat_private -c '%u:%g:%s' /etc/glversion) || fail firmware_identity_metadata
+    [ "$firmware_meta" = 0:0:6 ] || fail firmware_identity_metadata
+    hash_is /etc/glversion 00454f29247de581cee62dc867a330c6fcdab32b36dccb02881779512425558b
+}
+vp_os_transaction_check() (
+    # OS, credential assignment, privileged administration, vendor logd, and all
+    # principals writing exceptional ancestry are trusted. Static witnesses do
+    # not establish exclusion of other runtime writers or firmware provenance.
+    vp_os_firmware
+    pin_before=$(vp_pins) || fail profile_pins
+    for p in /etc/passwd /etc/group; do regular "$p"; vp_metadata "$p"; done
+    passwd_size=$(stat_private -c %s /etc/passwd) || fail account_metadata_read; group_size=$(stat_private -c %s /etc/group) || fail account_metadata_read
+    [ "$passwd_size" -gt 0 ] && [ "$passwd_size" -le 262144 ] && [ "$group_size" -gt 0 ] && [ "$group_size" -le 262144 ] || fail account_size
+    passwd_hash=$(vp_hash_value /etc/passwd) || fail hash_read; group_hash=$(vp_hash_value /etc/group) || fail hash_read
+    passwd_meta=$(stat_private -c '%u:%g:%a:%d:%i:%s' /etc/passwd) || fail account_metadata_read
+    group_meta=$(stat_private -c '%u:%g:%a:%d:%i:%s' /etc/group) || fail account_metadata_read
+    vp_account_select >/dev/null || fail malformed_ambiguous_or_unsupported_accounts
+    vp_providers
+    supervisor_before=$(vp_supervisor) || fail supervisor_changed
+    for p in /etc/passwd /etc/group; do regular "$p"; vp_metadata "$p"; done
+    [ "$(stat_private -c '%u:%g:%a:%d:%i:%s' /etc/passwd)" = "$passwd_meta" ] && [ "$(stat_private -c '%u:%g:%a:%d:%i:%s' /etc/group)" = "$group_meta" ] || fail account_metadata_drift
+    [ "$(stat_private -c %s /etc/passwd)" = "$passwd_size" ] && [ "$(stat_private -c %s /etc/group)" = "$group_size" ] || fail account_size_drift
+    [ "$(vp_hash_value /etc/passwd)" = "$passwd_hash" ] && [ "$(vp_hash_value /etc/group)" = "$group_hash" ] || fail account_drift_during_census
+    if [ "$nss_exists" = 1 ]; then
+        regular /etc/nsswitch.conf; vp_metadata /etc/nsswitch.conf
+        [ "$(stat_private -c '%u:%g:%a:%d:%i:%s' /etc/nsswitch.conf)" = "$nss_meta" ] || fail provider_metadata_drift
+        [ "$(vp_hash_value /etc/nsswitch.conf)" = "$nss_hash" ] || fail provider_config_drift
+    else [ ! -e /etc/nsswitch.conf ] && [ ! -L /etc/nsswitch.conf ] || fail provider_config_appeared
+    fi
+    vp_provider_scan
+    [ "$provider_sockets" = 0 ] || fail provider_socket_appeared
+    [ "$(vp_pins)" = "$pin_before" ] || fail profile_drift
+    [ "$(vp_supervisor)" = "$supervisor_before" ] || fail supervisor_changed
+    vp_os_firmware
+    printf '%s\n' 'OS_TRUST_PROFILE_ATTESTED: Fresh static account/provider/pin and PID1 witnesses; trusted OS/writers; no population exclusion proof.'
+)
 vp_transaction_check() (
     case "${vp_profile:-strict}" in
         strict)
@@ -422,6 +461,7 @@ vp_transaction_check() (
             done
             for p in /lib/libc.so /lib/libgcc_s.so.1 /lib/functions.sh /lib/config/uci.sh /etc/opkg/keys/06a6bf2ad909388f /usr/lib/opkg/status /bin/opkg; do regular "$p"; vp_metadata "$p"; done
             return 0;;
+        gl-xe3000-4.8.3-os-trust-v1) vp_os_transaction_check; return;;
         gl-xe3000-4.8.3-logd-011-v1) ;;
         *) fail unsupported_vendor_profile;;
     esac

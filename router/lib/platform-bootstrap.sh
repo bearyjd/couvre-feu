@@ -9,14 +9,43 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=c300640378726a63b1149ed17131b95e757186098c8aaa0bb5a1de326200f5c4
+CF_RELEASE_ID=96afe199c3c333d2b5ee6a8b49a96cfa7cad147550923f6dd725b1de84dcf7b8
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
-CF_RELEASE_MODULES='core.sh:b832763c7ab0274cb4e388c533837d3a6c641c79c0226e7f0b8db0b71fed1c6d rpc.sh:8e24e1fffb85f2ebb59d3ff7cbee5c52d5602014a2f64d919ba55cb84167dd7c firewall.sh:dc3e3b21a9b0644c3a164dd37b05add690b3b90763c7b5bf3b071d005b78ed01 install-common.sh:e75d2d3a28f9c87dc71fbcab5146c98d4d31dc1d07c2b5fab626a5582d01fcd3 state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:4923df06cf6338444f3d0b1c1a9416ca951f7c36b3444456389d13e272e541af'
+CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
+CF_PLATFORM_INITIAL_WRITE=0
+CF_RELEASE_MODULES='core.sh:1417d258a7a42583ee15e60f48b2abebe8759d9427e4ffe39b4388831f2e87a4 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:e498e8ef0f65638f45a77bcda5c247c1b5a5959608d5c3dcba5edb4f0a2c126b install-common.sh:6d703ad6c059d3231827e88f6ed27909466eeda581d199ced66dcfea6b0e8905 state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:4194c515c707c16a9218b05af6f110677283aa377f5cd68de291f696f1d8b0b7'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
     case "$0" in */cfctl) printf '%s\n' '{"ok":false,"errors":["platform_admission_refused"]}';; esac
     exit 2
+}
+platform_vendor_selected() {
+    case "$CF_PLATFORM_PROFILE" in "$CF_VENDOR_PROFILE"|"$CF_OS_TRUST_PROFILE") return 0;; *) return 1;; esac
+}
+platform_clock_tick() {
+    # /proc/uptime has two decimal places; centiseconds avoid rounded budgets.
+    IFS=' ' read -r platform_uptime platform_unused < /proc/uptime || platform_fail admission_clock_read
+    platform_seconds=${platform_uptime%.*}; platform_fraction=${platform_uptime#*.}
+    case "$platform_seconds:$platform_fraction" in *[!0-9:]*|:*) platform_fail admission_clock_format;; esac
+    [ "${#platform_seconds}" -le 10 ] && [ "${#platform_fraction}" = 2 ] || platform_fail admission_clock_format
+    case "$platform_seconds" in 0|[1-9]*) ;; *) platform_fail admission_clock_format;; esac
+    platform_fraction=${platform_fraction#0}; platform_fraction=${platform_fraction:-0}
+    printf '%s\n' "$((platform_seconds * 100 + platform_fraction))"
+}
+platform_deadline_check() {
+    [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ] || return 0
+    [ "${CF_PLATFORM_INITIAL_WRITE:-0}" != 1 ] || return 0
+    case "${CF_PLATFORM_ENTRY_TICK:-}" in ''|*[!0-9]*) platform_fail admission_clock_anchor;; esac
+    platform_now=$(platform_clock_tick) || platform_fail admission_clock_read
+    [ "$platform_now" -ge "$CF_PLATFORM_ENTRY_TICK" ] && [ "$((platform_now-CF_PLATFORM_ENTRY_TICK))" -lt 1300 ] || platform_fail admission_deadline
+}
+platform_initial_write() {
+    # Logical cutoff only: no hard syscall, scheduler-gap or drain guarantee.
+    # After the first protected write, existing journal/recovery semantics own
+    # interruption; never introduce an arbitrary mid-restoration deadline.
+    platform_deadline_check
+    CF_PLATFORM_INITIAL_WRITE=1
 }
 platform_entry_root_validate() {
     case "${CF_TEST_MODE:-0}" in
@@ -39,12 +68,14 @@ platform_hash() {
     platform_regular "$1"
     platform_hash_result=$(timeout -s KILL 6 sha256sum "$1") || platform_fail hash_read
     [ "${platform_hash_result%% *}" = "$2" ] || platform_fail hash_mismatch
+    platform_deadline_check
 }
 platform_stat() { command stat "$@"; }
 platform_private() {
     [ ! -L "$1" ] || platform_fail private_symlink
     platform_canonical "$1"
     [ "$(platform_stat -c '%u:%g:%a' "$1")" = "$CF_PLATFORM_OWNER:$2" ] || platform_fail private_metadata
+    platform_deadline_check
 }
 platform_read_profile() {
     platform_regular "$1"
@@ -53,6 +84,7 @@ platform_read_profile() {
     platform_read_value=$(timeout -s KILL 4 dd if="$1" bs=1 count=65 2>/dev/null && printf '.') || platform_fail profile_read
     if [ "$platform_read_value" = "$(printf 'strict\n.')" ]; then platform_read_value=strict
     elif [ "$platform_read_value" = "$(printf 'gl-xe3000-4.8.3-logd-011-v1\n.')" ]; then platform_read_value=gl-xe3000-4.8.3-logd-011-v1
+    elif [ "$platform_read_value" = "$(printf 'gl-xe3000-4.8.3-os-trust-v1\n.')" ]; then platform_read_value=gl-xe3000-4.8.3-os-trust-v1
     else platform_fail unknown_profile; fi
     # Exact bytes also reject NULs dropped by shell command substitution.
     printf '%s\n' "$platform_read_value" | timeout -s KILL 4 cmp -s - "$1" || platform_fail profile_bytes
@@ -70,7 +102,7 @@ platform_done_profile() {
         printf 'strict\n'
         return 0
     fi
-    for platform_completion_profile in strict gl-xe3000-4.8.3-logd-011-v1; do
+    for platform_completion_profile in strict gl-xe3000-4.8.3-logd-011-v1 gl-xe3000-4.8.3-os-trust-v1; do
         if [ "$platform_done_value" = "$(printf '3\n%s\n%s\n.' "$platform_completion_profile" "$CF_RELEASE_ID")" ]; then
             printf '3\n%s\n%s\n' "$platform_completion_profile" "$CF_RELEASE_ID" | timeout -s KILL 4 cmp -s - "$1" || platform_fail completion_bytes
             printf '%s\n' "$platform_completion_profile"
@@ -107,11 +139,12 @@ platform_choose() {
     if [ "$platform_selection" = runtime ]; then
         CF_PLATFORM_PROFILE=${platform_stage_profile:-${platform_disk_profile:-strict}}
     else
-        case "$platform_selection" in strict|gl-xe3000-4.8.3-logd-011-v1) ;; *) platform_fail unknown_profile;; esac
+        case "$platform_selection" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;; *) platform_fail unknown_profile;; esac
         CF_PLATFORM_PROFILE=$platform_selection
         [ -z "$platform_stage_profile" ] || [ "$platform_stage_profile" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
         [ -z "$platform_disk_profile" ] || [ "$platform_disk_profile" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
     fi
+    platform_deadline_check
 }
 platform_bootstrap_vendor() {
     for platform_parent in / /lib /usr /usr/libexec /bin; do
@@ -123,7 +156,13 @@ platform_bootstrap_vendor() {
     platform_hash /lib/libgcc_s.so.1 6baf0c0086b0bd2915019e942a2fa7b2b4dfb4e0935db43a71fc54add13d1a69
     platform_hash /usr/libexec/stat-coreutils 774eaa80136871de03ea7c94ef713aac209cea00eddb8e7d07c7036e511499a0
     [ -L /bin/stat ] && [ "$(readlink /bin/stat)" = /usr/libexec/stat-coreutils ] || platform_fail stat_alternative
-    platform_stat() { env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@"; }
+    platform_stat() {
+        if [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ]; then
+            platform_stat_result=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@") || platform_fail stat_read
+            platform_deadline_check
+            printf '%s\n' "$platform_stat_result"
+        else env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@"; fi
+    }
     [ "$(platform_stat -c '%u:%g:%a' /usr/libexec/stat-coreutils)" = 0:0:755 ] || platform_fail stat_metadata
     for platform_parent in / /lib /usr /bin; do
         [ "$(platform_stat -c '%u:%g:%a' "$platform_parent")" = 0:0:755 ] || platform_fail bootstrap_metadata
@@ -159,12 +198,15 @@ platform_external_closure() {
 }
 platform_lock_release() {
     if [ "$CF_PLATFORM_LOCKED" = 1 ]; then
+        platform_cleanup_saved=$CF_PLATFORM_INITIAL_WRITE
+        CF_PLATFORM_INITIAL_WRITE=1
         platform_private "$CF_PLATFORM_LOCK" 700
         platform_private "$CF_PLATFORM_LOCK/pid" 600
         printf '%s\n' "$$" | cmp -s - "$CF_PLATFORM_LOCK/pid" || platform_fail lock_owner_changed
         rm -f "$CF_PLATFORM_LOCK/pid" || platform_fail lock_cleanup
         rmdir "$CF_PLATFORM_LOCK" || platform_fail lock_cleanup
         CF_PLATFORM_LOCKED=0
+        CF_PLATFORM_INITIAL_WRITE=$platform_cleanup_saved
     fi
 }
 platform_lock_acquire() {
@@ -233,20 +275,22 @@ platform_attest_vendor() {
         vp_profile=$CF_PLATFORM_PROFILE
         . "$1/vendor-platform.sh"
         vp_transaction_check >/dev/null || platform_fail attestation
+        platform_deadline_check
 }
 platform_admit() {
     platform_choose "$1" "$2"
-    if [ "$CF_PLATFORM_PROFILE" = "$CF_VENDOR_PROFILE" ]; then platform_bootstrap_vendor; fi
+    if platform_vendor_selected; then platform_bootstrap_vendor; fi
     platform_private "$3/platform-bootstrap.sh" 644
     if [ "${CF_TEST_MODE:-0}" != 1 ]; then platform_private "$3" 700; fi
     platform_verify_modules "$3"
     CF_PLATFORM_LIB=$3
-    if [ "$CF_PLATFORM_PROFILE" = "$CF_VENDOR_PROFILE" ]; then
+    if platform_vendor_selected; then
         platform_lock_acquire
         platform_attest_vendor "$3" || platform_fail attestation
     fi
     CF_PLATFORM_ADMITTED=1
     platform_profile_validate
+    platform_deadline_check
 }
 
 platform_recovery_prepare() {
@@ -259,6 +303,7 @@ platform_recovery_prepare() {
     fi
     # No overwrite or speculative cleanup after partial acquisition. Such a
     # collision retains its evidence and requires explicit recovery.
+    platform_initial_write
     mkdir -m 700 "$platform_target_release" || platform_fail release_collision
     mkdir -m 700 "$platform_target_release/lib" || platform_fail release_directory
     while read -r platform_digest platform_file; do

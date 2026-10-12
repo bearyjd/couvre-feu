@@ -34,6 +34,14 @@ cf_backend_available() {
 cf_backend() {
     cf_cmd=$1; shift
     cf_backend_available "$cf_cmd" || { cf_fail missing_backend;return 127; }
+    case "$cf_cmd" in
+        iptables|ip6tables)
+            for cf_deadline_arg in "$@"; do case "$cf_deadline_arg" in -A|-I|-R|-D|-N|-X|-F|-P|-Z|--append|--insert|--replace|--delete|--new-chain|--delete-chain|--flush|--policy|--zero) platform_initial_write;; esac; done;;
+        ipset) case "${1:-}" in create|add|del|destroy|flush|swap|rename|restore) platform_initial_write;; esac;;
+        conntrack) for cf_deadline_arg in "$@"; do case "$cf_deadline_arg" in -D|-F|-I|-U|--delete|--flush|--create|--update) platform_initial_write;; esac; done;;
+        fw3) case "${1:-}" in reload|restart|start|stop) platform_initial_write;; esac;;
+        uci) for cf_deadline_arg in "$@"; do case "$cf_deadline_arg" in set|add|delete|rename|commit|import|revert) platform_initial_write;; esac; done;;
+    esac
     "$cf_executable" "$@"
 }
 cf_safe_file() {
@@ -111,7 +119,7 @@ cf_policy_safe() {
     printf '%s\n' "$CF_POLICY" | awk -F '\t' 'NR==FNR{protected[$1]=1;next}$1=="P"&&protected[$3]{exit 1}' "$CF_PROTECTED" - || { cf_fail protected_mac_overlap; return 1; }
 }
 cf_runtime_prepare() {
-    if [ ! -e "$CF_RUNTIME" ]; then mkdir -m 700 "$CF_RUNTIME" || { cf_fail runtime_create_failed; return 1; }; fi
+    if [ ! -e "$CF_RUNTIME" ]; then platform_initial_write; mkdir -m 700 "$CF_RUNTIME" || { cf_fail runtime_create_failed; return 1; }; fi
     cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime; return 1; }
 }
 cf_install_gate() {
@@ -146,16 +154,18 @@ cf_install_gate() {
 }
 
 cf_control_dirs() {
+    platform_deadline_check
     for cf_dir in "$CF_BASE/etc" "$CF_DIR";do
         [ -d "$cf_dir" ] && [ ! -L "$cf_dir" ] || { cf_fail unsafe_control_directory;return 1; }
         cf_dir_meta=$(stat -c '%u:%a' "$cf_dir") || return 1
         case $cf_dir_meta in "$CF_OWNER:700"|"$CF_OWNER:755"|"$CF_OWNER:750") ;;
             "$CF_OWNER:775")
-                [ "$cf_dir" = /etc ] && [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] && [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] || { cf_fail unsafe_control_directory;return 1; };;
+                [ "$cf_dir" = /etc ] && [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] && { [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] || [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-os-trust-v1 ]; } || { cf_fail unsafe_control_directory;return 1; };;
             *)cf_fail unsafe_control_directory;return 1;;esac
     done
 }
 cf_lock() {
+    platform_deadline_check
     if [ "${CF_RPC_REQUIRE_RUNTIME:-0}" = 1 ];then
         cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime;return 1; }
     else cf_runtime_prepare || return 1;fi
@@ -173,6 +183,7 @@ cf_lock() {
     fi
     printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
     CF_LOCKED=1
+    platform_deadline_check
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT
     trap 'cf_unlock; platform_lock_release; exit 143' TERM
@@ -271,16 +282,19 @@ cf_ssh_guard() {
     if ! awk -v mac="$cf_macs" '$0==mac{yes=1}END{exit !yes}' "$CF_PROTECTED"; then
         cf_temp=$CF_RUNTIME/.protected.$$
         [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || { cf_fail unsafe_temporary; return 1; }
+        platform_initial_write
         { awk '{print}' "$CF_PROTECTED"; printf '%s\n' "$cf_macs"; } > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_PROTECTED" || { cf_fail protected_update_failed; return 1; }
     fi
 }
 cf_write_policy() {
+    platform_deadline_check
     cf_temp=$CF_RUNTIME/.candidate.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || { cf_fail unsafe_temporary; return 1; }
     cf_runtime_device=$(stat -c %d "$CF_RUNTIME") || { cf_fail cross_filesystem_state;return 1; }
     cf_state_device=$(stat -c %d "$CF_DIR") || { cf_fail cross_filesystem_state;return 1; }
     [ "$cf_runtime_device" = "$cf_state_device" ] || { cf_fail cross_filesystem_state;return 1; }
     cf_rpc_checkpoint before_write
+    platform_initial_write
     printf '%s\n' "$CF_POLICY" > "$cf_temp" || { cf_fail state_write_failed;return 1; }
     cf_rpc_checkpoint during_write
     if [ -n "$CF_METADATA" ];then
@@ -341,6 +355,7 @@ cf_input_cleanup() {
     fi
 }
 cf_sync_stage() {
+    platform_deadline_check
     cf_timeout_available || return 1
     cf_input_parent=$CF_BASE/tmp
     [ -d "$cf_input_parent" ] && [ ! -L "$cf_input_parent" ] && [ "$(CDPATH='' cd -- "$cf_input_parent" && pwd -P)" = "$cf_input_parent" ] || { cf_fail unsafe_input_directory;return 1; }
@@ -352,6 +367,7 @@ cf_sync_stage() {
     trap 'cf_input_cleanup; cf_unlock;exit 143' TERM
     # Deadline and byte bound apply before acquiring the policy mutation lock.
     cf_input_deadline 10 dd bs=1 count=65537 of="$CF_INPUT_DIR/input" 2>/dev/null || { cf_input_cleanup;cf_fail input_deadline_or_read_failure;return 1; }
+    platform_deadline_check
     cf_input_size=$(wc -c < "$CF_INPUT_DIR/input")
     if [ "$cf_input_size" -gt 65536 ];then cf_input_cleanup;cf_fail policy_too_large;return 1;fi
     cf_ascii_size=$(tr -cd '\11\12\15\40-\176' < "$CF_INPUT_DIR/input" | wc -c)
@@ -396,6 +412,7 @@ cf_error_record() {
     [ "$CF_LOCKED" = 1 ] || return 0
     cf_temp=$CF_RUNTIME/.error.$$
     [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || return 1
+    platform_initial_write
     printf '%s\n' "${CF_ERROR:-apply_failed}" > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_RUNTIME/error"
 }
 cf_status() {
@@ -451,6 +468,7 @@ cf_busy_result() {
     printf '{"ok":false,"desiredRevision":%s,"confirmedRevision":null,"desiredPauses":[],"effectivePauses":[],"observed":{"kids":[],"paused":[]},"drift":true,"capabilities":{"ipv6":false,"conntrack":false,"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":["%s"]}\n' "${CF_REVISION:-0}" "${CF_ERROR:-locked}"
 }
 cf_main() {
+    platform_deadline_check
     cf_action=${1-}
     case $cf_action in
         rpc-sync|rpc-status) cf_rpc_main "$@";return $?;;

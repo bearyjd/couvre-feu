@@ -15,7 +15,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --platform-profile)
             [ "$#" -ge 2 ] && [ "$PLATFORM_OPTION" = 0 ] || fail 'one --platform-profile required'
-            case "$2" in strict|gl-xe3000-4.8.3-logd-011-v1) ;; *) fail 'unknown platform profile';; esac
+            case "$2" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;; *) fail 'unknown platform profile';; esac
             PLATFORM_SELECTION=$2; PLATFORM_OPTION=1; shift 2;;
         --activate) ACTIVATE=1; shift;;
         --protect)
@@ -39,18 +39,30 @@ if [ "${CF_TEST_MODE:-0}" != 1 ]; then PATH=/usr/sbin:/usr/bin:/sbin:/bin; fi
 LC_ALL=C
 export PATH LC_ALL
 umask 077
-if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
     printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
     exit 2
 fi
-unset CF_PLATFORM_ADMITTED CF_PLATFORM_LOCKED CF_PLATFORM_NESTED CF_RELEASE_ID CF_PLATFORM_PROFILE CF_VENDOR_PROFILE CF_RELEASE_MODULES CF_PLATFORM_CALLER_PID CF_PLATFORM_OWNER CF_PLATFORM_LIB vp_profile
-CF_BOOTSTRAP_PIN=bf93a1d753df799b313693d5c16a7e60740e476388b8ae2008fa0a03eab291fc
+unset CF_PLATFORM_ADMITTED CF_PLATFORM_LOCKED CF_PLATFORM_NESTED CF_RELEASE_ID CF_PLATFORM_PROFILE CF_VENDOR_PROFILE CF_OS_TRUST_PROFILE CF_PLATFORM_ENTRY_TICK CF_PLATFORM_INITIAL_WRITE CF_RELEASE_MODULES CF_PLATFORM_CALLER_PID CF_PLATFORM_OWNER CF_PLATFORM_LIB vp_profile
+# Capture once before bootstrap; invalid clocks refuse only the OS-trust profile.
+cf_capture_entry_tick() {
+    IFS=' ' read -r cf_entry_uptime cf_entry_unused < /proc/uptime || return 2
+    cf_entry_seconds=${cf_entry_uptime%.*}; cf_entry_fraction=${cf_entry_uptime#*.}
+    case "$cf_entry_seconds:$cf_entry_fraction" in *[!0-9:]*|:*) return 2;; esac
+    [ "${#cf_entry_seconds}" -le 10 ] && [ "${#cf_entry_fraction}" = 2 ] || return 2
+    case "$cf_entry_seconds" in 0|[1-9]*) ;; *) return 2;; esac
+    cf_entry_fraction=${cf_entry_fraction#0}; cf_entry_fraction=${cf_entry_fraction:-0}
+    printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
+}
+CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
+CF_BOOTSTRAP_PIN=82b75589b0a94b61ee9556f3906ac6daa0cf5999e36e56a9453b1ff27470dca8
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
 [ "${platform_bootstrap_digest%% *}" = "$CF_BOOTSTRAP_PIN" ] || exit 2
 # shellcheck disable=SC1091
 . "$platform_bootstrap_path"
+platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
 platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
@@ -63,6 +75,7 @@ else
 fi
 # shellcheck disable=SC1091
 . "$HERE/lib/install-common.sh"
+platform_deadline_check
 safe_paths
 if ! { [ "$BACKUP" != "$RECOVERY" ] && [ ! -e "$DONE" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
@@ -122,6 +135,7 @@ if [ -n "${SSH_CONNECTION:-}" ]; then
 "
 fi
 
+platform_deadline_check
 # Build staging outside managed paths. In fixtures it stays under CF_ROOT.
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
 else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
@@ -250,6 +264,7 @@ if [ ! -e "$BACKUP" ]; then
         if [ -d "$ROOT/$rel" ]; then stat -c %a "$ROOT/$rel" > "$STAGE/dir_$k"
         else printf '%s\n' absent > "$STAGE/dir_$k"; fi
     done
+    platform_initial_write
     mkdir -p "$BACKUP"
     chmod 700 "$BASE" "$BACKUP"
     for rel in $DIRS; do k=$(key "$rel"); mv "$STAGE/dir_$k" "$BACKUP/dir_$k"; done
