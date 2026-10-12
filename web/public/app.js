@@ -1,6 +1,6 @@
 import { createPasskey, getPasskey } from './auth-client.js';
 import { actorScope, clearStatusCache, saveStatus, readStatus, needsServerLogout, setServerLogoutNeeded, broadcastLogout, broadcastScope, LOGOUT_EVENT, LOGOUT_REQUIRED, SCOPE_EVENT } from './status-cache.js';
-import { createAlertJournal, alertText, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
+import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -375,8 +375,17 @@ function renderPeople() {
 function renderAlerts() {
   const panel = $('#operational-alerts'), feed = $('#alert-feed');
   if (!state.people || !actor()) { feed.replaceChildren(); panel.hidden = true; $('#hide-recovery').checked = false; return; }
-  const view = alertJournal.view(now());
-  const rows = view.records.map(record => {
+  const all = alertJournal.view(now(), true);
+  const view = {...all, records: all.records.filter(record => !all.hideRecovery || record.recoveredAt === null)};
+  const sameCondition = (record, condition) => record.code === condition.code && (record.operationId ?? null) === (condition.operationId ?? null) && (record.pauseUntil ?? null) === (condition.pauseUntil ?? null);
+  const currentRows = state.offline || !alertJournal.isBound() ? '' : state.people.people.filter(person => actor().personIds.includes(person.id)).flatMap(person => {
+    const evidence = cacheAlertEvidence(person.operationalAlerts, state.people.source);
+    const recoveredEvaluation = Math.max(0, ...all.records.filter(record => record.personId === person.id).map(record => record.recoveryEvaluatedAt ?? 0));
+    if (!evidence || evidence.evaluatedAt > now() || evidence.evaluatedAt < recoveredEvaluation) return [];
+    return evidence.conditions.filter(condition => !all.records.some(record => record.personId === person.id && record.recoveredAt === null && sameCondition(record, condition)))
+      .map(condition => `<li class="alert-row alert-current"><strong>${escape(person.name)} · Current response verification warning</strong><p>${escape(alertText(condition.code))}</p><small>Response evaluated ${escape(time(evidence.evaluatedAt))} · source observed ${escape(time(evidence.sourceObservedAt))}</small></li>`);
+  }).join('');
+  const rows = currentRows + view.records.map(record => {
     const person = state.people.people.find(person => person.id === record.personId);
     if (!person) return '';
     const current = !state.offline && (person.operationalAlerts?.conditions.some(condition => condition.code === record.code &&

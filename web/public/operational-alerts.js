@@ -51,9 +51,11 @@ function sanitizeRecord(value) {
   if (!condition || !personId(value.personId) || !epoch(value.firstNoticedAt) || !epoch(value.lastNoticedAt) ||
       !Number.isSafeInteger(value.occurrence) || value.occurrence < 1 || value.occurrence > 2147483647 ||
       value.lastNoticedAt < value.firstNoticedAt || !nullableEpoch(value.sourceObservedAt) || !nullableEpoch(value.serviceReceivedAt) ||
+      !epoch(value.failureEvaluatedAt) || !nullableEpoch(value.recoveryEvaluatedAt) || !nullableEpoch(value.witnessObservedAt) || !nullableEpoch(value.witnessReceivedAt) ||
       !nullableEpoch(value.recoveredAt) || value.recoveredAt !== null && value.recoveredAt < value.firstNoticedAt) return null;
   return {personId: value.personId, ...condition, occurrence: value.occurrence, firstNoticedAt: value.firstNoticedAt, lastNoticedAt: value.lastNoticedAt,
-    sourceObservedAt: value.sourceObservedAt, serviceReceivedAt: value.serviceReceivedAt, recoveredAt: value.recoveredAt};
+    sourceObservedAt: value.sourceObservedAt, serviceReceivedAt: value.serviceReceivedAt, failureEvaluatedAt: value.failureEvaluatedAt,
+    recoveryEvaluatedAt: value.recoveryEvaluatedAt, witnessObservedAt: value.witnessObservedAt, witnessReceivedAt: value.witnessReceivedAt, recoveredAt: value.recoveredAt};
 }
 
 function bounded(records, now, permitted) {
@@ -67,6 +69,10 @@ function bounded(records, now, permitted) {
     else episodes.set(key, {...previous, firstNoticedAt: Math.min(previous.firstNoticedAt, record.firstNoticedAt), lastNoticedAt: Math.max(previous.lastNoticedAt, record.lastNoticedAt),
       sourceObservedAt: Math.max(previous.sourceObservedAt ?? 0, record.sourceObservedAt ?? 0) || null,
       serviceReceivedAt: Math.max(previous.serviceReceivedAt ?? 0, record.serviceReceivedAt ?? 0) || null,
+      failureEvaluatedAt: Math.max(previous.failureEvaluatedAt, record.failureEvaluatedAt),
+      recoveryEvaluatedAt: Math.max(previous.recoveryEvaluatedAt ?? 0, record.recoveryEvaluatedAt ?? 0) || null,
+      witnessObservedAt: Math.max(previous.witnessObservedAt ?? 0, record.witnessObservedAt ?? 0) || null,
+      witnessReceivedAt: Math.max(previous.witnessReceivedAt ?? 0, record.witnessReceivedAt ?? 0) || null,
       recoveredAt: previous.recoveredAt ?? record.recoveredAt});
   }
   const result = [...episodes.values()].sort((a, b) => b.firstNoticedAt - a.firstNoticedAt || baseKey(a).localeCompare(baseKey(b)) || b.occurrence - a.occurrence).slice(0, MAX_RECORDS);
@@ -106,6 +112,7 @@ export function createAlertJournal(storage = globalThis.localStorage) {
   };
   return {
     clear,
+    isBound() { return scope !== null; },
     storageChanged(key, value) {
       if (scope && (key === ACTIVE && value !== scope || key === ALERT_PREFIX + scope && value === null)) {
         dropMemory();
@@ -136,37 +143,53 @@ export function createAlertJournal(storage = globalThis.localStorage) {
         const deadline = clocks ? Math.min(observed, received ?? observed) + 31 : null;
         const fresh = clocks && evidence.freshUntil === deadline && evidence.freshness === 'fresh' && now < deadline && evidence.evaluatedAt <= now && evidence.evaluatedAt >= observed;
         const conditions = [...evidence.conditions];
-        if (deadline !== null && now >= deadline && !conditions.some(value => value.code.startsWith('observation-'))) conditions.push({code: 'observation-stale'});
+        const localStale = deadline !== null && now >= deadline && !conditions.some(value => value.code.startsWith('observation-'));
+        if (localStale) conditions.push({code: 'observation-stale'});
         for (const condition of conditions) {
           const key = baseKey({...condition, personId: person.id});
+          const related = records.filter(record => baseKey(record) === key);
+          const personRecords = records.filter(record => record.personId === person.id);
+          const recoveryEvaluation = Math.max(0, ...personRecords.map(record => record.recoveryEvaluatedAt ?? 0));
+          const witnessObservedAt = Math.max(observed ?? 0, ...personRecords.map(record => record.witnessObservedAt ?? 0)) || null;
+          const witnessReceivedAt = Math.max(received ?? 0, ...personRecords.map(record => record.witnessReceivedAt ?? 0)) || null;
+          const failureEvaluation = localStale && condition.code === 'observation-stale' ? now : evidence.evaluatedAt;
+          // Cached/ticking failure copy cannot start another episode after a newer recovery.
+          // Expiry of the latest witness can; expiry of an older tab's witness cannot.
+          if (failureEvaluation > now || failureEvaluation <= recoveryEvaluation ||
+              localStale && condition.code === 'observation-stale' && observed < (witnessObservedAt ?? 0)) continue;
           const open = records.find(record => record.recoveredAt === null && baseKey(record) === key);
           if (open) {
             open.lastNoticedAt = Math.max(open.lastNoticedAt, now);
+            open.failureEvaluatedAt = Math.max(open.failureEvaluatedAt, failureEvaluation);
+            open.witnessObservedAt = witnessObservedAt; open.witnessReceivedAt = witnessReceivedAt;
             open.sourceObservedAt = Math.max(open.sourceObservedAt ?? 0, observed ?? 0) || null;
             open.serviceReceivedAt = Math.max(open.serviceReceivedAt ?? 0, received ?? 0) || null;
           } else {
-            const occurrence = Math.max(0, ...records.filter(record => baseKey(record) === key).map(record => record.occurrence)) + 1;
-            records.push({personId: person.id, ...condition, occurrence, firstNoticedAt: now, lastNoticedAt: now, sourceObservedAt: observed, serviceReceivedAt: received, recoveredAt: null});
+            const occurrence = Math.max(0, ...related.map(record => record.occurrence)) + 1;
+            records.push({personId: person.id, ...condition, occurrence, firstNoticedAt: now, lastNoticedAt: now, sourceObservedAt: observed, serviceReceivedAt: received,
+              failureEvaluatedAt: failureEvaluation, recoveryEvaluatedAt: null, witnessObservedAt, witnessReceivedAt, recoveredAt: null});
           }
         }
         if (!canRecover || !fresh || !evidence.healthy) continue;
         for (const record of records) {
           if (record.personId !== person.id || record.recoveredAt !== null || conditions.some(condition => baseKey({...condition, personId: person.id}) === baseKey(record)) ||
-              evidence.evaluatedAt < record.lastNoticedAt || observed <= (record.sourceObservedAt ?? 0) ||
-              evidence.source === 'router-policy' && received <= (record.serviceReceivedAt ?? 0)) continue;
+              evidence.evaluatedAt < record.failureEvaluatedAt || observed <= (record.witnessObservedAt ?? 0) ||
+              evidence.source === 'router-policy' && received <= (record.witnessReceivedAt ?? 0)) continue;
           if (record.code === 'control-verification-unavailable' && evidence.confirmedOperationId !== record.operationId) continue;
           if (record.code === 'pause-expiry-unverified' && (!epoch(evidence.expiryVerifiedThrough) || evidence.expiryVerifiedThrough > observed || evidence.expiryVerifiedThrough < record.pauseUntil)) continue;
           record.recoveredAt = now;
+          record.recoveryEvaluatedAt = evidence.evaluatedAt;
+          record.witnessObservedAt = observed; record.witnessReceivedAt = received;
         }
       }
       write(now);
     },
-    view(now) {
+    view(now, includeRecovery = false) {
       if (!scope) return {records: [], hideRecovery: false};
       lastClock = Math.max(lastClock, now); now = lastClock;
       if (expiresAt <= now) { clear(); return {records: [], hideRecovery: false}; }
       read(); write(now);
-      return {records: records.filter(record => !hideRecovery || record.recoveredAt === null).map(record => ({...record})), hideRecovery};
+      return {records: records.filter(record => includeRecovery || !hideRecovery || record.recoveredAt === null).map(record => ({...record})), hideRecovery};
     },
     setHideRecovery(value, now) { if (!scope) return; read(); if (!scope) return; hideRecovery = value === true; lastClock = Math.max(lastClock, now); write(lastClock); },
   };

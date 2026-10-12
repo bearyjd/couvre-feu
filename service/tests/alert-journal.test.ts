@@ -37,8 +37,36 @@ test('repeated failure, witnessed recovery and recurrence produce one bounded ep
     journal.ingest(status(evidence(t + 2)), t + 2, true);
     journal.ingest(status(evidence(t + 2)), t + 2, true);
     assert.equal(journal.view(t + 2).records.length, 1); assert.equal(journal.view(t + 2).records[0].recoveredAt, t + 2);
-    journal.ingest(status(unavailable(t + 2)), t + 2, true); // Recurrence in same second remains a separate episode.
-    assert.equal(journal.view(t + 2).records.length, 2); assert.equal(journal.view(t + 2).records.filter((record: any) => record.recoveredAt === null).length, 1);
+    journal.ingest(status(unavailable(t + 2)), t + 2, true); // Equal second has no ordering proof after recovery.
+    assert.equal(journal.view(t + 2).records.length, 1);
+    journal.ingest(status(unavailable(t + 3)), t + 3, true);
+    assert.equal(journal.view(t + 3).records.length, 2); assert.equal(journal.view(t + 3).records.filter((record: any) => record.recoveredAt === null).length, 1);
+});
+
+test('stale tab and offline replay cannot reopen recovered episodes; later read errors with the same source can recur', () => {
+    const {journal: first, storage} = fixture(), staleTab = createAlertJournal(storage);
+    staleTab.bind(session, status(), t);
+    first.ingest(status(unavailable(t)), t, true); staleTab.ingest(status(unavailable(t)), t, true);
+    first.ingest(status(evidence(t + 2)), t + 2, true);
+    staleTab.ingest(status(unavailable(t)), t + 3, false);
+    assert.equal(staleTab.view(t + 3).records.length, 1);
+    assert.equal(staleTab.view(t + 3).records[0].recoveredAt, t + 2);
+    first.ingest(status(evidence(t + 2)), t + 3, false); // Healthy replay negative control.
+    assert.equal(first.view(t + 3).records.length, 1);
+    const reload = createAlertJournal(storage); reload.bind(session, status(), t + 4);
+    reload.ingest(status(unavailable(t)), t + 4, false);
+    reload.ingest(status(unavailable(t + 2)), t + 4, true); // Equal evaluation time is also ambiguous.
+    assert.equal(reload.view(t + 4).records.length, 1);
+    const laterReadError = unavailable(t + 5);
+    Object.assign(laterReadError, {sourceObservedAt: t + 2, serviceReceivedAt: t + 2, freshUntil: t + 33});
+    reload.ingest(status(laterReadError), t + 5, true);
+    assert.equal(reload.view(t + 5).records.length, 2);
+    assert.equal(reload.view(t + 5).records.filter((record: any) => record.recoveredAt === null).length, 1);
+    reload.ingest(status(evidence(t + 2, {evaluatedAt: t + 6})), t + 6, true);
+    assert.equal(reload.view(t + 6).records.filter((record: any) => record.recoveredAt === null).length, 1);
+    reload.ingest(status(evidence(t + 7)), t + 7, true);
+    assert.equal(reload.view(t + 7).records.length, 2);
+    assert.equal(reload.view(t + 7).records.filter((record: any) => record.recoveredAt === null).length, 0);
 });
 
 test('only exact fresh confirmation can recover a historical request, never latest-operation change', () => {
@@ -62,6 +90,13 @@ test('freshness expires exactly at 31 seconds and expiry needs a verified post-d
     journal.ingest(status(evidence(t)), t + 31, false); assert.equal(journal.view(t + 31).records[0].code, 'observation-stale');
     journal.ingest(status(evidence(t)), t + 30, true); // Clock rewind cannot use same witness to recover.
     assert.equal(journal.view(t + 31).records[0].recoveredAt, null);
+    journal.ingest(status(evidence(t + 32)), t + 32, true);
+    assert.equal(journal.view(t + 32).records[0].recoveredAt, t + 32);
+    journal.ingest(status(evidence(t)), t + 63, false); // Old tab expiry is not a new failure.
+    assert.equal(journal.view(t + 63).records.length, 1);
+    journal.ingest(status(evidence(t + 32)), t + 63, false); // Latest witness really expires at its exclusive deadline.
+    assert.equal(journal.view(t + 63).records.length, 2);
+    assert.equal(journal.view(t + 63).records.filter((record: any) => record.recoveredAt === null).length, 1);
     const second = fixture().journal;
     second.ingest(status(evidence(t, {conditions: [{code: 'pause-expiry-unverified', pauseUntil: t + 1}]})), t + 1, true);
     second.ingest(status(evidence(t + 2, {expiryVerifiedThrough: t})), t + 2, true);

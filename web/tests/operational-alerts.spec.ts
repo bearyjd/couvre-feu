@@ -42,6 +42,15 @@ test('local alert feed survives reload, witnesses one recovery and keeps recurre
     await expect(page.locator('#alert-feed .recovered')).toHaveCount(1);
     await page.getByRole('button', {name: 'Refresh status'}).click(); await expect(page.locator('#alert-feed .recovered')).toHaveCount(1);
     await page.getByLabel('Hide recovery history').check(); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(0);
+    fixture.fail(fixture.at + 2); // Same epoch cannot order a history recurrence, but current warnings remain visible.
+    await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(page.locator('#alert-feed .alert-current')).toHaveCount(1);
+    await expect(page.locator('#alert-feed')).toContainText('Current response verification warning');
+    const history = await page.evaluate(() => {
+        const key = Object.keys(localStorage).find(value => value.startsWith('cf-alerts:v1:'))!;
+        return JSON.parse(localStorage.getItem(key)!).records;
+    });
+    expect(history).toHaveLength(1); expect(history[0].recoveredAt).toBe(fixture.at + 2);
     await page.clock.fastForward(1000); fixture.fail(fixture.at + 3);
     await page.getByRole('button', {name: 'Refresh status'}).click();
     await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
@@ -75,4 +84,29 @@ test('tabs share scoped episodes and preference; revocation clears alert DOM, me
     const keys = await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('cf-alerts'))); expect(keys).toEqual([]);
     await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {key: 'cf-alerts-active:v1', newValue: 'wrong-scope'})));
     await expect(page.locator('#alert-feed')).toBeEmpty(); await other.close();
+});
+
+test('an offline stale tab cannot reopen recovery; a later evaluated read error can recur without a newer source timestamp', async ({page, demo}) => {
+    const fixture = await alertFixture(page.context(), demo.origin);
+    await page.clock.install({time: new Date((fixture.at - 1) * 1000)}); await page.clock.pauseAt(new Date(fixture.at * 1000));
+    await page.goto(demo.origin); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
+    const staleTab = await page.context().newPage();
+    await staleTab.clock.install({time: new Date((fixture.at - 1) * 1000)}); await staleTab.clock.pauseAt(new Date(fixture.at * 1000));
+    await staleTab.goto(demo.origin); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
+    await staleTab.evaluate(() => window.dispatchEvent(new Event('offline')));
+    await staleTab.clock.fastForward(2000); await page.clock.fastForward(2000);
+    fixture.healthy(fixture.at + 2); await page.getByRole('button', {name: 'Refresh status'}).click();
+    await expect(page.locator('#alert-feed .recovered')).toHaveCount(1);
+    await expect(staleTab.locator('#alert-feed .recovered')).toHaveCount(1);
+    await staleTab.clock.fastForward(1000);
+    await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
+    await expect(staleTab.locator('#alert-feed .recovered')).toHaveCount(1);
+    await page.clock.fastForward(2000); await staleTab.clock.fastForward(1000);
+    fixture.fail(fixture.at + 4); // Source stays at the last successful t+2 observation.
+    await staleTab.evaluate(() => window.dispatchEvent(new Event('online')));
+    await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(2);
+    await expect(staleTab.locator('#alert-feed .recovered')).toHaveCount(1);
+    await expect(page.locator('#alert-feed .alert-row')).toHaveCount(2);
+    await staleTab.clock.fastForward(1000); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(2);
+    await staleTab.close();
 });
