@@ -9,11 +9,11 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=96afe199c3c333d2b5ee6a8b49a96cfa7cad147550923f6dd725b1de84dcf7b8
+CF_RELEASE_ID=44b82a7fddcaaf678c31a655b93dc1c2b84ff2d38e86654a35e2f8afa1e7bd2d
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-CF_RELEASE_MODULES='core.sh:1417d258a7a42583ee15e60f48b2abebe8759d9427e4ffe39b4388831f2e87a4 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:e498e8ef0f65638f45a77bcda5c247c1b5a5959608d5c3dcba5edb4f0a2c126b install-common.sh:6d703ad6c059d3231827e88f6ed27909466eeda581d199ced66dcfea6b0e8905 state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:4194c515c707c16a9218b05af6f110677283aa377f5cd68de291f696f1d8b0b7'
+CF_RELEASE_MODULES='core.sh:2b0c75bc7a13c657c9e140aeafdef9a53d845e9b884d557aadcd387e1809d051 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:c4c8e5d50ce56fd791cb0bc6176a29d172b09e7d93bf0b1d9042584a39b2819d install-common.sh:1531c0c42ef13128116c9800319f155fc6e499009fab6084254daac704d914ab state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:4194c515c707c16a9218b05af6f110677283aa377f5cd68de291f696f1d8b0b7'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -46,6 +46,21 @@ platform_initial_write() {
     # interruption; never introduce an arbitrary mid-restoration deadline.
     platform_deadline_check
     CF_PLATFORM_INITIAL_WRITE=1
+}
+platform_cleanup_receipt() {
+    # Source closure and selected profile bind this internal child result.
+    [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ] || platform_fail cleanup_receipt_profile
+    platform_cleanup_zero=0
+    case "$1" in
+        '{"ok":true,"removed":true,"zeroOwnedMutations":true,"initialProtectedWrite":false,"errors":[]}')
+            [ "$CF_PLATFORM_INITIAL_WRITE" = 0 ] || platform_fail cleanup_receipt_contradiction
+            platform_cleanup_zero=1;;
+        '{"ok":true,"removed":true,"zeroOwnedMutations":true,"initialProtectedWrite":true,"errors":[]}')
+            CF_PLATFORM_INITIAL_WRITE=1;platform_cleanup_zero=1;;
+        '{"ok":true,"removed":true,"zeroOwnedMutations":false,"initialProtectedWrite":true,"errors":[]}')
+            CF_PLATFORM_INITIAL_WRITE=1;;
+        *) platform_fail cleanup_receipt_shape;;
+    esac
 }
 platform_entry_root_validate() {
     case "${CF_TEST_MODE:-0}" in
@@ -234,6 +249,7 @@ platform_lock_recover() {
         [ -e "$platform_record" ] || [ -L "$platform_record" ] || continue
         [ "$platform_record" = "$CF_PLATFORM_LOCK/pid" ] || platform_fail ambiguous_lock
     done
+    platform_initial_write
     rm -f "$CF_PLATFORM_LOCK/pid"
     rmdir "$CF_PLATFORM_LOCK" || platform_fail lock_cleanup
 }

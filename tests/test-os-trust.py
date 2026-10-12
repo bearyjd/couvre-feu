@@ -197,6 +197,73 @@ class OsTrustRecoveryTests(platform.VendorRecoveryTests):
         self.assertNotEqual(r.returncode,0)
         self.assertEqual((self.root/'etc/couvrefeu/platform-profile').read_text(),PROFILE+'\n')
 
+class FirstWriteRegressionTests(unittest.TestCase):
+    setUp=DeadlineTests.setUp
+    run_shell=DeadlineTests.run_shell
+    def test_zero_owned_cleanup_checks_after_kernel_proof_and_empty_proof_does_not_disarm(self):
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-zero-') as folder:
+            root=Path(folder);record=root/'error';record.write_text('owned')
+            body=f'''. "{REPO}/router/lib/core.sh";. "{REPO}/router/lib/rpc.sh";. "{REPO}/router/lib/firewall.sh";
+CF_RUNTIME={root};fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
+cf_ownership_valid() {{ return 1; }};cf_zero_owned_runtime() {{ printf '%s\\n' "{record}"; }};
+cf_zero_owned_kernel() {{ fixture_tick=1400; }};cf_backend() {{ :; }};cf_remove_fw;printf unsafe'''
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertIn('admission_deadline',r.stderr)
+            self.assertTrue(record.exists());self.assertNotIn('unsafe',r.stdout)
+            body=body.replace(f'printf \'%s\\n\' "{record}"',':').replace('cf_remove_fw;printf unsafe','cf_remove_fw;[ "$CF_PLATFORM_INITIAL_WRITE" = 0 ];platform_initial_write;printf unsafe')
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertIn('admission_deadline',r.stderr)
+            self.assertTrue(record.exists());self.assertNotIn('unsafe',r.stdout)
+    def test_lock_expiry_installs_owned_cleanup_before_guard(self):
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-runtime-lock-') as folder:
+            root=Path(folder);runtime=root/'runtime';runtime.mkdir()
+            body=f'''. "{REPO}/router/lib/core.sh";CF_RUNTIME={runtime};CF_RPC_REQUIRE_RUNTIME=1;
+cf_private_dir() {{ :; }};fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
+mkdir() {{ command mkdir "$@";fixture_tick=1400; }};cf_lock;printf unsafe'''
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
+            self.assertFalse((runtime/'lock').exists())
+    def test_recovery_guard_after_slow_owner_validation_preserves_dead_lock(self):
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-dead-lock-') as folder:
+            root=Path(folder);lock=root/'lock';lock.mkdir();(lock/'pid').write_text('999999999\n')
+            text=self.bootstrap.read_text();start=text.index('platform_lock_recover() {');stop=text.index('platform_profile_validate()',start)
+            fn=text[start:stop].replace('/tmp/couvrefeu-platform.lock',str(lock))
+            body=f'''set -eu
+{fn}
+fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
+platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ fixture_tick=1400; }};
+platform_lock_recover;printf unsafe'''
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
+            self.assertEqual((lock/'pid').read_text(),'999999999\n')
+    def test_internal_receipt_separates_kernel_proof_and_protected_attempt(self):
+        for zero,started,ok in [(True,False,True),(True,True,True),(False,True,True),(False,False,False)]:
+            receipt=json.dumps({'ok':True,'removed':True,'zeroOwnedMutations':zero,'initialProtectedWrite':started,'errors':[]},separators=(',',':'))
+            r=self.run_shell('platform_cleanup_receipt '+shlex.quote(receipt)+';printf "%s:%s" "$platform_cleanup_zero" "$CF_PLATFORM_INITIAL_WRITE"')
+            self.assertEqual(r.returncode==0,ok,r.stderr)
+            if ok:self.assertEqual(r.stdout,str(int(zero))+':'+str(int(started)))
+        for receipt in ['{"ok":true,"removed":true,"zeroOwnedMutations":true,"errors":[]}',
+                        '{"ok":true,"removed":true,"zeroOwnedMutations":true,"initialProtectedWrite":1,"errors":[]}',
+                        '{"ok":true,"removed":true,"zeroOwnedMutations":true,"initialProtectedWrite":false,"errors":[],"extra":true}']:
+            self.assertNotEqual(self.run_shell('platform_cleanup_receipt '+shlex.quote(receipt)).returncode,0)
+        receipt='{"ok":true,"removed":true,"zeroOwnedMutations":true,"initialProtectedWrite":false,"errors":[]}'
+        self.assertNotEqual(self.run_shell('CF_PLATFORM_INITIAL_WRITE=1;platform_cleanup_receipt '+shlex.quote(receipt)).returncode,0)
+    def test_resume_barriers_and_atomic_copy_follow_blocking_proofs(self):
+        install=(REPO/'router/install.sh').read_text();uninstall=(REPO/'router/uninstall.sh').read_text()
+        self.assertIn('install_parent=$(dirname "$ROOT/$rel")\n    platform_initial_write\n    mkdir',install)
+        self.assertIn('else platform_initial_write; rm -f "$p"',uninstall)
+        self.assertIn('else platform_initial_write; chmod "$mode"',uninstall)
+        common=(REPO/'router/lib/install-common.sh').read_text();start=common.index('atomic_copy() (');stop=common.index('\n)\n',start)+3
+        fn=common[start:stop]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-copy-') as folder:
+            root=Path(folder);src=root/'src';dst=root/'dst';tmp=root/'dst.couvrefeu-tmp'
+            src.write_text('expected');dst.write_text('original');tmp.write_text('expected')
+            body=f'''set -eu
+{fn}
+fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
+fail() {{ exit 2; }};owned_temp() {{ :; }};signature() {{ fixture_tick=1400;printf expected; }};
+exact_mtime() {{ fixture_tick=1400;return 0; }};atomic_copy {src} {dst} 1;printf unsafe'''
+            # The actual proof executes in command substitution; use the final
+            # mtime callback to carry the injected clock into the copy scope.
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
+            self.assertEqual(dst.read_text(),'original');self.assertTrue(tmp.exists())
+
 class OperationalFlowTests(unittest.TestCase):
     def test_native_complete_flows_record_latency_without_target_claim(self):
         # The genuine ash/router code uses the isolated JSON backend. Hardware

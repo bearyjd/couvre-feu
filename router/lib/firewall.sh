@@ -1093,7 +1093,11 @@ cf_remove_fw() {
         fi
         cf_rf_zero_files=$(cf_zero_owned_runtime) || { cf_fail unsafe_zero_owned_runtime;return 1; }
         if [ "$CF_ZERO_BASELINE" != 1 ];then cf_zero_owned_kernel || { cf_fail zero_owned_kernel_unproven;return 1; };fi
-        while IFS= read -r cf_rf_file;do [ -z "$cf_rf_file" ] || rm -f "$cf_rf_file" || return 1;done <<EOZ
+        while IFS= read -r cf_rf_file;do
+            [ -z "$cf_rf_file" ] && continue
+            platform_initial_write
+            rm -f "$cf_rf_file" || return 1
+        done <<EOZ
 $cf_rf_zero_files
 EOZ
         cf_backend sync || return 1

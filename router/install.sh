@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=82b75589b0a94b61ee9556f3906ac6daa0cf5999e36e56a9453b1ff27470dca8
+CF_BOOTSTRAP_PIN=3da44fa95080f595a1a2b0c67f3a378fae63add5a072621080c701041caedc20
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -298,10 +298,13 @@ if [ ! -e "$BACKUP" ]; then
 fi
 preflight
 runtime_preflight
+platform_deadline_check
 COUNT=0
 for rel in $FILES; do
     k=$(key "$rel")
-    mkdir -p "$(dirname "$ROOT/$rel")"
+    install_parent=$(dirname "$ROOT/$rel")
+    platform_initial_write
+    mkdir -p "$install_parent"
     # Reinstall/resume never overwrites legitimate mutable runtime contents.
     case "$rel" in etc/couvrefeu/state|etc/couvrefeu/protected)
         if [ -f "$BACKUP/complete" ]; then continue; fi;;

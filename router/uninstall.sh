@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=82b75589b0a94b61ee9556f3906ac6daa0cf5999e36e56a9453b1ff27470dca8
+CF_BOOTSTRAP_PIN=3da44fa95080f595a1a2b0c67f3a378fae63add5a072621080c701041caedc20
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -85,15 +85,14 @@ if [ ! -f "$BACKUP/kernel-cleaned" ]; then
     if [ -f "$BACKUP/activated" ] && live_tools; then
         platform_deadline_check
         cleanup_result=$(installed_core remove-fw) || fail 'kernel cleanup failed; original files retained'
-        # Only the trusted core's exact explicit proof can suppress the reload.
-        # Activation failure alone may leave partially mutated kernel objects.
-        if [ "$cleanup_result" = '{"ok":true,"removed":true,"zeroOwnedMutations":true,"errors":[]}' ];then
-            phase no-kernel-mutations
-        else
-            # The completed owned cleanup may have written; preserve recovery
-            # semantics rather than introduce a deadline abort afterward.
-            CF_PLATFORM_INITIAL_WRITE=1
-        fi
+        # The kernel proof and protected filesystem/write-attempt receipt are
+        # separate. A successful readonly empty proof cannot waive expiry.
+        if [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ]; then
+            platform_cleanup_receipt "$cleanup_result"
+        elif [ "$cleanup_result" = '{"ok":true,"removed":true,"zeroOwnedMutations":true,"errors":[]}' ]; then
+            platform_cleanup_zero=1
+        else platform_cleanup_zero=0; fi
+        if [ "$platform_cleanup_zero" = 1 ]; then phase no-kernel-mutations; fi
     fi
     runtime_preflight
     phase kernel-cleaned
@@ -110,14 +109,17 @@ fi
 # be removed while all original bytes and directory records remain available.
 if [ ! -f "$BACKUP/restored" ]; then
     runtime_preflight
+    platform_deadline_check
     if [ -d "$BASE/runtime" ]; then
         for p in "$BASE/runtime"/* "$BASE/runtime"/.[!.]* "$BASE/runtime"/..?*; do
             [ -e "$p" ] || continue
             if [ -d "$p" ]; then
-                if [ -d "$p/.delta" ]; then rm -f "$p/.delta/firewall"; rmdir "$p/.delta"; fi
+                if [ -d "$p/.delta" ]; then platform_initial_write; rm -f "$p/.delta/firewall"; rmdir "$p/.delta"; fi
+                platform_initial_write
                 rm -f "$p/firewall"; rmdir "$p"
-            else rm -f "$p"; fi
+            else platform_initial_write; rm -f "$p"; fi
         done
+        platform_initial_write
         rmdir "$BASE/runtime"
     fi
     COUNT=0
@@ -126,11 +128,15 @@ if [ ! -f "$BACKUP/restored" ]; then
         before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
         original_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")
         if [ "$(signature "$ROOT/$rel")" != "$before" ] || ! exact_mtime "$ROOT/$rel" "$original_mtime"; then
-            if [ "$before" = absent ]; then rm -f "$ROOT/$rel"
-            else atomic_copy "$BACKUP/$k.original" "$ROOT/$rel" "$original_mtime"; fi
+            if [ "$before" = absent ]; then platform_initial_write; rm -f "$ROOT/$rel"
+            else
+                atomic_copy "$BACKUP/$k.original" "$ROOT/$rel" "$original_mtime"
+                # Successful atomic_copy always attempted a protected write.
+                CF_PLATFORM_INITIAL_WRITE=1
+            fi
         fi
         # Validated abandoned install rename sources are installation owned.
-        if [ -e "$ROOT/$rel.couvrefeu-tmp" ]; then rm -f "$ROOT/$rel.couvrefeu-tmp"; fi
+        if [ -e "$ROOT/$rel.couvrefeu-tmp" ]; then platform_initial_write; rm -f "$ROOT/$rel.couvrefeu-tmp"; fi
         COUNT=$((COUNT + 1))
         if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_FAIL_AFTER:-0}" = "$COUNT" ]; then fail 'injected partial restoration'; fi
     done
@@ -142,9 +148,10 @@ if [ ! -f "$BACKUP/restored" ]; then
         mode=$(awk 'NR==1 {print; exit}' "$BACKUP/dir_$k")
         if [ "$mode" = absent ]; then
             if [ -d "$ROOT/$rel" ]; then
+                platform_initial_write
                 rmdir "$ROOT/$rel" || fail "directory restoration incomplete: $rel; journal retained"
             fi
-        else chmod "$mode" "$ROOT/$rel"; fi
+        else platform_initial_write; chmod "$mode" "$ROOT/$rel"; fi
     done
 fi
 # Do not retire the journal on a copy tool success alone. Every original

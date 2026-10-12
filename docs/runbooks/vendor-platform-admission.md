@@ -94,8 +94,14 @@ not reset the anchor. Guards run after blocking prerequisites, source/input
 and lock phases, before private policy, and immediately before the initial
 protected record/configuration/kernel write. Admission locks and scratch are
 owned temporary effects; refusal can release only those owned resources.
-After the first protected write, existing UNKNOWN and journal restoration
+After the first eligible protected write attempt, existing UNKNOWN and journal restoration
 rules own interruption. No arbitrary deadline abort is inserted mid-restore.
+The new profile's internal `remove-fw` receipt separately reports whether a
+protected write attempt started. The existing zero-owned-mutation proof concerns
+kernel effects; it does not imply that no filesystem records were removed.
+The parent validates the exact profile/source-bound receipt before continuing.
+A readonly empty proof keeps the deadline active; contradictory or missing
+receipt fields refuse. Strict and 011 retain their original receipt bytes.
 
 This is a logical permission deadline. Bounded producers remain, but there is
 no hard syscall termination, scheduler-gap, atomic wall-time or remote-drain

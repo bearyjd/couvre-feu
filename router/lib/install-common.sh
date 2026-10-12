@@ -360,11 +360,14 @@ atomic_copy() (
         owned_temp "$dst" || fail "temporary path collision: $tmp"
         if [ "$(signature "$tmp")" = "$(signature "$src")" ] &&
             { [ -z "$expected_mtime" ] || exact_mtime "$tmp" "$expected_mtime"; }; then
+            platform_initial_write
             mv -f "$tmp" "$dst"
             exit 0
         fi
+        platform_initial_write
         rm -f "$tmp"
     fi
+    platform_initial_write
     cp -p "$src" "$tmp"
     if [ -n "$expected_mtime" ]; then
         if ! { [ "$(signature "$tmp")" = "$(signature "$src")" ] && exact_mtime "$tmp" "$expected_mtime"; }; then

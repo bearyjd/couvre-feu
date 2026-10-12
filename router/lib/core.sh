@@ -183,11 +183,11 @@ cf_lock() {
     fi
     printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
     CF_LOCKED=1
-    platform_deadline_check
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT
     trap 'cf_unlock; platform_lock_release; exit 143' TERM
     trap 'cf_unlock; platform_lock_release' 0
+    platform_deadline_check
 }
 cf_unlock() {
     if [ "$CF_LOCKED" = 1 ]; then
@@ -499,7 +499,14 @@ cf_main() {
     if ! cf_policy_safe || ! cf_ssh_guard; then cf_status;return 1;fi
     if [ "$cf_action" = remove-fw ];then
         cf_remove_fw || { cf_error_record;cf_status;return 1; }
-        printf '{"ok":true,"removed":true,"zeroOwnedMutations":%s,"errors":[]}\n' "${CF_ZERO_OWNED:-false}";return 0
+        if [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ]; then
+            cf_initial_write=false
+            [ "$CF_PLATFORM_INITIAL_WRITE" != 1 ] || cf_initial_write=true
+            printf '{"ok":true,"removed":true,"zeroOwnedMutations":%s,"initialProtectedWrite":%s,"errors":[]}\n' "${CF_ZERO_OWNED:-false}" "$cf_initial_write"
+        else
+            printf '{"ok":true,"removed":true,"zeroOwnedMutations":%s,"errors":[]}\n' "${CF_ZERO_OWNED:-false}"
+        fi
+        return 0
     fi
     # Validate capabilities and foreign-object ownership BEFORE accepting a new revision.
     if ! cf_preflight_baseline_prepare;then cf_status;return 1;fi
