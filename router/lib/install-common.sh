@@ -30,7 +30,7 @@ fi
 [ "$(stat -c %u "$recovery_parent")" = "$(id -u)" ] || fail 'unsafe recovery parent owner'
 recovery_parent_mode=$(stat -c %a "$recovery_parent")
 [ "$((0$recovery_parent_mode & 022))" = 0 ] || {
-    [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] && [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] && [ "$recovery_parent" = /etc ] && [ "$(stat -c '%u:%g:%a' "$recovery_parent")" = 0:0:775 ]
+    [ "${CF_PLATFORM_ADMITTED:-0}" = 1 ] && { [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-logd-011-v1 ] || [ "${CF_PLATFORM_PROFILE:-strict}" = gl-xe3000-4.8.3-os-trust-v1 ]; } && [ "$recovery_parent" = /etc ] && [ "$(stat -c '%u:%g:%a' "$recovery_parent")" = 0:0:775 ]
 } || fail 'unsafe writable recovery parent'
 # A recovery journal and its completion record are fixed, private paths.
 for recovery_path in "$RECOVERY" "$DONE"; do
@@ -326,6 +326,7 @@ valid_marker() {
         [ "$(stat -c %s "$1")" = 2 ] && [ "$(awk 'NR==1 {print}' "$1")" = "${2:-1}" ]
 }
 phase() {
+    platform_initial_write
     printf '%s\n' "${2:-1}" > "$BACKUP/$1.next"
     mv -f "$BACKUP/$1.next" "$BACKUP/$1"
 }
@@ -359,11 +360,14 @@ atomic_copy() (
         owned_temp "$dst" || fail "temporary path collision: $tmp"
         if [ "$(signature "$tmp")" = "$(signature "$src")" ] &&
             { [ -z "$expected_mtime" ] || exact_mtime "$tmp" "$expected_mtime"; }; then
+            platform_initial_write
             mv -f "$tmp" "$dst"
             exit 0
         fi
+        platform_initial_write
         rm -f "$tmp"
     fi
+    platform_initial_write
     cp -p "$src" "$tmp"
     if [ -n "$expected_mtime" ]; then
         if ! { [ "$(signature "$tmp")" = "$(signature "$src")" ] && exact_mtime "$tmp" "$expected_mtime"; }; then
@@ -405,6 +409,7 @@ installed_core() (
     . "$CF_LIB/core.sh"
     . "$CF_LIB/rpc.sh"
     . "$CF_LIB/firewall.sh"
+    platform_deadline_check
     cf_main "$@"
 )
 reload_firewall() {
@@ -413,8 +418,9 @@ reload_firewall() {
         if ! { [ -x "$CF_BACKEND_DIR/firewall" ] && [ ! -L "$CF_BACKEND_DIR/firewall" ]; }; then
             fail 'fixture firewall tool unavailable'
         fi
+        platform_initial_write
         "$CF_BACKEND_DIR/firewall" reload
-    else /etc/init.d/firewall reload; fi
+    else platform_initial_write; /etc/init.d/firewall reload; fi
 }
 
 # Runtime is newly owned by this installation; preexisting runtime is refused
