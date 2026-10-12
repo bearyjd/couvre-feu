@@ -649,8 +649,12 @@ for (const minutes of [15, 30, 60]) {
             f.advance(1);
             f.policy.reconcile();
             assert.equal(f.policy.operation(parent, end.result.operation.id).state, 'confirmed');
-            assert.equal(f.policy.people(parent).people[0].effectiveManualPause, null);
+            const ended = f.policy.people(parent).people[0];
+            assert.equal(ended.effectiveManualPause, null);
             assert.equal(f.router.observe().status.effectivePauses.length, 0);
+            // End now clears only the manual pause; the active schedule block remains.
+            assert.equal(ended.scheduleBlocked, true);
+            assert.match(ended.scheduleExplanation, /Resume clears only/);
         }
         finally {
             f.close();

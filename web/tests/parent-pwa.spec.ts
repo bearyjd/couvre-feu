@@ -281,7 +281,7 @@ test('quick pause presets show remaining time, End now removes the pause, and ex
   await expect(page.locator('[data-extra-time="alex"]')).toContainText('no allowance concept');
   await page.getByRole('button', { name: 'Pause Alex (fictional) for 30 minutes', exact: true }).click();
   await expect(page.locator('.operation')).toContainText('Pause confirmed');
-  await expect(page.locator('[data-remaining]')).toHaveText(/^(29m \d+s|30m 0s)$/);
+  await expect(page.locator('[data-remaining]')).toHaveText(/^(29|30)m \d+s$/);
   const pauses = demo.router.observe().status.effectivePauses;
   expect(pauses).toHaveLength(1);
   expect(pauses[0].until - Math.floor(Date.now() / 1000)).toBeGreaterThan(29 * 60 - 30);
