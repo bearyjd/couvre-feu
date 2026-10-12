@@ -8,10 +8,13 @@ import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import { hexDigest, sha256 } from '../../shared/src/router-rpc.ts';
 import type { Role, Provenance } from '../../shared/src/contracts.ts';
 import { scheduleClockReader } from './schedule-clock.ts';
+import { loadTLS, privateListenHost } from './tls.ts';
+import type { TLSFiles } from './tls.ts';
 
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
     origin?: string;
+    tls?: TLSFiles; listen?: {host: string; port: number}; publicOrigin?: string;
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
     router: {host: string; user: 'root'; port: 22; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
@@ -70,7 +73,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'scheduleClock']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'scheduleClock', 'tls', 'listen', 'publicOrigin']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -91,7 +94,8 @@ export function integrationConfig(path: string): IntegrationConfig {
     });
     if (new Set(accounts.map(a => a.id)).size !== accounts.length || !accounts.some(a => a.role === 'admin')) bad('admin_account_required');
     const enrollment = normalizePolicy(m.enrollment, protectedMacs);
-    const origin = m.origin === undefined ? `http://localhost:${m.port}` : privateHTTPSOrigin(m.origin);
+    const lan = lanHTTPS(m, m.port as number);
+    const origin = lan ? lan.publicOrigin : m.origin === undefined ? `http://localhost:${m.port}` : privateHTTPSOrigin(m.origin);
     let dispatch: IntegrationManifest['dispatch'];
     if (m.dispatch !== undefined) {
         const settings = object(m.dispatch, ['enabled', 'pollSeconds', 'maxBackoffSeconds']);
@@ -100,11 +104,23 @@ export function integrationConfig(path: string): IntegrationConfig {
         dispatch = {enabled: settings.enabled as boolean, pollSeconds, maxBackoffSeconds};
     }
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(scheduleClock ? {scheduleClock} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort()}));
     return {...manifest, origin, host: new URL(origin).host, manifestDigest: sha256(raw), targetDigest, provenance: {source: 'real-router-integration', routerCompatibilityVerified: false, integrationScope: sha256(`${targetDigest}\n${sha256(raw)}`)}};
+}
+/** tls, listen and publicOrigin are all-or-nothing and exclude the proxy-mode origin; without them the service stays loopback HTTP. */
+function lanHTTPS(m: Record<string, unknown>, port: number): {tls: TLSFiles; listen: {host: string; port: number}; publicOrigin: string} | undefined {
+    if (m.tls === undefined && m.listen === undefined && m.publicOrigin === undefined) return undefined;
+    if (m.tls === undefined || m.listen === undefined || m.publicOrigin === undefined || m.origin !== undefined) bad('lan_https_requires_tls_listen_public_origin');
+    const t = object(m.tls, ['certPath', 'keyPath']), l = object(m.listen, ['host', 'port']);
+    let host: string;
+    try { host = privateListenHost(l.host); } catch (error) { return bad((error as Error).message); }
+    if (integer(l.port) !== port) bad('listen_port_mismatch');
+    const tls = {certPath: safePath(t.certPath), keyPath: safePath(t.keyPath)};
+    loadTLS(tls);
+    return {tls, listen: {host, port}, publicOrigin: privateHTTPSOrigin(m.publicOrigin)};
 }
 /** The TLS proxy owns the private network boundary; this service only binds loopback. */
 export function privateHTTPSOrigin(value: unknown): string {

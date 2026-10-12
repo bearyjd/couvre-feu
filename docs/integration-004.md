@@ -137,6 +137,10 @@ preserves the configured Host and browser Origin and forwards only to loopback.
 Forwarded headers never select origin, host, user or RP identity. This change
 installs no proxy, certificate or phone/network deployment.
 
+Alternatively, `tls`, `listen` and `publicOrigin` (together, instead of `origin`) make the
+service itself serve private HTTPS on one RFC 1918 or Tailscale address; see
+`docs/runbooks/lan-https.md`.
+
 Any manifest edit changes its digest and existing database bindings refuse it.
 Restart is mandatory; use reviewed private backup/recovery or fresh explicit
 database/account enrollment rather than editing identity markers to bypass refusal.
