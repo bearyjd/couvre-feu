@@ -222,9 +222,9 @@ def main(argv=()):
             filename, index, count, status, log = future.result()
             print(f'{"PASS" if status == 0 else "FAIL"}: {filename} lane {index + 1}, {count} cases', flush=True)
             # Relay per-test durations that suites opt into; never other log text.
-            for line in log.read_text().splitlines():
-                if line.startswith('TIMING: '):
-                    print(line, flush=True)
+            # unittest's verbose '... ' prefix shares the line, so match anywhere.
+            for timing in re.findall(r'TIMING: \S+ [0-9]+\.[0-9]s', log.read_text()):
+                print(timing, flush=True)
             if args.shard:
                 write_json(args.receipt, receipt_for(plan, selected[0], status))
             if status:
