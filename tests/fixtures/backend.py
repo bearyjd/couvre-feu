@@ -23,6 +23,10 @@ def main():
         with open(os.environ["CF_BACKEND_LOG"], "a", encoding="utf-8") as log:
             log.write(json.dumps({"command": command, "argv": args}) + "\n")
         for failure in state.get("failures", []):
+            # Installer per-file flushes are not core durability barriers;
+            # injected sync failures count only argument-free barriers.
+            if command == "sync" and args and not failure.get("contains"):
+                continue
             if (failure["command"] == command
                     and all(part in args for part in failure.get("contains", []))
                     and failure.get("remaining", 1)):
