@@ -3,7 +3,10 @@
 # POSIX sh / BusyBox ash. tools/live/first-rehearsal.py fills the generated
 # regions below; the operator discloses the exact payload sha256 first.
 # Phases: PAYLOAD IDENTITY PREREQ SNAPSHOT INSTALL VERIFY UNINSTALL RESTORE
-# CONNECTIVITY. Only this script writes stdout; every child writes stderr.
+# CONNECTIVITY. Only this script writes stdout; children write the stage
+# child.log. Once mutation begins, SIGPIPE/SIGHUP are ignored and every marker
+# is also appended to the stage phase.log, so a dropped session still finishes
+# install -> verify -> uninstall -> restore and leaves its result on the router.
 # Never touches dnsmasq, the WAN zone, offload or firmware. Exit codes:
 # 0 pass, 10 refused before any router mutation, 20 failure after mutation.
 # shellcheck disable=SC2034
@@ -22,6 +25,8 @@ CFR_HISTORICAL_MACS=
 
 CFR_STAGE=
 CFR_FAILED=0
+CFR_STDOUT_LOST=0
+CFR_PREMUTATION_BUDGET=300
 CFR_LIVE_STATES='REACHABLE STALE DELAY'
 CFR_PRESENT_STATES='REACHABLE STALE DELAY PROBE PERMANENT'
 # Every path the installer may create or modify (router/install.sh and
@@ -30,20 +35,25 @@ CFR_FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/
 CFR_DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu etc/couvrefeu/backup etc/couvrefeu/runtime'
 CFR_RELEASE_FILES='install.sh uninstall.sh cfctl cfctl-ssh release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh'
 
-cfr_info() { printf 'INFO %s\n' "$*"; }
-cfr_ok() { printf 'PHASE %s OK\n' "$1"; }
+# Durable phase log first, then best-effort stdout (EPIPE never aborts).
+cfr_out() {
+    if [ -n "$CFR_STAGE" ] && [ -d "$CFR_STAGE" ]; then printf '%s\n' "$1" >> "$CFR_STAGE/phase.log"; fi
+    printf '%s\n' "$1" 2>/dev/null || CFR_STDOUT_LOST=1
+}
+cfr_info() { cfr_out "INFO $*"; }
+cfr_ok() { cfr_out "PHASE $1 OK"; }
 cfr_refuse() {
-    printf 'PHASE %s FAIL %s\n' "$1" "$2"
-    printf 'REFUSED_BEFORE_MUTATION %s\n' "$1"
+    cfr_out "PHASE $1 FAIL $2"
+    cfr_out "REFUSED_BEFORE_MUTATION $1"
     exit 10
 }
 cfr_fail() {
-    printf 'PHASE %s FAIL %s\n' "$1" "$2"
+    cfr_out "PHASE $1 FAIL $2"
     CFR_FAILED=1
 }
 cfr_stop() {
     cfr_fail "$1" "$2"
-    printf 'FAIL_AFTER_MUTATION %s\n' "$1"
+    cfr_out "FAIL_AFTER_MUTATION $1"
     exit 20
 }
 
@@ -52,20 +62,27 @@ cfr_stop() {
 cfr_cleanup() {
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) return 0;; esac
     if [ ! -d "$CFR_STAGE" ] || [ -L "$CFR_STAGE" ]; then return 0; fi
+    if [ "$CFR_STDOUT_LOST" = 1 ]; then
+        # The session is gone: keep phase.log/child.log for read-only inspection.
+        printf '%s\n' "STAGE_RETAINED $CFR_STAGE" >> "$CFR_STAGE/phase.log"
+        return 0
+    fi
+    if [ -f "$CFR_STAGE/child.log" ]; then sed 's/^/child: /' "$CFR_STAGE/child.log" >&2 2>/dev/null || :; fi
     if [ -f "$CFR_STAGE/manifest" ]; then
         while read -r cfr_sum cfr_mode cfr_path; do
             case "$cfr_path" in router/*) rm -f "$CFR_STAGE/$cfr_path";; esac
         done < "$CFR_STAGE/manifest"
     fi
     for cfr_name in manifest mtime-probe identity.neigh connectivity.neigh status.json snapshot.before snapshot.after \
-        text.before.iptables text.before.ip6tables text.before.ipset text.before.uci text.before.cron \
-        text.after.iptables text.after.ip6tables text.after.ipset text.after.uci text.after.cron; do
+        phase.log child.log diff.txt \
+        text.before.iptables text.before.ip6tables text.before.ipset text.before.ipsetsave text.before.uci text.before.cron \
+        text.after.iptables text.after.ip6tables text.after.ipset text.after.ipsetsave text.after.uci text.after.cron; do
         rm -f "$CFR_STAGE/$cfr_name"
     done
     for cfr_dir in $CFR_PAYLOAD_DIRS; do
         [ ! -d "$CFR_STAGE/$cfr_dir" ] || rmdir "$CFR_STAGE/$cfr_dir" 2>/dev/null || :
     done
-    rmdir "$CFR_STAGE" 2>/dev/null || printf 'INFO staging_cleanup_incomplete %s\n' "$CFR_STAGE"
+    rmdir "$CFR_STAGE" 2>/dev/null || printf 'couvre-feu-first: staging cleanup incomplete: %s\n' "$CFR_STAGE" >&2
 }
 
 cfr_setup_paths() {
@@ -101,8 +118,9 @@ cfr_setup_paths() {
 cfr_stat() { stat "$@"; }
 cfr_run_sh() {
     # Deliberate split of the fixed shell selection ("busybox ash").
+    # Child diagnostics go to the stage log, never to the marker stream.
     # shellcheck disable=SC2086
-    $CFR_SH "$@" </dev/null
+    $CFR_SH "$@" </dev/null 2>>"$CFR_STAGE/child.log"
 }
 
 cfr_extract() {
@@ -181,7 +199,7 @@ cfr_install() {
     set -- $(cfr_install_args) "$@"
     set +f
     cfr_info "run install.sh $*"
-    cfr_run_sh "$CFR_STAGE/router/install.sh" "$@" >&2
+    cfr_run_sh "$CFR_STAGE/router/install.sh" "$@" >>"$CFR_STAGE/child.log"
 }
 
 cfr_transients_absent() {
@@ -251,6 +269,7 @@ cfr_text() {
         iptables) iptables-save 2>/dev/null </dev/null | sed -e '/^#/d' -e 's/\[[0-9][0-9]*:[0-9][0-9]*\]/[0:0]/g' > "$cfr_text_file";;
         ip6tables) ip6tables-save 2>/dev/null </dev/null | sed -e '/^#/d' -e 's/\[[0-9][0-9]*:[0-9][0-9]*\]/[0:0]/g' > "$cfr_text_file";;
         ipset) ipset list -n 2>/dev/null </dev/null | LC_ALL=C sort > "$cfr_text_file";;
+        ipsetsave) ipset save 2>/dev/null </dev/null | LC_ALL=C sort > "$cfr_text_file";;
         uci) uci export firewall 2>/dev/null </dev/null > "$cfr_text_file";;
         cron) if [ -f "$CFR_ROOT/etc/crontabs/root" ]; then cat "$CFR_ROOT/etc/crontabs/root" > "$cfr_text_file"; else printf 'absent\n' > "$cfr_text_file"; fi;;
     esac
@@ -259,7 +278,7 @@ cfr_snapshot() {
     cfr_snap=$CFR_STAGE/snapshot.$1
     : > "$cfr_snap" || return 1
     # Pipelines hide producer failures; empty iptables output also refuses.
-    for cfr_kind in iptables ip6tables ipset uci cron; do
+    for cfr_kind in iptables ip6tables ipset ipsetsave uci cron; do
         cfr_text "$1" "$cfr_kind" || return 1
         case "$cfr_kind" in iptables|ip6tables|uci) [ -s "$CFR_STAGE/text.$1.$cfr_kind" ] || return 1;; esac
         cfr_sum=$(sha256sum < "$CFR_STAGE/text.$1.$cfr_kind") || return 1
@@ -285,27 +304,29 @@ cfr_verify() {
     # status exits nonzero when unhealthy; the JSON body is the gate.
     cfr_run_sh "$CFR_CFCTL" status --json > "$CFR_STAGE/status.json" || :
     cfr_status=$(awk 'NR==1{print}END{exit NR!=1}' "$CFR_STAGE/status.json") || { cfr_fail VERIFY status_output_shape; return 0; }
-    printf 'INFO status %s\n' "$cfr_status"
-    for cfr_need in '"ok":true' '"drift":false' '"errors":[]' '"desiredRevision":0' '"desiredPauses":[]' '"effectivePauses":[]' '"observed":{"kids":[],"paused":[]}'; do
-        case "$cfr_status" in *"$cfr_need"*) ;; *) cfr_fail VERIFY "status_missing $cfr_need"; return 0;; esac
-    done
+    cfr_info "status $cfr_status"
+    # Structural: the whole fixed cfctl status shape, with only boolean
+    # capabilities free; any other field value or extra field fails.
+    awk '/^\{"ok":true,"desiredRevision":0,"confirmedRevision":0,"desiredPauses":\[\],"effectivePauses":\[\],"observed":\{"kids":\[\],"paused":\[\]\},"drift":false,"capabilities":\{"ipv6":(true|false),"conntrack":(true|false),"nativeKernelConfirmed":(true|false),"addressCoverageComplete":(true|false),"routerCompatibilityVerified":false\},"errors":\[\]\}$/{n++}END{exit !(NR==1&&n==1)}' \
+        "$CFR_STAGE/status.json" || { cfr_fail VERIFY status_not_healthy_empty; return 0; }
     cfr_ok VERIFY
 }
 
 cfr_restore() {
     cfr_snapshot after || { cfr_fail RESTORE snapshot_failed; return 0; }
     if cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then cfr_ok RESTORE; return 0; fi
-    awk 'NR==FNR{before[$1 " " $2]=$0;order[++n]=$1 " " $2;next}
+    { awk 'NR==FNR{before[$1 " " $2]=$0;order[++n]=$1 " " $2;next}
         {after[$1 " " $2]=$0; if(!($1 " " $2 in before))order[++n]=$1 " " $2}
         END{for(i=1;i<=n;i++){k=order[i]; if(before[k]!=after[k]){print "DIFF - " (k in before?before[k]:k " missing"); print "DIFF + " (k in after?after[k]:k " missing")}}}' \
         "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"
-    for cfr_kind in iptables ip6tables ipset uci cron; do
+    for cfr_kind in iptables ip6tables ipset ipsetsave uci cron; do
         cmp -s "$CFR_STAGE/text.before.$cfr_kind" "$CFR_STAGE/text.after.$cfr_kind" && continue
         awk -v kind="$cfr_kind" 'NR==FNR{b[$0]++;next}{a[$0]++;if(a[$0]>b[$0]&&shown<40){print "DIFF " kind " + " $0;shown++}}' \
             "$CFR_STAGE/text.before.$cfr_kind" "$CFR_STAGE/text.after.$cfr_kind"
         awk -v kind="$cfr_kind" 'NR==FNR{a[$0]++;next}{b[$0]++;if(b[$0]>a[$0]&&shown<40){print "DIFF " kind " - " $0;shown++}}' \
             "$CFR_STAGE/text.after.$cfr_kind" "$CFR_STAGE/text.before.$cfr_kind"
-    done
+    done; } > "$CFR_STAGE/diff.txt"
+    while IFS= read -r cfr_line; do cfr_out "$cfr_line"; done < "$CFR_STAGE/diff.txt"
     cfr_fail RESTORE snapshot_mismatch
 }
 
@@ -318,6 +339,7 @@ cfr_connectivity() {
 
 cfr_main() {
     umask 077
+    CFR_START=$(date +%s)
     printf 'BEGIN first-rehearsal commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS"; do
         [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
@@ -325,13 +347,20 @@ cfr_main() {
     cfr_setup_paths || cfr_refuse PAYLOAD unsafe_environment
     [ "$(id -u)" = 0 ] || [ "$CFR_FIXTURE" = 1 ] || cfr_refuse PAYLOAD root_required
     trap cfr_cleanup 0
-    trap 'exit 20' HUP INT TERM PIPE
+    # Before mutation a lost session simply refuses.
+    trap 'exit 10' HUP INT TERM PIPE
     cfr_extract
     cfr_identity
     cfr_prereq
     cfr_snapshot before || cfr_refuse SNAPSHOT snapshot_failed
     cfr_ok SNAPSHOT
-    printf '%s\n' MUTATION_BEGIN
+    # The script bounds itself before mutating; afterwards the transaction runs
+    # to completion (the outer KILL timeout is a generous last resort).
+    cfr_now=$(date +%s)
+    [ "$((cfr_now - CFR_START))" -le "$CFR_PREMUTATION_BUDGET" ] || cfr_refuse SNAPSHOT premutation_budget_exceeded
+    trap '' HUP PIPE
+    trap 'exit 20' INT TERM
+    cfr_out MUTATION_BEGIN
     cfr_install --activate || cfr_stop INSTALL "installer_exit_nonzero; journal retained; uninstall not attempted"
     cfr_ok INSTALL
     cfr_verify
@@ -339,12 +368,12 @@ cfr_main() {
     # fixtures opt into the same path with CF_TEST_RELEASE_DIR=1.
     cfr_uninstall=$CFR_RELEASE_DIR/uninstall.sh
     cfr_info "run uninstall.sh once: $cfr_uninstall"
-    cfr_run_sh "$cfr_uninstall" >&2 || cfr_stop UNINSTALL "uninstall_refused_or_failed; journal preserved; resolve explicitly"
+    cfr_run_sh "$cfr_uninstall" >>"$CFR_STAGE/child.log" || cfr_stop UNINSTALL "uninstall_refused_or_failed; journal preserved; resolve explicitly"
     cfr_ok UNINSTALL
     cfr_restore
     cfr_connectivity
-    [ "$CFR_FAILED" = 0 ] || { printf 'FAIL_AFTER_MUTATION %s\n' summary; exit 20; }
-    printf '%s\n' FIRST_REHEARSAL_PASS
+    [ "$CFR_FAILED" = 0 ] || { cfr_out 'FAIL_AFTER_MUTATION summary'; exit 20; }
+    cfr_out FIRST_REHEARSAL_PASS
     exit 0
 }
 

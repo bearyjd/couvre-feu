@@ -15,11 +15,11 @@ Keep the real configuration outside the repository, in a private directory. [`co
 | `adminPublicKeyPath` | string | Absolute, normalized path to the admin **public** key. Its fingerprint must equal `adminKeyFingerprint`. The private key stays in the agent; the tool never reads it |
 | `adminKeyFingerprint` | string | `SHA256:` followed by 43 base64 characters, as printed by `ssh-add -l` |
 | `knownHostsPath` | string | Absolute path to a regular file holding the pinned router host key (`StrictHostKeyChecking=yes`) |
-| `evidenceDir` | string | Absolute path to an existing directory you own, with no group or other write access. Use a private path that is not tmpfs: each run creates a new `<UTC>-first-rehearsal/` directory there |
+| `evidenceDir` | string | Absolute path to an existing directory you own, with no group or other write access. It is refused under `/tmp`, `/run`, `/dev/shm`, `/var/tmp` or on tmpfs. Each run creates a new `<UTC>-first-rehearsal/` directory there |
 | `authorizationPath` | string | Absolute path to a regular file recording the user's approval of this exact run. Its sha256 goes into the evidence |
-| `deadlineUtc` | string | `YYYY-MM-DDTHH:MM:SSZ`. `execute` refuses if now + 300 s is past this time |
+| `deadlineUtc` | string | `YYYY-MM-DDTHH:MM:SSZ`. `execute` refuses unless now + local timeout + 300 s is no later than this time |
 | `platformProfile` | string | Optional. One of `strict`, `gl-xe3000-4.8.3-logd-011-v1`, `gl-xe3000-4.8.3-os-trust-v1` (the default) |
-| `remoteTimeoutSeconds` | integer | Optional, 120–1800, default 900. Router-side `timeout -s KILL`. The local timeout is this value + 60 s |
+| `remoteTimeoutSeconds` | integer | Optional, 600–3600, default 1800. Generous last-resort router-side `timeout -s KILL`; the script bounds itself first. The local timeout is this value + 60 s |
 | `roles.management` | object | `{"ip", "mac"}`. The SSH client device. Its MAC is protected |
 | `roles.jd_adult` | object | `{"ip", "mac"}`. The adult device that must stay connected. Its MAC is protected |
 | `roles.penn_child` | object | `{"ip", "mac"}`. The child device. It must be present, but it is **not** enrolled |

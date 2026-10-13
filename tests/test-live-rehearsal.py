@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -48,6 +49,11 @@ for line in child.stdout:
     if spec.get('drop_after') and line.decode().rstrip('\n') == spec['drop_after']:
         os.killpg(child.pid, signal.SIGKILL)
         child.wait()
+        sys.exit(255)
+    if spec.get('hangup_after') and line.decode().rstrip('\n') == spec['hangup_after']:
+        # A dropped session: hang up and close the channel; the router side lives on.
+        os.killpg(child.pid, signal.SIGHUP)
+        child.stdout.close()
         sys.exit(255)
 sys.exit(child.wait())
 '''
@@ -104,18 +110,23 @@ class LiveRehearsalTests(unittest.TestCase):
         self.addCleanup(self.fixture.close)
         self.work = Path(tempfile.mkdtemp(prefix='couvre-feu-live-work-'))
         self.addCleanup(shutil.rmtree, self.work, True)
+        # Evidence must be persistent storage, never /tmp or tmpfs.
+        persistent = Path.home() / '.cache'
+        persistent.mkdir(parents=True, exist_ok=True)
+        self.evidence_root = Path(tempfile.mkdtemp(prefix='couvre-feu-live-evidence-', dir=persistent))
+        self.addCleanup(shutil.rmtree, self.evidence_root, True)
         self.model_fresh_router()
         self.fake_tools()
         self.now = datetime.datetime(2026, 10, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
         self.config = {
             'schemaVersion': 1, 'host': HOST,
             'adminPublicKeyPath': str(self.work / 'admin.pub'), 'adminKeyFingerprint': self.fingerprint,
-            'knownHostsPath': str(self.work / 'known_hosts'), 'evidenceDir': str(self.work / 'evidence'),
+            'knownHostsPath': str(self.work / 'known_hosts'), 'evidenceDir': str(self.evidence_root / 'evidence'),
             'authorizationPath': str(self.work / 'authorization.txt'),
             'deadlineUtc': '2026-10-12T19:00:00Z', 'platformProfile': 'strict', 'remoteTimeoutSeconds': 600,
             'roles': {'management': MGMT, 'jd_adult': JD, 'penn_child': PENN},
             'protectedHistoricalMacs': HISTORICAL}
-        (self.work / 'evidence').mkdir(mode=0o700)
+        (self.evidence_root / 'evidence').mkdir(mode=0o700)
         (self.work / 'known_hosts').write_text(HOST + ' ssh-ed25519 AAAAfixture\n')
         (self.work / 'authorization.txt').write_text('fixture authorization only\n')
 
@@ -177,25 +188,29 @@ class LiveRehearsalTests(unittest.TestCase):
             code = self.tool.run(list(argv), env=self.tool_env(), now_fn=lambda: now or self.now)
         return code, out.getvalue(), err.getvalue()
 
-    def payload_sha(self, config_path):
+    def plan_details(self, config_path):
         code, out, err = self.invoke('plan', config_path)
         self.assertEqual(code, 0, err)
-        return json.loads(out[:out.rindex('}') + 1])['payloadSha256']
+        return json.loads(out[:out.rindex('}') + 1])
 
-    def execute(self, **changes):
+    def plan_sha(self, config_path):
+        return self.plan_details(config_path)['planSha256']
+
+    def execute(self, cleanup=True, **changes):
         config = self.write_config(**changes)
-        result = self.invoke('execute', config, '--expect-payload-sha256', self.payload_sha(config))
-        self.cleanup_staging()
+        result = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))
+        if cleanup:
+            self.cleanup_staging()
         return result
 
     def evidence(self):
-        runs = sorted((self.work / 'evidence').iterdir())
+        runs = sorted((self.evidence_root / 'evidence').iterdir())
         self.assertEqual(len(runs), 1)
         return runs[0]
 
     def cleanup_staging(self):
         # A killed session cannot run its own trap; reclaim only our staging dir.
-        for run in (self.work / 'evidence').iterdir():
+        for run in (self.evidence_root / 'evidence').iterdir():
             stdout = run / 'stdout.log'
             for line in stdout.read_text().splitlines() if stdout.exists() else []:
                 if line.startswith('INFO staging /tmp/couvre-feu-first.'):
@@ -273,7 +288,8 @@ class LiveRehearsalTests(unittest.TestCase):
         # The remote gate refuses independently of local config validation.
         config = self.tool.validate_config(json.loads(Path(self.write_config()).read_text()))
         config['protectedHistoricalMacs'] = [JD['mac']]
-        payload, _ = self.tool.build_payload(config, '0' * 40)
+        commit, blobs = self.tool.head_source()
+        payload, _ = self.tool.build_payload(config, commit, blobs)
         self.tool_env()
         result = subprocess.run([str(self.bin / 'ssh'), 'fixture'], input=payload, capture_output=True,
                                 env={'FAKE_SSH_SPEC': str(self.spec_path), 'PATH': os.environ['PATH']})
@@ -344,24 +360,122 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual((summary['outcome'], summary['remoteExit']), ('UNKNOWN', 255))
         self.assertIn('UNKNOWN:', out)
 
-    def test_payload_sha_mismatch_refused_without_connection(self):
-        code, _, err = self.invoke('execute', self.write_config(), '--expect-payload-sha256', 'a' * 64)
+    def test_plan_sha_mismatch_refused_without_connection(self):
+        code, _, err = self.invoke('execute', self.write_config(), '--expect-plan-sha256', 'a' * 64)
         self.assertEqual(code, 1)
         self.assertIn('differs from the disclosed value', err)
         self.assertFalse(self.ssh_log.exists())
-        self.assertEqual(list((self.work / 'evidence').iterdir()), [])
+        self.assertEqual(list((self.evidence_root / 'evidence').iterdir()), [])
 
-    def test_deadline_inside_safety_margin_refused(self):
-        config = self.write_config(deadlineUtc='2026-10-12T18:04:00Z')
-        code, _, err = self.invoke('execute', config, '--expect-payload-sha256', self.payload_sha(config))
+    def test_plan_sha_binds_argv_timeouts_and_key_files(self):
+        details = self.plan_details(self.write_config())
+        for field in self.tool.PLAN_DIGEST_FIELDS:
+            self.assertIn(field, details)
+        self.assertIn('GlobalKnownHostsFile=/dev/null', details['sshArgv'])
+        disclosed = details['planSha256']
+        original_hosts = (self.work / 'known_hosts').read_text()
+        changes = {'remote timeout': lambda: self.write_config(remoteTimeoutSeconds=900),
+                   'known hosts': lambda: (self.work / 'known_hosts').write_text(HOST + ' ssh-ed25519 AAAAchanged\n'),
+                   'deadline': lambda: self.write_config(deadlineUtc='2026-10-12T19:30:00Z')}
+        for label, change in changes.items():
+            with self.subTest(label):
+                change()
+                code, _, err = self.invoke('execute', str(self.work / 'config.json'), '--expect-plan-sha256', disclosed)
+                self.assertEqual(code, 1)
+                self.assertIn('differs from the disclosed value', err)
+                (self.work / 'known_hosts').write_text(original_hosts)
+                self.write_config()
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_deadline_includes_local_timeout_and_margin(self):
+        config = self.tool.validate_config(json.loads(Path(self.write_config()).read_text()))
+        needed = datetime.timedelta(seconds=600 + 60 + 300)
+        self.tool.check_deadline(dict(config, deadline=self.now + needed), self.now)
+        with self.assertRaises(self.tool.Refusal):
+            self.tool.check_deadline(dict(config, deadline=self.now + needed - datetime.timedelta(seconds=1)), self.now)
+        cli = self.write_config(deadlineUtc='2026-10-12T18:14:00Z')
+        code, _, err = self.invoke('execute', cli, '--expect-plan-sha256', self.plan_sha(cli))
         self.assertEqual(code, 1)
         self.assertIn('safety margin', err)
         self.assertFalse(self.ssh_log.exists())
 
+    def test_interrupt_after_connection_is_unknown_exit_2(self):
+        original = self.tool.run_ssh
+
+        def interrupted(*args, **kwargs):
+            original(*args, **kwargs)
+            raise KeyboardInterrupt
+        self.tool.run_ssh = interrupted
+        try:
+            code, out, err = self.execute()
+        finally:
+            self.tool.run_ssh = original
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual(json.loads((self.evidence() / 'summary.json').read_text())['outcome'], 'UNKNOWN')
+        self.assertIn('UNKNOWN:', err)
+
+    def test_dropped_session_still_completes_and_retains_stage_log(self):
+        before = self.router_snapshot()
+        self.spec['hangup_after'] = 'MUTATION_BEGIN'
+        code, out, err = self.execute(cleanup=False)
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual(json.loads((self.evidence() / 'summary.json').read_text())['outcome'], 'UNKNOWN')
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        stage = Path(next(line.split(' ', 2)[2] for line in stdout if line.startswith('INFO staging ')))
+        self.addCleanup(shutil.rmtree, stage, True)
+        phase_log = stage / 'phase.log'
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline and 'STAGE_RETAINED' not in (phase_log.read_text() if phase_log.exists() else ''):
+            time.sleep(0.5)
+        log = phase_log.read_text().splitlines()
+        self.assertIn('STAGE_RETAINED ' + str(stage), log)
+        for phase in ('INSTALL', 'VERIFY', 'UNINSTALL', 'RESTORE', 'CONNECTIVITY'):
+            self.assertIn(f'PHASE {phase} OK', log)
+        self.assertIn('FIRST_REHEARSAL_PASS', log)
+        self.assertTrue((stage / 'child.log').is_file())
+        self.assertEqual(self.router_snapshot(), before)
+
+    def test_evidence_dir_on_volatile_storage_refused(self):
+        volatile = self.work / 'evidence'
+        volatile.mkdir(mode=0o700)
+        config = self.write_config(evidenceDir=str(volatile))
+        code, _, err = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))
+        self.assertEqual(code, 1)
+        self.assertIn('persistent storage', err)
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_source_must_equal_head_blobs(self):
+        git = ['git', '-C', str(SOURCE.root)]
+        target = SOURCE.root / 'router/cron'
+        original = target.read_bytes()
+        exclude = SOURCE.root / '.git/info/exclude'
+        cases = {
+            'modified tracked file': (lambda: target.write_bytes(original + b'# drift\n'), lambda: target.write_bytes(original)),
+            'skip-worktree drift': (lambda: (subprocess.run(git + ['update-index', '--skip-worktree', 'router/cron'], check=True),
+                                             target.write_bytes(original + b'# hidden\n')),
+                                    lambda: (target.write_bytes(original),
+                                             subprocess.run(git + ['update-index', '--no-skip-worktree', 'router/cron'], check=True))),
+            'ignored file': (lambda: (exclude.write_text('ignored.txt\n'), (SOURCE.root / 'router/ignored.txt').write_text('x\n')),
+                             lambda: ((SOURCE.root / 'router/ignored.txt').unlink(), exclude.write_text(''))),
+        }
+        for label, (apply, revert) in cases.items():
+            with self.subTest(label):
+                apply()
+                try:
+                    status = subprocess.run(git + ['status', '--porcelain'], capture_output=True, text=True).stdout
+                    if label != 'modified tracked file':
+                        self.assertEqual(status, '', 'git itself reports clean; only the tool can catch this')
+                    code, _, err = self.invoke('plan', self.write_config())
+                finally:
+                    revert()
+                self.assertEqual(code, 1, label)
+                self.assertIn('REFUSED', err)
+        self.assertEqual(self.invoke('plan', self.write_config())[0], 0)
+
     def test_evidence_directory_collision_refused(self):
-        (self.work / 'evidence/20261012T180000Z-first-rehearsal').mkdir(mode=0o700)
+        (self.evidence_root / 'evidence/20261012T180000Z-first-rehearsal').mkdir(mode=0o700)
         config = self.write_config()
-        code, _, err = self.invoke('execute', config, '--expect-payload-sha256', self.payload_sha(config))
+        code, _, err = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))
         self.assertEqual(code, 1)
         self.assertIn('already exists', err)
         self.assertFalse(self.ssh_log.exists())
@@ -369,7 +483,7 @@ class LiveRehearsalTests(unittest.TestCase):
     def test_agent_without_admin_key_refused(self):
         self.write_agent('256 SHA256:' + 'A' * 43 + ' other (ED25519)')
         config = self.write_config()
-        code, _, err = self.invoke('execute', config, '--expect-payload-sha256', self.payload_sha(config))
+        code, _, err = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))
         self.assertEqual(code, 1)
         self.assertIn('ssh-agent does not hold', err)
         self.assertFalse(self.ssh_log.exists())
@@ -400,7 +514,7 @@ class LiveRehearsalTests(unittest.TestCase):
         finally:
             stray.unlink()
         self.assertEqual(code, 1)
-        self.assertIn('uncommitted', err)
+        self.assertIn('differs from HEAD', err)
 
     def test_cli_requires_isolated_mode_and_plan_is_local(self):
         config = self.write_config()
@@ -413,13 +527,14 @@ class LiveRehearsalTests(unittest.TestCase):
                                   env=env, capture_output=True, text=True)
         self.assertEqual(isolated.returncode, 0, isolated.stderr)
         details = json.loads(isolated.stdout[:isolated.stdout.rindex('}') + 1])
-        self.assertEqual(details['payloadSha256'], self.payload_sha(config))
+        self.assertEqual(details['planSha256'], self.plan_sha(config))
         self.assertEqual(details['sshArgv'][0], str(self.bin / 'ssh'))
         self.assertFalse(self.ssh_log.exists())
 
     def test_generated_payload_static_checks(self):
         config = self.tool.validate_config(json.loads(Path(self.write_config()).read_text()))
-        payload, _ = self.tool.build_payload(config, '0' * 40)
+        commit, blobs = self.tool.head_source()
+        payload, _ = self.tool.build_payload(config, commit, blobs)
         path = self.work / 'payload.sh'
         path.write_bytes(payload)
         checks = [['sh', '-n', str(path)]]
