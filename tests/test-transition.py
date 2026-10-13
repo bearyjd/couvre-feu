@@ -432,10 +432,107 @@ printf '%s\\n' '-A example -m time --weekdays Sun,Wed,Mon --kerneltz -j DROP' | 
 
 class FailClosedReconstructionTests(unittest.TestCase):
     """Ordering models for fail-closed reconstruction; not real-kernel atomicity."""
-    setUp, tearDown, success = TransitionTests.setUp, TransitionTests.tearDown, TransitionTests.success
+    success = TransitionTests.success
     paused_policy, verify_reachability = TransitionTests.paused_policy, TransitionTests.verify_reachability
     stop_at, install, uninstall = TransitionTests.stop_at, TransitionTests.install, TransitionTests.uninstall
     SCHEDULE = [{'person': 'alice', 'id': 'night', 'weekdays': ['Mon'], 'start': '22:00', 'stop': '06:30'}]
+    # Fresh fixture addresses per device; OTHER_KID has no IPv6 neighbor, so its
+    # IPv6 probe is outbound-only and blocked solely by source-MAC selectors.
+    DEVICES = {KID: {'iptables': '192.168.1.20', 'ip6tables': '2001:db8::20'},
+               OTHER_KID: {'iptables': '192.168.1.22', 'ip6tables': None}}
+
+    def setUp(self):
+        TransitionTests.setUp(self)
+        self.started = time.monotonic()
+
+    def tearDown(self):
+        # run-fixtures.py relays TIMING lines so CI reports per-test durations.
+        print(f'TIMING: {self.id()} {time.monotonic() - self.started:.1f}s', file=sys.stderr, flush=True)
+        TransitionTests.tearDown(self)
+
+    @staticmethod
+    def slots(fixture):
+        old = fixture.slot()
+        return old, 'b' if old == 'a' else 'a'
+
+    def assert_switches_guarded(self, effects, new):
+        switches = [row for row in effects if '-R' in row['argv']]
+        self.assertEqual(len(switches), 5)
+        for row in switches:
+            for family in ('iptables', 'ip6tables'):
+                with self.subTest(switch=row['argv'], family=family):
+                    first = self.dispatch_targets(row)[(family, 'cf_fwd')][0]
+                    self.assertEqual(first, f'cf2_{new}_g', 'guard must be first in cf_fwd at every switch')
+
+    def device_blocked(self, state, family, mac):
+        """True/False when every probe agrees, otherwise the mixed probe verdicts."""
+        remote = '2001:db8:ffff::1' if family == 'ip6tables' else '198.51.100.1'
+        address = self.DEVICES[mac][family]
+        probes = [(address or '2001:db8::22', False)] + ([(address, True)] if address else [])
+        verdicts = []
+        for local, reverse in probes:
+            probe = dict(src=remote if reverse else local, dst=local if reverse else remote,
+                         mac='02:ff:ff:ff:ff:01' if reverse else mac,
+                         **{'in': 'eth0' if reverse else 'br-lan', 'out': 'br-lan' if reverse else 'eth0'},
+                         protocol='udp', dport='5000', weekday='Mon', time='23:00:00', ctstate='ESTABLISHED')
+            result = model.evaluate_fixture_chain(state['tables'][family]['filter'], 'FORWARD', probe, state['sets'])
+            verdicts.append(result in ('REJECT', 'DROP'))
+        return verdicts[0] if len(set(verdicts)) == 1 else verdicts
+
+    def adults_reachable(self, state):
+        for family in ('iptables', 'ip6tables'):
+            for reverse in (False, True):
+                result = model.evaluate_fixture_chain(state['tables'][family]['filter'], 'FORWARD',
+                                                      packet(family, True, reverse), state['sets'])
+                self.assertNotIn(result, ('REJECT', 'DROP'), (family, reverse))
+
+    def child_set_transition(self, old_macs, new_macs):
+        old_doc, new_doc = self.paused_policy(), self.paused_policy(2)
+        old_doc['people'][0]['macs'], new_doc['people'][0]['macs'] = old_macs, new_macs
+        self.success(self.cfctl('sync', document=old_doc))
+        _, new = self.slots(self.f)
+        self.f.update_backend(capture_effects=True, effects=[])
+        self.success(self.cfctl('sync', document=new_doc))
+        effects = self.f.backend()['effects']
+        self.assert_switches_guarded(effects, new)
+        def position(family, operation):
+            matches = [index for index, row in enumerate(effects) if row['command'] == family
+                       and operation in row['argv'] and 'cf_fwd' in row['argv'] and f'cf2_{new}_g' in row['argv']]
+            self.assertEqual(len(matches), 1, (family, operation))
+            return matches[0]
+        attach = {family: position(family, '-I') for family in ('iptables', 'ip6tables')}
+        unguard = {family: position(family, '-D') for family in ('iptables', 'ip6tables')}
+        for index, row in enumerate(effects):
+            with self.subTest(index=index, command=row['command'], argv=row['argv']):
+                self.adults_reachable(row)
+                for family in ('iptables', 'ip6tables'):
+                    for mac in set(old_macs) | set(new_macs):
+                        if mac in old_macs and mac in new_macs:
+                            expected = True
+                        elif mac in old_macs:  # removed: blocked until its family is unguarded
+                            expected = index < unguard[family]
+                        else:  # added: blocked from its family's guard attachment onward
+                            expected = index >= attach[family]
+                        self.assertIs(self.device_blocked(row, family, mac), expected, (family, mac))
+        final = self.f.backend()
+        for family in ('iptables', 'ip6tables'):
+            for mac in set(old_macs) | set(new_macs):
+                self.assertIs(self.device_blocked(final, family, mac), mac in new_macs, (family, mac))
+        self.adults_reachable(final)
+        self.assert_only_active_generation()
+        return effects
+
+    def test_added_child_is_guarded_before_switch_and_drained(self):
+        effects = self.child_set_transition([KID], [KID, OTHER_KID])
+        drained = [row['argv'] for row in effects if row['command'] == 'conntrack']
+        self.assertIn(['-D', '-s', '192.168.1.22', '-f', 'ipv4'], drained)
+        self.assertIn(['-D', '-d', '192.168.1.22', '-f', 'ipv4'], drained)
+
+    def test_removed_child_stays_blocked_until_switch_completes(self):
+        self.child_set_transition([KID, OTHER_KID], [KID])
+
+    def test_swapped_child_mac_keeps_union_blocked_through_switch(self):
+        self.child_set_transition([KID], [OTHER_KID])
 
     def cfctl(self, *args, **options):
         # Effect capture copies every modeled table per command; allow loaded CI lanes.
@@ -487,10 +584,11 @@ class FailClosedReconstructionTests(unittest.TestCase):
     def test_schedule_and_resolver_change_blocks_child_in_every_observed_state(self):
         self.success(self.cfctl('sync', document=self.paused_policy()))
         self.f.update_backend(capture_effects=True, effects=[])
+        _, new = self.slots(self.f)
         self.success(self.cfctl('sync', document=self.changed_policy()))
         effects = self.f.backend()['effects']
         self.assertTrue(any(row['command'] == 'fw3' and 'reload' in row['argv'] for row in effects))
-        self.assertEqual(len([row for row in effects if '-R' in row['argv']]), 5)
+        self.assert_switches_guarded(effects, new)
         for index, row in enumerate(effects):
             with self.subTest(index=index, command=row['command'], argv=row['argv']):
                 self.verify_reachability(row)
@@ -503,24 +601,22 @@ class FailClosedReconstructionTests(unittest.TestCase):
         state = self.f.backend()
         state['sets'][self.f.active_set('d4')]['members'] = []
         self.f.update_backend(sets=state['sets'], capture_effects=True, effects=[])
-        old_slot = self.f.slot()
+        old_slot, new = self.slots(self.f)
         self.success(self.cfctl('apply-fw'))
-        self.assertNotEqual(self.f.slot(), old_slot, 'drift must be repaired into a new generation')
+        self.assertEqual(self.f.slot(), new, 'drift must be repaired into a new generation')
         effects = self.f.backend()['effects']
-        self.assertTrue(effects)
+        self.assert_switches_guarded(effects, new)
         for index, row in enumerate(effects):
             with self.subTest(index=index, command=row['command'], argv=row['argv']):
                 self.verify_reachability(row)
         self.assert_only_active_generation()
 
-    # One representative boundary per staging object class: new set creation and
-    # membership, new chains in both families/tables, second-family guard
-    # attachment, pre-switch drain and native reload. All precede the first
-    # dispatcher switch; switch/unguard failures are covered separately.
+    # Four representative pre-switch boundaries: shadow set membership, shadow
+    # chain construction, second-family guard attachment and native reload.
+    # {new} is the shadow slot. Switch/unguard failures are covered separately.
     STAGING_FAILURES = (
-        ('ipset', ['create', 'cf2_b_k']), ('ipset', ['add', 'cf2_b_p']), ('iptables', ['-A', 'cf2_b_f']),
-        ('ip6tables', ['-A', 'cf2_b_f']), ('iptables', ['-A', 'cf2_b_d']),
-        ('ip6tables', ['-I', 'cf_fwd', 'cf2_b_g']), ('conntrack', ['-D']), ('fw3', ['reload']),
+        ('ipset', ['add', 'cf2_{new}_p']), ('ip6tables', ['-A', 'cf2_{new}_f']),
+        ('ip6tables', ['-I', 'cf_fwd', 'cf2_{new}_g']), ('fw3', ['reload']),
     )
 
     def staging_failure_case(self, command, contains):
@@ -528,7 +624,9 @@ class FailClosedReconstructionTests(unittest.TestCase):
         try:
             self.success(fixture.run('sync', document=self.paused_policy(), timeout=300))
             before = fixture.backend()
-            old = self.generation('a', before)
+            active, new = self.slots(fixture)
+            contains = [part.format(new=new) for part in contains]
+            old = self.generation(active, before)
             confirmation = (fixture.root / 'etc/couvrefeu/runtime/confirmed').read_bytes()
             fixture.update_backend(capture_effects=True, effects=[],
                                    failures=[{'command': command, 'contains': contains, 'remaining': 1}])
@@ -538,9 +636,9 @@ class FailClosedReconstructionTests(unittest.TestCase):
                            injected=state['failures'][0]['remaining'] == 0,
                            switched=any('-R' in row['argv'] for row in state['effects']),
                            dispatch=self.generation_targets(state) == self.generation_targets(before),
-                           guard_only=all(target in (rows[-1], 'cf2_b_g') for rows in self.dispatch_targets(state).values()
+                           guard_only=all(target in (rows[-1], f'cf2_{new}_g') for rows in self.dispatch_targets(state).values()
                                           for target in rows),
-                           old_intact=self.generation('a', state) == old,
+                           old_intact=self.generation(active, state) == old,
                            confirmation=(fixture.root / 'etc/couvrefeu/runtime/confirmed').read_bytes() == confirmation,
                            blocked=[self.reachable(row) for row in state['effects']] + [self.reachable(state)])
             fixture.update_backend(failures=[], capture_effects=False)
@@ -584,6 +682,7 @@ class FailClosedReconstructionTests(unittest.TestCase):
 
     def test_first_dispatcher_switch_failure_keeps_old_generation_dispatched(self):
         self.success(self.cfctl('sync', document=self.paused_policy()))
+        _, new = self.slots(self.f)
         old_dispatch = self.dispatch_targets()
         self.f.update_backend(failures=[{'command': 'iptables', 'contains': ['-R', 'cf_fwd'], 'remaining': 1}])
         result = self.cfctl('sync', document=self.changed_policy())
@@ -594,7 +693,7 @@ class FailClosedReconstructionTests(unittest.TestCase):
             with self.subTest(dispatcher=key):
                 self.assertEqual(targets[-1], old_dispatch[key][-1])
                 if key[1] == 'cf_fwd':
-                    self.assertEqual(targets[0], 'cf2_b_g', 'guard must stay attached while unswitched')
+                    self.assertEqual(targets[0], f'cf2_{new}_g', 'guard must stay attached while unswitched')
         self.verify_reachability(state)
         self.success(self.cfctl('apply-fw'))
         self.verify_reachability(self.f.backend())
@@ -603,18 +702,19 @@ class FailClosedReconstructionTests(unittest.TestCase):
     def test_crashed_staging_leftover_generation_is_removed_on_next_run(self):
         self.success(self.cfctl('sync', document=self.paused_policy()))
         before = self.f.backend()
-        old = self.generation('a', before)
-        self.stop_at('after_6_cf2_b_f_A', ['cfctl', 'sync'], json.dumps(self.changed_policy()))
+        active, new = self.slots(self.f)
+        old = self.generation(active, before)
+        self.stop_at(f'after_6_cf2_{new}_f_A', ['cfctl', 'sync'], json.dumps(self.changed_policy()))
         crashed = self.f.backend()
-        chains, sets = self.generation('b', crashed)
+        chains, sets = self.generation(new, crashed)
         self.assertTrue(chains and sets, 'crash must leave a partial shadow generation')
-        self.assertEqual(self.generation('a', crashed), old)
+        self.assertEqual(self.generation(active, crashed), old)
         self.assertEqual(self.dispatch_targets(crashed), self.dispatch_targets(before))
         self.verify_reachability(crashed)
         self.assertFalse(json.loads(self.cfctl('status', '--json').stdout)['ok'])
         self.success(self.cfctl('apply-fw'))
-        self.assertEqual(self.f.slot(), 'a')
-        self.assertEqual(self.generation('a'), old)
+        self.assertEqual(self.f.slot(), active)
+        self.assertEqual(self.generation(active), old)
         self.assert_only_active_generation()
         self.verify_reachability(self.f.backend())
         self.success(self.cfctl('sync', document=self.changed_policy()))
