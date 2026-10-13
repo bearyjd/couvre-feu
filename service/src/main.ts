@@ -4,6 +4,7 @@ import { seedAccounts } from './fixtures.ts';
 import { Auth } from './auth.ts';
 import { PolicyService } from './policy.ts';
 import { appServer } from './http.ts';
+import { TimeRequestService } from './time-requests.ts';
 import { ParentAlerts, systemActor } from './parent-alerts.ts';
 import { demoConfig } from './config.ts';
 import { ActivityStore, retentionDays } from './activity-store.ts';
@@ -38,8 +39,9 @@ const timer = setInterval(() => {
         process.stderr.write('parent_alert_sync_failed\n');
     }
 }, 250);
-const alerts = new ParentAlerts(store, {people: () => policy.people(systemActor)});
-const server = appServer(auth, policy, config, alerts, activity);
+const timeRequests = new TimeRequestService(store, policy);
+const alerts = new ParentAlerts(store, {people: () => policy.people(systemActor), timeRequests: () => timeRequests.pendingForAlerts()});
+const server = appServer(auth, policy, config, alerts, activity, timeRequests);
 server.listen(config.port, '127.0.0.1', () => process.stdout.write(`Fictional authenticated demo: ${config.origin}; start demo:router independently.\n`));
 function stop() {
     clearInterval(timer); clearInterval(activityTimer); clearInterval(pruneTimer);

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <title>Ask for more time · Couvre-feu</title>
+    <script type="module" src="/request.js"></script>
+  </head>
+  <body>
+    <main id="main" class="child-request" tabindex="-1">
+      <p class="eyebrow">Couvre-feu</p>
+      <h1>Ask for more time</h1>
+      <p id="child-state" role="status" aria-live="polite">Loading…</p>
+      <form id="child-form" hidden>
+        <fieldset>
+          <legend>How much time?</legend>
+          <label><input type="radio" name="minutes" value="15" checked> 15 minutes</label>
+          <label><input type="radio" name="minutes" value="30"> 30 minutes</label>
+          <label><input type="radio" name="minutes" value="60"> 1 hour</label>
+        </fieldset>
+        <label for="child-reason">Why? (optional, up to 140 characters)</label>
+        <input id="child-reason" name="reason" type="text" maxlength="140" autocomplete="off">
+        <button class="button primary" type="submit">Send request</button>
+      </form>
+      <p class="fine-print">A parent decides. Nothing else about you or this device is sent.</p>
+    </main>
+  </body>
+</html>

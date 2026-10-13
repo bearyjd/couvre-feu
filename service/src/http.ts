@@ -12,6 +12,8 @@ import { provenance } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object, parseJSON } from '../../shared/src/json.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
+import { TimeRequestService } from './time-requests.ts';
+import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -21,6 +23,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -74,7 +77,8 @@ function send(response: ServerResponse, status: number, value: unknown) {
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
 type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore) {
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService) {
+    const requests = timeRequests ?? new TimeRequestService(auth.store, policy, (policy as {now?: () => number}).now ?? auth.now);
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
@@ -119,6 +123,12 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     throw new AppError(403, 'origin_rejected');
                 }
                 const payload = await body(request);
+                if (path.startsWith('/child/')) {
+                    // Capability token in the body is the only credential: no cookies, no ambient authority, so no CSRF surface.
+                    const routed = childRoute(requests, path, payload);
+                    send(response, routed.status, routed.body);
+                    return;
+                }
                 if (path.startsWith('/auth/') && path !== '/auth/logout') {
                     const browserToken = /^[A-Za-z0-9_-]{43}$/.test(jar.cf_browser ?? '') ? jar.cf_browser : randomBytes(32).toString('base64url');
                     response.setHeader('Set-Cookie', `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`);
@@ -172,6 +182,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]))});
                     return;
                 }
+                const parent = await parentPost(requests, session.dto.actor, path, payload);
+                if (parent) {
+                    send(response, parent.status, parent.body);
+                    return;
+                }
                 throw new AppError(404, 'route_not_found');
             }
             if (request.method !== 'GET') {
@@ -200,6 +215,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]))});
                 return;
             }
+            const parent = await parentGet(requests, session.dto.actor, path);
+            if (parent) {
+                send(response, parent.status, parent.body);
+                return;
+            }
             const operation = /^\/operations\/([0-9a-f-]{36})$/.exec(path);
             if (operation) {
                 await policy.reconcile();
@@ -223,6 +243,13 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
         }
     };
     const server = config.tlsMaterial ? createSecureServer({...config.tlsMaterial, minVersion: 'TLSv1.2'}, handler) : createServer(handler);
+    // Allowance follow-ups (restoring a lifted pause) must not depend on a parent having the app open.
+    let timer: NodeJS.Timeout | undefined;
+    server.on('listening', () => {
+        timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
+        timer.unref();
+    });
+    server.on('close', () => clearInterval(timer));
     server.requestTimeout = 10000;
     server.headersTimeout = 5000;
     server.maxHeadersCount = 40;
