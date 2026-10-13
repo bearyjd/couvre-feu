@@ -2,7 +2,7 @@
 
 Router-local internet pause and schedules, an authenticated fictional parent demo, and a separate operator-dispatched one-device integration path. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. Integration source implements exact policy CAS, durable receipts and asynchronous SSH; it is not installed or accepted on the target router. Real packet behavior and household production remain pending; companions, activity collection and bonus grants are later work.
 
-AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforcement-core.md) and [inspection report](docs/spike-001.md) explain the target. [Enforcement contract](docs/enforcement-contract.md), [acceptance and recovery](docs/acceptance-001.md), [parent PWA specification](docs/prp/PRP-002-parent-pwa.md), [policy service specification](docs/prp/PRP-003-policy-service.md), and [companion limits](docs/companion-capabilities.md) describe each phase. No Fengard source was copied.
+AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforcement-core.md) and [inspection report](docs/spike-001.md) explain the target. [Enforcement contract](docs/enforcement-contract.md), [acceptance and recovery](docs/acceptance-001.md), [parent PWA specification](docs/prp/PRP-002-parent-pwa.md), [policy service specification](docs/prp/PRP-003-policy-service.md), and [companion limits](docs/companion-capabilities.md) describe each phase. [PRP-005](docs/prp/PRP-005-domain-observations.md) is a proposal only for privacy-scoped domain observations; collection stays off. No Fengard source was copied.
 
 ## Run the local parent demo
 
