@@ -91,6 +91,15 @@ Originals are restored as the same file: install hard-links each existing origin
 
 Known residue cases: the journal (with its release ownership marker) is written durably before the release is created, so a fresh installation no longer leaves an unmarked release behind; releases left that way by earlier versions are treated as pre-existing and kept. If an interrupted uninstall removed the journal marker before the final step, the release is also kept. Both leave only the verified reviewed release.
 
+### Residual risk: in-place writes while the original is shared
+
+While the managed path and the journal `.original` are the same inode, a writer that edits in place (`>>`, `cat >`, BusyBox `vi`) changes the only exact original. This window runs from the hard link to the install rename in `install.sh`, and from the restore rename to final cleanup in `uninstall.sh`. Do not edit `/etc/config/firewall`, `/etc/sysupgrade.conf` or `/etc/crontabs/root` while either script runs.
+
+- The journal also keeps `backup/<key>.copy`, a plain byte copy taken at link time and checked with `cmp`. It is for manual recovery only. It does not restore mode, owner or mtime, and restore never uses it. The same guarded cleanup removes it with the journal.
+- Immediately before each install rename, `install.sh` re-checks the original's sha256 (which fixes its size), mode, owner and nanosecond mtime against the journal record. On a mismatch it refuses with `original changed in place before install rename`, and the journal is retained. A write that lands between this check and the rename is not detected; the rename is the next operation.
+- The uninstall side only detects. A changed restored path is drift, and drift refuses with the journal (and `.copy`) retained. Once the exact-restoration check passes and the completion record is published, later edits count as the user's own changes, and final cleanup removes `.copy` with the journal.
+- To recover by hand after such a refusal, compare the live file and `.original` with `.copy` and the `.before` and `.mtime` records. Then restore the bytes from `.copy`, and the mode, owner and mtime from the records, as a separately reviewed step. Never retry blindly.
+
 ### Residue from the 2026-10-13 refusal
 
 The first live `install.sh --activate` (main `f5dba46`, release id `bbbf1568debe492f4785043d7c69e77b6778f880acc18449bead63176418f572`; confirm against the `BEGIN ... release=` line of that run's evidence) refused with `cannot preserve exact original metadata/mtime: etc/config/firewall; no installation made`. That version created `/etc/.couvrefeu-release-<id>` before the refusal and wrote no journal or release ownership marker, so the router still holds that directory. Installers keep it unchanged: a release with a different id is never inspected, adopted or removed. Expect it in any read-only listing of `/etc`. It may be removed only by a separately reviewed and approved step that first verifies it against its own `release.sha256`; neither this rehearsal nor `uninstall.sh` removes it.

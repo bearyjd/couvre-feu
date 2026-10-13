@@ -19,6 +19,7 @@ jobs:
           CF_TEST_TIMEOUT: busybox timeout
         run: |
           busybox 2>&1 | awk 'NR == 1 { print }'
+          python3 tools/freeze-router-release.py --check
           sh tests/run.sh --preflight-only
           sh tests/acceptance.sh --preflight
           python3 tests/run-fixtures.py --write-plan "$RUNNER_TEMP/couvre-feu-plan.json"

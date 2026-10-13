@@ -240,12 +240,12 @@ journal_preflight() {
     # restoration inventory and its full preflight remain journal-derived.
     if [ "${1:-}" = cleanup ]; then
         platform_valid_done "$DONE" || fail 'unsafe cleanup completion record'
-        allowed_entries="$allowed_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.original etc_couvrefeu_rpc-allowed.staged etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
+        allowed_entries="$allowed_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.original etc_couvrefeu_rpc-allowed.copy etc_couvrefeu_rpc-allowed.staged etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
         record_entries="$record_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
     fi
     for rel in $FILES; do
         k=$(key "$rel")
-        allowed_entries="$allowed_entries $k.before $k.after $k.original $k.staged $k.mtime $k.inode"
+        allowed_entries="$allowed_entries $k.before $k.after $k.original $k.copy $k.staged $k.mtime $k.inode"
         record_entries="$record_entries $k.before $k.after $k.mtime $k.inode"
     done
     for rel in $DIRS; do
@@ -377,15 +377,26 @@ owned_temp() (
         [ -f "$BACKUP/firewall.transaction" ] &&
         [ "$temp_sig" = "$(signature "$BACKUP/firewall.pending")" ]
 )
+# Until the install rename, the managed path may still be the journal's only
+# original inode. Prove the original is unchanged (sha256 also fixes its size).
+original_intact() {
+    [ -e "$BACKUP/$1.original" ] || return 0
+    if ! { [ "$(signature "$BACKUP/$1.original")" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.before")" ] &&
+        exact_mtime "$BACKUP/$1.original" "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.mtime")"; }; then
+        fail "original changed in place before install rename: /$2; installation refused, journal retained; manual recovery copy: $BACKUP/$1.copy"
+    fi
+}
 # Rename in the same directory; do not write through existing files. Installed
 # content needs exact bytes/mode/owner only; its timestamp is never restored.
 # A third argument `durable` flushes the data before the publishing rename.
+# A fourth argument names the journal key whose original must be intact.
 atomic_copy() (
-    src=$1 dst=$2 tmp=$2.couvrefeu-tmp durable=${3:-}
+    src=$1 dst=$2 tmp=$2.couvrefeu-tmp durable=${3:-} original_key=${4:-}
     if [ -e "$tmp" ] || [ -L "$tmp" ]; then
         owned_temp "$dst" || fail "temporary path collision: $tmp"
         # Write barriers follow the blocking proofs.
         if [ "$(signature "$tmp")" = "$(signature "$src")" ]; then
+            if [ -n "$original_key" ]; then original_intact "$original_key" "${dst#"$ROOT"/}"; fi
             platform_initial_write
             mv -f "$tmp" "$dst"
             exit 0
@@ -400,6 +411,7 @@ atomic_copy() (
     # Flush data before the rename publishes it (BusyBox without
     # FEATURE_SYNC_FANCY ignores the operand and syncs everything).
     if [ "$durable" = durable ]; then sync "$tmp" 2>/dev/null; fi
+    if [ -n "$original_key" ]; then original_intact "$original_key" "${dst#"$ROOT"/}"; fi
     mv -f "$tmp" "$dst"
 )
 # Exact restoration never copies: the journal holds the original inode as a

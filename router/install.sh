@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=c72c3e68bb77e8aa1f310a02eb1fc8fe01874c674a5835c8751b5e3057e6f844
+CF_BOOTSTRAP_PIN=f79d189bf348097b50666c8f290bb46b00a9c4e5c83ff06c6548c59b7b511394
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -299,9 +299,19 @@ link_original() {
         fail "original changed while linking (overlay copy-up?): /$1; installation refused, journal removed"
     fi
     stat -c %i "$lo_dst" > "$BACKUP/$2.inode"
+    # Non-authoritative byte copy for manual recovery only: while the managed
+    # path and the journal share one inode, an in-place writer changes both.
+    cp "$lo_dst" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; no installation made"
+    cmp -s "$lo_dst" "$BACKUP/$2.copy" || fail "original recovery copy mismatch: $1; no installation made"
 }
 if [ ! -e "$BACKUP" ]; then
-    # Every refusal gate precedes the first managed write.
+    # Every refusal gate precedes the first managed write. Without a journal no
+    # rename source is installation owned, so any existing one is foreign.
+    for rel in $FILES; do
+        if [ -e "$ROOT/$rel.couvrefeu-tmp" ] || [ -L "$ROOT/$rel.couvrefeu-tmp" ]; then
+            fail "temporary path collision: $ROOT/$rel.couvrefeu-tmp; no installation made"
+        fi
+    done
     mkdir "$STAGE/.delta"
     backend uci -c "$STAGE" -t "$STAGE/.delta" show firewall >/dev/null || fail 'staged UCI firewall validation failed'
     for rel in $FILES; do
@@ -380,7 +390,7 @@ for rel in $FILES; do
     case "$rel" in etc/couvrefeu/state|etc/couvrefeu/protected)
         if [ -f "$BACKUP/complete" ]; then continue; fi;;
     esac
-    atomic_copy "$BACKUP/$k.staged" "$ROOT/$rel" durable
+    atomic_copy "$BACKUP/$k.staged" "$ROOT/$rel" durable "$k"
     COUNT=$((COUNT + 1))
     if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_FAIL_AFTER:-0}" = "$COUNT" ]; then fail 'injected partial installation'; fi
 done

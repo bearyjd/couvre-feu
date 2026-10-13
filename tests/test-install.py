@@ -443,9 +443,19 @@ esac
             'stat': ({}, ('stat', '#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = "%Y %y" ]; then\n'
                                    '    printf "%s\\n" "1234567890 2009-02-13 23:31:30 +0000"; exit 0\nfi\n'
                                    'exec ' + shlex.quote(real_stat) + ' "$@"\n'), 'precise original mtime unavailable'),
+            # A rename source that exists before any journal is never owned.
+            'temp-file': ({}, None, 'temporary path collision: ' + str(self.root) + '/etc/config/firewall.couvrefeu-tmp; no installation made'),
+            'temp-symlink': ({}, None, 'temporary path collision: ' + str(self.root) + '/etc/sysupgrade.conf.couvrefeu-tmp; no installation made'),
         }
         for name, (env, tool, message) in gates.items():
             with self.subTest(gate=name):
+                temp = None
+                if name == 'temp-file':
+                    temp = self.root / 'etc/config/firewall.couvrefeu-tmp'
+                    temp.write_bytes(b'foreign\n')
+                elif name == 'temp-symlink':
+                    temp = self.root / 'etc/sysupgrade.conf.couvrefeu-tmp'
+                    temp.symlink_to('/nonexistent-couvrefeu-target')
                 saved = None
                 if tool:
                     path = self.root / 'bin' / tool[0]
@@ -455,6 +465,12 @@ esac
                 self.env.update(env)
                 before = full_snapshot(self.root)
                 self.assert_refused_identically(before, release, message)
+                if temp:
+                    result = self.run_script('uninstall.sh')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('No recorded installation; no changes made.', result.stdout)
+                    self.assertEqual(full_snapshot(self.root), before)
+                    temp.unlink()
                 for variable in env:
                     self.env.pop(variable)
                 if tool:
@@ -462,6 +478,84 @@ esac
                         path.unlink()
                     else:
                         path.write_bytes(saved)
+
+    def test_in_place_append_before_install_rename_refuses_with_intact_copy(self):
+        originals = self.write_originals()
+        target = self.root / 'etc/config/firewall'
+        # The durable flush precedes the rename; the target is still the journal inode.
+        wrapper = self.root / 'bin/sync'
+        wrapper.write_text('#!/bin/sh\nfor destination do :; done\n'
+                           f'case "$destination" in {shlex.quote(str(target))}.couvrefeu-tmp) '
+                           f'printf "%s\\n" "# in-place append" >> {shlex.quote(str(target))};; esac\n'
+                           f'exec {shlex.quote(shutil.which("sync"))} "$@"\n')
+        wrapper.chmod(0o700)
+        result = self.install('--activate')
+        wrapper.unlink()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('original changed in place before install rename: /etc/config/firewall; installation refused, journal retained', result.stderr)
+        backup = self.root / 'etc/couvrefeu/backup'
+        self.assertFalse((backup / 'complete').exists())
+        self.assertEqual(target.stat().st_ino, originals['etc/config/firewall'][0])
+        self.assertEqual(target.read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'] + b'# in-place append\n')
+        before = full_snapshot(self.root)
+        for rel, content in EXISTING_ORIGINALS.items():
+            self.assertEqual((backup / (rel.replace('/', '_') + '.copy')).read_bytes(), content)
+        for retry in ('install.sh', 'uninstall.sh'):
+            with self.subTest(retry=retry):
+                result = self.install('--activate') if retry == 'install.sh' else self.run_script(retry)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual((backup / 'etc_config_firewall.copy').read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'])
+
+    def test_in_place_append_after_restore_rename_refuses_with_intact_copy(self):
+        self.write_originals()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env['CF_TEST_UNINSTALL_CRASH_AT'] = 'restored'
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.env.pop('CF_TEST_UNINSTALL_CRASH_AT')
+        self.kill_lock()
+        recovery = self.root / '.couvrefeu-recovery'
+        target = self.root / 'etc/config/firewall'
+        # The restored target and the journal original are one inode.
+        self.assertEqual(target.stat().st_ino, (recovery / 'etc_config_firewall.original').stat().st_ino)
+        with target.open('ab') as stream:
+            stream.write(b'# in-place append\n')
+        before = full_snapshot(self.root)
+        for _ in range(2):
+            result = self.run_script('uninstall.sh')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('drift at /etc/config/firewall', result.stderr)
+            self.assertEqual(full_snapshot(self.root), before)
+        self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
+        for rel, content in EXISTING_ORIGINALS.items():
+            self.assertEqual((recovery / (rel.replace('/', '_') + '.copy')).read_bytes(), content)
+
+    def test_same_signature_original_with_new_inode_refuses_identically(self):
+        self.write_originals()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backup = self.root / 'etc/couvrefeu/backup'
+        original = backup / 'etc_config_firewall.original'
+        recorded = original.stat()
+        substitute = backup / 'substitute'
+        shutil.copy2(original, substitute)
+        os.chmod(substitute, recorded.st_mode & 0o7777)
+        os.utime(substitute, ns=(recorded.st_atime_ns, recorded.st_mtime_ns))
+        os.replace(substitute, original)
+        replaced = original.stat()
+        self.assertNotEqual(replaced.st_ino, recorded.st_ino)
+        self.assertEqual((replaced.st_mode, replaced.st_uid, replaced.st_gid, replaced.st_mtime_ns),
+                         (recorded.st_mode, recorded.st_uid, recorded.st_gid, recorded.st_mtime_ns))
+        self.assertEqual(signature(original), (backup / 'etc_config_firewall.before').read_text().strip())
+        before = full_snapshot(self.root)
+        for script in ('uninstall.sh', 'install.sh'):
+            with self.subTest(script=script):
+                result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('corrupt original backup inode: etc/config/firewall', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
 
     def kill_lock(self):
         # A SIGKILLed transaction cannot run its trap; production /tmp is cleared on reboot.
