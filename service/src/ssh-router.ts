@@ -4,6 +4,8 @@ import { validateTransportFiles } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { normalizeEnvelope, parseObservation, requestDigest, rpcId, sha256 } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope, RPCObservation } from '../../shared/src/router-rpc.ts';
+import { parseRouterActivity } from '../../shared/src/router-activity.ts';
+import type { RouterActivity } from '../../shared/src/router-activity.ts';
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 
@@ -28,21 +30,30 @@ export class SSHRouter implements AsyncRouter {
             stdin = JSON.stringify(e) + '\n'; op = e.operation_id; digest = requestDigest(e); argv.push('cfctl rpc-sync');
         } else {
             if (kind === 'receipt') op = rpcId(operationId);
-            else if (kind !== 'observe' || envelope !== undefined || operationId !== undefined) throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
-            argv.push(`cfctl rpc-status --json${op ? ' ' + op : ''}`);
+            else if ((kind !== 'observe' && kind !== 'activity') || envelope !== undefined || operationId !== undefined) throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
+            argv.push(kind === 'activity' ? 'cfctl rpc-activity --json' : `cfctl rpc-status --json${op ? ' ' + op : ''}`);
             digest = sha256(`${kind}\n${r.generation}\n${op ?? ''}\n`);
         }
         return {executable: '/usr/bin/ssh', argv, stdin, deadlineMs: 15000, kind, operationId: op, requestDigest: digest};
     }
     async invoke(invocation: FrozenInvocation): Promise<RPCObservation> {
+        if (invocation.kind === 'activity') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
+        const text = await this.run(invocation);
+        try { return parseObservation(text); } catch { throw new RouterTransportError('invalid_router_response'); }
+    }
+    async invokeActivity(invocation: FrozenInvocation): Promise<RouterActivity> {
+        if (invocation.kind !== 'activity') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
+        const text = await this.run(invocation);
+        try { return parseRouterActivity(text); } catch { throw new RouterTransportError('invalid_router_response'); }
+    }
+    private async run(invocation: FrozenInvocation): Promise<string> {
         const expected = invocation.kind === 'apply'
             ? this.invocation('apply', JSON.parse(invocation.stdin))
             : this.invocation(invocation.kind, undefined, invocation.operationId ?? undefined);
         if (JSON.stringify(invocation) !== JSON.stringify(expected)) throw new RouterTransportError('invocation_changed', 'not_delivered');
         try { validateTransportFiles(this.config); } catch { throw new RouterTransportError('private_transport_configuration_unavailable', 'not_delivered'); }
-        const text = await boundedChild(invocation.executable, invocation.argv, invocation.stdin, invocation.deadlineMs,
+        return boundedChild(invocation.executable, invocation.argv, invocation.stdin, invocation.deadlineMs,
             {PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C', SSH_AUTH_SOCK: this.config.router.agentSocket}, true);
-        try { return parseObservation(text); } catch { throw new RouterTransportError('invalid_router_response'); }
     }
 }
 /** No shell, secret-bearing inherited environment, unbounded capture, or remote retry. */

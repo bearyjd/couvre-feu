@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { Auth } from './auth.ts';
 import type { PolicyService } from './policy.ts';
 import type { DemoConfig } from './config.ts';
+import type { ActivityStore } from './activity-store.ts';
 import { provenance } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object, parseJSON } from '../../shared/src/json.ts';
@@ -19,7 +20,7 @@ const STATIC: Record<string, [
     '/auth-client.js': ['auth-client.js', 'text/javascript; charset=utf-8'], '/status-cache.js': ['status-cache.js', 'text/javascript; charset=utf-8'],
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
-    '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'],
+    '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -73,7 +74,7 @@ function send(response: ServerResponse, status: number, value: unknown) {
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
 type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI) {
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore) {
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
@@ -183,6 +184,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 send(response, 200, await policy.people(session.dto.actor));
+                return;
+            }
+            const activityMatch = /^\/people\/([a-z][a-z0-9_]{0,31})\/activity$/.exec(path);
+            if (activityMatch && activity) {
+                send(response, 200, activity.report(session.dto.actor, activityMatch[1]));
                 return;
             }
             if (path === '/devices') {

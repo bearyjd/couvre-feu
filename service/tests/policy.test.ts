@@ -577,7 +577,7 @@ test('cross-process reconciliation cannot automatically reapply after another pr
         await Promise.all(children.map(child => child.exitCode === null ? once(child, 'exit') : Promise.resolve()));
     } finally { for (const child of children) if (child.exitCode === null) child.kill(); f.close(); }
 });
-test('migrations 002-004 preserve policy/accounts and revokes legacy sessions/challenges before listening', () => {
+test('migrations 002-005 preserve policy/accounts and revokes legacy sessions/challenges before listening', () => {
     const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-upgrade-')), path = join(dir, 'service.sqlite');
     const legacy = new Store(path, readFileSync(fileURLToPath(new URL('../migrations/001.sql', import.meta.url)), 'utf8'));
     try {
@@ -587,7 +587,8 @@ test('migrations 002-004 preserve policy/accounts and revokes legacy sessions/ch
         legacy.close();
         const upgraded = new Store(path);
         try {
-            assert.equal(upgraded.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 4);
+            assert.equal(upgraded.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 5);
+            assert.equal(upgraded.get<{ n: number }>('SELECT count(*) n FROM activity_samples')!.n, 0);
             assert.equal(upgraded.get<{ revoked: number }>('SELECT revoked FROM sessions')!.revoked, 1);
             assert.equal(upgraded.get<{ n: number }>('SELECT count(*) n FROM challenges')!.n, 0);
             assert.equal(upgraded.get<{ n: number }>('SELECT count(*) n FROM accounts')!.n, 2);

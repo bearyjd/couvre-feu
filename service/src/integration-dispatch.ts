@@ -20,7 +20,7 @@ try {
         requirePrivatePath(dirname(planPath), 'directory');
         const worker = new IntegrationWorker(store, new SSHRouter(config));
         if (command === 'prepare') {
-            if (!['observe', 'apply', 'receipt'].includes(argument) || process.argv.length !== (argument === 'observe' ? 6 : 7)) throw new Error('usage_prepare_manifest_permit_kind_operation');
+            if (!['observe', 'apply', 'receipt', 'activity'].includes(argument) || process.argv.length !== (argument === 'observe' || argument === 'activity' ? 6 : 7)) throw new Error('usage_prepare_manifest_permit_kind_operation');
             const plan = worker.prepare(argument as DispatchKind, operationId);
             writeFileSync(planPath, JSON.stringify(plan, null, 2) + '\n', {mode: 0o600, flag: 'wx'});
             process.stdout.write(`Prepared one invocation; no SSH executed. Review private permit script. SHA256 ${plan.scriptSha256}\n`);

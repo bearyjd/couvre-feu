@@ -2,6 +2,8 @@
 
 This offline prototype evaluates preconstructed fictional browser-focus intervals. It has no collector, event adapter, upload, persistence, enrollment or UI integration. Its only provenance is `synthetic-browser-focus`; its scope is `focused-browser`. The result estimates observed focused-browser time for one fictional device, never device presence, network use, website visits or general screen time.
 
+Router byte-counter estimates of network activity are a separate feature described in [activity-service.md](activity-service.md); this prototype does not feed it.
+
 Run its deterministic fixtures with the repository's Node 26.8.1:
 
 ```sh

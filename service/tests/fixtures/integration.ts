@@ -7,6 +7,8 @@ import { IntegrationPolicy } from '../../src/integration-policy.ts';
 import { IntegrationWorker } from '../../src/integration-worker.ts';
 import { SSHRouter } from '../../src/ssh-router.ts';
 import { RouterTransportError } from '../../src/router-transport.ts';
+import { normalizeRouterActivity } from '../../../shared/src/router-activity.ts';
+import type { RouterActivity } from '../../../shared/src/router-activity.ts';
 import type { AsyncRouter, FrozenInvocation, DispatchKind } from '../../src/router-transport.ts';
 import { normalizeEnvelope, policyDigest, requestDigest } from '../../../shared/src/router-rpc.ts';
 import type { RPCObservation, RPCEnvelope, RPCReceipt } from '../../../shared/src/router-rpc.ts';
@@ -42,8 +44,16 @@ export class TestRouter implements AsyncRouter {
     afterApplyFailure: RouterTransportError | null = null;
     transform: ((o: RPCObservation) => RPCObservation) | null = null;
     defer: Promise<void> | null = null;
+    activity: unknown = null;
     constructor(store: IntegrationStore, now: () => number) { this.store = store; this.config = store.config; this.ssh = new SSHRouter(this.config); this.now = now; this.policy = store.config.enrollment; }
     invocation(kind: DispatchKind, envelope?: RPCEnvelope, operationId?: string): FrozenInvocation { return this.ssh.invocation(kind, envelope, operationId); }
+    async invokeActivity(i: FrozenInvocation): Promise<RouterActivity> {
+        if (this.store.db.isTransaction) throw new Error('test_network_transaction');
+        this.calls.push(i);
+        if (this.defer) await this.defer;
+        if (this.failure) throw this.failure;
+        return normalizeRouterActivity(this.activity);
+    }
     async invoke(i: FrozenInvocation): Promise<RPCObservation> {
         if (this.store.db.isTransaction) throw new Error('test_network_transaction');
         this.calls.push(i);
