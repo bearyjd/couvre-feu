@@ -20,6 +20,7 @@ python3 tests/test-install.py
 python3 tests/test-platform-integration.py
 python3 tests/test-os-trust.py
 python3 tests/test-client-probe.py
+python3 tests/test-live-rehearsal.py
 
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck --version
@@ -27,7 +28,7 @@ else
     printf '%s\n' 'FAIL: shellcheck is required for the complete fixture gate.' >&2
     exit 1
 fi
-find router tests -type f | {
+find router tests tools -type f | {
     static_failed=0
     while IFS= read -r script; do
         if is_shell "$script"; then

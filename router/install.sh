@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=c1004ca9e9d211aa5e81886a925204d012a0b3ed36630b6e1956a8b84b50f206
+CF_BOOTSTRAP_PIN=1aa722c3311b963674ef2bdec3ce895b22982d8a9aed69e98526620f52157a9c
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -240,7 +240,14 @@ fi
     . "$SOURCE/lib/core.sh"
     cf_check
 ) || fail 'core dependency/capability gate failed'
-if [ "${CF_TEST_MODE:-0}" != 1 ]; then platform_recovery_prepare "$HERE"; fi
+# The external recovery release is retired by uninstall only when this
+# installation created it. Isolated fixtures opt in explicitly.
+RELEASE_ABSENT=0
+if [ "${CF_TEST_MODE:-0}" != 1 ] || [ "${CF_TEST_RELEASE_DIR:-0}" = 1 ]; then
+    release_dir=$ROOT/etc/.couvrefeu-release-$CF_RELEASE_ID
+    if [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ]; then RELEASE_ABSENT=1; fi
+    platform_recovery_prepare "$HERE" "$ROOT"
+fi
 if [ ! -e "$BACKUP" ]; then
     # Validate the native UCI configuration from the staging directory.
     mkdir "$STAGE/.delta"
@@ -294,6 +301,7 @@ if [ ! -e "$BACKUP" ]; then
             *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
     done
+    if [ "$RELEASE_ABSENT" = 1 ]; then printf '%s\n' 1 > "$BACKUP/release-absent"; fi
     printf '%s\n' 1 > "$BACKUP/ready"
 fi
 preflight
