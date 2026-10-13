@@ -117,6 +117,8 @@ class LiveRehearsalTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.evidence_root, True)
         self.model_fresh_router()
         self.fake_tools()
+        self.cp_log = self.work / 'cp-p.log'
+        self.truncating_cp('s')
         self.now = datetime.datetime(2026, 10, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
         self.config = {
             'schemaVersion': 1, 'host': HOST,
@@ -148,6 +150,20 @@ class LiveRehearsalTests(unittest.TestCase):
             uci={'network.lan.ipaddr': HOST}, addresses4=[f'2: br-lan    inet {HOST}/24 scope global br-lan'])
         # Seed steady post-reload tables so a clean uninstall is comparable.
         subprocess.run([str(self.fixture.bin / 'firewall'), 'reload'], env=self.fixture.env, check=True)
+
+    def truncating_cp(self, precision):
+        """Router `cp -p` like BusyBox: fractional mtimes lost to seconds or microseconds."""
+        stat = shlex.quote(shutil.which('stat'))
+        stamp = '"@$seconds"' if precision == 's' else '"@$seconds.${fraction%???}"'
+        wrapper = self.fixture.bin / 'cp'
+        wrapper.write_text('#!/bin/sh\n' + shlex.quote(shutil.which('cp')) + ' "$@" || exit\n'
+                           'case " $* " in *" -p "*) ;; *) exit 0;; esac\n'
+                           'for destination do :; done\n[ -f "$destination" ] || exit 0\n'
+                           f'seconds=$({stat} -c %Y "$destination")\n'
+                           f'fraction=$({stat} -c %y "$destination" | sed "s/.*\\.\\([0-9]*\\) .*/\\1/")\n'
+                           f'{shlex.quote(shutil.which("touch"))} -m -d {stamp} "$destination"\n'
+                           f'printf "%s\\n" "$destination" >> {shlex.quote(str(self.cp_log))}\n')
+        wrapper.chmod(0o700)
 
     def fake_tools(self):
         self.bin = self.work / 'bin'
@@ -264,6 +280,20 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual(argv[0][-2:], ['root@' + HOST, 'exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C '
                                         'SSH_CONNECTION="$SSH_CONNECTION" timeout -s KILL 600 /bin/sh -s'])
         self.assertIn('PASS:', out)
+        # The baseline is local evidence: digests of every original and table.
+        self.assertIn(f'SNAPSHOT F {self.root}/etc/config/firewall ', '\n'.join(stdout))
+        for kind in ('iptables', 'ip6tables', 'ipset', 'ipsetsave', 'uci', 'cron'):
+            self.assertTrue(any(line.startswith(f'SNAPSHOT H {kind} ') for line in stdout), kind)
+        # Fractional originals were restored exactly although cp -p truncated.
+        self.assertTrue(self.cp_log.read_text().strip())
+
+    def test_microsecond_truncating_cp_still_restores_exactly(self):
+        self.truncating_cp('us')
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertTrue(self.cp_log.read_text().strip())
 
     def test_identity_mac_mismatch_refused_before_install(self):
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'),
@@ -351,6 +381,11 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertNotIn('run uninstall.sh', stdout)
         self.assertNotIn('PHASE UNINSTALL', stdout)
         self.assertTrue((self.root / 'etc/couvrefeu/backup/ready').is_file())
+        # A read-only re-snapshot reports exactly what the failed install left.
+        self.assertIn(f'DIFF - D {self.root}/etc/couvrefeu/backup absent', stdout)
+        self.assertIn(f'DIFF + D {self.root}/etc/couvrefeu/backup dir:700:', stdout)
+        self.assertIn('SNAPSHOT F ', stdout)
+        self.assertLess(stdout.index('DIFF - D'), stdout.index('FAIL_AFTER_MUTATION INSTALL'))
 
     def test_ssh_drop_mid_run_is_unknown(self):
         self.spec['drop_after'] = 'PHASE INSTALL OK'

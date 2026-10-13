@@ -53,6 +53,11 @@ cfr_fail() {
 }
 cfr_stop() {
     cfr_fail "$1" "$2"
+    # Read-only re-snapshot: report exactly what the failed step left behind.
+    if cfr_snapshot after; then
+        if cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then cfr_info 'post-failure snapshot equals SNAPSHOT'
+        else cfr_diff; fi
+    else cfr_info 'post-failure snapshot unavailable'; fi
     cfr_out "FAIL_AFTER_MUTATION $1"
     exit 20
 }
@@ -312,9 +317,8 @@ cfr_verify() {
     cfr_ok VERIFY
 }
 
-cfr_restore() {
-    cfr_snapshot after || { cfr_fail RESTORE snapshot_failed; return 0; }
-    if cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then cfr_ok RESTORE; return 0; fi
+# Print DIFF lines between snapshot.before and snapshot.after (both present).
+cfr_diff() {
     { awk 'NR==FNR{before[$1 " " $2]=$0;order[++n]=$1 " " $2;next}
         {after[$1 " " $2]=$0; if(!($1 " " $2 in before))order[++n]=$1 " " $2}
         END{for(i=1;i<=n;i++){k=order[i]; if(before[k]!=after[k]){print "DIFF - " (k in before?before[k]:k " missing"); print "DIFF + " (k in after?after[k]:k " missing")}}}' \
@@ -327,6 +331,11 @@ cfr_restore() {
             "$CFR_STAGE/text.after.$cfr_kind" "$CFR_STAGE/text.before.$cfr_kind"
     done; } > "$CFR_STAGE/diff.txt"
     while IFS= read -r cfr_line; do cfr_out "$cfr_line"; done < "$CFR_STAGE/diff.txt"
+}
+cfr_restore() {
+    cfr_snapshot after || { cfr_fail RESTORE snapshot_failed; return 0; }
+    if cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then cfr_ok RESTORE; return 0; fi
+    cfr_diff
     cfr_fail RESTORE snapshot_mismatch
 }
 
@@ -353,6 +362,8 @@ cfr_main() {
     cfr_identity
     cfr_prereq
     cfr_snapshot before || cfr_refuse SNAPSHOT snapshot_failed
+    # The baseline digests belong in local evidence, not only on the router.
+    while IFS= read -r cfr_line; do cfr_out "SNAPSHOT $cfr_line"; done < "$CFR_STAGE/snapshot.before"
     cfr_ok SNAPSHOT
     # The script bounds itself before mutating; afterwards the transaction runs
     # to completion (the outer KILL timeout is a generous last resort).

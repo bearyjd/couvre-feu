@@ -23,6 +23,10 @@ def main():
         with open(os.environ["CF_BACKEND_LOG"], "a", encoding="utf-8") as log:
             log.write(json.dumps({"command": command, "argv": args}) + "\n")
         for failure in state.get("failures", []):
+            # Installer per-file flushes are not core durability barriers;
+            # injected sync failures count only argument-free barriers.
+            if command == "sync" and args and not failure.get("contains"):
+                continue
             if (failure["command"] == command
                     and all(part in args for part in failure.get("contains", []))
                     and failure.get("remaining", 1)):
@@ -56,7 +60,12 @@ def main():
 def dispatch(command, args, state):
     if command == "sync":
         if args:
-            raise ValueError("sync takes no arguments")
+            # Per-file flush (GNU, or BusyBox FEATURE_SYNC_FANCY) before an
+            # installer rename; only existing regular file operands are valid.
+            if any(arg.startswith("-") or not os.path.isfile(arg) for arg in args):
+                raise ValueError("sync accepts only existing regular file operands")
+            state["file_barriers"] = state.get("file_barriers", 0) + len(args)
+            return 0, ""
         state["durability_barriers"] = state.get("durability_barriers", 0) + 1
         return 0, ""
     if command == "ipset":

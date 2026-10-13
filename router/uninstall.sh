@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=1aa722c3311b963674ef2bdec3ce895b22982d8a9aed69e98526620f52157a9c
+CF_BOOTSTRAP_PIN=f79d189bf348097b50666c8f290bb46b00a9c4e5c83ff06c6548c59b7b511394
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -75,6 +75,17 @@ finish_cleanup() {
     platform_valid_done "$DONE" || fail 'unsafe/legacy recovery completion record; preserved'
     if [ -e "$BACKUP" ]; then
         journal_preflight cleanup
+        # A journal hard link may be the only remaining name of an original.
+        # Remove it only while the managed path still holds that inode or an
+        # exact copy (legacy copy journals).
+        for rel in $FILES etc/couvrefeu/rpc-allowed; do
+            k=$(key "$rel")
+            [ -e "$BACKUP/$k.original" ] || continue
+            if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] && { same_file "$ROOT/$rel" "$BACKUP/$k.original" ||
+                { [ "$(signature "$ROOT/$rel")" = "$(signature "$BACKUP/$k.original")" ] && [ "$(mtime "$ROOT/$rel")" = "$(mtime "$BACKUP/$k.original")" ]; }; }; }; then
+                fail "original backup is not restored at /$rel; journal preserved"
+            fi
+        done
         platform_initial_write
         for entry in "$BACKUP"/* "$BACKUP"/.[!.]* "$BACKUP"/..?*; do
             [ -e "$entry" ] || continue
@@ -154,13 +165,14 @@ if [ ! -f "$BACKUP/restored" ]; then
         k=$(key "$rel")
         before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
         original_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")
-        if [ "$(signature "$ROOT/$rel")" != "$before" ] || ! exact_mtime "$ROOT/$rel" "$original_mtime"; then
-            if [ "$before" = absent ]; then platform_initial_write; rm -f "$ROOT/$rel"
-            else
-                atomic_copy "$BACKUP/$k.original" "$ROOT/$rel" "$original_mtime"
-                # Successful atomic_copy always attempted a protected write.
-                CF_PLATFORM_INITIAL_WRITE=1
-            fi
+        if [ "$before" = absent ]; then
+            if [ -e "$ROOT/$rel" ]; then platform_initial_write; rm -f "$ROOT/$rel"; fi
+        elif ! { [ -e "$ROOT/$rel" ] && same_file "$ROOT/$rel" "$BACKUP/$k.original"; }; then
+            # Never copy: put the journal's original inode back by name.
+            restore_original "$BACKUP/$k.original" "$ROOT/$rel"
+            # Successful restoration always attempted a protected write.
+            CF_PLATFORM_INITIAL_WRITE=1
+            if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CRASH_AT:-}" = restored ]; then kill -KILL "$$"; fi
         fi
         # Validated abandoned install rename sources are installation owned.
         if [ -e "$ROOT/$rel.couvrefeu-tmp" ]; then platform_initial_write; rm -f "$ROOT/$rel.couvrefeu-tmp"; fi
@@ -189,6 +201,13 @@ for rel in $FILES; do
     original_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")
     if ! { [ "$(signature "$ROOT/$rel")" = "$before" ] && exact_mtime "$ROOT/$rel" "$original_mtime"; }; then
         fail "exact restoration incomplete: $rel; journal retained"
+    fi
+    # The restored path must be the journal's original inode itself.
+    if [ "$before" != absent ]; then
+        same_file "$ROOT/$rel" "$BACKUP/$k.original" || fail "restored inode differs from original: $rel; journal retained"
+        if [ -e "$BACKUP/$k.inode" ]; then
+            [ "$(stat -c %i "$ROOT/$rel")" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$k.inode")" ] || fail "restored inode differs from record: $rel; journal retained"
+        fi
     fi
 done
 release_retire_check

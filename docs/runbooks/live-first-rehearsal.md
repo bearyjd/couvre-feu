@@ -48,8 +48,8 @@ It then runs one `ssh` with the payload on stdin. From then on, every local fail
 | PAYLOAD | Every file's sha256 matches the embedded manifest; the release closure modes are set |
 | IDENTITY | Each role has one `br-lan` IPv4 neighbor with the configured MAC (management REACHABLE, as the installer requires; the others REACHABLE, STALE or DELAY) and one matching DHCP lease. `SSH_CONNECTION` comes from the management IP. No live MAC equals a protected historical MAC |
 | PREREQ | Normal-PATH `stat` and `od` (coreutils `/bin/stat` and `/usr/bin/od` on the target) are callable; their paths are printed. `stat -c %y` on a probe file the script creates in its own staging directory, and on `/etc/config/firewall`, must show nine fractional digits. `install.sh` validates and stages without `--activate` and leaves no lock or stage residue |
-| SNAPSHOT | Records sha256, mode, uid, gid, size and mtime (seconds plus nanoseconds) for every installer-managed path, their `.couvrefeu-tmp` siblings, the journal, recovery, release and lock paths, and records absent paths explicitly. Records mode, owner and existence for the managed directories (not their mtimes). Hashes `iptables-save`/`ip6tables-save` (comments and counters stripped), sorted `ipset list -n` and `ipset save` (members), `uci export firewall` and the root crontab |
-| INSTALL | `install.sh --activate` with the profile and `--protect` for management, JD and every historical MAC. No people are enrolled |
+| SNAPSHOT | Records sha256, mode, uid, gid, size and mtime (seconds plus nanoseconds) for every installer-managed path, their `.couvrefeu-tmp` siblings, the journal, recovery, release and lock paths, and records absent paths explicitly. Records mode, owner and existence for the managed directories (not their mtimes). Hashes `iptables-save`/`ip6tables-save` (comments and counters stripped), sorted `ipset list -n` and `ipset save` (members), `uci export firewall` and the root crontab. Every snapshot record is also printed as a `SNAPSHOT` line, so local `stdout.log` holds the baseline |
+| INSTALL | `install.sh --activate` with the profile and `--protect` for management, JD and every historical MAC. No people are enrolled. The installer keeps each existing original as a hard link in its journal (never a `cp -p` copy) and refuses, with no change, if the link cannot be made or is not the original inode with identical bytes, mode, owner and nanosecond mtime |
 | VERIFY | `cfctl status --json` is ok, with no drift, no errors, revision 0 and no kids or pauses |
 | UNINSTALL | `/etc/.couvrefeu-release-<id>/uninstall.sh`, run exactly once (also after a VERIFY failure). If a cron `cfctl expire` holds the runtime lock, uninstall waits up to 20 s (OS-trust admission deadlines still refuse first), then refuses fail-safe. When this installation created the recovery release, uninstall removes it as its final command after verifying it against `release.sha256` |
 | RESTORE | A second snapshot must equal the first byte for byte. Each difference prints as `DIFF` lines |
@@ -75,6 +75,7 @@ The remote script refuses to begin INSTALL if more than 300 s have passed since 
 
 - Preserve the evidence directory unchanged. It holds `plan.json`, `stdout.log`, `stderr.log`, `exit-code.txt` and `summary.json`.
 - Do not retry blindly. Do not rerun install or uninstall to "clean up".
+- INSTALL or UNINSTALL failed: before `FAIL_AFTER_MUTATION`, the script takes a read-only snapshot and prints `DIFF` lines against SNAPSHOT (or `INFO post-failure snapshot equals SNAPSHOT`), showing exactly what the failed step left behind.
 - INSTALL failed: the installer kept its journal. Uninstall was deliberately not attempted. Read the recovery runbook and get approval for a specific recovery command.
 - UNINSTALL refused: drift protection kept the journal and the changed files. Resolve the drift explicitly. Never delete the journal.
 - RESTORE failed: the `DIFF -` and `DIFF +` lines show the before and after records. Report them before doing anything else.
@@ -86,7 +87,22 @@ The recovery release `/etc/.couvrefeu-release-<id>` is created by `install.sh --
 
 Directory mtimes (`/etc`, `/usr/sbin`, `/etc/config` and the rest) are a known non-restored attribute. Creating and removing entries changes them, and neither the installer nor the uninstaller restores them. The snapshot records directory mode, owner and existence only.
 
-Known residue cases: if installation stops after creating the release but before writing its journal, a later run sees the release as pre-existing and keeps it. If an interrupted uninstall removed the journal marker before the final step, the release is also kept. Both leave only the verified reviewed release.
+Originals are restored as the same file: install hard-links each existing original into the journal and installs new content by renaming a sibling temporary file over the path; uninstall links the journal copy back beside the path and renames it into place, then proves the path is the journal inode with the recorded bytes, mode, owner and nanosecond mtime. RESTORE compares sha256, mode, owner, size and mtime, not inode numbers: on overlayfs, linking a file that exists only in the read-only lower layer copies it up first, which changes its inode, and the restored original then stays in the upper layer.
+
+Known residue cases: the journal (with its release ownership marker) is written durably before the release is created, so a fresh installation no longer leaves an unmarked release behind; releases left that way by earlier versions are treated as pre-existing and kept. If an interrupted uninstall removed the journal marker before the final step, the release is also kept. Both leave only the verified reviewed release.
+
+### Residual risk: in-place writes while the original is shared
+
+While the managed path and the journal `.original` are the same inode, a writer that edits in place (`>>`, `cat >`, BusyBox `vi`) changes the only exact original. This window runs from the hard link to the install rename in `install.sh`, and from the restore rename to final cleanup in `uninstall.sh`. Do not edit `/etc/config/firewall`, `/etc/sysupgrade.conf` or `/etc/crontabs/root` while either script runs.
+
+- The journal also keeps `backup/<key>.copy`, a plain byte copy taken at link time and checked against the recorded sha256. It is for manual recovery only. It does not restore mode, owner or mtime, and restore never uses it. The same guarded cleanup removes it with the journal.
+- Immediately before each install rename, `install.sh` re-checks the original's sha256 (which fixes its size), mode, owner and nanosecond mtime against the journal record. On a mismatch it refuses with `original changed in place before install rename`, and the journal is retained. A write that lands between this check and the rename is not detected; the rename is the next operation.
+- The uninstall side only detects. A changed restored path is drift, and drift refuses with the journal (and `.copy`) retained. Once the exact-restoration check passes, later edits count as the user's own changes: final cleanup only checks that each path is still the journal inode, so it removes `.copy` with the journal even if an in-place write lands between that check and cleanup.
+- To recover by hand after such a refusal, compare the live file and `.original` with `.copy` and the `.before` and `.mtime` records. Then restore the bytes from `.copy`, and the mode, owner and mtime from the records, as a separately reviewed step. Never retry blindly.
+
+### Residue from the 2026-10-13 refusal
+
+The first live `install.sh --activate` (main `f5dba46`, release id `bbbf1568debe492f4785043d7c69e77b6778f880acc18449bead63176418f572`; confirm against the `BEGIN ... release=` line of that run's evidence) refused with `cannot preserve exact original metadata/mtime: etc/config/firewall; no installation made`. That version created `/etc/.couvrefeu-release-<id>` before the refusal and wrote no journal or release ownership marker, so the router still holds that directory. Installers keep it unchanged: a release with a different id is never inspected, adopted or removed. Expect it in any read-only listing of `/etc`. It may be removed only by a separately reviewed and approved step that first verifies it against its own `release.sha256`; neither this rehearsal nor `uninstall.sh` removes it.
 
 ## Evidence limits
 
