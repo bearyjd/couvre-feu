@@ -45,11 +45,11 @@ It then runs one `ssh` with the payload on stdin. On the router, the script writ
 |---|---|
 | PAYLOAD | Every file's sha256 matches the embedded manifest; the release closure modes are set |
 | IDENTITY | Each role has one `br-lan` IPv4 neighbor with the configured MAC (management REACHABLE, as the installer requires; the others REACHABLE, STALE or DELAY) and one matching DHCP lease. `SSH_CONNECTION` comes from the management IP. No live MAC equals a protected historical MAC |
-| PREREQ | `od` and the installer's `stat` work, with nanosecond mtimes. `install.sh` validates and stages without `--activate` and leaves no lock or stage residue |
+| PREREQ | Normal-PATH `stat` and `od` (coreutils `/bin/stat` and `/usr/bin/od` on the target) are callable; their paths are printed. `stat -c %y` on a probe file the script creates in its own staging directory, and on `/etc/config/firewall`, must show nine fractional digits. `install.sh` validates and stages without `--activate` and leaves no lock or stage residue |
 | SNAPSHOT | Records sha256, mode, uid, gid, size and mtime (seconds plus nanoseconds) for every installer-managed path, their `.couvrefeu-tmp` siblings, the journal, recovery, release and lock paths, and records absent paths explicitly. Records mode, owner and existence for the managed directories (not their mtimes). Hashes `iptables-save`/`ip6tables-save` (comments and counters stripped), sorted `ipset list -n`, `uci export firewall` and the root crontab |
 | INSTALL | `install.sh --activate` with the profile and `--protect` for management, JD and every historical MAC. No people are enrolled |
 | VERIFY | `cfctl status --json` is ok, with no drift, no errors, revision 0 and no kids or pauses |
-| UNINSTALL | `/etc/.couvrefeu-release-<id>/uninstall.sh`, run exactly once (also after a VERIFY failure) |
+| UNINSTALL | `/etc/.couvrefeu-release-<id>/uninstall.sh`, run exactly once (also after a VERIFY failure). If a cron `cfctl expire` holds the runtime lock, uninstall waits up to 20 s (OS-trust admission deadlines still refuse first), then refuses fail-safe. When this installation created the recovery release, uninstall removes it as its final command after verifying it against `release.sha256` |
 | RESTORE | A second snapshot must equal the first byte for byte. Each difference prints as `DIFF` lines |
 | CONNECTIVITY | The management and JD neighbors are still present with the same MACs |
 
@@ -72,10 +72,14 @@ The script never touches dnsmasq, the WAN zone, offload or firmware. It removes 
 - RESTORE failed: the `DIFF -` and `DIFF +` lines show the before and after records. Report them before doing anything else.
 - UNKNOWN (for example ssh exit 255): treat the router as possibly mid-transaction. Use a separately approved read-only inspection to find the journal state before deciding on recovery.
 
-## Expected first-run result
+## Restored and non-restored attributes
 
-`install.sh --activate` creates the external recovery release `/etc/.couvrefeu-release-<id>`, and `uninstall.sh` runs from that directory and leaves it in place. The snapshot records that path as absent before install, so RESTORE on a router that never had that release reports it as a difference. The fixture tests cannot show this, because test mode skips the release copy. Decide before the run whether that retained directory is acceptable. The tool does not exempt it.
+The recovery release `/etc/.couvrefeu-release-<id>` is created by `install.sh --activate`, and the journal records whether it was absent beforehand. After an exact uninstall, `uninstall.sh` removes it as its last command, but only if the journal recorded it as absent and its contents still match `release.sha256` with no extra entries. Drift refuses with the journal kept, like any other drift. A release that existed before installation is kept unchanged. RESTORE therefore expects exact equality for it, with no allowlist.
+
+Directory mtimes (`/etc`, `/usr/sbin`, `/etc/config` and the rest) are a known non-restored attribute. Creating and removing entries changes them, and neither the installer nor the uninstaller restores them. The snapshot records directory mode, owner and existence only.
+
+Known residue cases: if installation stops after creating the release but before writing its journal, a later run sees the release as pre-existing and keeps it. If an interrupted uninstall removed the journal marker before the final step, the release is also kept. Both leave only the verified reviewed release.
 
 ## Evidence limits
 
-The fixture tests (`tests/test-live-rehearsal.py`) run the generated payload through a fake `ssh` against a private fixture root with simulated router tools. They do not prove real BusyBox/ash behavior on the target, `stat-coreutils` output, Dropbear's handling of `SSH_CONNECTION`, real fw3/iptables restoration, or the release-directory behavior.
+The fixture tests (`tests/test-live-rehearsal.py`) run the generated payload through a fake `ssh` against a private fixture root with simulated router tools. Fixtures opt into the recovery-release path (`CF_TEST_RELEASE_DIR=1`) and run uninstall from that directory. They do not prove real BusyBox/ash behavior on the target, coreutils `stat` output on the target filesystems, Dropbear's handling of `SSH_CONNECTION`, real fw3/iptables restoration, or real crond timing.

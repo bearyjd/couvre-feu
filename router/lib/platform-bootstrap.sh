@@ -9,11 +9,11 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=a9b76a1b311236f09b17b9ee7c9e19d05f9dfbb98b2c3a51e5460174b3c7ec66
+CF_RELEASE_ID=bbbf1568debe492f4785043d7c69e77b6778f880acc18449bead63176418f572
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-CF_RELEASE_MODULES='core.sh:2b0c75bc7a13c657c9e140aeafdef9a53d845e9b884d557aadcd387e1809d051 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:c4c8e5d50ce56fd791cb0bc6176a29d172b09e7d93bf0b1d9042584a39b2819d install-common.sh:dbd944810dbbee4e231af28ea5e435e954021c712f3f1167cd90705459019ce8 state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b'
+CF_RELEASE_MODULES='core.sh:2b0c75bc7a13c657c9e140aeafdef9a53d845e9b884d557aadcd387e1809d051 rpc.sh:98730940343bfd835475ed5bf16b4bf67ee9fac1731a7f67443bdbde705dcd78 firewall.sh:c4c8e5d50ce56fd791cb0bc6176a29d172b09e7d93bf0b1d9042584a39b2819d install-common.sh:8f2715a69fb36c4a20824681a83e312ed7e9d0763e009b945cd853b9ce38a421 state.awk:94ba25a7e0b07975347b5b340b93f73ae104d113883c31816c86028105f20993 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:81e4809f23822395038a6d72141f6f6e2f696fa235a5dfb8252c81726a4fb35d vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -311,7 +311,8 @@ platform_admit() {
 
 platform_recovery_prepare() {
     platform_source_release=$1
-    platform_target_release=/etc/.couvrefeu-release-$CF_RELEASE_ID
+    # Optional isolated fixture root; production always uses /etc.
+    platform_target_release=${2:-}/etc/.couvrefeu-release-$CF_RELEASE_ID
     if [ -e "$platform_target_release" ] || [ -L "$platform_target_release" ]; then
         platform_external_closure "$platform_target_release"
         cmp -s "$platform_source_release/release.sha256" "$platform_target_release/release.sha256" || platform_fail release_id_collision

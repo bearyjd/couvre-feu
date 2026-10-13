@@ -1038,5 +1038,135 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         self.assertEqual(self.snapshot(), before)
 
 
+class ReleaseRetirementTests(unittest.TestCase):
+    """The external recovery release is retired only when this installation created it."""
+    setUp = InstallerTests.setUp
+    tearDown = InstallerTests.tearDown
+    run_script = InstallerTests.run_script
+    snapshot = InstallerTests.snapshot
+    install = InstallerTests.install
+
+    def release(self):
+        self.env['CF_TEST_RELEASE_DIR'] = '1'
+        # Production /etc always exists before the release is created.
+        (self.root / 'etc').mkdir(mode=0o755, exist_ok=True)
+        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        release_id = next(line.split('=', 1)[1] for line in bootstrap.splitlines() if line.startswith('CF_RELEASE_ID='))
+        return self.root / ('etc/.couvrefeu-release-' + release_id)
+
+    def run_release_uninstall(self, release):
+        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(release / 'uninstall.sh')],
+                              env=self.env, capture_output=True, text=True)
+
+    def test_created_release_removed_after_exact_uninstall(self):
+        release = self.release()
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((release / 'uninstall.sh').is_file())
+        self.assertTrue((self.root / 'etc/couvrefeu/backup/release-absent').is_file())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Recovery release removed', result.stdout)
+        self.assertFalse(release.exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_uninstall_running_from_release_removes_itself_last(self):
+        release = self.release()
+        before = self.snapshot()
+        self.assertEqual(self.install('--activate').returncode, 0)
+        result = self.run_release_uninstall(release)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.rstrip().endswith('Recovery release removed: ' + str(release)), result.stdout)
+        self.assertFalse(release.exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_preexisting_release_is_kept(self):
+        release = self.release()
+        (release / 'lib').mkdir(parents=True, mode=0o700)
+        release.chmod(0o700)
+        for line in (REPO / 'router/release.sha256').read_text().splitlines():
+            name = line.split()[1]
+            shutil.copyfile(REPO / 'router' / name, release / name)
+            (release / name).chmod(0o644 if name.startswith('lib/') else 0o755)
+        shutil.copyfile(REPO / 'router/release.sha256', release / 'release.sha256')
+        (release / 'release.sha256').chmod(0o600)
+        before = self.snapshot()
+        self.assertEqual(self.install('--activate').returncode, 0)
+        self.assertFalse((self.root / 'etc/couvrefeu/backup/release-absent').exists())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('Recovery release removed', result.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_tampered_or_foreign_release_refused_and_kept(self):
+        for label in ('tampered', 'foreign'):
+            with self.subTest(label):
+                release = self.release()
+                before = self.snapshot()
+                self.assertEqual(self.install('--activate').returncode, 0)
+                target = release / ('cfctl-ssh' if label == 'tampered' else 'lib/extra')
+                original = target.read_bytes() if target.exists() else None
+                with open(target, 'ab') as handle:
+                    handle.write(b'#')
+                if label == 'foreign':
+                    target.chmod(0o644)
+                result = self.run_script('uninstall.sh')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('recovery release', result.stderr)
+                self.assertTrue(target.exists())
+                self.assertTrue((self.root / '.couvrefeu-recovery/release-absent').is_file())
+                # Explicit resolution of the drift lets the retained journal finish.
+                if original is None:
+                    target.unlink()
+                else:
+                    target.write_bytes(original)
+                result = self.run_script('uninstall.sh')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(release.exists())
+                self.assertEqual(self.snapshot(), before)
+
+    def hold_runtime_lock(self):
+        lock = self.root / 'etc/couvrefeu/runtime/lock'
+        lock.mkdir(parents=True, mode=0o700)
+        lock.parent.chmod(0o700)
+        (lock / 'pid').write_text(f'{os.getpid()}\n')
+        (lock / 'pid').chmod(0o600)
+        return lock
+
+    def test_uninstall_waits_for_concurrent_core_lock(self):
+        before = self.snapshot()
+        self.assertEqual(self.install('--activate').returncode, 0)
+        lock = self.hold_runtime_lock()
+        command = [*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(REPO / 'router/uninstall.sh')]
+        started = time.monotonic()
+        process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(2)
+            self.assertIsNone(process.poll(), 'uninstall did not wait for the runtime lock')
+            (lock / 'pid').unlink()
+            lock.rmdir()
+            _, stderr = process.communicate(timeout=30)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 2)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_uninstall_lock_wait_is_bounded(self):
+        self.assertEqual(self.install('--activate').returncode, 0)
+        self.hold_runtime_lock()
+        expected = self.snapshot()
+        started = time.monotonic()
+        result = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(REPO / 'router/uninstall.sh')],
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('core operation is running', result.stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 19)
+        self.assertEqual(self.snapshot(), expected)
+
+
 if __name__ == '__main__':
     unittest.main()

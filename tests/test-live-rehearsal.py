@@ -151,7 +151,7 @@ class LiveRehearsalTests(unittest.TestCase):
         self.ssh_log = self.work / 'ssh-argv.jsonl'
         self.spec_path = self.work / 'fake-ssh.json'
         self.spec = {'log': str(self.ssh_log),
-                     'env': dict(self.fixture.env, CF_TEST_INSTALL_KERNEL='1'),
+                     'env': dict(self.fixture.env, CF_TEST_INSTALL_KERNEL='1', CF_TEST_RELEASE_DIR='1'),
                      'ssh_connection': f'{MGMT["ip"]} 50000 {HOST} 22',
                      'shell': os.environ.get('CF_TEST_SHELL', 'sh')}
 
@@ -235,6 +235,10 @@ class LiveRehearsalTests(unittest.TestCase):
         for phase in self.tool.PHASES:
             self.assertIn(f'PHASE {phase} OK', stdout)
         self.assertIn('INFO mtime_precision nanoseconds', stdout)
+        release = next(line.split(': ', 1)[1] for line in stdout if line.startswith('INFO run uninstall.sh once: '))
+        self.assertRegex(release, r'/etc/\.couvrefeu-release-[0-9a-f]{64}/uninstall\.sh$')
+        self.assertFalse(Path(release).parent.exists())
+        self.assertTrue(any(line.startswith('INFO tools stat=') for line in stdout))
         summary = json.loads((run / 'summary.json').read_text())
         self.assertEqual((summary['outcome'], summary['exitCode'], summary['remoteExit']), ('PASS', 0, 0))
         staging = next(line.split(' ', 2)[2] for line in stdout if line.startswith('INFO staging '))

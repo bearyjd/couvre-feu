@@ -57,7 +57,7 @@ cfr_cleanup() {
             case "$cfr_path" in router/*) rm -f "$CFR_STAGE/$cfr_path";; esac
         done < "$CFR_STAGE/manifest"
     fi
-    for cfr_name in manifest identity.neigh connectivity.neigh status.json snapshot.before snapshot.after \
+    for cfr_name in manifest mtime-probe identity.neigh connectivity.neigh status.json snapshot.before snapshot.after \
         text.before.iptables text.before.ip6tables text.before.ipset text.before.uci text.before.cron \
         text.after.iptables text.after.ip6tables text.after.ipset text.after.uci text.after.cron; do
         rm -f "$CFR_STAGE/$cfr_name"
@@ -97,14 +97,8 @@ cfr_setup_paths() {
     CFR_CFCTL=$CFR_ROOT/usr/sbin/cfctl
 }
 
-# The installer's own numeric metadata reader for vendor profiles.
-cfr_stat() {
-    if [ "$CFR_FIXTURE" = 0 ] && { [ "$CFR_PROFILE" = gl-xe3000-4.8.3-os-trust-v1 ] || [ "$CFR_PROFILE" = gl-xe3000-4.8.3-logd-011-v1 ]; }; then
-        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib /usr/libexec/stat-coreutils "$@"
-    else
-        stat "$@"
-    fi
-}
+# Normal-PATH stat (coreutils-stat on the target); PREREQ proves its format.
+cfr_stat() { stat "$@"; }
 cfr_run_sh() {
     # Deliberate split of the fixed shell selection ("busybox ash").
     # shellcheck disable=SC2086
@@ -207,9 +201,16 @@ cfr_prereq() {
     for cfr_tool in sha256sum awk sed sort cmp mktemp iptables-save ip6tables-save ipset uci ip; do
         command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
     done
-    command -v od >/dev/null 2>&1 || cfr_refuse PREREQ od_missing
+    cfr_od=$(command -v od) || cfr_refuse PREREQ od_missing
+    cfr_stat_path=$(command -v stat) || cfr_refuse PREREQ stat_missing
+    cfr_info "tools stat=$cfr_stat_path od=$cfr_od"
     [ "$(printf A | od -An -tx1 2>/dev/null | tr -d ' \n')" = 41 ] || cfr_refuse PREREQ od_not_callable
     cfr_stat -c %a / >/dev/null 2>&1 </dev/null || cfr_refuse PREREQ stat_not_callable
+    # A probe this script creates proves stat reports nine fractional digits.
+    : > "$CFR_STAGE/mtime-probe" || cfr_refuse PREREQ probe_create
+    cfr_probe_y=$(cfr_stat -c %y "$CFR_STAGE/mtime-probe" </dev/null) || cfr_refuse PREREQ stat_format
+    rm -f "$CFR_STAGE/mtime-probe"
+    case "$cfr_probe_y" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\ *) ;; *) cfr_refuse PREREQ stat_mtime_not_nanosecond;; esac
     # The installer refuses originals without nanosecond mtimes; so do we.
     [ -f "$CFR_ROOT/etc/config/firewall" ] || cfr_refuse PREREQ firewall_config_missing
     cfr_precision=$(cfr_file_record "$CFR_ROOT/etc/config/firewall") || cfr_refuse PREREQ stat_format
@@ -334,8 +335,9 @@ cfr_main() {
     cfr_install --activate || cfr_stop INSTALL "installer_exit_nonzero; journal retained; uninstall not attempted"
     cfr_ok INSTALL
     cfr_verify
-    if [ "$CFR_FIXTURE" = 1 ]; then cfr_uninstall=$CFR_STAGE/router/uninstall.sh
-    else cfr_uninstall=$CFR_RELEASE_DIR/uninstall.sh; fi
+    # Production uninstall must run from the external recovery release;
+    # fixtures opt into the same path with CF_TEST_RELEASE_DIR=1.
+    cfr_uninstall=$CFR_RELEASE_DIR/uninstall.sh
     cfr_info "run uninstall.sh once: $cfr_uninstall"
     cfr_run_sh "$cfr_uninstall" >&2 || cfr_stop UNINSTALL "uninstall_refused_or_failed; journal preserved; resolve explicitly"
     cfr_ok UNINSTALL

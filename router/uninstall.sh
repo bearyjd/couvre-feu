@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=c1004ca9e9d211aa5e81886a925204d012a0b3ed36630b6e1956a8b84b50f206
+CF_BOOTSTRAP_PIN=1aa722c3311b963674ef2bdec3ce895b22982d8a9aed69e98526620f52157a9c
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -42,6 +42,32 @@ platform_admit runtime "${CF_ROOT:-}" "$HERE/lib"
 platform_deadline_check
 [ "$#" = 0 ] || fail 'usage: uninstall.sh'
 safe_paths
+RELEASE_DIR=$ROOT/etc/.couvrefeu-release-$CF_RELEASE_ID
+RELEASE_RETIRE=0
+# A recovery release this installation created is retired only with exact
+# reviewed contents and no foreign entries; drift refuses and keeps it.
+release_retire_check() {
+    [ -e "$BACKUP/release-absent" ] || return 0
+    valid_marker "$BACKUP/release-absent" || fail 'invalid release marker; journal retained'
+    if [ ! -e "$RELEASE_DIR" ] && [ ! -L "$RELEASE_DIR" ]; then return 0; fi
+    ( platform_external_closure "$RELEASE_DIR" ) || fail "recovery release drift at $RELEASE_DIR; retained with journal"
+    release_names=$(awk '{print $2}' "$RELEASE_DIR/release.sha256")
+    for entry in "$RELEASE_DIR"/* "$RELEASE_DIR"/.[!.]* "$RELEASE_DIR"/..?* "$RELEASE_DIR"/lib/* "$RELEASE_DIR"/lib/.[!.]* "$RELEASE_DIR"/lib/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name=${entry#"$RELEASE_DIR"/}
+        case "$name" in release.sha256|lib) continue;; esac
+        printf '%s\n' "$release_names" | awk -v n="$name" '$0==n{found=1}END{exit !found}' || fail "unexpected recovery release entry: $name; retained with journal"
+    done
+    RELEASE_RETIRE=1
+}
+# Final command only: exec leaves no shell reading this (possibly removed) script.
+release_retire() {
+    [ "$RELEASE_RETIRE" = 1 ] || exit 0
+    # Names are validated release manifest entries without whitespace.
+    # shellcheck disable=SC2086
+    exec sh -c 'd=$1; shift; for f do rm -f "$d/$f" || exit 1; done; rmdir "$d/lib" "$d" || { printf "couvre-feu: recovery release removal incomplete: %s\n" "$d" >&2; exit 1; }; printf "%s\n" "Recovery release removed: $d"' \
+        release-retire "$RELEASE_DIR" $release_names release.sha256
+}
 # Final cleanup has its own private completion record: removing the journal
 # can be interrupted without losing the fact that every restoration succeeded.
 finish_cleanup() {
@@ -68,9 +94,10 @@ finish_cleanup() {
     rm -f "$DONE"
 }
 if [ -e "$DONE" ]; then
+    if [ -e "$BACKUP" ]; then release_retire_check; fi
     finish_cleanup
     printf '%s\n' 'Original files restored; Couvre-feu installation removed.'
-    exit 0
+    release_retire
 fi
 if [ ! -e "$BACKUP" ]; then
     printf '%s\n' 'No recorded installation; no changes made.'
@@ -164,6 +191,7 @@ for rel in $FILES; do
         fail "exact restoration incomplete: $rel; journal retained"
     fi
 done
+release_retire_check
 [ -f "$BACKUP/restored" ] || phase restored 2
 if [ -f "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then
     platform_publish_done
@@ -173,3 +201,4 @@ else
 fi
 finish_cleanup
 printf '%s\n' 'Original files restored; Couvre-feu installation removed.'
+release_retire

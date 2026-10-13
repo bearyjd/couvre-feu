@@ -103,6 +103,17 @@ trap 'exit 1' 1 2 15
 # own runtime lock. Once this lock is held, an existing runtime lock means
 # an operation predates us and we must stop. Journal calls come directly
 # from that lock-owning core process and are the sole exception here.
+# Uninstall already holds the install lock, so no new core mutation can
+# start. A cron `cfctl expire` that took the runtime lock first gets a bounded
+# wait to finish; OS-trust admission deadlines still refuse first.
+case "$0" in */uninstall.sh)
+    lock_wait=0
+    while { [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; } && [ "$lock_wait" -lt 20 ]; do
+        sleep 1
+        lock_wait=$((lock_wait + 1))
+        platform_deadline_check
+    done;;
+esac
 if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then
     case "${1:-}" in
         firewall-prepare|firewall-commit)
@@ -215,8 +226,8 @@ journal_preflight() {
             [ "$(awk 'NR==1 {print; exit}' "$BACKUP/dir_etc_couvrefeu")" = absent ] || fail 'original installation directory missing'
         fi
     fi
-    allowed_entries='ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next firewall.pending etc_config_firewall.staged.couvrefeu-tmp'
-    record_entries='ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next'
+    allowed_entries='release-absent ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next firewall.pending etc_config_firewall.staged.couvrefeu-tmp'
+    record_entries='release-absent ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next'
     # DONE proves full exact restoration has already succeeded. Its authenticated
     # cleanup-only whitelist survives deletion of the optional scope .after;
     # restoration inventory and its full preflight remain journal-derived.
@@ -248,7 +259,7 @@ journal_preflight() {
             [ "$(stat -c %s "$entry")" -le 512 ] || fail "oversized journal record: $name"
         ;; esac
     done
-    for marker in ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next; do
+    for marker in release-absent ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next; do
         if [ -e "$BACKUP/$marker" ]; then
             marker_version=1
             case "$marker" in restored|restored.next) marker_version=2;; esac
