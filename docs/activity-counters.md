@@ -31,7 +31,7 @@ With `on`, the counters undercount. Vendor acceleration that is not configured t
 
 ## Lifecycle
 
-The chain is created and updated from the confirmed-apply hook, so it follows every successful `sync`, `pause`, `resume`, `expire`, `apply-fw`, `rpc-sync` and firewall-include reconstruction. Unchanged rules are left alone, so the minute cron keeps counter values. The hook runs in a subshell. If it fails, enforcement results stay as they are, and the next `activity` read reports the problem. `remove-fw`, used during uninstall, deletes the owned hooks and chain in both families and proves they are gone. Zero-owned-kernel proofs treat `cf_acct` as an owned object.
+The chain is created and updated from the confirmed-apply hook, so it follows every successful `sync`, `pause`, `resume`, `expire`, `apply-fw`, `rpc-sync` and firewall-include reconstruction. Unchanged rules are left alone, so the minute cron keeps counter values. The hook runs in a subshell. If it fails, enforcement results stay as they are, and the next `activity` read reports the problem. `remove-fw`, used during uninstall, removes the owned hooks and chain in both families only after its drift-refusal checks and, on the zero-owned path, after both the runtime and kernel zero proofs pass. A refused uninstall therefore leaves `cf_acct` and `activity.epoch` intact as evidence. The proofs treat `cf_acct` in mangle and the epoch file as owned; `cf_acct` anywhere else refuses. A failed mangle inspection is never read as absence; only a genuinely missing mangle table is.
 
 ## Counter epoch
 
@@ -49,6 +49,19 @@ The epoch therefore never repeats while the installation exists, even across cha
 The installer and uninstaller runtime allowlists recognize the file. `remove-fw` deletes it after removing the chain, and uninstall removes the runtime directory. After a reinstall, the clock term keeps new values above earlier ones unless the clock has moved backwards.
 
 Consumers treat any epoch change as a reset. They compute deltas only between samples that have the same `counter_epoch` and no `errors`. `router_epoch` is the router clock (Unix seconds) at read time. An external `iptables -Z` that leaves the rules in place cannot be detected.
+
+## Failure behavior
+
+- A corrupt `activity.epoch` (not one positive integer) makes the apply hook refuse whenever a new epoch is needed, such as a rebuild, a missing chain or a slot swap. Existing unchanged accounting keeps counting. A missing or stale chain stays unavailable (`accounting_unavailable` or `counter_epoch_stale`) until an operator repairs or removes the file. Enforcement is unaffected.
+- An epoch file with the wrong owner, mode or type (not a root-owned `0600` regular file) is refused as `unsafe_activity_epoch`. It also blocks uninstall's runtime proofs (`unsafe_zero_owned_runtime`, and the installer's runtime allowlist), so that state is preserved for inspection rather than deleted.
+
+## Live verification (pending)
+
+On the real GL-XE3000, check that the mangle FORWARD hook survives `fw3 reload` (`/etc/init.d/firewall reload`), or see how it is lost. This is unverified. fw3 is expected to flush built-in chains, which drops the hook and leaves the `cf_acct` chain.
+
+Self-healing relies on the firewall include (`apply-fw`) and the minute cron reaching `cf_confirm_apply`, so restoration should happen within about one minute. Until then, `cfctl activity --json` reports `accounting_hook_missing`, and counters miss traffic but do not reset.
+
+Also confirm the exact `iptables -nvxL` and `ip6tables -nvxL` column layout and `-m mac` behavior on that firmware before relying on these numbers.
 
 ## Output
 

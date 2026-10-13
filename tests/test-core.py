@@ -1685,6 +1685,55 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(rebuilt["errors"], [])
 
 
+    def remove_fw(self):
+        result = self.fixture.run("remove-fw", timeout=180)
+        return result, json.loads(result.stdout)
+
+    def accounting(self):
+        tables = self.fixture.backend()["tables"]
+        return {command: tables[command]["mangle"] for command in ("iptables", "ip6tables")}
+
+    def test_zero_owned_refusal_preserves_accounting_until_both_proofs_pass(self):
+        initial = self.fixture.backend()
+        self.sync(policy())
+        runtime = self.fixture.root / "etc/couvrefeu/runtime"
+        epoch = runtime / "activity.epoch"
+        recorded = epoch.read_bytes()
+        accounting = self.accounting()
+        for name in ("firewall.owned", "confirmed", "firewall.snapshot"):
+            (runtime / name).unlink()
+        # The runtime proof passes but owned filter/NAT generations remain: the kernel proof refuses.
+        result, document = self.remove_fw()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("zero_owned_kernel_unproven", document["errors"])
+        self.assertEqual(self.accounting(), accounting)
+        self.assertEqual(epoch.read_bytes(), recorded)
+        # With only accounting left, both proofs pass and accounting is removed last.
+        state = self.fixture.backend()
+        for command in ("iptables", "ip6tables"):
+            for table in ("filter", "nat"):
+                state["tables"][command][table] = initial["tables"][command][table]
+        state["sets"] = {}
+        self.fixture.state.write_text(json.dumps(state))
+        result, document = self.remove_fw()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIs(document["zeroOwnedMutations"], True)
+        for mangle in self.accounting().values():
+            self.assertNotIn("cf_acct", json.dumps(mangle))
+        self.assertFalse(epoch.exists())
+
+    def test_failed_accounting_inspection_is_not_absence(self):
+        for message, expected in (("iptables: Resource temporarily unavailable.", "rc=1 activity_cleanup_failed"),
+                                  ("iptables v1.8.7 (legacy): can't initialize iptables table `mangle': Table does not exist", "rc=0 ")):
+            script = (f'CF_BASE=/nonexistent;CF_LOCAL_TEST=1;. "{REPO}/router/lib/core.sh";. "{REPO}/router/lib/firewall.sh";'
+                      f'. "{REPO}/router/lib/activity.sh";cf_table() {{ printf "%s\\n" "$MESSAGE" >&2;return 4; }};'
+                      'cf_activity_remove_kernel;printf "rc=%s %s" "$?" "$CF_ERROR"')
+            result = subprocess.run(self.fixture.shell + ["-c", script], env=dict(self.fixture.env, MESSAGE=message),
+                                    capture_output=True, text=True, timeout=30)
+            with self.subTest(message=message):
+                self.assertEqual(result.stdout, expected, result.stderr)
+
+
 class InstalledPackageTests(unittest.TestCase):
     def fresh_fixture(self):
         fixture = RouterFixture()

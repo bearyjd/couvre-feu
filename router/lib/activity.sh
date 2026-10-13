@@ -112,19 +112,15 @@ EOA
         cf_acct_unhook "$cf_aa_f" && cf_table "$cf_aa_f" -t mangle -I FORWARD 1 $CF_ACCT_HOOK -j "$CF_ACCT_CHAIN" || return 1
     done
 }
-# Uninstall: remove owned hooks and chain in both families, prove absence, then
-# drop the persisted generation (uninstall also removes the runtime directory).
-cf_activity_remove() {
-    cf_activity_remove_kernel || return 1
-    if [ -e "$CF_RUNTIME/$CF_ACCT_EPOCH_FILE" ] || [ -L "$CF_RUNTIME/$CF_ACCT_EPOCH_FILE" ];then
-        cf_safe_file "$CF_RUNTIME/$CF_ACCT_EPOCH_FILE" || { cf_fail unsafe_activity_epoch;return 1; }
-        platform_initial_write
-        rm -f "$CF_RUNTIME/$CF_ACCT_EPOCH_FILE" && cf_backend sync || { cf_fail activity_cleanup_failed;return 1; }
-    fi
-}
+# Uninstall (remove-fw) calls this only after its refusal checks and proofs pass;
+# the persisted epoch file is removed with the other runtime records.
 cf_activity_remove_kernel() {
     for cf_ar_f in 4 6;do
-        cf_ar_all=$(cf_table "$cf_ar_f" -t mangle -S 2>/dev/null) || continue
+        # A failed inspection is never absence; only a genuinely missing table is.
+        if ! cf_ar_all=$(cf_table "$cf_ar_f" -t mangle -S 2>&1);then
+            case $cf_ar_all in *"Table does not exist"*|*"can't initialize ip"*"table \`mangle'"*) continue;; esac
+            cf_fail activity_cleanup_failed;return 1
+        fi
         printf '%s\n' "$cf_ar_all" | awk -v c="$CF_ACCT_CHAIN" '$1=="-N"&&$2==c{yes=1}{for(i=1;i<NF;i++)if(($i=="-j"||$i=="-g")&&$(i+1)==c)yes=1}END{exit !yes}' || continue
         cf_acct_unhook "$cf_ar_f" || { cf_fail activity_cleanup_failed;return 1; }
         if printf '%s\n' "$cf_ar_all" | awk -v c="$CF_ACCT_CHAIN" '$1=="-N"&&$2==c{yes=1}END{exit !yes}';then
