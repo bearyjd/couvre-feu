@@ -90,6 +90,45 @@ cf_enforced_policy() {
     cf_ep_allowed=$(cf_active_allowances | awk -F '\t' '{print $1}')
     printf '%s\n' "$CF_POLICY" | awk -F '\t' -v allowed="$cf_ep_allowed" 'BEGIN{n=split(allowed,a,"\n");for(i=1;i<=n;i++)if(a[i]!="")skip[a[i]]=1}($1=="A"||$1=="S")&&skip[$2]{next}{print}'
 }
+# Kernel-side expiry: while an allowance is active, the person's pause and
+# schedule blocks stay installed, gated by xt_time --datestart (UTC) at
+# `until`, so they re-apply at the deadline even if cron or the shell clock
+# fails afterwards. `cfctl expire` later rebuilds the ungated form.
+cf_allowance_gates() {
+    cf_active_allowances | while IFS="$(printf '\t')" read -r cf_ag_person cf_ag_until cf_ag_rest; do
+        [ -n "$cf_ag_person" ] || continue
+        cf_ag_date=$(date -u -d "@$cf_ag_until" +%Y-%m-%dT%H:%M:%S) || return 1
+        case $cf_ag_date in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;; *) return 1;; esac
+        printf '%s\t%s\t%s\n' "$cf_ag_person" "$cf_ag_until" "$cf_ag_date"
+    done
+}
+cf_gated_ips() {
+    printf '%s\n' "$CF_ADDRESS_DATA" | awk -F '\t' -v m="$1" -v f="$2" 'NF==2&&$2==m&&((index($1,":")>0)==(f==6)){print $1}'
+}
+cf_gated_plan() {
+    cf_gp_family=$1
+    cf_gp_gates=$(cf_allowance_gates) || { cf_fail allowance_gate_failed;return 1; }
+    printf '%s\n' "$cf_gp_gates" | while IFS="$(printf '\t')" read -r cf_gp_person cf_gp_until cf_gp_date; do
+        [ -n "$cf_gp_person" ] || continue
+        # Pauses still in force at the gate, plus every schedule, for this person only.
+        cf_gp_policy=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_gp_person" -v g="$cf_gp_until" '$2!=p{next}$1=="P"||$1=="S"||($1=="A"&&($3==0||$3>g)){print}')
+        cf_gp_paused=$(printf '%s\n' "$cf_gp_policy" | awk -F '\t' '$1=="P"&&$3!="-"{m[++n]=$3}$1=="A"{a=1}END{if(a)for(i=1;i<=n;i++)print m[i]}')
+        for cf_gp_mac in $cf_gp_paused;do
+            printf '%s\tfilter\tcf_fwd\t-i br-lan -m mac --mac-source %s -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_mac" "$cf_gp_date"
+            for cf_gp_ip in $(cf_gated_ips "$cf_gp_mac" "$cf_gp_family");do
+                printf '%s\tfilter\tcf_fwd\t-o br-lan -d %s -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_ip" "$cf_gp_date"
+            done
+        done
+        printf '%s\n' "$cf_gp_policy" | cf_schedule_rows | while IFS="$(printf '\t')" read -r cf_gp_name cf_gp_p cf_gp_mac cf_gp_days cf_gp_start cf_gp_stop;do
+            [ -n "$cf_gp_name" ] || continue
+            # Schedule windows keep --kerneltz like the ungated mirrors; the gate is a separate UTC time match.
+            printf '%s\tfilter\tcf_fwd\t-i br-lan -m mac --mac-source %s -m time --weekdays %s --timestart %s --timestop %s --kerneltz -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_mac" "$cf_gp_days" "$cf_gp_start" "$cf_gp_stop" "$cf_gp_date"
+            for cf_gp_ip in $(cf_gated_ips "$cf_gp_mac" "$cf_gp_family");do
+                printf '%s\tfilter\tcf_fwd\t-o br-lan -d %s -m time --weekdays %s --timestart %s --timestop %s --kerneltz -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_ip" "$cf_gp_days" "$cf_gp_start" "$cf_gp_stop" "$cf_gp_date"
+            done
+        done
+    done
+}
 cf_allowance_admissible() {
     # Newly staged policy only; retained expired allowances stay inert for replay equality.
     printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" -v horizon="$CF_ALLOWANCE_HORIZON" '$1=="U"&&$3+0>now+0&&$3+0>now+horizon{exit 1}' || { cf_fail allowance_beyond_horizon;return 1; }
