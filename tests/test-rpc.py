@@ -225,6 +225,11 @@ class RpcTests(unittest.TestCase):
         document['schedules'] = [{'person': 'alice', 'id': 'night', 'weekdays': ['Mon'], 'start': '22:00', 'stop': '06:30'}]
         accepted = self.accept(self.request(base=observed, document=document))
         self.assertTrue(accepted['status']['ok'], accepted)
+        # Cron-driven expiry rewrites the journaled native config without the service.
+        self.f.env['CF_NOW'] = str(int(self.f.env['CF_NOW']) + 61)
+        expired = self.f.run('expire')
+        self.assertEqual(expired.returncode, 0, expired.stdout + expired.stderr)
+        self.assertIn('cf_sched_alice', firewall.read_text())
         result = self.script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.f.durable_snapshot(), original)
