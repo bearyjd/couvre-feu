@@ -507,6 +507,25 @@ esac
                 self.assertEqual(full_snapshot(self.root), before)
         self.assertEqual((backup / 'etc_config_firewall.copy').read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'])
 
+    def test_in_place_append_while_copying_original_refuses_before_ready(self):
+        self.write_originals()
+        target = self.root / 'etc/config/firewall'
+        real_copy = shutil.which('cp')
+        wrapper = self.root / 'bin/cp'
+        # The recovery copy reads the shared inode; a concurrent append corrupts both.
+        wrapper.write_text('#!/bin/sh\nfor destination do :; done\n'
+                           'case "$destination" in */etc_config_firewall.copy) '
+                           f'printf "%s\\n" "# in-place append" >> {shlex.quote(str(target))};; esac\n'
+                           f'exec {shlex.quote(real_copy)} "$@"\n')
+        wrapper.chmod(0o700)
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('original recovery copy mismatch: etc/config/firewall; no installation made', result.stderr)
+        # The append is the writer's own change to the live file; no journal remains.
+        self.assertEqual(target.read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'] + b'# in-place append\n')
+        self.assertFalse((self.root / 'etc/couvrefeu/backup').exists())
+        self.assertEqual(list(self.root.glob('.couvrefeu-stage.*')), [])
+
     def test_in_place_append_after_restore_rename_refuses_with_intact_copy(self):
         self.write_originals()
         result = self.install('--activate')

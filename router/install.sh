@@ -302,7 +302,8 @@ link_original() {
     # Non-authoritative byte copy for manual recovery only: while the managed
     # path and the journal share one inode, an in-place writer changes both.
     cp "$lo_dst" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; no installation made"
-    cmp -s "$lo_dst" "$BACKUP/$2.copy" || fail "original recovery copy mismatch: $1; no installation made"
+    # The copy is read from the shared inode: prove it against the recorded sha.
+    [ "$(sha256sum "$BACKUP/$2.copy" | awk '{print $1}')" = "${lo_before%%:*}" ] || fail "original recovery copy mismatch: $1; no installation made"
 }
 if [ ! -e "$BACKUP" ]; then
     # Every refusal gate precedes the first managed write. Without a journal no
