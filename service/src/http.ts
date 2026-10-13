@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createServer as createSecureServer } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -76,8 +77,9 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
-    const server = createServer(async (request, response) => {
+    const handler = async (request: IncomingMessage, response: ServerResponse) => {
         response.setHeader('Cache-Control', 'no-store');
+        if (config.tlsMaterial) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
         response.setHeader('X-Content-Type-Options', 'nosniff');
         response.setHeader('Referrer-Policy', 'no-referrer');
         response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
@@ -213,7 +215,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 response.end();
             }
         }
-    });
+    };
+    const server = config.tlsMaterial ? createSecureServer({...config.tlsMaterial, minVersion: 'TLSv1.2'}, handler) : createServer(handler);
     server.requestTimeout = 10000;
     server.headersTimeout = 5000;
     server.maxHeadersCount = 40;

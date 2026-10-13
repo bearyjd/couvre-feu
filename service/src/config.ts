@@ -4,6 +4,8 @@ export interface DemoConfig {
     origin: string;
     host: string;
     dataDir: string;
+    /** Present only for the LAN HTTPS integration listener. */
+    tlsMaterial?: {cert: Buffer; key: Buffer};
 }
 export function demoConfig(env: NodeJS.ProcessEnv = process.env): DemoConfig {
     // No production mode or transport exists. Only a local port and data directory are configurable.
