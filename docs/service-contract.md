@@ -70,3 +70,34 @@ Wire them with `new ParentAlerts(store, {people, activity, timeRequests})`; `mai
 ### Gap: notification delivery beyond the app
 
 Alerts are visible only inside the PWA while open. Web Push is out of scope. Sketch: generate a VAPID key pair on the service (private key in an environment secret, never in the repo); `POST /push/subscriptions` stores each parent's browser `PushSubscription` (endpoint, keys) bound to the account and revoked on logout or permission change; on alert creation (not on every count increment) send an encrypted, content-free payload ("Couvre-feu: new alert") with the `web-push` protocol directly to the browser vendor's push service, the only third party involved, and have the service worker fetch the actual alert over the authenticated session when the notification is tapped. Open design points: quiet hours, per-severity opt-in, expired-subscription cleanup (HTTP 404/410), and the service needing outbound HTTPS to the push service even when its own listener is tailnet-only.
+
+## Child time requests
+
+A child asks for more time through a per-child request link; there are no child accounts. All state lives in the service (migration `006.sql`); the router and the policy write path are untouched.
+
+| Route | Caller | Purpose |
+|---|---|---|
+| `POST /people/:id/request-link` | Assigned parent (session + CSRF) | Issue a link, revoking the previous one. The token is returned once as `path` (`/request.html#<token>`); only its SHA-256 is stored. |
+| `POST /people/:id/request-link/revoke` | Assigned parent | Turn the link off; its pending request is cancelled. |
+| `GET /time-requests` | Parent | Pending and 24 h of recent requests, plus link active/inactive, for assigned people only. |
+| `POST /time-requests/:uuid/approve` `{minutes: 15\|30\|60}` | Assigned parent | Approve; the parent may grant less than requested. |
+| `POST /time-requests/:uuid/decline` | Assigned parent | Decline. |
+| `POST /child/request` `{token, minutes, reason?}` | Child (token in body only) | Submit; one pending request per link, 5 minute cooldown after each request, reason at most 140 characters of plain text without control or bidirectional-override characters. |
+| `POST /child/status` `{token}` | Child | Own latest request: `pending`, `approved` (with `allowanceUntil`), `declined`, `expired`, `unsupported`, `apply_failed` or `cancelled`. Nothing else is returned. |
+
+Unanswered requests expire after 15 minutes. Link failures are indistinguishable (`404 link_invalid`) and flood-limited (`429`).
+
+Approval effect, all through the existing revision-CAS `PolicyService.mutate` / `IntegrationPolicy.mutate` path using the approving parent's identity:
+
+- Active manual pause: `resume` now. The pause is restored by a later `pause` once the allowance ends, with its original expiry (or indefinite). The re-pause is skipped when the original pause would have ended inside the allowance, or when a later *pending or confirmed* policy operation for that child exists (failed and conflicted operations do not count). It runs as any active account assigned to the child, not the approver's session, and is retried without limit every few seconds until it succeeds or is provably unnecessary; while overdue the parent UI shows an alert. There is no terminal failure state that leaves the child unpaused. If the resume operation ends `failed` or `conflict`, the request becomes `apply_failed`.
+- Nothing blocking: approved with no policy change.
+- Schedule blocking: the policy contract has no override or allowance concept yet, so approval returns request state `unsupported` with code `schedule_override_unsupported` ("Not supported yet: schedules cannot be overridden") to both the parent and the child, and writes nothing. `TimeRequestService` accepts an optional `ScheduleOverride` hook; when provided it is called before approval proceeds and may refuse by throwing `AppError`.
+- Schedule state unknown: `503 schedule_state_unknown`; the request stays pending.
+
+The allowance is `approval time + minutes`; on the integration path a `202` resume may take effect after operator dispatch, so the child can see "approved" slightly before enforcement lifts. Audit rows record `time_request_create|approve|decline|unsupported|expire|apply_failed|repause` and `request_link_issue|revoke`, with the deciding account in `time_requests.decided_by` and `decided_at`.
+
+Approval intent and fail-open window: the restore step (`TimeRequestService.repause`, the single place to replace with a router-side allowance once the policy contract has one) runs from the service. Intent is durable before the resume is attempted: one transaction moves the request to `approving` and records the original pause expiry, allowance end and restore obligation. A refused `mutate` (it refuses before writing) releases the claim back to `pending`; any unknown outcome (other error, 409/502 result) counts as approved so the pause is still restored; an `approving` row found after a restart is completed as approved. Revoking a link cancels only unanswered requests; `approving` and `approved` ones still complete. **Known fail-open window:** if the service is down when the allowance ends, the child stays unpaused until the service returns and restores the pause. Router-side expiry (a future `allowances` policy entry) removes this window.
+
+Enablement: in the synthetic demo, time requests are always on. In real-router integration they are **off by default**; the private manifest must set `"timeRequests": {"enabled": true}` (strictly validated; see [integration-004](integration-004.md)). When off, the child routes and request page return 404, no link can be issued and the 5 second follow-up timer is not armed. When on without automatic dispatch, the resume and the later re-pause each wait for an operator permit, and the router-local allowance (PR #31) is expected to replace the service-side re-pause.
+
+Disabling time requests in integration does not abandon obligations: a drain-only timer continues to restore lifted pauses (no routes, no new requests) until none remain, then stops.

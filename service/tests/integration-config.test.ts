@@ -24,6 +24,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
     try {
         save(manifest); const c = integrationConfig(path);
         assert.equal(c.dispatch, undefined);
+        assert.equal(c.timeRequests, undefined, 'time requests are off unless explicitly enabled');
+        save({...manifest, timeRequests: {enabled: true}}); assert.equal(integrationConfig(path).timeRequests?.enabled, true);
+        save({...manifest, timeRequests: {enabled: false}}); assert.equal(integrationConfig(path).timeRequests?.enabled, false);
+        for (const timeRequests of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, true, null, []]) { save({...manifest, timeRequests}); assert.throws(() => integrationConfig(path)); }
         save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
         const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
         const scheduled = {...manifest, enrollment: {...manifest.enrollment, schedules: [{person: 'pilot', id: 'bedtime', weekdays: ['Mon'], start: '21:00', stop: '07:00'}]}, scheduleClock: {timezone: 'America/New_York'}};

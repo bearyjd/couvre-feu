@@ -54,6 +54,10 @@ The approved supplemental read-only inspection reached its deliberate exit-2 bou
 
 The temporary [client probe](tests/client-probe/README.md) is prepared and tested offline only. Public WebSocket echoes are application observations, not packet acceptance or proof of family/offload coverage.
 
+## Child time requests
+
+A parent can create a private request link per child (parent app, "Time requests"). The child opens `/request.html#<token>` with no account or passkey, picks 15/30/60 minutes and sees pending/approved/declined. Approval ends a current manual pause and restores it when the allowance ends, through the existing revision-CAS write path. Schedules cannot be overridden yet and say so. Details and security model: [service contract](docs/service-contract.md#child-time-requests).
+
 ## Local verification
 
 ```sh

@@ -16,6 +16,8 @@ export interface IntegrationManifest {
     origin?: string;
     tls?: TLSFiles; listen?: {host: string; port: number}; publicOrigin?: string;
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
+    /** Child time requests are off unless the owner enables them here. */
+    timeRequests?: {enabled: boolean};
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
     router: {host: string; user: 'root'; port: 22; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
     person: {id: string; name: string; device: {id: string; label: string; mac: string}};
@@ -73,7 +75,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'scheduleClock', 'tls', 'listen', 'publicOrigin']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -103,8 +105,14 @@ export function integrationConfig(path: string): IntegrationConfig {
         if (typeof settings.enabled !== 'boolean' || pollSeconds < 2 || pollSeconds > 15 || maxBackoffSeconds < pollSeconds || maxBackoffSeconds > 300) bad('invalid_dispatch_bounds');
         dispatch = {enabled: settings.enabled as boolean, pollSeconds, maxBackoffSeconds};
     }
+    let timeRequests: IntegrationManifest['timeRequests'];
+    if (m.timeRequests !== undefined) {
+        const settings = object(m.timeRequests, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_time_requests');
+        timeRequests = {enabled: settings.enabled as boolean};
+    }
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort()}));
