@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=1aa722c3311b963674ef2bdec3ce895b22982d8a9aed69e98526620f52157a9c
+CF_BOOTSTRAP_PIN=c72c3e68bb77e8aa1f310a02eb1fc8fe01874c674a5835c8751b5e3057e6f844
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -139,8 +139,42 @@ platform_deadline_check
 # Build staging outside managed paths. In fixtures it stays under CF_ROOT.
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
 else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
+JOURNAL_ROLLBACK=0
+ROLLBACK_BASE=absent
+ROLLBACK_ETC=absent
+# Until the new journal is ready (and before any release directory exists),
+# every exit removes exactly what the journal step created. Managed targets
+# are untouched in this window, so each journal hard link has a second name.
+journal_rollback() {
+    [ "$JOURNAL_ROLLBACK" = 1 ] || return 0
+    JOURNAL_ROLLBACK=0
+    if [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ]; then
+        for rel in $FILES; do
+            k=$(key "$rel")
+            [ -e "$BACKUP/$k.original" ] || continue
+            # Delete only while the managed path still holds the original
+            # (the same inode, or its exact pre-recorded signature and mtime).
+            if [ -f "$ROOT/$rel" ] && { same_file "$ROOT/$rel" "$BACKUP/$k.original" ||
+                { [ "$(signature "$ROOT/$rel")" = "$(awk 'NR==1 {print; exit}' "$STAGE/$k.before")" ] &&
+                    [ "$(mtime "$ROOT/$rel")" = "$(awk 'NR==1 {print; exit}' "$STAGE/$k.mtime")" ]; }; }; then rm -f "$BACKUP/$k.original"
+            else printf 'couvre-feu: original link kept: %s\n' "$BACKUP/$k.original" >&2; return 0; fi
+        done
+        set +f
+        for entry in "$BACKUP"/* "$BACKUP"/.[!.]* "$BACKUP"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            rm -f "$entry"
+        done
+        set -f
+        rmdir "$BACKUP" || { printf 'couvre-feu: journal rollback incomplete: %s\n' "$BACKUP" >&2; return 0; }
+    fi
+    if [ "$ROLLBACK_BASE" = absent ]; then rmdir "$BASE" 2>/dev/null || :
+    elif [ -d "$BASE" ]; then chmod "$ROLLBACK_BASE" "$BASE" || :; fi
+    if [ "$ROLLBACK_ETC" = absent ]; then rmdir "$ROOT/etc" 2>/dev/null || :; fi
+}
 cleanup() {
-    for file in restore-probe cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
+    journal_rollback
+    for file in cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
+    for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
@@ -241,29 +275,40 @@ fi
     cf_check
 ) || fail 'core dependency/capability gate failed'
 # The external recovery release is retired by uninstall only when this
-# installation created it. Isolated fixtures opt in explicitly.
+# installation created it. Isolated fixtures opt in explicitly. An existing
+# release (including refusal residue) is verified read-only and never adopted.
+RELEASE_MANAGED=0
 RELEASE_ABSENT=0
 if [ "${CF_TEST_MODE:-0}" != 1 ] || [ "${CF_TEST_RELEASE_DIR:-0}" = 1 ]; then
+    RELEASE_MANAGED=1
     release_dir=$ROOT/etc/.couvrefeu-release-$CF_RELEASE_ID
-    if [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ]; then RELEASE_ABSENT=1; fi
-    platform_recovery_prepare "$HERE" "$ROOT"
+    if [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ]; then RELEASE_ABSENT=1
+    else platform_recovery_prepare "$HERE" "$ROOT"; fi
 fi
+# Hard-link one existing original into the new journal and prove the link is
+# the original inode with its pre-recorded exact signature, size and mtime.
+link_original() {
+    lo_src=$ROOT/$1 lo_dst=$BACKUP/$2.original
+    lo_before=$(awk 'NR==1 {print; exit}' "$STAGE/$2.before")
+    lo_mtime=$(awk 'NR==1 {print; exit}' "$STAGE/$2.mtime")
+    lo_size=$(awk 'NR==1 {print; exit}' "$STAGE/$2.size")
+    ln "$lo_src" "$lo_dst" || fail "cannot preserve exact original by hard link: $1; no installation made"
+    same_file "$lo_src" "$lo_dst" || fail "original hard link identity mismatch: $1; no installation made"
+    # An overlayfs copy-up on link must preserve the original exactly.
+    if ! { [ "$(signature "$lo_src")" = "$lo_before" ] && exact_mtime "$lo_src" "$lo_mtime" && [ "$(stat -c %s "$lo_src")" = "$lo_size" ]; }; then
+        fail "original changed while linking (overlay copy-up?): /$1; installation refused, journal removed"
+    fi
+    stat -c %i "$lo_dst" > "$BACKUP/$2.inode"
+}
 if [ ! -e "$BACKUP" ]; then
-    # Validate the native UCI configuration from the staging directory.
+    # Every refusal gate precedes the first managed write.
     mkdir "$STAGE/.delta"
     backend uci -c "$STAGE" -t "$STAGE/.delta" show firewall >/dev/null || fail 'staged UCI firewall validation failed'
-    # Test the actual originals with the target copy implementation before any
-    # managed path changes. BusyBox cp -p may truncate fractional timestamps;
-    # integer originals remain supported, fractional originals then refuse.
     for rel in $FILES; do
-        original_mtime=$(mtime "$ROOT/$rel") || fail "precise original mtime unavailable: $rel"
-        if [ "$original_mtime" != absent ]; then
-            cp -p "$ROOT/$rel" "$STAGE/restore-probe"
-            if ! { [ "$(signature "$ROOT/$rel")" = "$(signature "$STAGE/restore-probe")" ] && exact_mtime "$STAGE/restore-probe" "$original_mtime"; }; then
-                fail "cannot preserve exact original metadata/mtime: $rel; no installation made"
-            fi
-            rm -f "$STAGE/restore-probe"
-        fi
+        k=$(key "$rel")
+        mtime "$ROOT/$rel" > "$STAGE/$k.mtime" || fail "precise original mtime unavailable: $rel"
+        signature "$ROOT/$rel" > "$STAGE/$k.before"
+        if [ -e "$ROOT/$rel" ]; then stat -c %s "$ROOT/$rel" > "$STAGE/$k.size"; fi
     done
     # Capture directory modes before creating anything in managed paths.
     for rel in $DIRS; do
@@ -271,15 +316,22 @@ if [ ! -e "$BACKUP" ]; then
         if [ -d "$ROOT/$rel" ]; then stat -c %a "$ROOT/$rel" > "$STAGE/dir_$k"
         else printf '%s\n' absent > "$STAGE/dir_$k"; fi
     done
+    ROLLBACK_BASE=$(awk 'NR==1 {print; exit}' "$STAGE/dir_etc_couvrefeu")
+    ROLLBACK_ETC=$(awk 'NR==1 {print; exit}' "$STAGE/dir_etc")
+    JOURNAL_ROLLBACK=1
     platform_initial_write
     mkdir -p "$BACKUP"
-    chmod 700 "$BASE" "$BACKUP"
-    for rel in $DIRS; do k=$(key "$rel"); mv "$STAGE/dir_$k" "$BACKUP/dir_$k"; done
+    chmod 700 "$BACKUP"
     for rel in $FILES; do
         k=$(key "$rel")
-        signature "$ROOT/$rel" > "$BACKUP/$k.before"
-        mtime "$ROOT/$rel" > "$BACKUP/$k.mtime" || fail "precise original mtime unavailable: $rel"
-        if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.original"; fi
+        if [ -e "$ROOT/$rel" ]; then link_original "$rel" "$k"; fi
+    done
+    chmod 700 "$BASE"
+    for rel in $DIRS; do k=$(key "$rel"); cp "$STAGE/dir_$k" "$BACKUP/dir_$k"; done
+    for rel in $FILES; do
+        k=$(key "$rel")
+        cp "$STAGE/$k.before" "$BACKUP/$k.before"
+        cp "$STAGE/$k.mtime" "$BACKUP/$k.mtime"
         case "$rel" in
             usr/lib/couvrefeu/platform-bootstrap.sh) staged=lib/platform-bootstrap.sh;;
             usr/lib/couvrefeu/vendor-platform.sh) staged=lib/vendor-platform.sh;;
@@ -301,9 +353,20 @@ if [ ! -e "$BACKUP" ]; then
             *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
     done
+    # The ownership marker is durable before any release directory exists.
     if [ "$RELEASE_ABSENT" = 1 ]; then printf '%s\n' 1 > "$BACKUP/release-absent"; fi
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = linked ]; then kill -KILL "$$"; fi
     printf '%s\n' 1 > "$BACKUP/ready"
+    set +f
+    sync "$BACKUP"/* 2>/dev/null
+    set -f
+    JOURNAL_ROLLBACK=0
+elif [ "$RELEASE_ABSENT" = 1 ] && [ ! -e "$BACKUP/release-absent" ]; then
+    # A recorded journal that is about to create the release owns it.
+    phase release-absent
 fi
+if [ "$RELEASE_MANAGED" = 1 ] && [ "$RELEASE_ABSENT" = 1 ]; then platform_recovery_prepare "$HERE" "$ROOT"; fi
+if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = ready ]; then kill -KILL "$$"; fi
 preflight
 runtime_preflight
 platform_deadline_check
@@ -317,7 +380,7 @@ for rel in $FILES; do
     case "$rel" in etc/couvrefeu/state|etc/couvrefeu/protected)
         if [ -f "$BACKUP/complete" ]; then continue; fi;;
     esac
-    atomic_copy "$BACKUP/$k.staged" "$ROOT/$rel"
+    atomic_copy "$BACKUP/$k.staged" "$ROOT/$rel" durable
     COUNT=$((COUNT + 1))
     if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_FAIL_AFTER:-0}" = "$COUNT" ]; then fail 'injected partial installation'; fi
 done

@@ -68,7 +68,7 @@ if [ "$PROFILE_INVENTORY" = 1 ]; then
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
-for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
+for dep in sha256sum stat cp ln mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
     command -v "$dep" >/dev/null 2>&1 || fail "missing dependency: $dep"
 done
 
@@ -182,6 +182,13 @@ exact_mtime() {
     [ "$observed_mtime" = "$2" ]
 }
 key() { printf '%s' "$1" | sed 's|/|_|g'; }
+# Same-run identity only: device numbers of overlay/ubifs mounts are not
+# stable across reboot, so journals persist the inode number alone.
+file_id() { stat -c '%d:%i' "$1"; }
+same_file() { [ "$(file_id "$1")" = "$(file_id "$2")" ]; }
+valid_inode_record() {
+    awk '$0 ~ /^[0-9]+$/ && length($0) <= 20 {good=1} END {exit !good || NR!=1}' "$1"
+}
 
 valid_protection() {
     awk -F: '
@@ -233,13 +240,13 @@ journal_preflight() {
     # restoration inventory and its full preflight remain journal-derived.
     if [ "${1:-}" = cleanup ]; then
         platform_valid_done "$DONE" || fail 'unsafe cleanup completion record'
-        allowed_entries="$allowed_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.original etc_couvrefeu_rpc-allowed.staged etc_couvrefeu_rpc-allowed.mtime"
-        record_entries="$record_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.mtime"
+        allowed_entries="$allowed_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.original etc_couvrefeu_rpc-allowed.staged etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
+        record_entries="$record_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
     fi
     for rel in $FILES; do
         k=$(key "$rel")
-        allowed_entries="$allowed_entries $k.before $k.after $k.original $k.staged $k.mtime"
-        record_entries="$record_entries $k.before $k.after $k.mtime"
+        allowed_entries="$allowed_entries $k.before $k.after $k.original $k.staged $k.mtime $k.inode"
+        record_entries="$record_entries $k.before $k.after $k.mtime $k.inode"
     done
     for rel in $DIRS; do
         k=$(key "$rel")
@@ -326,6 +333,12 @@ preflight() {
             [ "$(signature "$BACKUP/$k.original")" = "$before" ] || fail "corrupt original backup: $rel"
             exact_mtime "$BACKUP/$k.original" "$original_mtime" || fail "corrupt original backup mtime: $rel"
         fi
+        # Hard-link journals record the original inode; a copied or replaced
+        # backup (e.g. a cross-device mv fallback) is not the original.
+        if [ -e "$BACKUP/$k.inode" ]; then
+            [ "$before" != absent ] && valid_inode_record "$BACKUP/$k.inode" || fail "invalid original inode record: $rel"
+            [ "$(stat -c %i "$BACKUP/$k.original")" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$k.inode")" ] || fail "corrupt original backup inode: $rel"
+        fi
         owned_temp "$ROOT/$rel" || fail "temporary path collision: $ROOT/$rel.couvrefeu-tmp"
         staged_sig=$(signature "$BACKUP/$k.staged")
         [ "$staged_sig" = "$after" ] || [ "$staged_sig" = "$tx_old" ] || [ "$staged_sig" = "$tx_new" ] || fail "corrupt staged backup: $rel"
@@ -364,13 +377,15 @@ owned_temp() (
         [ -f "$BACKUP/firewall.transaction" ] &&
         [ "$temp_sig" = "$(signature "$BACKUP/firewall.pending")" ]
 )
-# Rename in the same directory; do not write through existing files.
+# Rename in the same directory; do not write through existing files. Installed
+# content needs exact bytes/mode/owner only; its timestamp is never restored.
+# A third argument `durable` flushes the data before the publishing rename.
 atomic_copy() (
-    src=$1 dst=$2 tmp=$2.couvrefeu-tmp expected_mtime=${3:-}
+    src=$1 dst=$2 tmp=$2.couvrefeu-tmp durable=${3:-}
     if [ -e "$tmp" ] || [ -L "$tmp" ]; then
         owned_temp "$dst" || fail "temporary path collision: $tmp"
-        if [ "$(signature "$tmp")" = "$(signature "$src")" ] &&
-            { [ -z "$expected_mtime" ] || exact_mtime "$tmp" "$expected_mtime"; }; then
+        # Write barriers follow the blocking proofs.
+        if [ "$(signature "$tmp")" = "$(signature "$src")" ]; then
             platform_initial_write
             mv -f "$tmp" "$dst"
             exit 0
@@ -380,12 +395,32 @@ atomic_copy() (
     fi
     platform_initial_write
     cp -p "$src" "$tmp"
-    if [ -n "$expected_mtime" ]; then
-        if ! { [ "$(signature "$tmp")" = "$(signature "$src")" ] && exact_mtime "$tmp" "$expected_mtime"; }; then
-            fail "exact original copy failed: $dst; journal retained"
-        fi
-    fi
+    chmod "$(stat -c %a "$src")" "$tmp"
+    [ "$(signature "$tmp")" = "$(signature "$src")" ] || fail "staged copy metadata mismatch: $dst; journal retained"
+    # Flush data before the rename publishes it (BusyBox without
+    # FEATURE_SYNC_FANCY ignores the operand and syncs everything).
+    if [ "$durable" = durable ]; then sync "$tmp" 2>/dev/null; fi
     mv -f "$tmp" "$dst"
+)
+# Exact restoration never copies: the journal holds the original inode as a
+# hard link. Link it beside the target (a link cannot silently degrade into a
+# copy on EXDEV, unlike mv), prove identity, then rename within the directory.
+# The journal link remains until final cleanup; the original is never the
+# sole name being moved.
+restore_original() (
+    src=$1 dst=$2 tmp=$2.couvrefeu-tmp
+    if [ -e "$dst" ] && same_file "$dst" "$src"; then exit 0; fi
+    if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+        owned_temp "$dst" || fail "temporary path collision: $tmp"
+        if ! same_file "$tmp" "$src"; then platform_initial_write; rm -f "$tmp"; fi
+    fi
+    platform_initial_write
+    if [ ! -e "$tmp" ]; then
+        ln "$src" "$tmp" || fail "exact original link failed: $dst; journal retained"
+    fi
+    same_file "$tmp" "$src" || fail "exact original link identity mismatch: $dst; journal retained"
+    mv -f "$tmp" "$dst"
+    same_file "$dst" "$src" || fail "exact original rename identity mismatch: $dst; journal retained"
 )
 
 # Only explicitly marked isolated fixtures can emulate live tool calls.

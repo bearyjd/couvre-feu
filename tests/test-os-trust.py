@@ -277,11 +277,11 @@ platform_lock_recover;printf unsafe'''
             src.write_text('expected');dst.write_text('original');tmp.write_text('expected')
             body=f'''set -eu
 {fn}
-fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
-fail() {{ exit 2; }};owned_temp() {{ :; }};signature() {{ fixture_tick=1400;printf expected; }};
-exact_mtime() {{ fixture_tick=1400;return 0; }};atomic_copy {src} {dst} 1;printf unsafe'''
-            # The actual proof executes in command substitution; use the final
-            # mtime callback to carry the injected clock into the copy scope.
+printf 100 > {root}/tick;platform_clock_tick() {{ cat {root}/tick; }};
+fail() {{ exit 2; }};owned_temp() {{ :; }};signature() {{ printf 1400 > {root}/tick;printf expected; }};
+atomic_copy {src} {dst};printf unsafe'''
+            # The signature proof runs in command substitution; a clock file
+            # carries the injected time past the proof into the write barrier.
             r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
             self.assertEqual(dst.read_text(),'original');self.assertTrue(tmp.exists())
 
