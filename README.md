@@ -117,6 +117,14 @@ IPv4 kids DNS redirection includes a narrowly scoped UDP INPUT allowance to prec
 
 Healthy unchanged `expire`, `apply-fw` and identical same-revision sync verify actual objects and leave kernel rules/sets and conntrack intact. Fresh address/protection, effective policy or configuration changes and drift require reconstruction; higher revisions deliberately rebuild. Persistent native configuration and kernel witnesses are both checked before reporting health.
 
-Reconstruction for changed policy, drift or reload is **not atomic**: it can briefly open enforcement, and a mid-apply failure can leave enforcement open until successful repair. Production activation is blocked pending explicit design acceptance and actual integration evidence for this behavior. Local fixture passes do not remove this gate.
+Reconstruction for changed policy, drift or selective reload is **fail-closed by ordering, not globally atomic**. The new effective policy is built into the inactive immutable generation (`cf2_<slot>_*` chains and sets), populated and verified while the stable `cf_fwd`, `cf_input` and `cf_dns` dispatchers still reach only the active generation.
+
+A failure or crash while staging leaves the old generation dispatched and the command fails. The only prior edit to the old generation is exact removal of stale inbound reverse-address selectors no longer attributed to a child; source-MAC blocking stays intact. The next run removes the abandoned partial generation, and so does uninstall (after a killed process, only once one ordinary run has recovered the stale lock).
+
+Before cutover, a temporary guard for the union of old and new children is attached in both forwarding families, so an added, removed or swapped child stays blocked until the switch completes. Each of the five dispatcher switches is one fixed-position `iptables -R`/`ip6tables -R`. On the **legacy (non-nft) iptables backend**, that commits as a single whole-table replacement, so one table/family sees either the old or the new target. Switches across families and tables are sequential, and the guard covers that window. This argument assumes the legacy backend; the GL-XE3000 firmware's actual iptables backend is unverified.
+
+Fixtures record the modeled ruleset after every mutating command and assert the expected blocking at each step, including injected staging and switch failures and changed child sets. They prove ordering in a model, not real-kernel atomicity, concurrent GL tooling, fw3 selective-reload preservation or acceleration behavior on the target. A full firewall restart or reboot removes hooks and tables and remains degraded reconstruction with no continuity claim.
+
+Production activation remains blocked pending explicit design acceptance and actual integration evidence; local fixture passes do not remove this gate.
 
 Timed pauses expire through router cron even if the service is absent; normal cron tolerance is about one minute after expiry, subject to clock/cron health. Firmware file preservation is configured, but actual upgrade compatibility and enforcement recovery are unverified. This package has no production-readiness claim.

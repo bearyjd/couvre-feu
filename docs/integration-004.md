@@ -257,7 +257,7 @@ restoration/uninstall; never treat a local kill as remote drain.
 At handoff record the exact reviewed source, batch hashes, measured/unavailable
 checks, private evidence locations, dispatch state, final router installation and
 ownership of retained recovery/key backups. Household production remains blocked
-by the documented non-atomic transition and unmeasured target gates.
+by the unmeasured real-kernel behavior of the guarded generation transition and other target gates.
 
 ## Prepared client observation
 

@@ -14,7 +14,7 @@ A prior complete local `sh tests/run.sh` run passed 43 installer fixtures (73.92
 
 ## Production activation gate
 
-Changed-policy/drift/reload reconstruction is non-atomic and can briefly open enforcement; a mid-apply failure can leave fail-open enforcement until successful repair. Production activation is blocked pending explicit design acceptance and real compatible integration evidence for this limitation. An approved test script is not production acceptance. Healthy unchanged same-revision reconciliation must be tested to preserve actual rules/sets/conntrack; drift, fresh address/protection changes, higher revisions and missing objects must defeat the shortcut and repair. Inject failure during reconstruction and measure both the transient gap and recovery, without describing uncertain status as confirmed enforcement.
+Changed-policy/drift/selective-reload reconstruction stages an inactive generation and switches guarded dispatchers; fixtures show staging and switch failures leave a blocked child blocked, but this is ordering in a model, not measured real-kernel atomicity. A full restart/reboot remains degraded reconstruction without continuity. Production activation is blocked pending explicit design acceptance and real compatible integration evidence for this behavior. An approved test script is not production acceptance. Healthy unchanged same-revision reconciliation must be tested to preserve actual rules/sets/conntrack; drift, fresh address/protection changes, higher revisions and missing objects must defeat the shortcut and repair. Inject failure during reconstruction and measure both the transient gap and recovery, without describing uncertain status as confirmed enforcement.
 
 ## Before approving a live script
 
