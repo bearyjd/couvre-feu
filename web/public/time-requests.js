@@ -19,7 +19,7 @@ function el(tag, props = {}, ...children) {
 
 export function createTimeRequests({ session, people }) {
   const root = document.querySelector('#time-requests');
-  let key = '', data = null, notice = '', link = null, drawn = '', timer = null;
+  let disabled = false, key = '', data = null, notice = '', link = null, drawn = '', timer = null;
 
   const nameOf = (id) => people().find((person) => person.id === id)?.name ?? id;
   async function call(path, body) {
@@ -30,13 +30,17 @@ export function createTimeRequests({ session, people }) {
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(12000),
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error?.message ?? 'The request could not be completed.');
+    if (!response.ok) { const error = new Error(result.error?.message ?? 'The request could not be completed.'); error.status = response.status; throw error; }
     return result;
   }
   async function load() {
     if (!session() || !navigator.onLine) return;
     try { data = await call('/time-requests'); }
-    catch (error) { notice = error.message; }
+    catch (error) {
+      // 404: this installation has time requests switched off. Stop polling and stay hidden.
+      if (error.status === 404) { disabled = true; clearInterval(timer); timer = null; root.hidden = true; return; }
+      notice = error.message;
+    }
     draw();
   }
   async function act(path, body, then) {
@@ -101,7 +105,7 @@ export function createTimeRequests({ session, people }) {
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.csrfToken}` : '';
     if (next !== key) { key = next; data = null; link = null; notice = ''; drawn = ''; draw(); if (next) void load(); }
-    if (next && !timer) timer = setInterval(() => { if (!document.hidden && !root.contains(document.activeElement?.closest('input'))) void load(); }, POLL_MS);
+    if (next && !timer && !disabled) timer = setInterval(() => { if (!document.hidden && !root.contains(document.activeElement?.closest('input'))) void load(); }, POLL_MS);
     if (!next && timer) { clearInterval(timer); timer = null; }
   }
   return { update };

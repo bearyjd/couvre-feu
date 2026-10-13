@@ -78,7 +78,9 @@ type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operatio
 type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService) {
-    const requests = timeRequests ?? new TimeRequestService(auth.store, policy, (policy as {now?: () => number}).now ?? auth.now);
+    // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
+    const timeRequestsEnabled = timeRequests !== undefined || auth.provenance.source !== 'real-router-integration' || (config as {timeRequests?: {enabled?: boolean}}).timeRequests?.enabled === true;
+    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, (policy as {now?: () => number}).now ?? auth.now);
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
@@ -105,6 +107,9 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             if (path.includes('?') || path.includes('%') || path.includes('#')) {
                 throw new AppError(400, 'invalid_path');
             }
+            if (!requests && ['/request.html', '/request.js'].includes(path)) {
+                throw new AppError(404, 'route_not_found');
+            }
             if (request.method === 'GET' && STATIC[path]) {
                 const [name, type] = STATIC[path];
                 let data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
@@ -124,6 +129,9 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const payload = await body(request);
                 if (path.startsWith('/child/')) {
+                    if (!requests) {
+                        throw new AppError(404, 'route_not_found');
+                    }
                     // Capability token in the body is the only credential: no cookies, no ambient authority, so no CSRF surface.
                     const routed = childRoute(requests, path, payload);
                     send(response, routed.status, routed.body);
@@ -182,7 +190,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]))});
                     return;
                 }
-                const parent = await parentPost(requests, session.dto.actor, path, payload);
+                const parent = requests && await parentPost(requests, session.dto.actor, path, payload);
                 if (parent) {
                     send(response, parent.status, parent.body);
                     return;
@@ -215,7 +223,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]))});
                 return;
             }
-            const parent = await parentGet(requests, session.dto.actor, path);
+            const parent = requests && await parentGet(requests, session.dto.actor, path);
             if (parent) {
                 send(response, parent.status, parent.body);
                 return;
@@ -246,6 +254,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Allowance follow-ups (restoring a lifted pause) must not depend on a parent having the app open.
     let timer: NodeJS.Timeout | undefined;
     server.on('listening', () => {
+        if (!requests) return;
         timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
         timer.unref();
     });
