@@ -10,12 +10,14 @@ import { Auth, issueBootstrap } from '../../service/src/auth.ts';
 import { PolicyService } from '../../service/src/policy.ts';
 import { appServer } from '../../service/src/http.ts';
 import { ParentAlerts, systemActor } from '../../service/src/parent-alerts.ts';
+import { ActivityStore } from '../../service/src/activity-store.ts';
 import { FakeRouter } from '../../demo-router/src/router.ts';
 import { policyJSON, normalizePolicy } from '../../shared/src/router-schema.ts';
 
 type Demo = {
   origin: string; store: Store; router: FakeRouter; policy: PolicyService; alerts: ParentAlerts;
   token: (id: 'jd' | 'bryn') => string;
+  activity: ActivityStore; setActivityClock: (seconds: number | null) => void;
   advanceRouterClock: (seconds: number) => void;
   stopService: () => Promise<void>; startService: () => Promise<void>;
 };
@@ -38,15 +40,17 @@ export const test = base.extend<{ demo: Demo }>({
     const auth = new Auth(store, origin);
     const policy = new PolicyService(store, router, () => Math.floor(routerNow()));
     const alerts = new ParentAlerts(store, { people: () => policy.people(systemActor) }, () => Math.floor(routerNow()));
+    let activityClock: number | null = null; // Tests that seed history pin the evaluation time; otherwise it follows the router clock.
+    const activity = new ActivityStore(store, { now: () => activityClock ?? Math.floor(routerNow()) });
     const config = { port, origin, host: `localhost:${port}`, dataDir };
-    let server = appServer(auth, policy, config, alerts);
-    const startService = async () => { server = appServer(auth, policy, config, alerts); server.listen(port, '127.0.0.1'); await once(server, 'listening'); };
+    let server = appServer(auth, policy, config, alerts, activity);
+    const startService = async () => { server = appServer(auth, policy, config, alerts, activity); server.listen(port, '127.0.0.1'); await once(server, 'listening'); };
     const stopService = async () => { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); };
     router.tick();
     const tick = setInterval(() => router.tick(), 50); // Independent fake engine, never calls policy/service.
     await startService();
     try {
-      await use({ origin, store, router, policy, alerts, token: (id) => issueBootstrap(store, id), advanceRouterClock: (seconds) => { clockOffset += seconds; router.tick(); }, stopService, startService });
+      await use({ origin, store, router, policy, alerts, activity, setActivityClock: (seconds) => { activityClock = seconds; }, token: (id) => issueBootstrap(store, id), advanceRouterClock: (seconds) => { clockOffset += seconds; router.tick(); }, stopService, startService });
     } finally {
       clearInterval(tick);
       if (server.listening) await stopService();

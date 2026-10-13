@@ -46,6 +46,10 @@ export class IntegrationStore extends Store {
                 });
             } catch (initializationError) { this.close(); throw initializationError; }
         }
+        // integration-002 admits the read-only `activity` step kind. Fresh and existing databases both pass through it exactly once.
+        if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatch_steps'")!.sql.includes("'activity'")) {
+            this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/integration-002.sql', import.meta.url), 'utf8')));
+        }
         // Separate additive state keeps existing manifest-bound databases readable.
         this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_dispatch (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL,

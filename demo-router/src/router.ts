@@ -4,6 +4,8 @@ import { INITIAL_POLICY, PROTECTED_MACS } from '../../service/src/fixtures.ts';
 import { effectivePauses, normalizePolicy, policyJSON, MAX_INTEGER } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy, RouterStatus } from '../../shared/src/router-schema.ts';
 import { AppError } from '../../shared/src/errors.ts';
+import { syntheticActivity } from './activity.ts';
+import type { OffloadState, RouterActivity } from '../../shared/src/router-activity.ts';
 const MIGRATION = `CREATE TABLE fake_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), policy TEXT NOT NULL, confirmed_revision INTEGER, highwater INTEGER NOT NULL, ready_at REAL NOT NULL, fault TEXT NOT NULL, next_fault TEXT NOT NULL, operation_id TEXT) STRICT;`;
 export const SCENARIOS = ['healthy', 'pending', 'drift', 'errors', 'coverage', 'stale', 'unreachable', 'failed', 'timeout'] as const;
 export type Scenario = typeof SCENARIOS[number];
@@ -26,10 +28,13 @@ export class FakeRouter {
     readonly store: Store;
     readonly now: () => number;
     readonly delay: number;
+    readonly offload: OffloadState;
     constructor(path: string, options: {
         now?: () => number;
         delay?: number;
+        offload?: OffloadState;
     } = {}) {
+        this.offload = options.offload ?? 'off';
         this.store = new Store(path, MIGRATION);
         this.now = options.now ?? (() => Date.now() / 1000);
         this.delay = options.delay ?? 0.35;
@@ -71,6 +76,12 @@ export class FakeRouter {
                 },
             }
         };
+    }
+    /** Read-only synthetic counters for the devices of the current fictional policy; the service filters them again. */
+    activity(): RouterActivity {
+        const row = this.row();
+        if (row.fault === 'unreachable' || row.next_fault === 'unreachable') throw new AppError(503, 'router_unreachable');
+        return syntheticActivity(normalizePolicy(JSON.parse(row.policy)), this.now(), this.offload);
     }
     apply(policy: RouterPolicy, operationId: string, base: {
         revision: number;

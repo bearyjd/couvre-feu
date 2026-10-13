@@ -48,13 +48,14 @@
           <ul id="parent-alert-feed" aria-label="Saved parent alerts" aria-live="polite"></ul>
           <button id="parent-alerts-more" class="button secondary" type="button" hidden>Show older alerts</button>
         </section>
+        <section id="activity-panel" class="activity-panel" aria-label="Estimated network activity" hidden></section>
         <section id="operational-alerts" class="alert-panel" aria-labelledby="alerts-title" hidden>
           <h2 id="alerts-title">Recent alerts in this browser</h2>
           <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>
           <label class="alert-preference"><input id="hide-recovery" type="checkbox"> Hide recovery history</label>
           <ul id="alert-feed" aria-label="Recent operational alerts" aria-live="polite"></ul>
         </section>
-        <section class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No activity collectors or screen-time measurements are included.</p></section>
+        <section class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No app, domain or screen-time measurement is included. The estimated network activity above comes from router byte counters only.</p></section>
         <p class="source-footnote">Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.</p>
       </section>
       <noscript><p class="notice">JavaScript is required for passkey sign-in and status. No controls can run without it.</p></noscript>

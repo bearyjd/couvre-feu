@@ -2,6 +2,7 @@ import { createPasskey, getPasskey } from './auth-client.js';
 import { actorScope, clearStatusCache, saveStatus, readStatus, needsServerLogout, setServerLogoutNeeded, broadcastLogout, broadcastScope, LOGOUT_EVENT, LOGOUT_REQUIRED, SCOPE_EVENT } from './status-cache.js';
 import { createScheduleEditor, actionVerb } from './schedule-editor.js';
 import { createParentAlerts } from './parent-alerts.js';
+import { createActivityPanel } from './activity.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -14,6 +15,7 @@ let alertStorage;
 try { alertStorage = localStorage; } catch { alertStorage = null; }
 const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
+const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
@@ -429,7 +431,9 @@ function render() {
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
     renderConnection(); renderPeople(); renderControlState();
+    activityPanel.update(state.people.people, Boolean(state.session) && !state.offline);
   } else {
+    activityPanel.clear();
     $('#people').replaceChildren();
     $('#connection').replaceChildren();
     $('#account-context').textContent = '';

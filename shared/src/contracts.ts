@@ -124,3 +124,34 @@ export interface ErrorDTO extends Provenance {
         message: string;
     };
 }
+export interface ActivityGapDTO {
+    start: number;
+    end: number;
+}
+/** One UTC day of router-counter evidence. Null means unknown, never zero. */
+export interface ActivityDayDTO {
+    date: string;
+    start: number;
+    /** Exclusive end of the evaluated range: the end of the day, or the last completed minute for today. */
+    end: number;
+    expectedMinutes: number;
+    coveredMinutes: number;
+    unknownMinutes: number;
+    coverage: 'complete' | 'partial' | 'none';
+    estimatedOnlineMinutes: number | null;
+    totalBytes: number | null;
+    blockedAttempts: number | null;
+    offload: 'off' | 'on' | 'unknown' | null;
+    possiblyUndercounted: boolean;
+    gaps: ActivityGapDTO[];
+    gapsTruncated: boolean;
+}
+export interface ActivityDTO extends Provenance {
+    personId: string;
+    generatedAt: number;
+    scope: 'estimated-network-activity';
+    disclaimer: string;
+    thresholdBytesPerMinute: number;
+    retentionDays: number;
+    days: ActivityDayDTO[];
+}

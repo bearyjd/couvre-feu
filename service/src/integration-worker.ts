@@ -6,6 +6,8 @@ import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { healthyConfirmation, policyJSON } from '../../shared/src/router-schema.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
+import { ActivityStore } from './activity-store.ts';
+import type { RouterActivity } from '../../shared/src/router-activity.ts';
 import { validatePilotPolicy } from './integration-config.ts';
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
@@ -24,9 +26,11 @@ export class IntegrationWorker {
     readonly store: IntegrationStore;
     readonly router: AsyncRouter;
     readonly policy: IntegrationPolicy;
+    readonly activity: ActivityStore;
     readonly now: () => number;
     constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000)) {
         this.store = store; this.router = router; this.now = now; this.policy = new IntegrationPolicy(store, now);
+        this.activity = new ActivityStore(store, {now, provenance: store.config.provenance});
     }
     /** Preparing a review artifact performs no network call and grants no authorization. */
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
@@ -59,6 +63,8 @@ export class IntegrationWorker {
     }
     /** Only a live manifest-bound owner session can authorize generated invocations. */
     async executeAutomatic(kind: DispatchKind, owner: {token: string; epoch: number}, operationId?: string): Promise<void> {
+        // Activity polling is a separate permit type that is only wired to the operator-approved path.
+        if (kind === 'activity') throw new AppError(403, 'activity_requires_operator_permit');
         await this.run(this.prepare(kind, operationId), owner);
     }
     private async run(plan: PreparedDispatch, owner: {token: string; epoch: number} | null): Promise<void> {
@@ -103,6 +109,7 @@ export class IntegrationWorker {
             } else if (owner) this.store.run("INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES('operator',?,?,?,'claimed_once')", invocation.operationId, 'automatic_apply', now);
         });
         if (!this.store.get('SELECT id FROM dispatch_batches WHERE id=?', batchId)) return;
+        if (invocation.kind === 'activity') { await this.runActivity(batchId, token, epoch, invocation); return; }
         // A crash here is deliberately possible delivery. Restart must not replay the operation.
         try {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
@@ -115,6 +122,26 @@ export class IntegrationWorker {
             const failure = error instanceof RouterTransportError ? error : new RouterTransportError('router_observation_invalid');
             this.finish(batchId, token, epoch, invocation, null, failure);
         }
+    }
+    /** Read-only counters: never touches the policy observation, receipts or active operation. Ingest filters to enrolled children. */
+    private async runActivity(batchId: string, token: string, epoch: number, invocation: FrozenInvocation): Promise<void> {
+        let activity: RouterActivity | null = null, failure: RouterTransportError | null = null;
+        try {
+            if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
+            activity = await this.router.invokeActivity(invocation);
+        } catch (error) { failure = error instanceof RouterTransportError ? error : new RouterTransportError('router_activity_invalid'); }
+        this.store.transaction(() => {
+            const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
+            if (!step || step.claim_token !== token || step.state !== 'consumed' || s.dispatch_epoch !== epoch || s.generation !== this.store.config.router.generation || s.dispatch_stopped || step.lease_until < this.now()) return;
+            let code = failure?.code ?? null;
+            if (activity) {
+                try { code = this.activity.ingest(activity, this.now()).skipped; } catch { code = 'router_activity_invalid'; }
+            }
+            this.store.run('UPDATE dispatch_steps SET state=? WHERE batch_id=? AND ordinal=1 AND claim_token=?', failure ? 'uncertain' : 'resolved', batchId, token);
+            this.store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
+            this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', 'operator', 'activity_poll', this.now(), code ?? 'ingested');
+            this.store.run('UPDATE integration_state SET dispatch_stopped=1 WHERE singleton=1');
+        });
     }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {
         this.store.transaction(() => {
@@ -137,6 +164,7 @@ export class IntegrationWorker {
                 }
                 this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
                 this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
+                this.activity.purgeUnenrolled();
                 if (o!.errors.length === 0 && healthyConfirmation(o!.status, o!.acceptedPolicy, o!.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o!.routerTime);
                 if (!active) return;
                 const e = this.policy.envelope(active), accepted = exactReceipt(o!, e), healthy = accepted && exactHealthy(o!, e);
