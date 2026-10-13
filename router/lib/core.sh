@@ -80,6 +80,10 @@ cf_clock() {
 # so an uncertain clock or out-of-bound record blocks (fails closed).
 CF_ALLOWANCE_HORIZON=14400
 cf_active_allowances() {
+    # Conservative recovery must replay the immutable prepared generation, so it
+    # evaluates at the prepared epoch like pauses. That replay cannot fail open:
+    # the generation carries the person's blocks gated by --datestart <until>,
+    # which the kernel already enforces once until has passed.
     printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" -v horizon="$CF_ALLOWANCE_HORIZON" '
     BEGIN{valid=now~/^[1-9][0-9]*$/&&length(now)<=10&&now+0>=1577836800}
     valid&&$1=="U"&&NF==3&&$3~/^[1-9][0-9]*$/&&length($3)<=10&&$3+0>now+0&&$3+0<=now+horizon{print $2 "\t" $3 "\t" ($3-now)}'
@@ -130,8 +134,9 @@ cf_gated_plan() {
     done
 }
 cf_allowance_admissible() {
-    # Newly staged policy only; retained expired allowances stay inert for replay equality.
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" -v horizon="$CF_ALLOWANCE_HORIZON" '$1=="U"&&$3+0>now+0&&$3+0>now+horizon{exit 1}' || { cf_fail allowance_beyond_horizon;return 1; }
+    # Newly staged policy only ($1, default CF_POLICY); retained expired allowances stay inert for replay equality.
+    cf_number_valid "${CF_EXPIRY_NOW-}" && [ "$CF_EXPIRY_NOW" -ge 1577836800 ] || { cf_fail invalid_clock;return 1; }
+    printf '%s\n' "${1-$CF_POLICY}" | awk -F '\t' -v now="$CF_EXPIRY_NOW" -v horizon="$CF_ALLOWANCE_HORIZON" '$1=="U"&&$3+0>now+0&&$3+0>now+horizon{exit 1}' || { cf_fail allowance_beyond_horizon;return 1; }
 }
 cf_protected_valid() {
     cf_safe_file "$CF_PROTECTED" && [ -s "$CF_PROTECTED" ] || { cf_fail unsafe_protected_file; return 1; }
@@ -376,7 +381,8 @@ cf_pause_edit() {
     [ "$cf_until" = 0 ] || [ "$cf_until" -gt "$CF_EXPIRY_NOW" ] || { cf_fail expired_until; return 1; }
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&$2==p{next}{print}END{print "A",p,u}' | cf_canonical)
+    # An explicit local pause is an emergency block: it also clears the person's allowance.
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&$2==p{next}{print}END{print "A",p,u}' | cf_canonical)
 }
 cf_resume_edit() {
     cf_person=$1
@@ -450,8 +456,8 @@ cf_sync_read() {
     cf_new_rev=$(printf '%s\n' "$cf_new" | awk -F '\t' '$1=="R"{print $2}')
     [ "$cf_new_rev" -ge "$CF_REVISION" ] || { cf_fail stale_revision;return 1; }
     if [ "$cf_new_rev" = "$CF_REVISION" ] && [ "$cf_new" != "$CF_POLICY" ];then cf_fail conflicting_revision;return 1;fi
+    cf_allowance_admissible "$cf_new" || return 1
     CF_POLICY=$cf_new;CF_REVISION=$cf_new_rev
-    cf_allowance_admissible
 }
 cf_check() {
     cf_missing=

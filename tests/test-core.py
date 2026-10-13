@@ -456,18 +456,19 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.kid_outbound_blocked())
         self.assertEqual(self.gated_rules(), [])
 
-    def test_allowance_timed_pause_rides_through_and_cli_pause_does_not_clear_it(self):
+    def test_cli_pause_is_an_emergency_block_that_clears_the_allowance(self):
         now = int(self.fixture.env["CF_NOW"])
         document = policy()
         document["allowances"] = [{"person": "alice", "until": now + 60}]
         self.allowance_sync(document)
+        self.assertEqual(self.paused(), [])
         paused = self.success(self.fixture.run("pause", "alice", timeout=ALLOWANCE_DEADLINE))
         self.assertEqual(paused["desiredRevision"], 2)
-        self.assertEqual(paused["desiredAllowances"], [{"person": "alice", "until": now + 60}])
-        self.assertEqual(self.paused(), [])
-        self.fixture.env["CF_NOW"] = str(now + 61)
-        self.success(self.fixture.run("expire", timeout=ALLOWANCE_DEADLINE))
+        self.assertEqual(paused["desiredAllowances"], [])
+        self.assertEqual(paused["effectiveAllowances"], [])
         self.assertCountEqual(self.paused(), [KID, OTHER_KID])
+        self.assertEqual(self.gated_rules(), [])
+        self.assertTrue(self.kid_outbound_blocked())
 
     def test_invalid_allowances_rejected_without_mutation(self):
         self.sync()

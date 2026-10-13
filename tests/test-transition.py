@@ -27,7 +27,8 @@ def packet(family, adult=False, reverse=False):
     return dict(src=remote if reverse else address, dst=address if reverse else remote,
                 mac='02:ff:ff:ff:ff:01' if reverse else PROTECTED if adult else KID,
                 **{'in': 'eth0' if reverse else 'br-lan', 'out': 'br-lan' if reverse else 'eth0'},
-                protocol='udp', dport='5000', weekday='Mon', time='23:00:00', ctstate='ESTABLISHED')
+                protocol='udp', dport='5000', weekday='Mon', time='23:00:00', ctstate='ESTABLISHED',
+                datetime='2025-01-06T23:00:00')
 
 
 class TransitionTests(unittest.TestCase):
@@ -322,6 +323,32 @@ printf '%s\\n' '-A example -m time --weekdays Sun,Wed,Mon --kerneltz -j DROP' | 
         self.success(self.f.run('expire', timeout=160))
         self.assertEqual(self.f.backend()['sets'][self.f.active_set('p')]['members'], [])
         self.verify_reachability(self.f.backend(), child_blocked=False)
+        self.assertFalse((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
+
+    def test_interrupted_transition_never_revives_allowance_expired_in_between(self):
+        # Conservative recovery replays the generation prepared while the allowance was active. Every
+        # intermediate kernel state must still block at the real (post-until) time via the datestart gate.
+        self.success(self.f.run('sync', document=self.paused_policy(), timeout=180))
+        until = int(self.f.env['CF_NOW']) + 30
+        doc = self.paused_policy(2)
+        doc['allowances'] = [{'person': 'alice', 'until': until}]
+        self.f.update_backend(failures=[{'command': 'ip6tables', 'contains': ['-R', 'cf_fwd'], 'remaining': 1}])
+        result = self.f.run('sync', document=doc, timeout=180)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)['desiredRevision'], 2)
+        self.f.update_backend(capture_effects=True, effects=[])
+        self.f.env['CF_NOW'] = str(until + 1)
+        self.success(self.f.run('expire', timeout=240))
+        state = self.f.backend()
+        self.assertCountEqual(state['sets'][self.f.active_set('p')]['members'], [KID, OTHER_KID])
+        self.verify_reachability(state, child_blocked=True)
+        late = dict(datetime=time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(until + 1)))
+        self.assertTrue(state['effects'])
+        for effect in state['effects']:
+            for family in ('iptables', 'ip6tables'):
+                decision = model.evaluate_fixture_chain(effect['tables'][family]['filter'], 'FORWARD', {**packet(family), **late}, effect['sets'])
+                with self.subTest(argv=effect['argv'][:6], family=family):
+                    self.assertIn(decision, ('REJECT', 'DROP'))
         self.assertFalse((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
 
     def test_interrupted_expiry_repair_never_restores_a_protected_reverse_selector(self):
