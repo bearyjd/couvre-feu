@@ -221,6 +221,10 @@ def main(argv=()):
         for future in as_completed([pool.submit(run_lane, job, directory) for job in jobs]):
             filename, index, count, status, log = future.result()
             print(f'{"PASS" if status == 0 else "FAIL"}: {filename} lane {index + 1}, {count} cases', flush=True)
+            # Relay per-test durations that suites opt into; never other log text.
+            for line in log.read_text().splitlines():
+                if line.startswith('TIMING: '):
+                    print(line, flush=True)
             if args.shard:
                 write_json(args.receipt, receipt_for(plan, selected[0], status))
             if status:
