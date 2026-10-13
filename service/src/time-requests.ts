@@ -150,6 +150,18 @@ export class TimeRequestService {
         return this.store.all<RequestRow>("SELECT * FROM time_requests WHERE state='pending'").map(row => ({person: row.person_id, requestId: row.id, createdAt: row.created_at}));
     }
 
+    /** Unfinished restore obligations: approvals still in flight, or a lifted pause not yet confirmed restored. */
+    hasObligations(): boolean {
+        return Boolean(this.store.get("SELECT 1 FROM time_requests WHERE state='approving' OR (state IN ('approved','apply_failed') AND repause_state IN ('waiting','applying')) LIMIT 1"));
+    }
+    /** Drain-only pass for an installation whose time requests were switched off: finish owed restores, accept nothing new. */
+    async drain(): Promise<{remaining: boolean; overdue: boolean}> {
+        if (!this.hasObligations()) return {remaining: false, overdue: false};
+        await this.advance();
+        const overdue = Boolean(this.store.get("SELECT 1 FROM time_requests WHERE repause_state IN ('waiting','applying') AND allowance_until<=? LIMIT 1", this.now()));
+        return {remaining: this.hasObligations(), overdue};
+    }
+
     // ---- Parent decisions -------------------------------------------------------------------------------------
     decline(actor: Actor, id: string): ParentRequestDTO {
         this.expire();

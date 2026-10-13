@@ -113,7 +113,7 @@ approval writes a resume through the normal revision-CAS path and the service la
 writes a re-pause. Without automatic `dispatch`, both of those queued intents wait for
 an exact operator permit, so the child may be told "approved" before the pause lifts
 and a queued re-pause blocks other parent actions until dispatched. If the service is
-down when the allowance ends, the child stays unpaused until it returns. The router-local
+down when the allowance ends, the child stays unpaused until it returns. Switching the flag off later does not abandon owed restores: while any approval is still approving, waiting or applying, a drain-only timer keeps running `advance()` (no routes mounted, no new requests accepted) and stops once none remain; an overdue restore is logged to stderr as `time_request_restore_overdue` (the parent-alerts feed is demo-only, so there is no in-app alert in integration mode). The router-local
 allowance (PR #31) will replace the service-side re-pause. See
 [service-contract](service-contract.md#child-time-requests).
 

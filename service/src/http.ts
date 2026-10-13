@@ -80,7 +80,10 @@ const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService) {
     // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
     const timeRequestsEnabled = timeRequests !== undefined || auth.provenance.source !== 'real-router-integration' || (config as {timeRequests?: {enabled?: boolean}}).timeRequests?.enabled === true;
-    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, (policy as {now?: () => number}).now ?? auth.now);
+    const clock = (policy as {now?: () => number}).now ?? auth.now;
+    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock);
+    // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
+    const drain = requests ? null : new TimeRequestService(auth.store, policy, clock);
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
@@ -254,9 +257,16 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Allowance follow-ups (restoring a lifted pause) must not depend on a parent having the app open.
     let timer: NodeJS.Timeout | undefined;
     server.on('listening', () => {
-        if (!requests) return;
-        timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
-        timer.unref();
+        if (requests) {
+            timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
+            timer.unref();
+        } else if (drain?.hasObligations()) {
+            timer = setInterval(() => drain.drain().then(({remaining, overdue}) => {
+                if (overdue) process.stderr.write('time_request_restore_overdue\n');
+                if (!remaining) { clearInterval(timer); timer = undefined; }
+            }).catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
+            timer.unref();
+        }
     });
     server.on('close', () => clearInterval(timer));
     server.requestTimeout = 10000;

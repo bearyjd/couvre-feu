@@ -49,3 +49,38 @@ test('integration time requests mount only when the manifest enables them', asyn
         assert.equal(timers.length, 1);
     });
 });
+
+test('after time requests are switched off, owed restores still drain and then the timer stops', async () => {
+    const f = integrationFixture(), port = 38000 + process.pid % 10000 + runs++, origin = `http://localhost:${port}`, host = `localhost:${port}`;
+    const person = f.config.person.id, now = f.now();
+    // State left behind by an approval made while the flag was on: pause lifted, restore owed, allowance over.
+    f.store.run('INSERT INTO request_links(id,person_id,token_hash,created_by,created_at,revoked_at,revoked_by) VALUES(?,?,?,?,?,?,?)', 'link-1', person, 'h'.repeat(64), 'parent', now - 2000, now - 100, 'parent');
+    f.store.run("INSERT INTO time_requests(id,link_id,person_id,minutes,reason,state,created_at,expires_at,decided_by,decided_at,granted_minutes,allowance_until,original_pause_until,repause_state) VALUES('req-1','link-1',?,15,'','approved',?,?,'parent',?,15,?,0,'waiting')", person, now - 1500, now - 600, now - 1000, now - 10);
+    const calls: string[] = [];
+    const policy = {
+        people: () => ({people: [{id: person, manualPause: null}], revisionToken: '"s1-r1-x"'}),
+        mutate: (_actor: unknown, who: string, action: string) => { calls.push(`${who}:${action}`); return {status: 200, result: {operation: {id: 'op-1', revision: 5, state: 'confirmed'}}}; },
+        now: f.now, devices: () => ({}), operation: () => ({}), reconcile: () => undefined,
+    };
+    const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
+    const ticks: (() => unknown)[] = [], cleared: unknown[] = [], realSet = globalThis.setInterval, realClear = globalThis.clearInterval;
+    globalThis.setInterval = ((handler: () => unknown, ms?: number, ...args: unknown[]) => { if (ms === 5000) { ticks.push(handler); return {unref() {}} as unknown as NodeJS.Timeout; } return realSet(handler, ms, ...args); }) as typeof setInterval;
+    globalThis.clearInterval = ((handle: never) => { cleared.push(handle); return realClear(handle); }) as typeof clearInterval;
+    const server = appServer(auth, policy as never, {...f.config, port, origin, host});
+    try {
+        server.listen(port, '127.0.0.1'); await once(server, 'listening');
+        assert.equal(ticks.length, 1, 'a drain-only timer is armed because a restore is owed');
+        assert.equal((await post(origin, '/child/status', {token: 'a'.repeat(43)})).status, 404, 'no routes are mounted');
+        await ticks[0]();
+        assert.deepEqual(calls, [`${person}:pause`], 'the lifted pause is restored');
+        assert.equal(f.store.get<{repause_state: string}>("SELECT repause_state FROM time_requests WHERE id='req-1'")!.repause_state, 'done');
+        await new Promise(resolve => setImmediate(resolve));
+        assert.ok(cleared.length >= 1, 'the drain timer stops once nothing is owed');
+        await ticks[0]();
+        assert.equal(calls.length, 1);
+    } finally {
+        globalThis.setInterval = realSet; globalThis.clearInterval = realClear;
+        server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+        f.cleanup();
+    }
+});
