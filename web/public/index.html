@@ -41,6 +41,13 @@
         <div id="connection" class="connection" role="status"></div>
         <div id="people" class="people-list"></div>
         <section id="schedule-editor" class="schedule-editor" aria-labelledby="schedules-title" hidden></section>
+        <section id="parent-alerts" class="alert-panel" aria-labelledby="parent-alerts-title" hidden>
+          <h2 id="parent-alerts-title">Parent alerts <span id="alert-badge" class="alert-badge" hidden>0</span></h2>
+          <p class="fine-print">Saved by the service for your permitted people and kept for 90 days. They resolve on their own when the condition clears. The badge also counts current warnings from this browser, listed below.</p>
+          <p id="parent-alerts-hint" class="fine-print" role="alert" hidden>The alert could not be acknowledged. Check your connection and try again.</p>
+          <ul id="parent-alert-feed" aria-label="Saved parent alerts" aria-live="polite"></ul>
+          <button id="parent-alerts-more" class="button secondary" type="button" hidden>Show older alerts</button>
+        </section>
         <section id="operational-alerts" class="alert-panel" aria-labelledby="alerts-title" hidden>
           <h2 id="alerts-title">Recent alerts in this browser</h2>
           <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>
