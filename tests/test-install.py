@@ -480,6 +480,9 @@ esac
                              'cron init script unavailable or not procd-based: ' + str(self.root) + '/bin/cron; no installation made'),
             'cron-not-procd': ({'CF_TEST_INSTALL_KERNEL': '1'}, ('cron', '#!/bin/sh\nexit 0\n'),
                                'cron init script unavailable or not procd-based: ' + str(self.root) + '/bin/cron; no installation made'),
+            # A commented-out marker is not procd; only an exact USE_PROCD=1 line counts.
+            'cron-procd-comment': ({'CF_TEST_INSTALL_KERNEL': '1'}, ('cron', '#!/bin/sh\n# USE_PROCD=1\nexit 0\n'),
+                                   'cron init script unavailable or not procd-based: ' + str(self.root) + '/bin/cron; no installation made'),
             'cron-disabled': ({'CF_TEST_INSTALL_KERNEL': '1'}, ('cron', '#!/bin/sh\nUSE_PROCD=1\n[ "$1" != enabled ]\n'),
                               'cron service is not enabled at boot; minute expiry would stop after reboot; no installation made'),
         }

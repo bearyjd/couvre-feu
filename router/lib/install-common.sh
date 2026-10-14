@@ -522,15 +522,12 @@ cron_service() (
 )
 # A non-procd script falls back to `help` (exit 0) for unknown actions, so the
 # only running proof is procd's own instance record.
+# One pipeline: fixtures vary only the tool directory and the env -i prefix.
 cron_running() (
-    if [ "${CF_TEST_MODE:-0}" = 1 ]; then
-        fixture_tools
-        "$CF_BACKEND_DIR/ubus" call service list '{"name":"cron"}' |
-            "$CF_BACKEND_DIR/jsonfilter" -e '@.cron.instances[*].running' | grep -qx true
-    else
-        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C ubus call service list '{"name":"cron"}' |
-            env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C jsonfilter -e '@.cron.instances[*].running' | grep -qx true
-    fi
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then fixture_tools; tools=$CF_BACKEND_DIR/; set --
+    else tools=; set -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C; fi
+    "$@" "${tools}ubus" call service list '{"name":"cron"}' |
+        "$@" "${tools}jsonfilter" -e '@.cron.instances[*].running' | grep -qx true
 )
 # Read-only, before the first protected write: expiry needs a procd-managed
 # crond that also starts at boot.
