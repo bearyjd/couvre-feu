@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=f79d189bf348097b50666c8f290bb46b00a9c4e5c83ff06c6548c59b7b511394
+CF_BOOTSTRAP_PIN=6dd250a8be44668c1e6d6e8fe47f28b692a9a30d122c6f88c823452192f7fac6
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -144,21 +144,11 @@ ROLLBACK_BASE=absent
 ROLLBACK_ETC=absent
 # Until the new journal is ready (and before any release directory exists),
 # every exit removes exactly what the journal step created. Managed targets
-# are untouched in this window, so each journal hard link has a second name.
+# are untouched in this window; each journal original is an independent copy.
 journal_rollback() {
     [ "$JOURNAL_ROLLBACK" = 1 ] || return 0
     JOURNAL_ROLLBACK=0
     if [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ]; then
-        for rel in $FILES; do
-            k=$(key "$rel")
-            [ -e "$BACKUP/$k.original" ] || continue
-            # Delete only while the managed path still holds the original
-            # (the same inode, or its exact pre-recorded signature and mtime).
-            if [ -f "$ROOT/$rel" ] && { same_file "$ROOT/$rel" "$BACKUP/$k.original" ||
-                { [ "$(signature "$ROOT/$rel")" = "$(awk 'NR==1 {print; exit}' "$STAGE/$k.before")" ] &&
-                    [ "$(mtime "$ROOT/$rel")" = "$(awk 'NR==1 {print; exit}' "$STAGE/$k.mtime")" ]; }; }; then rm -f "$BACKUP/$k.original"
-            else printf 'couvre-feu: original link kept: %s\n' "$BACKUP/$k.original" >&2; return 0; fi
-        done
         set +f
         for entry in "$BACKUP"/* "$BACKUP"/.[!.]* "$BACKUP"/..?*; do
             [ -e "$entry" ] || [ -L "$entry" ] || continue
@@ -174,7 +164,7 @@ journal_rollback() {
 cleanup() {
     journal_rollback
     for file in cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
-    for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size"; done
+    for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size" "$STAGE/$k.touch"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
@@ -285,25 +275,25 @@ if [ "${CF_TEST_MODE:-0}" != 1 ] || [ "${CF_TEST_RELEASE_DIR:-0}" = 1 ]; then
     if [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ]; then RELEASE_ABSENT=1
     else platform_recovery_prepare "$HERE" "$ROOT"; fi
 fi
-# Hard-link one existing original into the new journal and prove the link is
-# the original inode with its pre-recorded exact signature, size and mtime.
-link_original() {
-    lo_src=$ROOT/$1 lo_dst=$BACKUP/$2.original
-    lo_before=$(awk 'NR==1 {print; exit}' "$STAGE/$2.before")
-    lo_mtime=$(awk 'NR==1 {print; exit}' "$STAGE/$2.mtime")
-    lo_size=$(awk 'NR==1 {print; exit}' "$STAGE/$2.size")
-    ln "$lo_src" "$lo_dst" || fail "cannot preserve exact original by hard link: $1; no installation made"
-    same_file "$lo_src" "$lo_dst" || fail "original hard link identity mismatch: $1; no installation made"
-    # An overlayfs copy-up on link must preserve the original exactly.
-    if ! { [ "$(signature "$lo_src")" = "$lo_before" ] && exact_mtime "$lo_src" "$lo_mtime" && [ "$(stat -c %s "$lo_src")" = "$lo_size" ]; }; then
-        fail "original changed while linking (overlay copy-up?): /$1; installation refused, journal removed"
+# Copy one existing original into the new journal as an independent file with
+# its owner, mode and mtime, and prove the pre-recorded exact signature, size
+# and nanosecond mtime. Reading never copies an overlay lower file up, so no
+# managed path is written; hard links are not used (their overlay identity is
+# not the original's; see exact_file in install-common.sh).
+preserve_original() {
+    po_src=$ROOT/$1 po_dst=$BACKUP/$2.original
+    po_before=$(awk 'NR==1 {print; exit}' "$STAGE/$2.before")
+    po_mtime=$(awk 'NR==1 {print; exit}' "$STAGE/$2.mtime")
+    po_size=$(awk 'NR==1 {print; exit}' "$STAGE/$2.size")
+    copy_exact "$po_src" "$po_dst" "$po_before" "$po_mtime" || fail "cannot preserve exact original: $1; no installation made"
+    [ "$(stat -c %s "$po_dst")" = "$po_size" ] || fail "cannot preserve exact original: $1; no installation made"
+    # Non-authoritative byte copy for manual recovery, read from the live path.
+    cp "$po_src" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; no installation made"
+    [ "$(sha256sum "$BACKUP/$2.copy" | awk '{print $1}')" = "${po_before%%:*}" ] || fail "original recovery copy mismatch: $1; no installation made"
+    # The live original must still be exactly what was recorded and copied.
+    if ! { exact_file "$po_src" "$po_before" "$po_mtime" && [ "$(stat -c %s "$po_src")" = "$po_size" ]; }; then
+        fail "original changed while preserving: /$1; installation refused, journal removed"
     fi
-    stat -c %i "$lo_dst" > "$BACKUP/$2.inode"
-    # Non-authoritative byte copy for manual recovery only: while the managed
-    # path and the journal share one inode, an in-place writer changes both.
-    cp "$lo_dst" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; no installation made"
-    # The copy is read from the shared inode: prove it against the recorded sha.
-    [ "$(sha256sum "$BACKUP/$2.copy" | awk '{print $1}')" = "${lo_before%%:*}" ] || fail "original recovery copy mismatch: $1; no installation made"
 }
 if [ ! -e "$BACKUP" ]; then
     # Every refusal gate precedes the first managed write. Without a journal no
@@ -319,7 +309,15 @@ if [ ! -e "$BACKUP" ]; then
         k=$(key "$rel")
         mtime "$ROOT/$rel" > "$STAGE/$k.mtime" || fail "precise original mtime unavailable: $rel"
         signature "$ROOT/$rel" > "$STAGE/$k.before"
-        if [ -e "$ROOT/$rel" ]; then stat -c %s "$ROOT/$rel" > "$STAGE/$k.size"; fi
+        if [ -e "$ROOT/$rel" ]; then
+            stat -c %s "$ROOT/$rel" > "$STAGE/$k.size"
+            # Read-only capability proof outside managed paths: touch -r must
+            # carry this original's exact nanosecond mtime (BusyBox -d cannot).
+            : > "$STAGE/$k.touch"
+            touch -r "$ROOT/$rel" "$STAGE/$k.touch" || fail "touch -r unavailable: $rel; no installation made"
+            exact_mtime "$STAGE/$k.touch" "$(awk 'NR==1 {print; exit}' "$STAGE/$k.mtime")" || fail "touch -r cannot restore exact nanosecond mtime: $rel; no installation made"
+            rm -f "$STAGE/$k.touch"
+        fi
     done
     # Capture directory modes before creating anything in managed paths.
     for rel in $DIRS; do
@@ -335,7 +333,7 @@ if [ ! -e "$BACKUP" ]; then
     chmod 700 "$BACKUP"
     for rel in $FILES; do
         k=$(key "$rel")
-        if [ -e "$ROOT/$rel" ]; then link_original "$rel" "$k"; fi
+        if [ -e "$ROOT/$rel" ]; then preserve_original "$rel" "$k"; fi
     done
     chmod 700 "$BASE"
     for rel in $DIRS; do k=$(key "$rel"); cp "$STAGE/dir_$k" "$BACKUP/dir_$k"; done

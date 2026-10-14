@@ -68,7 +68,7 @@ if [ "$PROFILE_INVENTORY" = 1 ]; then
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
-for dep in sha256sum stat cp ln mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
+for dep in sha256sum stat cp mv mkdir rmdir chmod chown touch awk sed cmp dd od tr sync wc; do
     command -v "$dep" >/dev/null 2>&1 || fail "missing dependency: $dep"
 done
 
@@ -182,10 +182,23 @@ exact_mtime() {
     [ "$observed_mtime" = "$2" ]
 }
 key() { printf '%s' "$1" | sed 's|/|_|g'; }
-# Same-run identity only: device numbers of overlay/ubifs mounts are not
-# stable across reboot, so journals persist the inode number alone.
-file_id() { stat -c '%d:%i' "$1"; }
-same_file() { [ "$(file_id "$1")" = "$(file_id "$2")" ]; }
+# Identity is exact content and metadata, never dev:ino. Without index=on,
+# overlayfs reports a copied-up file with an origin xattr as the overlay dev
+# plus the lower inode, while a new hard link to it reports another identity
+# (GL-XE3000, OpenWrt 21.02). Journals therefore hold independent byte copies.
+exact_file() {
+    [ "$(signature "$1")" = "$2" ] && exact_mtime "$1" "$3"
+}
+# Byte-copy $1 to $2 with $1's owner, mode and mtime (touch -r), then prove the
+# copy is the recorded signature $3 and mtime $4. A touch that truncates the
+# nanoseconds fails the proof; the caller refuses with the journal retained.
+copy_exact() {
+    cp "$1" "$2" || return 1
+    chown "$(stat -c %u:%g "$1")" "$2" || return 1
+    chmod "$(stat -c %a "$1")" "$2" || return 1
+    touch -r "$1" "$2" || return 1
+    exact_file "$2" "$3" "$4"
+}
 valid_inode_record() {
     awk '$0 ~ /^[0-9]+$/ && length($0) <= 20 {good=1} END {exit !good || NR!=1}' "$1"
 }
@@ -333,11 +346,11 @@ preflight() {
             [ "$(signature "$BACKUP/$k.original")" = "$before" ] || fail "corrupt original backup: $rel"
             exact_mtime "$BACKUP/$k.original" "$original_mtime" || fail "corrupt original backup mtime: $rel"
         fi
-        # Hard-link journals record the original inode; a copied or replaced
-        # backup (e.g. a cross-device mv fallback) is not the original.
+        # Legacy hard-link journals (7676637) also recorded an inode number.
+        # It is validated as a record only: overlayfs inode numbers are not
+        # stable identity, and exact bytes/metadata/mtime above are the proof.
         if [ -e "$BACKUP/$k.inode" ]; then
             [ "$before" != absent ] && valid_inode_record "$BACKUP/$k.inode" || fail "invalid original inode record: $rel"
-            [ "$(stat -c %i "$BACKUP/$k.original")" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$k.inode")" ] || fail "corrupt original backup inode: $rel"
         fi
         owned_temp "$ROOT/$rel" || fail "temporary path collision: $ROOT/$rel.couvrefeu-tmp"
         staged_sig=$(signature "$BACKUP/$k.staged")
@@ -377,12 +390,23 @@ owned_temp() (
         [ -f "$BACKUP/firewall.transaction" ] &&
         [ "$temp_sig" = "$(signature "$BACKUP/firewall.pending")" ]
 )
-# Until the install rename, the managed path may still be the journal's only
-# original inode. Prove the original is unchanged (sha256 also fixes its size).
+# Immediately before the install rename, the managed path must still be what
+# preflight accepted: the exact original, or content this journal owns. An
+# in-place writer's change is never silently replaced. The journal original is
+# an independent copy and must also be intact (sha256 also fixes its size).
 original_intact() {
-    [ -e "$BACKUP/$1.original" ] || return 0
-    if ! { [ "$(signature "$BACKUP/$1.original")" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.before")" ] &&
-        exact_mtime "$BACKUP/$1.original" "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.mtime")"; }; then
+    oi_before=$(awk 'NR==1 {print; exit}' "$BACKUP/$1.before")
+    oi_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$1.mtime")
+    oi_current=$(signature "$ROOT/$2")
+    oi_tx_old='' oi_tx_new=''
+    if [ "$2" = etc/config/firewall ] && [ -f "$BACKUP/firewall.transaction" ]; then
+        oi_tx_old=$(awk 'NR==1 {print}' "$BACKUP/firewall.transaction")
+        oi_tx_new=$(awk 'NR==2 {print}' "$BACKUP/firewall.transaction")
+    fi
+    if ! { { [ "$oi_current" = "$oi_before" ] && exact_mtime "$ROOT/$2" "$oi_mtime"; } ||
+        [ "$oi_current" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.after")" ] ||
+        [ "$oi_current" = "$oi_tx_old" ] || [ "$oi_current" = "$oi_tx_new" ]; } ||
+        { [ -e "$BACKUP/$1.original" ] && ! exact_file "$BACKUP/$1.original" "$oi_before" "$oi_mtime"; }; then
         fail "original changed in place before install rename: /$2; installation refused, journal retained; manual recovery copy: $BACKUP/$1.copy"
     fi
 }
@@ -414,25 +438,23 @@ atomic_copy() (
     if [ -n "$original_key" ]; then original_intact "$original_key" "${dst#"$ROOT"/}"; fi
     mv -f "$tmp" "$dst"
 )
-# Exact restoration never copies: the journal holds the original inode as a
-# hard link. Link it beside the target (a link cannot silently degrade into a
-# copy on EXDEV, unlike mv), prove identity, then rename within the directory.
-# The journal link remains until final cleanup; the original is never the
-# sole name being moved.
+# Exact restoration copies the journal original to a sibling temporary file,
+# sets owner, mode and mtime, proves the recorded signature and nanosecond
+# mtime, flushes it, and only then renames within the directory (never a
+# cross-filesystem mv). The journal original remains until final cleanup.
 restore_original() (
-    src=$1 dst=$2 tmp=$2.couvrefeu-tmp
-    if [ -e "$dst" ] && same_file "$dst" "$src"; then exit 0; fi
+    src=$1 dst=$2 tmp=$2.couvrefeu-tmp before=$3 original_mtime=$4
+    if [ -e "$dst" ] && exact_file "$dst" "$before" "$original_mtime"; then exit 0; fi
     if [ -e "$tmp" ] || [ -L "$tmp" ]; then
         owned_temp "$dst" || fail "temporary path collision: $tmp"
-        if ! same_file "$tmp" "$src"; then platform_initial_write; rm -f "$tmp"; fi
+        platform_initial_write
+        rm -f "$tmp"
     fi
     platform_initial_write
-    if [ ! -e "$tmp" ]; then
-        ln "$src" "$tmp" || fail "exact original link failed: $dst; journal retained"
-    fi
-    same_file "$tmp" "$src" || fail "exact original link identity mismatch: $dst; journal retained"
+    copy_exact "$src" "$tmp" "$before" "$original_mtime" || fail "exact original copy mismatch: $dst; journal retained"
+    sync "$tmp" 2>/dev/null
     mv -f "$tmp" "$dst"
-    same_file "$dst" "$src" || fail "exact original rename identity mismatch: $dst; journal retained"
+    exact_file "$dst" "$before" "$original_mtime" || fail "exact original rename mismatch: $dst; journal retained"
 )
 
 # Only explicitly marked isolated fixtures can emulate live tool calls.

@@ -270,6 +270,7 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertRegex(release, r'/etc/\.couvrefeu-release-[0-9a-f]{64}/uninstall\.sh$')
         self.assertFalse(Path(release).parent.exists())
         self.assertTrue(any(line.startswith('INFO tools stat=') for line in stdout))
+        self.assertTrue(any(line.startswith('INFO tools touch=') for line in stdout))
         summary = json.loads((run / 'summary.json').read_text())
         self.assertEqual((summary['outcome'], summary['exitCode'], summary['remoteExit']), ('PASS', 0, 0))
         staging = next(line.split(' ', 2)[2] for line in stdout if line.startswith('INFO staging '))
@@ -292,6 +293,27 @@ class LiveRehearsalTests(unittest.TestCase):
         before = self.router_snapshot()
         code, out, err = self.execute()
         self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertTrue(self.cp_log.read_text().strip())
+
+    def test_touch_without_nanoseconds_refused_at_prereq(self):
+        # Older BusyBox `touch -r` may truncate; install would refuse, PREREQ does first.
+        stat = shlex.quote(shutil.which('stat'))
+        wrapper = self.fixture.bin / 'touch'
+        wrapper.write_text('#!/bin/sh\n' + shlex.quote(shutil.which('touch')) + ' "$@" || exit\n'
+                           'for destination do :; done\n'
+                           f'seconds=$({stat} -c %Y "$destination")\n'
+                           f'{shlex.quote(shutil.which("touch"))} -m -d "@$seconds" "$destination"\n'
+                           f'printf "%s\\n" "$destination" >> {shlex.quote(str(self.cp_log))}\n')
+        wrapper.chmod(0o700)
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        self.assertEqual(code, 1, out + err)
+        stdout = (self.evidence() / 'stdout.log').read_text()
+        self.assertIn('PHASE PREREQ FAIL touch_mtime_not_nanosecond', stdout)
+        self.assertIn('REFUSED_BEFORE_MUTATION PREREQ', stdout)
+        self.assertNotIn('MUTATION_BEGIN', stdout)
+        self.assertFalse(self.installer_ran())
         self.assertEqual(self.router_snapshot(), before)
         self.assertTrue(self.cp_log.read_text().strip())
 
