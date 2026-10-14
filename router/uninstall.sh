@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=6dd250a8be44668c1e6d6e8fe47f28b692a9a30d122c6f88c823452192f7fac6
+CF_BOOTSTRAP_PIN=d980da93454ac4d757c002996075f6cb7f7d5f0e5804dcf2fb074a686617a7b4
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -202,6 +202,12 @@ for rel in $FILES; do
         fail "exact restoration incomplete: $rel; journal retained"
     fi
 done
+# Restored crontab bytes may share one second with crond's directory check.
+# Restoration is already exact and verified; a signalling failure only warns.
+if live_tools; then
+    platform_initial_write
+    cron_service reload || printf '%s\n' 'couvre-feu: warning: cron reload failed; crond may keep a stale cfctl expire entry for up to an hour; run /etc/init.d/cron restart' >&2
+fi
 release_retire_check
 [ -f "$BACKUP/restored" ] || phase restored 2
 if [ -f "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then

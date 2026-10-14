@@ -5,6 +5,7 @@ All subprocess arguments are recorded as arrays, never evaluated as shell code.
 State and failure injection live entirely below CF_BACKEND_STATE.
 """
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ import time
 def main():
     command, args = sys.argv[1], sys.argv[2:]
     state_path = Path(os.environ["CF_BACKEND_STATE"])
+    if command == "jsonfilter":
+        # Drain a piped producer before locking: it may itself be a backend
+        # double (ubus) waiting for this lock.
+        sys.stdin = io.StringIO(sys.stdin.read())
     with open(str(state_path) + ".lock", "a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = json.loads(state_path.read_text())
@@ -105,6 +110,13 @@ def dispatch(command, args, state):
         raise ValueError("unsupported ip operation")
     if command == "jsonfilter":
         return jsonfilter(args)
+    if command == "cron":
+        return cron(args, state)
+    if command == "ubus":
+        if args != ["call", "service", "list", '{"name":"cron"}']:
+            raise ValueError("unsupported ubus call")
+        running = state.get("crond", {}).get("running", False)
+        return 0, json.dumps({"cron": {"instances": {"instance1": {"running": running}}}} if running else {"cron": {}}, indent="\t")
     if command in ("fw3", "firewall"):
         state.setdefault("firewall_calls", []).append(args)
         if args == ["-q", "zone", "wan"]:
@@ -124,6 +136,27 @@ def dispatch(command, args, state):
                     return result.returncode, result.stdout
         return 0, ""
     raise ValueError("unknown backend")
+
+
+def cron(args, state):
+    """Model the OpenWrt 21.02 procd cron init script and crond's loaded tables.
+
+    reload stops crond without crontabs and (re)starts it, loading every table,
+    only when the tables differ from the running instance.
+    """
+    crond = state.setdefault("crond", {"running": False, "tables": {}, "starts": 0})
+    if args == ["enabled"]:
+        return (1 if state.get("cron_disabled") else 0), ""
+    if args != ["reload"]:
+        raise ValueError("unsupported cron operation")
+    directory = Path(os.environ["CF_ROOT"]) / "etc/crontabs"
+    tables = ({entry.name: entry.read_text() for entry in sorted(directory.iterdir()) if entry.is_file()}
+              if directory.is_dir() else {})
+    if not tables:
+        crond.update(running=False, tables={})
+    elif not crond["running"] or crond["tables"] != tables:
+        crond.update(running=True, tables=tables, starts=crond["starts"] + 1)
+    return 0, ""
 
 
 def reload_firewall(state):
