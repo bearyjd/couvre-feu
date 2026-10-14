@@ -1111,6 +1111,31 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
 [ "${CF_TEST_RELOAD_FAIL:-0}" != 1 ]
 ''')
         tool.chmod(0o700)
+        # OpenWrt 21.02 procd cron init double: reload stops crond without
+        # crontabs, (re)starts it only for changed tables; `running` reports it.
+        cron = self.root / 'bin/cron'
+        cron.write_text('''#!/bin/sh
+set -eu
+[ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] || exit 96
+printf '%s\\n' "$1" >> "$CF_ROOT/cron-log"
+[ "$1" != "${CF_TEST_CRON_FAIL:-}" ] || exit 1
+case "$1" in
+reload)
+    if [ -z "$(ls "$CF_ROOT/etc/crontabs" 2>/dev/null)" ]; then
+        rm -f "$CF_ROOT/crond-table"; printf '%s\\n' stopped >> "$CF_ROOT/cron-log"; exit 0
+    fi
+    if [ -f "$CF_ROOT/crond-table" ] && cat "$CF_ROOT"/etc/crontabs/* | cmp -s - "$CF_ROOT/crond-table"; then exit 0; fi
+    exec "$CF_BACKEND_DIR/crond";;
+running) [ -f "$CF_ROOT/crond-table" ];;
+*) exit 95;;
+esac
+''')
+        cron.chmod(0o700)
+        # crond double: records exactly the tables it loaded at (re)start.
+        crond = self.root / 'bin/crond'
+        crond.write_text('#!/bin/sh\nset -eu\ncat "$CF_ROOT"/etc/crontabs/* > "$CF_ROOT/crond-table"\n'
+                         'printf \'%s\\n\' started >> "$CF_ROOT/cron-log"\n')
+        crond.chmod(0o700)
 
     def assert_originals_retained(self, backup):
         self.assertTrue((backup / 'ready').is_file())
@@ -1672,6 +1697,144 @@ class OverlayIdentityTests(unittest.TestCase):
         self.assertTrue(self.cp_log.read_text().strip())
         self.assertEqual(self.copy_ups(), [])
     touch_tool = InstallerTests.touch_tool
+
+
+class CrondPickupTests(unittest.TestCase):
+    """crond sees every installer/uninstaller crontab change without its mtime rescan."""
+    setUp = InstallerTests.setUp
+    tearDown = InstallerTests.tearDown
+    run_script = InstallerTests.run_script
+    snapshot = InstallerTests.snapshot
+    install = InstallerTests.install
+    write_originals = InstallerTests.write_originals
+    kill_lock = InstallerTests.kill_lock
+    production_tools = InterruptedRecoveryTests.production_tools
+    LOGS = ('tool-log', 'cron-log', 'crond-table')
+    EXPIRE = '* * * * * /usr/sbin/cfctl expire'
+
+    def restorable(self):
+        return {k: v for k, v in self.snapshot().items() if k not in self.LOGS}
+
+    def cron_log(self):
+        log = self.root / 'cron-log'
+        return log.read_text().splitlines() if log.exists() else []
+
+    def crond_table(self):
+        table = self.root / 'crond-table'
+        return table.read_text() if table.exists() else None
+
+    def test_fresh_install_starts_crond_with_expiry_and_uninstall_stops_it(self):
+        self.production_tools()
+        before = self.restorable()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running'])
+        self.assertIn(self.EXPIRE, self.crond_table())
+        self.assertEqual((self.root / 'etc/crontabs/root').read_text(), self.crond_table())
+        self.assertEqual((self.root / 'tool-log').read_text().splitlines(), ['apply-fw'])
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'stopped'])
+        self.assertIsNone(self.crond_table())
+        self.assertFalse((self.root / 'etc').exists())
+        self.assertEqual(self.restorable(), before)
+
+    def test_vendor_crontab_reloaded_on_install_and_restored_in_crond(self):
+        self.production_tools()
+        self.write_originals()
+        vendor = EXISTING_ORIGINALS['etc/crontabs/root'].decode()
+        (self.root / 'crond-table').write_text(vendor)
+        before = self.restorable()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.crond_table().startswith(vendor))
+        self.assertIn(self.EXPIRE, self.crond_table())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'started'])
+        self.assertEqual(self.crond_table(), vendor)
+        self.assertEqual(self.restorable(), before)
+
+    def test_resumed_install_signals_crond_after_rename(self):
+        self.production_tools()
+        before = self.restorable()
+        self.env['CF_TEST_INSTALL_FAIL_AFTER'] = '5'
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.cron_log(), [])
+        self.env.pop('CF_TEST_INSTALL_FAIL_AFTER')
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running'])
+        self.assertIn(self.EXPIRE, self.crond_table())
+        # A recorded reinstall renames again and re-signals; unchanged tables do not restart crond.
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'running'])
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.crond_table())
+        self.assertEqual(self.restorable(), before)
+
+    def test_install_signalling_failure_refuses_success_and_uninstall_restores(self):
+        for failing in ('reload', 'running'):
+            with self.subTest(failing=failing):
+                self.production_tools()
+                before = self.restorable()
+                self.env['CF_TEST_CRON_FAIL'] = failing
+                result = self.install('--activate')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('cron reload failed; expiry cron may be unseen', result.stderr)
+                self.assertNotIn('Installation recorded', result.stdout)
+                backup = self.root / 'etc/couvrefeu/backup'
+                self.assertTrue((backup / 'activated').is_file())
+                self.assertFalse((backup / 'complete').exists())
+                self.assertFalse((self.root / 'tool-log').exists())
+                self.env.pop('CF_TEST_CRON_FAIL')
+                result = self.run_script('uninstall.sh')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNone(self.crond_table())
+                self.assertFalse((self.root / 'etc').exists())
+                self.assertEqual(self.restorable(), before)
+                for name in self.LOGS:
+                    (self.root / name).unlink(missing_ok=True)
+
+    def test_uninstall_signalling_failure_warns_and_completes_exact_restoration(self):
+        self.production_tools()
+        self.write_originals()
+        before = self.restorable()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env['CF_TEST_CRON_FAIL'] = 'reload'
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('warning: cron reload failed', result.stderr)
+        self.assertIn('/etc/init.d/cron restart', result.stderr)
+        self.assertIn('Original files restored', result.stdout)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload'])
+        self.assertFalse((self.root / '.couvrefeu-recovery').exists())
+        self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
+        self.assertEqual(self.restorable(), before)
+
+    def test_uninstall_retry_after_crash_signals_crond(self):
+        self.production_tools()
+        self.write_originals()
+        vendor = EXISTING_ORIGINALS['etc/crontabs/root'].decode()
+        before = self.restorable()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env['CF_TEST_UNINSTALL_CRASH_AT'] = 'restored'
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.env.pop('CF_TEST_UNINSTALL_CRASH_AT')
+        self.kill_lock()
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running'])
+        self.assertIn(self.EXPIRE, self.crond_table())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'started'])
+        self.assertEqual(self.crond_table(), vendor)
+        self.assertEqual(self.restorable(), before)
 
 
 if __name__ == '__main__':

@@ -267,6 +267,9 @@ class ActivatedLegacyRecoveryTests(unittest.TestCase):
         result = self.command('install.sh', *options)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertTrue(self.fixture.backend()['sets'], 'owned kernel objects must exist')
+        crond = self.fixture.backend()['crond']
+        self.assertTrue(crond['running'])
+        self.assertIn('* * * * * /usr/sbin/cfctl expire', crond['tables']['root'])
         backup = private/'backup'
         archive = REPO/'tests/fixtures/legacy-router-5c45e3e.tar.gz'
         manifest = json.loads((REPO/'tests/fixtures/legacy-router-5c45e3e.json').read_text())
@@ -306,6 +309,9 @@ class ActivatedLegacyRecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertEqual(fixtures.exact_signature(self.firewall),self.original)
         self.assertEqual(self.fixture.backend()['sets'],{})
+        # The restored, originally absent crontab directory stops crond.
+        self.assertEqual(self.fixture.backend()['crond']['tables'],{})
+        self.assertFalse(self.fixture.backend()['crond']['running'])
         self.assertFalse((self.root/'etc/couvrefeu').exists())
         self.assertFalse((self.root/'usr/lib/couvrefeu').exists())
         self.assertFalse((self.root/'.couvrefeu-recovery.done').exists())

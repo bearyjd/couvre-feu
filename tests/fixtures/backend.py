@@ -105,6 +105,8 @@ def dispatch(command, args, state):
         raise ValueError("unsupported ip operation")
     if command == "jsonfilter":
         return jsonfilter(args)
+    if command == "cron":
+        return cron(args, state)
     if command in ("fw3", "firewall"):
         state.setdefault("firewall_calls", []).append(args)
         if args == ["-q", "zone", "wan"]:
@@ -124,6 +126,27 @@ def dispatch(command, args, state):
                     return result.returncode, result.stdout
         return 0, ""
     raise ValueError("unknown backend")
+
+
+def cron(args, state):
+    """Model the OpenWrt 21.02 procd cron init script and crond's loaded tables.
+
+    reload stops crond without crontabs and (re)starts it, loading every table,
+    only when the tables differ from the running instance; running reports it.
+    """
+    crond = state.setdefault("crond", {"running": False, "tables": {}, "starts": 0})
+    if args == ["running"]:
+        return (0 if crond["running"] else 1), ""
+    if args != ["reload"]:
+        raise ValueError("unsupported cron operation")
+    directory = Path(os.environ["CF_ROOT"]) / "etc/crontabs"
+    tables = ({entry.name: entry.read_text() for entry in sorted(directory.iterdir()) if entry.is_file()}
+              if directory.is_dir() else {})
+    if not tables:
+        crond.update(running=False, tables={})
+    elif not crond["running"] or crond["tables"] != tables:
+        crond.update(running=True, tables=tables, starts=crond["starts"] + 1)
+    return 0, ""
 
 
 def reload_firewall(state):

@@ -502,6 +502,22 @@ reload_firewall() {
         "$CF_BACKEND_DIR/firewall" reload
     else platform_initial_write; /etc/init.d/firewall reload; fi
 }
+# BusyBox crond rescans its directory only when the whole-second mtime changes,
+# so a temporary file and its rename within one second can stay unseen for up
+# to an hour. The OpenWrt 21.02 procd init script registers each crontab's md5:
+# reload restarts crond only when a crontab changed, starts an absent crond and
+# stops crond when /etc/crontabs is empty. Its exit status is not evidence
+# (procd start returns 0); callers needing crond check `running` separately.
+# Callers own the protected-write barrier; this subshell confines failures.
+cron_service() (
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then
+        fixture_tools
+        if ! { [ -x "$CF_BACKEND_DIR/cron" ] && [ ! -L "$CF_BACKEND_DIR/cron" ]; }; then
+            fail 'fixture cron tool unavailable'
+        fi
+        "$CF_BACKEND_DIR/cron" "$1"
+    else umask 022; /etc/init.d/cron "$1"; fi
+)
 
 # Runtime is newly owned by this installation; preexisting runtime is refused
 # by install. Never remove unknown paths, symlinks, active locks, or weak modes.
