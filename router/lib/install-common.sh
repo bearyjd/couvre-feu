@@ -507,17 +507,41 @@ reload_firewall() {
 # to an hour. The OpenWrt 21.02 procd init script registers each crontab's md5:
 # reload restarts crond only when a crontab changed, starts an absent crond and
 # stops crond when /etc/crontabs is empty. Its exit status is not evidence
-# (procd start returns 0); callers needing crond check `running` separately.
-# Callers own the protected-write barrier; this subshell confines failures.
+# (procd start returns 0); cron_running asks procd directly.
+# Callers own the protected-write barrier; these subshells confine failures.
+cron_script() {
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then fixture_tools; printf '%s\n' "$CF_BACKEND_DIR/cron"
+    else printf '%s\n' /etc/init.d/cron; fi
+}
 cron_service() (
+    script=$(cron_script)
+    if ! { [ -f "$script" ] && [ -x "$script" ]; }; then fail "cron init script unavailable: $script"; fi
+    # Fixed environment; rc.common inherits only the init-script umask.
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then "$script" "$1"
+    else umask 022; env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$script" "$1"; fi
+)
+# A non-procd script falls back to `help` (exit 0) for unknown actions, so the
+# only running proof is procd's own instance record.
+cron_running() (
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         fixture_tools
-        if ! { [ -x "$CF_BACKEND_DIR/cron" ] && [ ! -L "$CF_BACKEND_DIR/cron" ]; }; then
-            fail 'fixture cron tool unavailable'
-        fi
-        "$CF_BACKEND_DIR/cron" "$1"
-    else umask 022; /etc/init.d/cron "$1"; fi
+        "$CF_BACKEND_DIR/ubus" call service list '{"name":"cron"}' |
+            "$CF_BACKEND_DIR/jsonfilter" -e '@.cron.instances[*].running' | grep -qx true
+    else
+        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C ubus call service list '{"name":"cron"}' |
+            env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C jsonfilter -e '@.cron.instances[*].running' | grep -qx true
+    fi
 )
+# Read-only, before the first protected write: expiry needs a procd-managed
+# crond that also starts at boot.
+cron_preflight() {
+    cron_preflight_script=$(cron_script) || fail 'cron init script unavailable; no installation made'
+    if ! { [ -f "$cron_preflight_script" ] && [ -x "$cron_preflight_script" ] &&
+        grep -qx 'USE_PROCD=1' "$cron_preflight_script"; }; then
+        fail "cron init script unavailable or not procd-based: $cron_preflight_script; no installation made"
+    fi
+    cron_service enabled || fail 'cron service is not enabled at boot; minute expiry would stop after reboot; no installation made'
+}
 
 # Runtime is newly owned by this installation; preexisting runtime is refused
 # by install. Never remove unknown paths, symlinks, active locks, or weak modes.

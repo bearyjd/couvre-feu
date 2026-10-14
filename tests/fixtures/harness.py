@@ -131,9 +131,11 @@ class RouterFixture:
             "failures": [], "delays": [], "reload_include": True,
             "native_witness": True}))
         for command in ("ipset", "iptables", "ip6tables", "iptables-save", "ip6tables-save",
-                        "conntrack", "uci", "ip", "jsonfilter", "fw3", "firewall", "cron", "sync"):
+                        "conntrack", "uci", "ip", "jsonfilter", "fw3", "firewall", "cron", "ubus", "sync"):
             wrapper = self.bin / command
-            wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " "
+            # The cron double stands in for a procd init script (installer preflight).
+            wrapper.write_text("#!/bin/sh\n" + ("USE_PROCD=1\n" if command == "cron" else "")
+                               + "exec " + shlex.quote(sys.executable) + " "
                                + shlex.quote(str(REPO / "tests/fixtures/backend.py")) + " "
                                + shlex.quote(command) + ' "$@"\n')
             wrapper.chmod(0o700)

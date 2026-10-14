@@ -475,6 +475,13 @@ esac
             # A rename source that exists before any journal is never owned.
             'temp-file': ({}, None, 'temporary path collision: ' + str(self.root) + '/etc/config/firewall.couvrefeu-tmp; no installation made'),
             'temp-symlink': ({}, None, 'temporary path collision: ' + str(self.root) + '/etc/sysupgrade.conf.couvrefeu-tmp; no installation made'),
+            # Live expiry requires a procd cron script that starts at boot.
+            'cron-missing': ({'CF_TEST_INSTALL_KERNEL': '1'}, None,
+                             'cron init script unavailable or not procd-based: ' + str(self.root) + '/bin/cron; no installation made'),
+            'cron-not-procd': ({'CF_TEST_INSTALL_KERNEL': '1'}, ('cron', '#!/bin/sh\nexit 0\n'),
+                               'cron init script unavailable or not procd-based: ' + str(self.root) + '/bin/cron; no installation made'),
+            'cron-disabled': ({'CF_TEST_INSTALL_KERNEL': '1'}, ('cron', '#!/bin/sh\nUSE_PROCD=1\n[ "$1" != enabled ]\n'),
+                              'cron service is not enabled at boot; minute expiry would stop after reboot; no installation made'),
         }
         for name, (env, tool, message) in gates.items():
             with self.subTest(gate=name):
@@ -1115,6 +1122,7 @@ printf '%s\n' reload >> "$CF_ROOT/tool-log"
         # crontabs, (re)starts it only for changed tables; `running` reports it.
         cron = self.root / 'bin/cron'
         cron.write_text('''#!/bin/sh
+USE_PROCD=1
 set -eu
 [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] || exit 96
 printf '%s\\n' "$1" >> "$CF_ROOT/cron-log"
@@ -1126,11 +1134,31 @@ reload)
     fi
     if [ -f "$CF_ROOT/crond-table" ] && cat "$CF_ROOT"/etc/crontabs/* | cmp -s - "$CF_ROOT/crond-table"; then exit 0; fi
     exec "$CF_BACKEND_DIR/crond";;
-running) [ -f "$CF_ROOT/crond-table" ];;
+enabled) [ "${CF_TEST_CRON_DISABLED:-0}" != 1 ];;
 *) exit 95;;
 esac
 ''')
         cron.chmod(0o700)
+        # procd ubus double: the cron instance runs while crond holds a table.
+        ubus = self.root / 'bin/ubus'
+        ubus.write_text('''#!/bin/sh
+set -eu
+[ "$*" = 'call service list {"name":"cron"}' ] || exit 95
+printf '%s\\n' ubus >> "$CF_ROOT/cron-log"
+[ "${CF_TEST_CRON_FAIL:-}" != ubus-fail ] || exit 4
+running=false
+if [ -f "$CF_ROOT/crond-table" ] && [ "${CF_TEST_CRON_FAIL:-}" != ubus-stopped ]; then running=true; fi
+printf '{\\n\\t"cron": {\\n\\t\\t"instances": {\\n\\t\\t\\t"instance1": {\\n\\t\\t\\t\\t"running": %s,\\n\\t\\t\\t\\t"pid": 1234\\n\\t\\t\\t}\\n\\t\\t}\\n\\t}\\n}\\n' "$running"
+''')
+        ubus.chmod(0o700)
+        # jsonfilter subset double for this one expression only.
+        jsonfilter = self.root / 'bin/jsonfilter'
+        jsonfilter.write_text('''#!/bin/sh
+set -eu
+[ "$*" = '-e @.cron.instances[*].running' ] || exit 95
+grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
+''')
+        jsonfilter.chmod(0o700)
         # crond double: records exactly the tables it loaded at (re)start.
         crond = self.root / 'bin/crond'
         crond.write_text('#!/bin/sh\nset -eu\ncat "$CF_ROOT"/etc/crontabs/* > "$CF_ROOT/crond-table"\n'
@@ -1728,13 +1756,13 @@ class CrondPickupTests(unittest.TestCase):
         before = self.restorable()
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus'])
         self.assertIn(self.EXPIRE, self.crond_table())
         self.assertEqual((self.root / 'etc/crontabs/root').read_text(), self.crond_table())
         self.assertEqual((self.root / 'tool-log').read_text().splitlines(), ['apply-fw'])
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'stopped'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload', 'stopped'])
         self.assertIsNone(self.crond_table())
         self.assertFalse((self.root / 'etc').exists())
         self.assertEqual(self.restorable(), before)
@@ -1751,7 +1779,7 @@ class CrondPickupTests(unittest.TestCase):
         self.assertIn(self.EXPIRE, self.crond_table())
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'started'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload', 'started'])
         self.assertEqual(self.crond_table(), vendor)
         self.assertEqual(self.restorable(), before)
 
@@ -1761,23 +1789,23 @@ class CrondPickupTests(unittest.TestCase):
         self.env['CF_TEST_INSTALL_FAIL_AFTER'] = '5'
         result = self.install('--activate')
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.cron_log(), [])
+        self.assertEqual(self.cron_log(), ['enabled'])
         self.env.pop('CF_TEST_INSTALL_FAIL_AFTER')
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running'])
+        self.assertEqual(self.cron_log(), ['enabled', 'enabled', 'reload', 'started', 'ubus'])
         self.assertIn(self.EXPIRE, self.crond_table())
         # A recorded reinstall renames again and re-signals; unchanged tables do not restart crond.
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'running'])
+        self.assertEqual(self.cron_log(), ['enabled', 'enabled', 'reload', 'started', 'ubus', 'enabled', 'reload', 'ubus'])
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.crond_table())
         self.assertEqual(self.restorable(), before)
 
     def test_install_signalling_failure_refuses_success_and_uninstall_restores(self):
-        for failing in ('reload', 'running'):
+        for failing in ('reload', 'ubus-stopped', 'ubus-fail'):
             with self.subTest(failing=failing):
                 self.production_tools()
                 before = self.restorable()
@@ -1811,7 +1839,7 @@ class CrondPickupTests(unittest.TestCase):
         self.assertIn('warning: cron reload failed', result.stderr)
         self.assertIn('/etc/init.d/cron restart', result.stderr)
         self.assertIn('Original files restored', result.stdout)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload'])
         self.assertFalse((self.root / '.couvrefeu-recovery').exists())
         self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
         self.assertEqual(self.restorable(), before)
@@ -1828,11 +1856,11 @@ class CrondPickupTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.env.pop('CF_TEST_UNINSTALL_CRASH_AT')
         self.kill_lock()
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus'])
         self.assertIn(self.EXPIRE, self.crond_table())
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['reload', 'started', 'running', 'reload', 'started'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload', 'started'])
         self.assertEqual(self.crond_table(), vendor)
         self.assertEqual(self.restorable(), before)
 

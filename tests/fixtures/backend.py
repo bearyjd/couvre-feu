@@ -107,6 +107,11 @@ def dispatch(command, args, state):
         return jsonfilter(args)
     if command == "cron":
         return cron(args, state)
+    if command == "ubus":
+        if args != ["call", "service", "list", '{"name":"cron"}']:
+            raise ValueError("unsupported ubus call")
+        running = state.get("crond", {}).get("running", False)
+        return 0, json.dumps({"cron": {"instances": {"instance1": {"running": running}}}} if running else {"cron": {}}, indent="\t")
     if command in ("fw3", "firewall"):
         state.setdefault("firewall_calls", []).append(args)
         if args == ["-q", "zone", "wan"]:
@@ -132,11 +137,11 @@ def cron(args, state):
     """Model the OpenWrt 21.02 procd cron init script and crond's loaded tables.
 
     reload stops crond without crontabs and (re)starts it, loading every table,
-    only when the tables differ from the running instance; running reports it.
+    only when the tables differ from the running instance.
     """
     crond = state.setdefault("crond", {"running": False, "tables": {}, "starts": 0})
-    if args == ["running"]:
-        return (0 if crond["running"] else 1), ""
+    if args == ["enabled"]:
+        return (1 if state.get("cron_disabled") else 0), ""
     if args != ["reload"]:
         raise ValueError("unsupported cron operation")
     directory = Path(os.environ["CF_ROOT"]) / "etc/crontabs"

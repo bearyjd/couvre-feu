@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=684e01c929d45fc6667ee94a07d4bc04c475839ec66e71e6945af49f11b0618a
+CF_BOOTSTRAP_PIN=bd6fa302e25e17afde5f33b5637ea12e7c23acf191a31f019d9728f1af366e29
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -264,6 +264,7 @@ fi
     . "$SOURCE/lib/core.sh"
     cf_check
 ) || fail 'core dependency/capability gate failed'
+if live_tools; then cron_preflight; fi
 # The external recovery release is retired by uninstall only when this
 # installation created it. Isolated fixtures opt in explicitly. An existing
 # release (including refusal residue) is verified read-only and never adopted.
@@ -405,7 +406,7 @@ printf '%s\n' 1 > "$BACKUP/activated"
 # crond load it now, and refuse success unless the cron instance is running.
 if live_tools; then
     platform_initial_write
-    { cron_service reload && cron_service running; } || fail 'cron reload failed; expiry cron may be unseen; journal retained; retry install or use uninstall for recovery'
+    { cron_service reload && cron_running; } || fail 'cron reload failed; expiry cron may be unseen; journal retained; retry install or use uninstall for recovery'
 fi
 if live_tools; then
     installed_core apply-fw || fail 'apply failed; journal retained; use uninstall for recovery'
