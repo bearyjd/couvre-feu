@@ -5,6 +5,7 @@ All subprocess arguments are recorded as arrays, never evaluated as shell code.
 State and failure injection live entirely below CF_BACKEND_STATE.
 """
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ import time
 def main():
     command, args = sys.argv[1], sys.argv[2:]
     state_path = Path(os.environ["CF_BACKEND_STATE"])
+    if command == "jsonfilter":
+        # Drain a piped producer before locking: it may itself be a backend
+        # double (ubus) waiting for this lock.
+        sys.stdin = io.StringIO(sys.stdin.read())
     with open(str(state_path) + ".lock", "a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = json.loads(state_path.read_text())
