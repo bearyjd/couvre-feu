@@ -239,16 +239,12 @@ cfr_prereq() {
     cfr_precision=$(cfr_file_record "$CFR_ROOT/etc/config/firewall") || cfr_refuse PREREQ stat_format
     case "$cfr_precision" in *:s) cfr_refuse PREREQ stat_mtime_not_nanosecond;; esac
     cfr_info mtime_precision nanoseconds
-    # The installer copies originals and sets mtimes with touch -r (overlayfs
-    # hard links are not identity). Prove it carries nanoseconds read-only.
-    cfr_touch=$(command -v touch) || cfr_refuse PREREQ touch_missing
-    cfr_info "tools touch=$cfr_touch"
-    : > "$CFR_STAGE/touch-probe" || cfr_refuse PREREQ probe_create
-    touch -r "$CFR_ROOT/etc/config/firewall" "$CFR_STAGE/touch-probe" || cfr_refuse PREREQ touch_reference_failed
-    cfr_probe_ref=$(cfr_stat -c '%Y %y' "$CFR_ROOT/etc/config/firewall" </dev/null) || cfr_refuse PREREQ stat_format
-    cfr_probe_y=$(cfr_stat -c '%Y %y' "$CFR_STAGE/touch-probe" </dev/null) || cfr_refuse PREREQ stat_format
-    rm -f "$CFR_STAGE/touch-probe"
-    [ "$cfr_probe_y" = "$cfr_probe_ref" ] || cfr_refuse PREREQ touch_mtime_not_nanosecond
+    # Originals move into the journal and back by rename only (no touch, no
+    # copy); the installer proves one filesystem with `stat -c '%d %m'` on
+    # directories. Prove that format here, read-only, before any change.
+    cfr_mount=$(cfr_stat -c '%d %m' "$CFR_ROOT/etc/config" </dev/null) || cfr_refuse PREREQ stat_mount_format
+    case "$cfr_mount" in [0-9]*' '/*) ;; *) cfr_refuse PREREQ stat_mount_format;; esac
+    cfr_info "etc_config_filesystem $cfr_mount"
     cfr_transients_absent || cfr_refuse PREREQ installer_transient_present
     cfr_install || cfr_refuse PREREQ installer_stage_validation_failed
     cfr_transients_absent || cfr_refuse PREREQ installer_stage_left_transient

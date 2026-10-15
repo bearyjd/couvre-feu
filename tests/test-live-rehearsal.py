@@ -271,7 +271,8 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertRegex(release, r'/etc/\.couvrefeu-release-[0-9a-f]{64}/uninstall\.sh$')
         self.assertFalse(Path(release).parent.exists())
         self.assertTrue(any(line.startswith('INFO tools stat=') for line in stdout))
-        self.assertTrue(any(line.startswith('INFO tools touch=') for line in stdout))
+        # Exact restoration is by rename; touch is no longer a prerequisite.
+        self.assertFalse(any(line.startswith('INFO tools touch=') for line in stdout))
         summary = json.loads((run / 'summary.json').read_text())
         self.assertEqual((summary['outcome'], summary['exitCode'], summary['remoteExit']), ('PASS', 0, 0))
         staging = next(line.split(' ', 2)[2] for line in stdout if line.startswith('INFO staging '))
@@ -297,26 +298,22 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual(self.router_snapshot(), before)
         self.assertTrue(self.cp_log.read_text().strip())
 
-    def test_touch_without_nanoseconds_refused_at_prereq(self):
-        # Older BusyBox `touch -r` may truncate; install would refuse, PREREQ does first.
-        stat = shlex.quote(shutil.which('stat'))
+    def test_truncating_touch_is_never_invoked(self):
+        # BusyBox 1.33.2 `touch -r` truncates (live PREREQ refusal 2026-10-15).
+        # Neither the rehearsal nor the installer calls touch at all now.
+        touch_log = self.work / 'touch.log'
         wrapper = self.fixture.bin / 'touch'
-        wrapper.write_text('#!/bin/sh\n' + shlex.quote(shutil.which('touch')) + ' "$@" || exit\n'
-                           'for destination do :; done\n'
-                           f'seconds=$({stat} -c %Y "$destination")\n'
-                           f'{shlex.quote(shutil.which("touch"))} -m -d "@$seconds" "$destination"\n'
-                           f'printf "%s\\n" "$destination" >> {shlex.quote(str(self.cp_log))}\n')
+        wrapper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(touch_log))}\nexit 1\n')
         wrapper.chmod(0o700)
         before = self.router_snapshot()
         code, out, err = self.execute()
-        self.assertEqual(code, 1, out + err)
+        self.assertEqual(code, 0, out + err)
         stdout = (self.evidence() / 'stdout.log').read_text()
-        self.assertIn('PHASE PREREQ FAIL touch_mtime_not_nanosecond', stdout)
-        self.assertIn('REFUSED_BEFORE_MUTATION PREREQ', stdout)
-        self.assertNotIn('MUTATION_BEGIN', stdout)
-        self.assertFalse(self.installer_ran())
+        self.assertIn('PHASE PREREQ OK', stdout)
+        self.assertIn('FIRST_REHEARSAL_PASS', stdout)
+        self.assertNotIn('touch_mtime_not_nanosecond', stdout)
         self.assertEqual(self.router_snapshot(), before)
-        self.assertTrue(self.cp_log.read_text().strip())
+        self.assertFalse(touch_log.exists())
 
     def shell_status_check(self, line):
         script = (REPO / 'tools/live/first-rehearsal.sh').read_text()
@@ -414,6 +411,24 @@ class LiveRehearsalTests(unittest.TestCase):
 
     def test_restoration_mtime_truncation_fails_with_diff(self):
         self.assert_restore_failure(f'touch -m -d @{STAMP // 10**9} "$CF_ROOT/etc/config/firewall"')
+
+    def test_restoration_mode_change_fails_with_diff(self):
+        self.assert_restore_failure('chmod 600 "$CF_ROOT/etc/config/firewall"')
+
+    def test_restored_original_with_new_inode_and_ctime_passes(self):
+        # A rename-restored original may report another inode and always has a
+        # new ctime on the overlay; RESTORE compares content and metadata only.
+        copy = shlex.quote(shutil.which('cp'))
+        mv = shlex.quote(shutil.which('mv'))
+        target = '"$CF_ROOT/etc/config/firewall"'
+        self.arm_restore_tamper(f'{copy} -p {target} "$CF_ROOT/.arm-copy" && {mv} -f "$CF_ROOT/.arm-copy" {target}')
+        inode = (self.root / 'etc/config/firewall').stat().st_ino
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('PHASE RESTORE OK', (self.evidence() / 'stdout.log').read_text())
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertNotEqual((self.root / 'etc/config/firewall').stat().st_ino, inode)
 
     def test_restoration_changed_byte_fails_with_diff(self):
         self.assert_restore_failure('printf x >> "$CF_ROOT/etc/config/firewall"')

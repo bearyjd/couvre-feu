@@ -22,6 +22,8 @@ measure the five-second packet cutoff acceptance gate or real router performance
 overlay dev and its lower inode, and while it has more than one link any name
 other than the original reports its real dev:ino (only "differs" was measured,
 not the link's exact value). Pure-upper and new files report their real
-identity. `ln`, `chmod`, `chown` and `touch` shims log any operation that would
-copy a lower-only managed path up. This is a model, not overlayfs: it does not
+identity. `ln`, `chmod`, `chown`, `touch` and `mv` (sources) shims log any
+operation that would copy a lower-only managed path up. Directories answer the
+installer's `stat -c '%d %m'` filesystem proof with the overlay dev and `/`;
+a test may split a subtree onto another filesystem. This is a model, not overlayfs: it does not
 prove copy-up timing, dentry-cache eviction or behaviour after reboot.

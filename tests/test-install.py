@@ -261,6 +261,14 @@ esac
         self.env['CF_BACKEND_DIR'] = str(backend)
         # Like target BusyBox, fixture `cp -p` loses fractional mtimes by default.
         InstallerTests.install_copy_tool(self, 's')
+        # Exactness never depends on touch: any invocation is logged and fails.
+        self.touch_log = Path(logs.name) / 'touch.log'
+        touch = backend / 'touch'
+        touch.write_text(f'#!/bin/sh\nprintf "touch %s\\n" "$*" >> {shlex.quote(str(self.touch_log))}\nexit 1\n')
+        touch.chmod(0o700)
+
+    def assert_no_touch(self):
+        self.assertFalse(self.touch_log.exists(), self.touch_log.read_text() if self.touch_log.exists() else '')
 
     def install(self, *extra, protect=True):
         args = ['--source-dir', str(self.source)]
@@ -365,7 +373,7 @@ esac
         return {rel: exact_signature(self.root / rel) for rel in EXISTING_ORIGINALS}
 
     def test_fractional_originals_restore_exact_despite_truncating_cp(self):
-        # BusyBox cp -p truncates; journal copies set the mtime with touch -r.
+        # BusyBox cp -p truncates; originals move into the journal by rename.
         originals = self.write_originals()
         for precision in ('s', 'us', None):
             with self.subTest(precision=precision):
@@ -388,6 +396,7 @@ esac
                 if precision:
                     # The wrapper really ran and really truncated a cp -p copy.
                     self.assertTrue(self.cp_log.read_text().strip())
+                self.assert_no_touch()
 
     def copy_fail_tool(self, fail_suffix):
         """`cp` failing (as on ENOSPC) for one destination suffix; logs every refusal."""
@@ -404,7 +413,7 @@ esac
         real_touch = shutil.which('touch')
         real_stat = shutil.which('stat')
         truncate = {'s': '"@$seconds"', 'us': '"@$seconds.${fraction%???}"'}[precision]
-        wrapper.write_text('#!/bin/sh\n' + shlex.quote(real_touch) + ' "$@" || exit\n'
+        wrapper.write_text('#!/bin/sh\n: > "$CF_ROOT/touch-called"\n' + shlex.quote(real_touch) + ' "$@" || exit\n'
                            'for destination do :; done\n'
                            f'case "$destination" in *{only}*) ;; *) exit 0;; esac\n'
                            f'seconds=$({shlex.quote(real_stat)} -c %Y "$destination")\n'
@@ -436,31 +445,26 @@ esac
         self.write_originals()
         (self.root / 'etc/couvrefeu').mkdir(mode=0o750)
         (self.root / 'etc/couvrefeu').chmod(0o750)
-        # Fail on the last existing original: earlier journal copies are rolled back.
-        self.copy_fail_tool('etc_crontabs_root.original')
+        # Fail on the last existing original: earlier recovery copies are rolled back.
+        self.copy_fail_tool('etc_crontabs_root.copy')
         before = full_snapshot(self.root)
-        result = self.assert_refused_identically(before, release, 'cannot preserve exact original: etc/crontabs/root; no installation made')
+        result = self.assert_refused_identically(before, release, 'cannot copy original for manual recovery: etc/crontabs/root; no installation made')
         self.assertIn('No space left on device', result.stderr)
         self.assertTrue(self.cp_log.read_text().strip())
 
-    def test_preservation_that_truncates_mtime_refuses_identically(self):
-        # Successor of "link that copies": a preservation that silently loses
-        # nanoseconds must refuse before any write, never journal a near-copy.
-        release = self.enable_release()
-        self.write_originals()
-        cases = {('s', ''): 'touch -r cannot restore exact nanosecond mtime: etc/config/firewall; no installation made',
-                 ('us', ''): 'touch -r cannot restore exact nanosecond mtime: etc/config/firewall; no installation made',
-                 # Only the journal filesystem truncates: the per-copy proof refuses.
-                 ('us', '/backup/'): 'cannot preserve exact original: etc/config/firewall; no installation made'}
-        for (precision, only), message in cases.items():
-            with self.subTest(precision=precision, only=only):
-                if self.cp_log.exists():
-                    self.cp_log.unlink()
-                self.touch_tool(precision, only)
-                before = full_snapshot(self.root)
-                self.assert_refused_identically(before, release, message)
-                self.assertTrue(self.cp_log.read_text().strip())
-        (self.root / 'bin/touch').unlink()
+    def test_truncating_touch_is_never_invoked(self):
+        # The live refusal (BusyBox 1.33.2 touch -r truncates) is irrelevant:
+        # originals move by rename; no tool re-applies a timestamp.
+        originals = self.write_originals()
+        self.touch_tool('s')
+        before = self.snapshot()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.originals_state(), originals)
+        self.assertFalse((self.root / 'touch-called').exists())
 
     def test_every_prewrite_gate_leaves_root_identical(self):
         release = self.enable_release()
@@ -567,7 +571,7 @@ esac
         self.assertEqual(list(self.root.glob('.couvrefeu-stage.*')), [])
 
     def test_in_place_append_after_restore_rename_refuses_with_intact_copy(self):
-        self.write_originals()
+        originals = self.write_originals()
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.env['CF_TEST_UNINSTALL_CRASH_AT'] = 'restored'
@@ -577,9 +581,9 @@ esac
         self.kill_lock()
         recovery = self.root / '.couvrefeu-recovery'
         target = self.root / 'etc/config/firewall'
-        # The restored target is an exact, independent copy of the journal original.
-        self.assertEqual(exact_signature(target), exact_signature(recovery / 'etc_config_firewall.original'))
-        self.assertNotEqual(target.stat().st_ino, (recovery / 'etc_config_firewall.original').stat().st_ino)
+        # The journal original itself was renamed back; it is no longer in the journal.
+        self.assertEqual(exact_signature(target), originals['etc/config/firewall'])
+        self.assertFalse((recovery / 'etc_config_firewall.original').exists())
         with target.open('ab') as stream:
             stream.write(b'# in-place append\n')
         before = full_snapshot(self.root)
@@ -622,6 +626,27 @@ esac
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('corrupt original backup mtime: etc/config/firewall', result.stderr)
                 self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual((self.root / 'etc/couvrefeu/backup/etc_config_firewall.copy').read_bytes(),
+                         EXISTING_ORIGINALS['etc/config/firewall'])
+
+    def test_tampered_journal_original_content_refuses_identically(self):
+        # Same mode, owner and nanosecond mtime, other bytes: never renamed back.
+        self.write_originals()
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        original = self.root / 'etc/couvrefeu/backup/etc_config_firewall.original'
+        stamp = original.stat().st_mtime_ns
+        original.write_bytes(b"config zone 'wan'\n option input 'ACCEPT'\n")
+        os.utime(original, ns=(stamp, stamp))
+        installed = exact_signature(self.root / 'etc/config/firewall')
+        before = full_snapshot(self.root)
+        for script in ('uninstall.sh', 'install.sh'):
+            with self.subTest(script=script):
+                result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('corrupt original backup: etc/config/firewall', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual(exact_signature(self.root / 'etc/config/firewall'), installed)
         self.assertEqual((self.root / 'etc/couvrefeu/backup/etc_config_firewall.copy').read_bytes(),
                          EXISTING_ORIGINALS['etc/config/firewall'])
 
@@ -692,9 +717,12 @@ esac
         self.env.pop('CF_TEST_UNINSTALL_CRASH_AT')
         self.kill_lock()
         recovery = self.root / '.couvrefeu-recovery'
+        # Each exact original is in exactly one place: renamed back, or still journaled.
         for rel, exact in originals.items():
             original = recovery / (rel.replace('/', '_') + '.original')
-            self.assertEqual(exact_signature(original), exact)
+            places = [p for p in (original, self.root / rel) if exact_signature(p) == exact]
+            self.assertEqual(len(places), 1, rel)
+        self.assertFalse((recovery / 'etc_config_firewall.original').exists())
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), before)
@@ -731,10 +759,14 @@ esac
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('original backup is not restored at /etc/config/firewall', result.stderr)
-        original = self.root / '.couvrefeu-recovery/etc_config_firewall.original'
-        self.assertEqual(exact_signature(original), originals['etc/config/firewall'])
+        # The original was renamed back by the completed restore; the journal
+        # and its manual recovery copy are kept.
+        recovery = self.root / '.couvrefeu-recovery'
+        self.assertFalse((recovery / 'etc_config_firewall.original').exists())
+        self.assertEqual((recovery / 'etc_config_firewall.copy').read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'])
+        self.assertTrue(originals)
 
-    def test_restore_copy_failure_retains_journal_and_retries(self):
+    def test_restore_rename_failure_retains_journal_and_retries(self):
         target = self.root / 'etc/config/firewall'
         target.parent.mkdir(parents=True)
         target.write_text("config zone 'wan'\n")
@@ -744,28 +776,32 @@ esac
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = exact_signature(target)
-        self.copy_fail_tool('firewall.couvrefeu-tmp')
+        # A rename that cannot happen (as EXDEV would) restores nothing.
+        wrapper = self.root / 'bin/mv'
+        wrapper.write_text('#!/bin/sh\ncase "$*" in *.original" "*) printf "mv: Invalid cross-device link\\n" >&2; exit 1;; esac\n'
+                           f'exec {shlex.quote(shutil.which("mv"))} "$@"\n')
+        wrapper.chmod(0o700)
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('exact original copy mismatch', result.stderr)
-        self.assertTrue(self.cp_log.read_text().strip())
+        self.assertIn('exact original rename failed', result.stderr)
         self.assertEqual(exact_signature(target), installed)
         backup = self.root / '.couvrefeu-recovery'
         self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), original)
         self.assertFalse((backup / 'restored').exists())
-        InstallerTests.install_copy_tool(self, 's')
+        wrapper.unlink()
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(exact_signature(target), original)
         self.assertFalse(backup.exists())
+        self.assert_no_touch()
 
-    def test_native_busybox_cp_and_touch_actual_timestamp_capability(self):
+    def test_native_busybox_cp_and_mv_actual_timestamp_capability(self):
         shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
         busybox = os.environ.get('CF_TEST_BUSYBOX_CP') or (shell[0] if len(shell) == 2 and shell[1] == 'ash' else shutil.which('busybox'))
         if not busybox or subprocess.run([busybox, 'cp', '--help'], capture_output=True).returncode == 127:
             self.skipTest('native BusyBox cp unavailable; capability remains unproved')
-        # This BusyBox's own cp and touch -r carry every journal/restore copy.
-        for tool in ('cp', 'touch'):
+        # This BusyBox's own cp and mv carry every copy and rename; touch is never used.
+        for tool in ('cp', 'mv'):
             wrapper = self.root / 'bin' / tool
             wrapper.write_text(f'#!/bin/sh\nprintf "%s\\n" {tool} >> {shlex.quote(str(self.cp_log))}\n'
                                'exec ' + shlex.quote(busybox) + f' {tool} "$@"\n')
@@ -786,7 +822,8 @@ esac
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual(target.stat().st_mtime_ns, stamp)
-                self.assertEqual(set(self.cp_log.read_text().split()), {'cp', 'touch'})
+                self.assertEqual(set(self.cp_log.read_text().split()), {'cp', 'mv'})
+                self.assert_no_touch()
 
     def test_original_backup_mtime_corruption_refuses_all_restoration(self):
         backup = self.root / 'etc/couvrefeu/backup'
@@ -1406,6 +1443,37 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         self.assertFalse((self.root / 'etc').exists())
         self.assertFalse((self.root / 'usr').exists())
 
+    def test_failure_between_install_renames_recovers(self):
+        # Original moved into the journal, new content not yet renamed in: the
+        # managed path is absent. Resume and direct uninstall both recover exactly.
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                self.tearDown()
+                self.setUp()
+                originals = InstallerTests.write_originals(self)
+                target = self.root / 'etc/config/firewall'
+                temp = Path(str(target) + '.couvrefeu-tmp')
+                self.tool_failure('mv', target)
+                before = {k: v for k, v in self.snapshot().items() if k != 'fail-tool'}
+                result = self.install('--activate')
+                self.assertNotEqual(result.returncode, 0)
+                backup = self.root / 'etc/couvrefeu/backup'
+                self.assertFalse(target.exists())
+                self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), originals['etc/config/firewall'])
+                self.assertEqual(signature(temp), signature(backup / 'etc_config_firewall.staged'))
+                self.assertFalse((backup / 'complete').exists())
+                (self.root / 'fail-tool').unlink()
+                if resume:
+                    result = self.install('--activate')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(signature(target), signature(backup / 'etc_config_firewall.staged'))
+                result = self.run_script('uninstall.sh')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(temp.exists())
+                self.assertEqual({k: v for k, v in self.snapshot().items() if k != 'fail-tool'}, before)
+                self.assertEqual(InstallerTests.originals_state(self), originals)
+                InstallerTests.assert_no_touch(self)
+
     def test_restore_rename_failure_resumes_owned_original(self):
         target = self.root / 'etc/config/firewall'
         target.parent.mkdir(parents=True)
@@ -1414,10 +1482,13 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         original = signature(target)
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
+        installed = signature(target)
         self.tool_failure('mv', target)
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(signature(Path(str(target) + '.couvrefeu-tmp')), original)
+        # Restoration renames the journal original itself; nothing is staged.
+        self.assertFalse(Path(str(target) + '.couvrefeu-tmp').exists())
+        self.assertEqual(signature(target), installed)
         self.assert_originals_retained(self.root / '.couvrefeu-recovery')
         (self.root / 'fail-tool').unlink()
         result = self.run_script('uninstall.sh')
@@ -1637,7 +1708,7 @@ class OverlayIdentityTests(unittest.TestCase):
     LOWER_INODES = {'etc/config/firewall': 101, 'etc/sysupgrade.conf': 1072, 'etc/crontabs/root': 2001}
     LIVE_LAYOUT = {'etc/config/firewall': 'upper', 'etc/sysupgrade.conf': 'origin', 'etc/crontabs/root': 'absent'}
 
-    def model(self, states):
+    def model(self, states, mounts=None):
         self.write_originals()
         for rel, state in states.items():
             if state == 'absent':
@@ -1646,7 +1717,8 @@ class OverlayIdentityTests(unittest.TestCase):
         self.addCleanup(lambda: self.overlay_log.unlink(missing_ok=True))
         self.overlay_log.write_text('')
         overlay.install(self.root / 'bin', self.overlay_log,
-                        {str(self.root / rel): (state, self.LOWER_INODES[rel]) for rel, state in states.items() if state != 'absent'})
+                        {str(self.root / rel): (state, self.LOWER_INODES[rel]) for rel, state in states.items() if state != 'absent'},
+                        self.root, mounts)
         # The shim is first in the scripts' PATH and reports the modeled identity.
         for rel, state in states.items():
             if state in ('lower', 'origin'):
@@ -1683,10 +1755,17 @@ class OverlayIdentityTests(unittest.TestCase):
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual({rel: exact_signature(self.root / rel) for rel in states}, originals)
                 self.assertFalse((self.root / '.couvrefeu-recovery').exists())
-                # Reading a lower-only original never copies it up before the
-                # install rename; nothing queries overlay-unstable identity.
-                self.assertEqual(self.copy_ups(), [])
+                # A lower-only original is copied up once, by the kernel, when
+                # the install rename moves it into the journal; nothing earlier
+                # writes it and nothing queries overlay-unstable file identity.
+                self.assertEqual(self.copy_ups(), self.rename_copy_ups(states))
                 self.assertNotIn('stat ', self.overlay_log.read_text())
+                # Renames were preceded by directory filesystem proofs.
+                self.assertIn('mount ', self.overlay_log.read_text())
+                self.assert_no_touch()
+
+    def rename_copy_ups(self, states):
+        return [f'copy-up {self.root / rel} mv' for rel in EXISTING_ORIGINALS if states.get(rel) == 'lower']
 
     def test_copied_up_or_lower_original_matches_live_refusal_on_7676637(self):
         # Proof harness for the old hard-link design: run this class against a
@@ -1716,18 +1795,43 @@ class OverlayIdentityTests(unittest.TestCase):
                     # Exact bytes, mode, owner and ns mtime; a fresh inode by design.
                     strip = lambda snap: {k: v[:3] if v[0] == 'file' else v for k, v in snap.items()}  # noqa: E731
                     self.assertEqual(strip(after), strip(before))
-                    self.assertEqual(self.copy_ups(), [])
+                    self.assertEqual(self.copy_ups(), [f'copy-up {self.root}/etc/sysupgrade.conf mv'] if state == 'lower' else [])
 
-    def test_truncating_touch_refuses_before_any_write_in_overlay_layout(self):
-        release = self.enable_release()
-        self.touch_tool('us')
-        self.model(self.LIVE_LAYOUT)
+    def test_cross_filesystem_journal_refuses_before_first_write(self):
+        # BusyBox mv falls back to copy+unlink on EXDEV, which would lose the
+        # exact original. Any split between an original's directory, the
+        # journal and the recovery journal refuses before the first write.
+        lower = {rel: 'lower' for rel in EXISTING_ORIGINALS}
+        splits = {'journal': ('etc/couvrefeu', 'etc/config/firewall'),
+                  'original': ('etc/crontabs', 'etc/crontabs/root'),
+                  'recovery': ('etc', 'etc/config/firewall')}
+        for name, (subtree, first) in splits.items():
+            with self.subTest(split=name):
+                self.tearDown()
+                self.setUp()
+                release = self.enable_release()
+                (self.root / 'etc/couvrefeu').mkdir(mode=0o750)
+                (self.root / 'etc/couvrefeu').chmod(0o750)
+                self.model(lower, {str(self.root / subtree): (20, '/' + name)})
+                before = full_snapshot(self.root)
+                self.assert_refused_identically(
+                    before, release, f'original, journal and recovery journal are not on one filesystem: /{first}; no installation made')
+                self.assertEqual(self.copy_ups(), [])
+                self.assert_no_touch()
+
+    def test_cross_filesystem_restore_refuses_before_any_write(self):
+        originals = {rel: 'origin' for rel in EXISTING_ORIGINALS}
+        self.model(originals)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (self.root / 'bin/overlay.mounts').open('a') as table:
+            table.write(f'{self.root / "etc/config"} 20 /split\n')
         before = full_snapshot(self.root)
-        self.assert_refused_identically(
-            before, release, 'touch -r cannot restore exact nanosecond mtime: etc/config/firewall; no installation made')
-        self.assertTrue(self.cp_log.read_text().strip())
-        self.assertEqual(self.copy_ups(), [])
-    touch_tool = InstallerTests.touch_tool
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('journal original and /etc/config/firewall are not on one filesystem; no changes made', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+    assert_no_touch = InstallerTests.assert_no_touch
 
 
 class CrondPickupTests(unittest.TestCase):
