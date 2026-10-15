@@ -470,7 +470,8 @@ def status_healthy(lines):
         status = json.loads(statuses[0])
     except ValueError:
         return False
-    return isinstance(status, dict) and all(status.get(key) == value for key, value in HEALTHY_STATUS.items())
+    return (isinstance(status, dict) and set(status) == set(HEALTHY_STATUS) | {'capabilities'}
+            and all(status.get(key) == value for key, value in HEALTHY_STATUS.items()))
 
 
 def classify(stdout_text, remote_exit, timed_out):
