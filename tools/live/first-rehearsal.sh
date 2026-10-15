@@ -318,7 +318,7 @@ cfr_verify() {
     cfr_info "status $cfr_status"
     # Structural: the whole fixed cfctl status shape, with only boolean
     # capabilities free; any other field value or extra field fails.
-    awk '/^\{"ok":true,"desiredRevision":0,"confirmedRevision":0,"desiredPauses":\[\],"effectivePauses":\[\],"observed":\{"kids":\[\],"paused":\[\]\},"drift":false,"capabilities":\{"ipv6":(true|false),"conntrack":(true|false),"nativeKernelConfirmed":(true|false),"addressCoverageComplete":(true|false),"routerCompatibilityVerified":false\},"errors":\[\]\}$/{n++}END{exit !(NR==1&&n==1)}' \
+    awk '/^\{"ok":true,"desiredRevision":0,"confirmedRevision":0,"desiredPauses":\[\],"effectivePauses":\[\],"desiredAllowances":\[\],"effectiveAllowances":\[\],"observed":\{"kids":\[\],"paused":\[\]\},"drift":false,"capabilities":\{"ipv6":(true|false),"conntrack":(true|false),"nativeKernelConfirmed":(true|false),"addressCoverageComplete":(true|false),"routerCompatibilityVerified":false\},"errors":\[\]\}$/{n++}END{exit !(NR==1&&n==1)}' \
         "$CFR_STAGE/status.json" || { cfr_fail VERIFY status_not_healthy_empty; return 0; }
     cfr_ok VERIFY
 }
