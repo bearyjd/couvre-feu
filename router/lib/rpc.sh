@@ -55,7 +55,7 @@ cf_rpc_response() {
     # Subshell observation avoids modifying the locked accepted authority globals.
     cf_rpc_status=$(cf_status)
     cf_rpc_status_rc=$?
-    cf_rpc_policy=$(printf '%s\n' "$CF_POLICY" | cf_state_json /dev/stdin) || cf_rpc_policy=null
+    cf_rpc_policy=$(printf '%s\n' "$CF_POLICY" | cf_state_json -) || cf_rpc_policy=null
     cf_rpc_errors='[]'
     [ -z "$cf_rpc_error" ] || cf_rpc_errors=$(printf '%s\n' "$cf_rpc_error" | cf_json_strings)
     cf_rpc_current=null

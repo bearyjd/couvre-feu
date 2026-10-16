@@ -1,6 +1,6 @@
 # Strict, bounded JSON parser and v1 policy schema. POSIX awk; no eval.
 # Strings deliberately permit ASCII without escapes only; policy values need none.
-function bad(m) { print "invalid_policy: " m > "/dev/stderr"; failed=1; exit 2 }
+function bad(m) { print "invalid_policy: " m | "cat 1>&2"; failed=1; exit 2 }
 function ws() { while (substr(src,pos,1) ~ /[ \t\r\n]/ && pos <= length(src)) pos++ }
 function str(    c,out) {
     if (substr(src,pos++,1) != "\"") bad("expected string")
