@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=5979557bd4c7833d48e4409d2c1475c090cbf153c08b4f2f1fccf1b563b41ae1
+CF_BOOTSTRAP_PIN=c58c173d4187594696610ec4eb176932f756ce6554f269dd18afcb9874dc2777
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -141,7 +141,12 @@ platform_deadline_check
 if [ ! -f "$BACKUP/kernel-cleaned" ]; then
     if [ -f "$BACKUP/activated" ] && live_tools; then
         platform_deadline_check
-        cleanup_result=$(installed_core remove-fw) || fail 'kernel cleanup failed; original files retained'
+        # The refusal status JSON (its error code) is the only diagnosis; keep it.
+        cleanup_result=$(installed_core remove-fw) || {
+            cleanup_code=$?
+            printf '%s\n' "couvre-feu: remove-fw exit $cleanup_code: $cleanup_result" >&2
+            fail 'kernel cleanup failed; original files retained'
+        }
         # The kernel proof and protected filesystem/write-attempt receipt are
         # separate. A successful readonly empty proof cannot waive expiry.
         if [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ]; then

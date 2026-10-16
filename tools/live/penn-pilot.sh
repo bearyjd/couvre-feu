@@ -47,10 +47,13 @@ CFP_MUTATED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
 CFP_FRESH_STATES='REACHABLE DELAY'
-CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list dns.out ping.out identity.neigh counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final'
+CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final'
 
 cfp_cleanup() {
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ] && [ "$CFR_STDOUT_LOST" != 1 ]; then
+        # The rpc-sync reply is evidence: copy it to stderr (stderr.log) before
+        # removal; stdout must keep the outcome line last.
+        if [ -s "$CFP_DIR/rpc-sync.json" ]; then sed 's/^/rpc-sync: /' "$CFP_DIR/rpc-sync.json" >&2 2>/dev/null || :; fi
         for cfp_name in $CFP_FILES; do rm -f "$CFP_DIR/$cfp_name"; done
         rmdir "$CFP_DIR" 2>/dev/null || :
     fi
@@ -242,6 +245,21 @@ cfp_penn_state() {
     elif grep -qx "$CFR_PENN_MAC" "$CFP_DIR/members.list"; then printf 'paused\n'
     else printf 'clear\n'; fi
 }
+# Diagnostic only: paused=, guard_reachable= (cf_fwd jumps to a cf2_[ab]_g in
+# either family) and in_u= (Penn in cf2_a_u or cf2_b_u, either slot); each is
+# 1, 0 or unknown (a failed read is never 0).
+cfp_kernel_state() {
+    case $(cfp_penn_state) in paused) cfp_ks_p=1;; clear) cfp_ks_p=0;; *) cfp_ks_p=unknown;; esac
+    cfp_ks_g=0
+    for cfp_ks_cmd in iptables ip6tables; do
+        if ! timeout -s KILL "$CFP_READ_TIMEOUT" "$cfp_ks_cmd" -w 5 -t filter -S > "$CFP_DIR/guard.S" 2>/dev/null </dev/null; then cfp_ks_g=unknown; break; fi
+        if awk '$1=="-A"&&$2=="cf_fwd"{for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&$(i+1)~/^cf2_[ab]_g$/)f=1}END{exit !f}' "$CFP_DIR/guard.S"; then cfp_ks_g=1; fi
+    done
+    if ! timeout -s KILL "$CFP_READ_TIMEOUT" ipset save > "$CFP_DIR/members.all" 2>/dev/null </dev/null; then cfp_ks_u=unknown
+    elif awk -v m="$CFR_PENN_MAC" '$1=="add"&&$2~/^cf2_[ab]_u$/&&tolower($3)==m{f=1}END{exit !f}' "$CFP_DIR/members.all"; then cfp_ks_u=1
+    else cfp_ks_u=0; fi
+    printf 'paused=%s guard_reachable=%s in_u=%s\n' "$cfp_ks_p" "$cfp_ks_g" "$cfp_ks_u"
+}
 # Pair `-S` specs with `-nvxL` rows by index; classify only Penn-relevant rules.
 cfp_chain_counts() {
     if [ "$1" = 4 ]; then cfp_cmd=iptables; else cfp_cmd=ip6tables; fi
@@ -341,7 +359,7 @@ cfp_teardown() {
     cfr_uninstall=$CFR_RELEASE_DIR/uninstall.sh
     if [ ! -f "$cfr_uninstall" ]; then
         cfr_fail UNINSTALL installed_uninstall_absent
-        cfr_out "PENN_KERNEL_STATE $(cfp_penn_state)"
+        cfr_out "PENN_KERNEL_STATE $(cfp_kernel_state)"
         cfr_out 'FAIL_AFTER_MUTATION UNINSTALL'
         exit 20
     fi
@@ -351,7 +369,7 @@ cfp_teardown() {
         cfr_fail UNINSTALL 'uninstall_refused_or_failed; journal preserved; resolve explicitly'
         if cfr_snapshot after; then cfr_diff; fi
         # Penn stays blocked while paused; pause rules have no kernel time bound.
-        cfr_out "PENN_KERNEL_STATE $(cfp_penn_state)"
+        cfr_out "PENN_KERNEL_STATE $(cfp_kernel_state)"
         cfr_out 'FAIL_AFTER_MUTATION UNINSTALL'
         exit 20
     fi
@@ -388,7 +406,11 @@ cfp_enroll() {
         "$cfp_gen" "$CFP_OPERATION_ID" "$cfp_digest" "$CFP_POLICY" > "$CFP_DIR/request.json" || cfp_stop ENROLL request_write_failed
     cfp_policy_only_penn "$(cat "$CFP_DIR/request.json")" || cfp_stop ENROLL request_not_penn_only
     cfr_info "rpc-sync operation=$CFP_OPERATION_ID"
-    cfp_cfctl_input "$CFP_DIR/request.json" rpc-sync > "$CFP_DIR/rpc-sync.json" || cfp_stop ENROLL rpc_sync_failed
+    cfp_cfctl_input "$CFP_DIR/request.json" rpc-sync > "$CFP_DIR/rpc-sync.json" || {
+        cfp_rc=$?
+        cfr_info "rpc-sync exit=$cfp_rc $(tr '\n' ' ' < "$CFP_DIR/rpc-sync.json")"
+        cfp_stop ENROLL rpc_sync_failed
+    }
     cfr_info "rpc-sync $(cat "$CFP_DIR/rpc-sync.json")"
     grep -q "\"receipt\":{\"operationId\":\"$CFP_OPERATION_ID\"" "$CFP_DIR/rpc-sync.json" || cfp_stop ENROLL receipt_missing
     cfp_status "\"observed\":{\"kids\":[\"$CFR_PENN_MAC\"],\"paused\":[]}" '"effectivePauses":[]' || cfp_stop ENROLL penn_not_observed

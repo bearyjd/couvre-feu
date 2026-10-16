@@ -762,11 +762,124 @@ class FailClosedReconstructionTests(unittest.TestCase):
         shadow = 'b' if self.f.slot() == 'a' else 'a'
         self.f.update_backend(failures=[{'command': 'iptables', 'contains': ['-A', f'cf2_{shadow}_d'], 'remaining': 1}])
         self.assertNotEqual(self.cfctl('sync', document=self.changed_policy()).returncode, 0)
-        self.assertTrue(all(self.generation(shadow)), 'failure must leave a partial shadow generation')
-        self.assertTrue((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
+        # A failed staging build rolls back its own unreferenced shadow slot.
+        self.assertEqual(self.generation(shadow), ({}, {}))
+        self.assertFalse((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
         result = self.uninstall()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_no_owned_kernel_objects()
+
+    # The second ip6tables mangle read of a changing sync is the final staging
+    # inventory check (cf_reference_guard_v2), after the whole shadow is built.
+    AFTER_BUILD = {'command': 'ip6tables', 'contains': ['-t', 'mangle', '-S'], 'skip': 1, 'remaining': 1}
+
+    def kernel_view(self):
+        # The fake backend lazily adds empty builtin chains on read; they are not rules.
+        state = self.f.backend()
+        rules = {(family, table, chain): rows for family, tables in state['tables'].items()
+                 for table, chains in tables.items() for chain, rows in chains.items() if rows}
+        return rules, state['sets']
+
+    def fail_after_shadow_build(self, rollback_failures=()):
+        """Fail a changing sync after its complete shadow build; returns (result, active, shadow)."""
+        self.install()
+        self.success(self.cfctl('sync', document=self.paused_policy()))
+        active, shadow = self.slots(self.f)
+        failures = [dict(self.AFTER_BUILD)] + [dict(row, contains=[part.format(shadow=shadow) for part in row['contains']])
+                                               for row in rollback_failures]
+        self.f.update_backend(capture_effects=True, effects=[], failures=failures)
+        result = self.cfctl('sync', document=self.changed_policy())
+        state = self.f.backend()
+        self.assertEqual(state['failures'][0]['remaining'], 0, state['failures'])
+        self.assertTrue(any(row['command'] == 'ip6tables' and '-A' in row['argv'] and f'cf2_{shadow}_g' in row['argv']
+                            for row in state['effects']), 'failure must follow the complete shadow build')
+        self.f.update_backend(failures=[], capture_effects=False, effects=[])
+        self.assertNotEqual(result.returncode, 0)
+        return result, active, shadow
+
+    def test_failure_after_complete_shadow_build_rolls_back_slot_and_intent(self):
+        result, active, shadow = self.fail_after_shadow_build()
+        status = json.loads(result.stdout)
+        self.assertFalse(status['ok'])
+        self.assertEqual((status['desiredRevision'], status['confirmedRevision']), (1, 1))
+        self.assertEqual(self.generation(shadow), ({}, {}))
+        self.assertFalse((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
+        self.assertEqual(self.f.slot(), active)
+        self.assert_only_active_generation()
+        self.verify_reachability(self.f.backend())
+        status = json.loads(self.cfctl('status', '--json').stdout)
+        self.assertEqual((status['desiredRevision'], status['confirmedRevision'], status['drift']), (1, 1, False), status)
+        self.success(self.cfctl('sync', document=self.changed_policy()))
+        self.assert_only_active_generation()
+
+    def staged_drifted_intent(self, rollback_failures):
+        _, active, shadow = self.fail_after_shadow_build(rollback_failures)
+        runtime = self.f.root / 'etc/couvrefeu/runtime'
+        self.assertTrue((runtime / 'firewall.intent').exists(), 'failed rollback keeps the staging intent')
+        self.assertTrue(all(self.generation(shadow)), 'failed rollback keeps the shadow slot')
+        # Emulate the live failure: the staged slot no longer matches its recorded
+        # inventory, so the transition inventory check refuses it.
+        state = self.f.backend()
+        state['sets'][f'cf2_{shadow}_u']['members'].append('02:00:00:00:00:99')
+        self.f.update_backend(sets=state['sets'])
+        mutations = len(self.f.mutation_calls())
+        self.assertNotEqual(self.cfctl('apply-fw').returncode, 0, 'drifted staging must fail the inventory check')
+        self.assertEqual(len(self.f.mutation_calls()), mutations)
+        return active, shadow
+
+    ROLLBACK_FAILS = ({'command': 'iptables', 'contains': ['-F', 'cf2_{shadow}_f'], 'remaining': 1},)
+
+    def test_uninstall_from_drifted_staging_intent_restores_exactly(self):
+        pristine = self.kernel_view()
+        self.staged_drifted_intent(self.ROLLBACK_FAILS)
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+        # uninstall.sh itself proves exact file restoration; every pristine rule
+        # returns exactly, and only the modeled fw3 reload adds its base chains.
+        rules, sets = self.kernel_view()
+        self.assertEqual(({key: rows for key, rows in rules.items() if key in pristine[0]}, sets), pristine)
+        self.assertTrue(all(key[2] == 'reject' or key[2].startswith('zone_') for key in rules if key not in pristine[0]), rules)
+        self.assertFalse((self.f.root / 'usr/sbin/cfctl').exists())
+
+    def assert_journal_or_clean(self, shadow):
+        intent = (self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists()
+        self.assertTrue(intent or self.generation(shadow) == ({}, {}), 'intent removed with shadow objects left')
+        return intent
+
+    def test_failed_set_read_never_drops_journal_and_uninstall_recovers(self):
+        _, _, shadow = self.fail_after_shadow_build(
+            ({'command': 'ipset', 'contains': ['save', 'cf2_{shadow}_k'], 'skip': 1, 'remaining': 1},))
+        self.assert_journal_or_clean(shadow)
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+
+    def test_rollback_failing_after_partial_deletes_keeps_journal_and_uninstall_recovers(self):
+        result, _, shadow = self.fail_after_shadow_build(
+            ({'command': 'ipset', 'contains': ['destroy', 'cf2_{shadow}_p'], 'remaining': 1},))
+        self.assertIn('couvre-feu: staging_rollback refused: set_delete', result.stderr)
+        chains, sets = self.generation(shadow)
+        self.assertEqual(chains, {}, 'chain deletes precede the failed set delete')
+        self.assertTrue(sets)
+        self.assertTrue(self.assert_journal_or_clean(shadow), 'failed rollback keeps the staging intent')
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+
+    def test_uninstall_refuses_referenced_staging_slot_without_mutation(self):
+        _, shadow = self.staged_drifted_intent(self.ROLLBACK_FAILS)
+        state = self.f.backend()
+        state['tables']['iptables']['filter']['foreign'] = [['-j', f'cf2_{shadow}_g']]
+        self.f.update_backend(tables=state['tables'])
+        before, mutations = self.kernel_view(), len(self.f.mutation_calls())
+        refused = self.uninstall()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('remove-fw exit', refused.stderr)
+        self.assertIn('couvre-feu: staging_rollback refused: referenced_target (after transition_object_drift)', refused.stderr)
+        self.assertEqual(self.kernel_view(), before)
+        self.assertEqual(len(self.f.mutation_calls()), mutations)
+        self.assertTrue((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
 
     def test_uninstall_after_crashed_staging_refuses_until_stale_lock_recovery(self):
         self.install()
