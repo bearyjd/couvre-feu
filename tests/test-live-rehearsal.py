@@ -323,11 +323,11 @@ class LiveRehearsalTests(unittest.TestCase):
 
     def test_empty_install_status_line_gates_agree_and_shell_is_order_strict(self):
         healthy = ('{"ok":true,"desiredRevision":0,"confirmedRevision":0,"desiredPauses":[],"effectivePauses":[],'
-                   '"observed":{"kids":[],"paused":[]},"drift":false,"capabilities":{"ipv6":false,"conntrack":false,'
+                   '"desiredAllowances":[],"effectiveAllowances":[],"observed":{"kids":[],"paused":[]},"drift":false,"capabilities":{"ipv6":false,"conntrack":false,'
                    '"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":[]}')
         # Same printf shape as router/lib/core.sh cf_status.
         self.assertIn('{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,'
-                      '"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,',
+                      '"desiredAllowances":%s,"effectiveAllowances":%s,"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,',
                       (REPO / 'router/lib/core.sh').read_text())
         verdicts = lambda line: (self.shell_status_check(line), self.tool.status_healthy(['INFO status ' + line]))  # noqa: E731
         self.assertEqual(verdicts(healthy), (True, True))
