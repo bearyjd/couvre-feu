@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -295,6 +296,13 @@ class PilotPlanTests(PilotBase):
                    'STOPPED_AFTER_MUTATION PAUSE', 'PENN_PILOT_STOPPED_RESTORED']
         self.assertEqual(classify('\n'.join(stopped), 20, False)[:2], ('STOPPED', 2))
         self.assertEqual(classify('\n'.join(stopped[:-1] + ['FAIL_AFTER_MUTATION summary']), 20, False)[0], 'FAIL')
+        no_link = stopped[:5] + ['PHASE CONNECTIVITY FAIL jd_adult_neighbor_lost', 'STOPPED_AFTER_MUTATION PAUSE',
+                                 'PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED']
+        outcome = classify('\n'.join(no_link), 20, False)[:2]
+        self.assertEqual(outcome, ('STOPPED_CONNECTIVITY_FAILED', 2))
+        self.assertIn('CONNECTIVITY check FAILED', self.tool.MESSAGES[outcome[0]])
+        # A plain STOPPED line never hides a failed connectivity check.
+        self.assertNotEqual(classify('\n'.join(no_link[:-1] + ['PENN_PILOT_STOPPED_RESTORED']), 20, False)[0], 'STOPPED')
         refused = ['PHASE IDENTITY FAIL penn_child_not_fresh', 'REFUSED_BEFORE_MUTATION IDENTITY']
         self.assertEqual(classify('\n'.join(refused), 10, False)[:2], ('REFUSED', 1))
         self.assertEqual(classify('\n'.join(refused + ['MUTATION_BEGIN']), 10, False)[0], 'UNKNOWN')
@@ -311,6 +319,68 @@ class PilotPlanTests(PilotBase):
         self.assertTrue(self.tool.evaluate_host(slow_after)['adultDisruption'])
         unmeasured = self.tool.evaluate_host([{'phase': 'before', 'pingMs': None, 'dnsMs': None}])
         self.assertEqual((unmeasured['pingMs']['label'], unmeasured['adultDisruption']), ('unmeasured', False))
+
+    def pilot_shell(self, body):
+        """Run penn-pilot.sh helper definitions (no cfp_main) plus `body`, with stubs."""
+        script = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        helpers = script[:script.index('cfp_main() {')]
+        stubs = ('cfr_out() { printf "%s\\n" "$1"; }\ncfr_info() { :; }\n'
+                 'cfp_stop() { printf "STOP %s %s\\n" "$1" "$2"; exit 20; }\n')
+        result = subprocess.run(shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')) + ['-c', helpers + stubs + body],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        return result.returncode, result.stdout
+
+    def test_counter_delta_unmeasured_across_slots_or_when_negative(self):
+        slot_a = 'slot a 41 2026-10-16 10:00:00.100000000 +0000'
+        snapshots = {'one': [slot_a, 'paused 5', 'reverse 1', 'dot 3'],
+                     'two': [slot_a, 'paused 12', 'reverse 1', 'dot 9'],
+                     'refill': ['slot a 77 2026-10-16 10:05:00.200000000 +0000', 'paused 20', 'reverse 1', 'dot 9'],
+                     'otherslot': ['slot b 52 2026-10-16 10:01:00.300000000 +0000', 'paused 30', 'reverse 2', 'dot 9'],
+                     'fell': [slot_a, 'paused 2', 'reverse 9', 'dot 9'],
+                     'noslot': ['paused 30', 'reverse 2', 'dot 9']}
+        for name, lines in snapshots.items():
+            (self.work / f'counters.{name}').write_text('\n'.join(lines) + '\n')
+        pairs = (('one two paused reverse', '7'), ('one two dot', '6'),
+                 ('one refill paused', '-'),       # same letter, new slot instance
+                 ('one otherslot paused', '-'),    # different slot
+                 ('one fell paused reverse', '-'),  # sum +5, but paused fell
+                 ('noslot two paused', '-'), ('one missing paused', '-'))
+        body = f'CFP_DIR={shlex.quote(str(self.work))}\n' + ''.join(f'cfp_delta {args}\n' for args, _ in pairs)
+        code, out = self.pilot_shell(body)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split(), [want for _, want in pairs])
+
+    def test_phase_budget_refuses_when_worst_case_reaches_into_reserve(self):
+        base = 'cfp_now() { echo 1100; }\nCFR_START=1000\nCFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\n'
+        self.assertEqual(self.pilot_shell(base + 'cfp_budget EXPIRY 600 && echo started\n'), (0, 'started\n'))
+        self.assertEqual(self.pilot_shell(base + 'cfp_budget EXPIRY 601 && echo started\n'),
+                         (20, 'STOP EXPIRY remote_budget_reserved_for_teardown\n'))
+        # Observe loops re-check before each iteration.
+        code, out = self.pilot_shell(base + 'CFP_ITERATION_WORST=601\ncfp_observe 5 paused PAUSE\n')
+        self.assertEqual((code, out), (20, 'STOP PAUSE remote_budget_reserved_for_teardown\n'))
+        # The plan's minimum equals the per-phase worst cases the script checks.
+        timing = self.tool.TIMING
+        phases = self.tool.phase_worst_seconds(timing)
+        self.assertEqual(set(phases), {'ENROLL', 'PAUSE', 'RESUME', 'EXPIRY', 'DNS'})
+        self.assertEqual(self.tool.worst_case_seconds(timing),
+                         timing['premutationBudgetSeconds'] + self.tool.SAFE_BAND_WAIT_SECONDS
+                         + self.tool.INSTALL_ALLOWANCE_SECONDS + sum(phases.values())
+                         + self.tool.TEARDOWN_RESERVE_SECONDS)
+        config = self.tool.FR.load_config(self.write_config())
+        commit, blobs = self.tool.FR.head_source()
+        payload = self.tool.build_payload(config, commit, blobs, timing)[0].decode()
+        for phase, seconds in phases.items():
+            self.assertIn(f"CFP_WORST_{phase}='{seconds}'\n", payload)
+            self.assertIn(f'cfp_budget {phase} "$CFP_WORST_{phase}"', payload)
+
+    def test_teardown_ignores_signals_before_marking_itself(self):
+        script = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        body = script[script.index('cfp_teardown() {'):]
+        body = body[:body.index('\n}\n')]
+        self.assertLess(body.index("trap '' INT TERM"), body.index('\n    CFP_TEARDOWN=1\n'))
+        self.assertLess(body.index("trap '' INT TERM"), body.index('[ "$CFP_TEARDOWN" = 0 ]'))
+        self.assertEqual(body.count('PENN_KERNEL_STATE $(cfp_penn_state)'), 2)
+        self.assertIn('PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED', body)
 
     def test_every_pause_is_timed_and_no_open_ended_pause(self):
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()

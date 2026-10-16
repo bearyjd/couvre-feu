@@ -32,6 +32,14 @@ CFP_RTT_MARGIN_MS=
 CFP_PREMUTATION_BUDGET=
 CFP_REMOTE_TIMEOUT=
 CFP_TEARDOWN_RESERVE=
+CFP_READ_TIMEOUT=
+CFP_COUNTERS_WORST=
+CFP_ITERATION_WORST=
+CFP_WORST_ENROLL=
+CFP_WORST_PAUSE=
+CFP_WORST_RESUME=
+CFP_WORST_EXPIRY=
+CFP_WORST_DNS=
 # @CF_PILOT_PARAMETERS_END@
 
 CFP_DIR=
@@ -39,7 +47,7 @@ CFP_MUTATED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
 CFP_FRESH_STATES='REACHABLE DELAY'
-CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list dns.out ping.out identity.neigh counters.enrolled counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.final'
+CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list dns.out ping.out identity.neigh counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final'
 
 cfp_cleanup() {
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ] && [ "$CFR_STDOUT_LOST" != 1 ]; then
@@ -61,7 +69,8 @@ cfp_cs() {
     printf '%s\n' "$cfp_up" | awk '{split($1,a,".");printf "%d\n", a[1]*100+substr(a[2] "00",1,2)}'
 }
 cfp_now() { date +%s; }
-cfp_elapsed_ok() { [ "$(($(cfp_now) - CFR_START))" -le "$((CFP_REMOTE_TIMEOUT - CFP_TEARDOWN_RESERVE))" ]; }
+# True while elapsed time plus $1 more seconds still leaves the teardown reserve.
+cfp_elapsed_ok() { [ "$(($(cfp_now) - CFR_START + ${1:-0}))" -le "$((CFP_REMOTE_TIMEOUT - CFP_TEARDOWN_RESERVE))" ]; }
 
 # --- Read-only adult probes -------------------------------------------------
 # Prints "<replies> <avg_ms|-> " for three pings (BusyBox or iputils summary).
@@ -196,7 +205,10 @@ cfp_cfctl_input() {
     $CFR_SH "$CFR_CFCTL" "$@" <"$cfp_input" 2>>"$CFR_STAGE/child.log"
 }
 # Timed pause only; fails only if the safe band never opens.
+# Optional $2: counters tag snapshotted just before the safe-band wait and the
+# pause apply (same slot instance until that apply).
 cfp_pause() {
+    [ -z "$2" ] || cfp_counters "$2" || cfr_info "counters $2 unavailable"
     cfp_safe_band || return 1
     CFP_UNTIL=$(($(cfp_now) + $1))
     cfr_info "pause $CFP_PERSON until=$CFP_UNTIL seconds=$1"
@@ -221,7 +233,7 @@ cfp_status() {
 cfp_slot() { awk 'NR==2&&($0=="a"||$0=="b"){print;f=1}END{exit !f}' "$CFR_ROOT/etc/couvrefeu/runtime/firewall.owned" 2>/dev/null; }
 cfp_paused_members() {
     cfp_s=$(cfp_slot) || return 1
-    ipset save "cf2_${cfp_s}_p" > "$CFP_DIR/members" 2>/dev/null </dev/null || return 1
+    timeout -s KILL "$CFP_READ_TIMEOUT" ipset save "cf2_${cfp_s}_p" > "$CFP_DIR/members" 2>/dev/null </dev/null || return 1
     awk -v n="cf2_${cfp_s}_p" '$1=="add"&&$2==n{print tolower($3)}' "$CFP_DIR/members"
 }
 # Prints paused, clear or unknown (an unreadable set is never read as clear).
@@ -233,8 +245,8 @@ cfp_penn_state() {
 # Pair `-S` specs with `-nvxL` rows by index; classify only Penn-relevant rules.
 cfp_chain_counts() {
     if [ "$1" = 4 ]; then cfp_cmd=iptables; else cfp_cmd=ip6tables; fi
-    "$cfp_cmd" -w 5 -t "$2" -S "$3" > "$CFP_DIR/rules.S" 2>/dev/null </dev/null || return 1
-    "$cfp_cmd" -w 5 -t "$2" -nvxL "$3" > "$CFP_DIR/rules.L" 2>/dev/null </dev/null || return 1
+    timeout -s KILL "$CFP_READ_TIMEOUT" "$cfp_cmd" -w 5 -t "$2" -S "$3" > "$CFP_DIR/rules.S" 2>/dev/null </dev/null || return 1
+    timeout -s KILL "$CFP_READ_TIMEOUT" "$cfp_cmd" -w 5 -t "$2" -nvxL "$3" > "$CFP_DIR/rules.L" 2>/dev/null </dev/null || return 1
     awk -v ip="$CFR_PENN_IP" -v chain="$3" '
         function cls(s){s=s " "
             if(s~/--match-set cf2_[ab]_p src /&&s~/-j REJECT /)return "paused"
@@ -250,9 +262,20 @@ cfp_chain_counts() {
         FNR>2&&NF{r++;c=cls(spec[r]);if(c!=""&&$1~/^[0-9]+$/)print c " " $1}
         END{if(r!=n)exit 1}' "$CFP_DIR/rules.S" "$CFP_DIR/rules.L"
 }
+# Slot letter plus the inode and nanosecond mtime of firewall.owned, which every
+# changing apply rewrites by rename: a/b alternate, so the letter alone cannot
+# tell one chain instance (and its counters) from the next.
+cfp_slot_id() {
+    cfp_sl=$(cfp_slot) || return 1
+    cfp_st=$(cfr_stat -c '%i %y' "$CFR_ROOT/etc/couvrefeu/runtime/firewall.owned" </dev/null 2>/dev/null) || return 1
+    printf 'slot %s %s\n' "$cfp_sl" "$cfp_st"
+}
 cfp_counters() {
     cfp_ctag=$1
     rm -f "$CFP_DIR/counters.$cfp_ctag"
+    # A skipped snapshot is only "unmeasured"; the teardown reserve comes first.
+    cfp_elapsed_ok "$CFP_COUNTERS_WORST" || { cfr_info "counters_skipped $cfp_ctag budget"; return 1; }
+    cfp_id=$(cfp_slot_id) || return 1
     cfp_s=$(cfp_slot) || return 1
     # The IPv4 forward chain is required; the others only add classes.
     cfp_chain_counts 4 filter "cf2_${cfp_s}_f" > "$CFP_DIR/rules.out" || return 1
@@ -262,14 +285,22 @@ cfp_counters() {
         if cfp_chain_counts "$1" "$2" "cf2_${cfp_s}_$3" > "$CFP_DIR/rules.one"; then cat "$CFP_DIR/rules.one" >> "$CFP_DIR/rules.out"
         else cfr_info "counters_partial $cfp_ctag $cfp_spec"; fi
     done
-    awk '{t[$1]+=$2}END{split("paused reverse dot doq doh dns6 dnsin dnat",k," ");for(i=1;i<=8;i++)print k[i] " " t[k[i]]+0}' "$CFP_DIR/rules.out" > "$CFP_DIR/counters.$cfp_ctag"
+    # A slot change during the reads makes the snapshot unusable.
+    [ "$(cfp_slot_id)" = "$cfp_id" ] || { cfr_info "counters_slot_changed $cfp_ctag"; return 1; }
+    { printf '%s\n' "$cfp_id"
+      awk '{t[$1]+=$2}END{split("paused reverse dot doq doh dns6 dnsin dnat",k," ");for(i=1;i<=8;i++)print k[i] " " t[k[i]]+0}' "$CFP_DIR/rules.out"
+    } > "$CFP_DIR/counters.$cfp_ctag"
     cfr_info "counters $cfp_ctag $(tr '\n' ' ' < "$CFP_DIR/counters.$cfp_ctag")"
 }
-# Sum of classes $3.. between snapshots $1 and $2; "-" when either is missing.
+# Sum of classes $3.. between snapshots $1 and $2. Prints "-" (unmeasured) when
+# either is missing, they come from different slot instances, or any class fell.
 cfp_delta() {
     cfp_a=$CFP_DIR/counters.$1; cfp_b=$CFP_DIR/counters.$2; shift 2
     if [ ! -f "$cfp_a" ] || [ ! -f "$cfp_b" ]; then printf '%s\n' -; return 0; fi
-    awk -v want=" $* " 'NR==FNR{a[$1]=$2;next}index(want," " $1 " "){d+=$2-a[$1]}END{print d+0}' "$cfp_a" "$cfp_b"
+    awk -v want=" $* " '$1=="slot"{if(NR==FNR)sa=$0;else sb=$0;next}
+        NR==FNR{a[$1]=$2;next}
+        index(want," " $1 " "){if(!($1 in a)||$2<a[$1])bad=1;d+=$2-a[$1]}
+        END{if(bad||sa==""||sa!=sb)print "-";else print d+0}' "$cfp_a" "$cfp_b"
 }
 # Sleep $1 seconds in $CFP_POLL steps with adult probes; optional $2 = Penn must stay paused.
 # A slot swap by cron `cfctl expire` can make one read transiently unknown;
@@ -287,6 +318,7 @@ cfp_observe() {
     cfp_end=$(($(cfp_now) + $1))
     CFP_UNKNOWN=0
     while [ "$(cfp_now)" -lt "$cfp_end" ]; do
+        cfp_elapsed_ok "$CFP_ITERATION_WORST" || cfp_stop "$3" remote_budget_reserved_for_teardown
         cfp_adult_probe "$3" || cfp_stop "$3" "adult_disruption $CFP_ADULT_REASON"
         cfp_state_check "$2" "$3"
         sleep "$CFP_POLL"
@@ -302,12 +334,14 @@ cfp_stop() {
 }
 # The single approved teardown; never retried. Always exits.
 cfp_teardown() {
+    # Ignore signals first: one arriving before CFP_TEARDOWN=1 must not skip uninstall.
+    trap '' INT TERM
     [ "$CFP_TEARDOWN" = 0 ] || exit 20
     CFP_TEARDOWN=1
-    trap '' INT TERM
     cfr_uninstall=$CFR_RELEASE_DIR/uninstall.sh
     if [ ! -f "$cfr_uninstall" ]; then
         cfr_fail UNINSTALL installed_uninstall_absent
+        cfr_out "PENN_KERNEL_STATE $(cfp_penn_state)"
         cfr_out 'FAIL_AFTER_MUTATION UNINSTALL'
         exit 20
     fi
@@ -316,23 +350,32 @@ cfp_teardown() {
     if ! cfr_run_sh "$cfr_uninstall" >>"$CFR_STAGE/child.log"; then
         cfr_fail UNINSTALL 'uninstall_refused_or_failed; journal preserved; resolve explicitly'
         if cfr_snapshot after; then cfr_diff; fi
+        # Penn stays blocked while paused; pause rules have no kernel time bound.
+        cfr_out "PENN_KERNEL_STATE $(cfp_penn_state)"
         cfr_out 'FAIL_AFTER_MUTATION UNINSTALL'
         exit 20
     fi
     cfr_ok UNINSTALL
     cfp_crond_count after_uninstall
     cfr_restore
+    # CFR_FAILED is already 1 after a STOP; isolate the connectivity result.
+    cfp_failed=$CFR_FAILED
+    CFR_FAILED=0
     cfr_connectivity
+    cfp_connectivity=$CFR_FAILED
+    [ "$cfp_failed" = 0 ] || CFR_FAILED=1
     if [ "$CFR_FAILED" = 0 ] && [ -z "$CFP_STOPPED" ]; then cfr_out PENN_PILOT_PASS; exit 0; fi
     if [ -n "$CFP_STOPPED" ] && cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then
         cfr_out "STOPPED_AFTER_MUTATION $CFP_STOPPED"
-        cfr_out PENN_PILOT_STOPPED_RESTORED
+        if [ "$cfp_connectivity" = 0 ]; then cfr_out PENN_PILOT_STOPPED_RESTORED
+        else cfr_out PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED; fi
         exit 20
     fi
     cfr_out 'FAIL_AFTER_MUTATION summary'
     exit 20
 }
-cfp_budget() { cfp_elapsed_ok || cfp_stop "$1" remote_budget_reserved_for_teardown; }
+# $1 phase, $2 its worst-case seconds: start it only if it can finish before the reserve.
+cfp_budget() { cfp_elapsed_ok "$2" || cfp_stop "$1" remote_budget_reserved_for_teardown; }
 
 cfp_enroll() {
     cfp_cfctl rpc-status --json > "$CFP_DIR/rpc-status.json" || cfp_stop ENROLL rpc_status_failed
@@ -354,7 +397,7 @@ cfp_enroll() {
     cfr_ok ENROLL
 }
 cfp_pause_phase() {
-    cfp_pause "$CFP_PAUSE_SECONDS" || cfp_stop PAUSE pause_failed
+    cfp_pause "$CFP_PAUSE_SECONDS" prepause || cfp_stop PAUSE pause_failed
     cfp_status_has "$CFP_DIR/status.json" "\"effectivePauses\":[{\"person\":\"$CFP_PERSON\",\"until\":$CFP_UNTIL}]" \
         "\"paused\":[\"$CFR_PENN_MAC\"]" || cfp_stop PAUSE pause_not_effective
     [ "$(cfp_penn_state)" = paused ] || cfp_stop PAUSE penn_not_in_kernel_set
@@ -364,7 +407,7 @@ cfp_pause_phase() {
     cfp_counters pause1 || cfr_info 'counters pause1 unavailable'
     CFP_PAUSE_DELTA=$(cfp_delta pause0 pause1 paused reverse)
     case $CFP_PAUSE_DELTA in
-        -) cfr_out 'MEASURE packet_blocking unmeasured counters_unavailable';;
+        -) cfr_out 'MEASURE packet_blocking unmeasured counters_unavailable_or_slot_changed';;
         0) cfr_out 'MEASURE packet_blocking unmeasured reject_counters_did_not_increase';;
         *) cfr_out "MEASURE packet_blocking measured router_side_block_observed reject_delta=$CFP_PAUSE_DELTA window_s=$CFP_PAUSE_OBSERVE";;
     esac
@@ -379,7 +422,7 @@ cfp_resume_phase() {
     cfp_counters resume1 || cfr_info 'counters resume1 unavailable'
     cfp_resume_delta=$(cfp_delta resume0 resume1 paused reverse)
     case "$cfp_resume_delta:$CFP_PAUSE_DELTA" in
-        -:*|*:-) cfr_out 'MEASURE resume_unblock unmeasured counters_unavailable';;
+        -:*|*:-) cfr_out 'MEASURE resume_unblock unmeasured counters_unavailable_or_slot_changed';;
         0:0) cfr_out 'MEASURE resume_unblock unmeasured no_pause_counter_baseline';;
         0:*) cfr_out "MEASURE resume_unblock measured reject_counters_stopped window_s=$CFP_RESUME_OBSERVE";;
         *) cfp_stop RESUME "reject_counters_increased_after_resume $cfp_resume_delta";;
@@ -395,6 +438,7 @@ cfp_expiry_phase() {
     cfp_last=0
     CFP_UNKNOWN=0
     while :; do
+        cfp_elapsed_ok "$CFP_ITERATION_WORST" || cfp_stop EXPIRY remote_budget_reserved_for_teardown
         cfp_t=$(cfp_now)
         cfp_state_check '' EXPIRY
         if [ "$cfp_state" = clear ]; then
@@ -409,6 +453,7 @@ cfp_expiry_phase() {
         sleep "$CFP_EXPIRY_POLL"
     done
     cfr_info "expiry_observed latency_s=$((cfp_t - CFP_UNTIL))"
+    cfp_counters expired || cfr_info 'counters expired unavailable'
     cfr_out "MEASURE timed_expiry measured latency_s=$((cfp_t - CFP_UNTIL)) tolerance_s=$CFP_EXPIRY_TOLERANCE poll_s=$CFP_EXPIRY_POLL"
     cfp_status '"effectivePauses":[]' '"paused":[]' || cfp_stop EXPIRY status_not_clean_after_expiry
     cfr_out "MEASURE crond_processes measured baseline=$CFP_CROND_BASELINE after_install=$CFP_CROND_INSTALL during_expiry=$CFP_CROND_EXPIRY"
@@ -416,13 +461,21 @@ cfp_expiry_phase() {
 }
 cfp_dns_phase() {
     cfp_counters final || cfr_info 'counters final unavailable'
+    # Every changing apply builds a new slot instance with fresh counters, so
+    # hits are summed only over windows whose two snapshots share one instance;
+    # apply transitions and the expiry wait are never counted.
     for cfp_class in dot doq doh dns6 dnsin dnat; do
-        cfp_d=$(cfp_delta enrolled final "$cfp_class")
-        case $cfp_class:$cfp_d in
-            *:-) cfr_out "MEASURE dns_rule_$cfp_class unmeasured counters_unavailable";;
-            doh:0) cfr_out 'MEASURE dns_rule_doh unmeasured no_hits_and_no_doh_list_configured';;
-            *:0) cfr_out "MEASURE dns_rule_$cfp_class unmeasured no_router_side_hits";;
-            *) cfr_out "MEASURE dns_rule_$cfp_class measured router_side_hits_while_enrolled=$cfp_d";;
+        cfp_d=0; cfp_w=0
+        for cfp_win in 'enrolled prepause' 'pause0 pause1' 'resume0 resume1' 'expired final'; do
+            # shellcheck disable=SC2086
+            cfp_x=$(cfp_delta $cfp_win "$cfp_class")
+            [ "$cfp_x" = - ] || { cfp_d=$((cfp_d + cfp_x)); cfp_w=$((cfp_w + 1)); }
+        done
+        case $cfp_class:$cfp_w:$cfp_d in
+            *:0:*) cfr_out "MEASURE dns_rule_$cfp_class unmeasured counters_unavailable_or_slot_changed";;
+            doh:*:0) cfr_out "MEASURE dns_rule_doh unmeasured no_hits_and_no_doh_list_configured windows=$cfp_w/4";;
+            *:*:0) cfr_out "MEASURE dns_rule_$cfp_class unmeasured no_router_side_hits windows=$cfp_w/4";;
+            *) cfr_out "MEASURE dns_rule_$cfp_class measured router_side_hits_while_enrolled=$cfp_d windows=$cfp_w/4 same_slot_windows_only";;
         esac
     done
     cfr_out "MEASURE adult_router_dns measured baseline_max_cs=$CFP_BASE_DNS_CS observed_max_cs=${CFP_MAX_DNS_CS:-0} limit_cs=$CFP_DNS_LIMIT_CS"
@@ -435,7 +488,9 @@ cfp_main() {
     CFR_PREMUTATION_BUDGET=$CFP_PREMUTATION_BUDGET
     printf 'BEGIN penn-pilot commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS" \
-        "$CFP_ROUTER_IP" "$CFP_PERSON" "$CFP_OPERATION_ID" "$CFP_POLICY" "$CFP_DNS_NAME" "$CFP_SAFE_BAND" "$CFP_REMOTE_TIMEOUT"; do
+        "$CFP_ROUTER_IP" "$CFP_PERSON" "$CFP_OPERATION_ID" "$CFP_POLICY" "$CFP_DNS_NAME" "$CFP_SAFE_BAND" "$CFP_REMOTE_TIMEOUT" \
+        "$CFP_TEARDOWN_RESERVE" "$CFP_READ_TIMEOUT" "$CFP_COUNTERS_WORST" "$CFP_ITERATION_WORST" "$CFP_WORST_ENROLL" "$CFP_WORST_PAUSE" \
+        "$CFP_WORST_RESUME" "$CFP_WORST_EXPIRY" "$CFP_WORST_DNS"; do
         [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
     done
     cfr_setup_paths || cfr_refuse PAYLOAD unsafe_environment
@@ -464,10 +519,12 @@ cfp_main() {
     cfr_ok INSTALL
     cfp_crond_count after_install
     for cfp_phase in ENROLL PAUSE RESUME EXPIRY DNS; do
-        cfp_budget "$cfp_phase"
         case $cfp_phase in
-            ENROLL) cfp_enroll;; PAUSE) cfp_pause_phase;; RESUME) cfp_resume_phase;;
-            EXPIRY) cfp_expiry_phase;; DNS) cfp_dns_phase;;
+            ENROLL) cfp_budget ENROLL "$CFP_WORST_ENROLL"; cfp_enroll;;
+            PAUSE) cfp_budget PAUSE "$CFP_WORST_PAUSE"; cfp_pause_phase;;
+            RESUME) cfp_budget RESUME "$CFP_WORST_RESUME"; cfp_resume_phase;;
+            EXPIRY) cfp_budget EXPIRY "$CFP_WORST_EXPIRY"; cfp_expiry_phase;;
+            DNS) cfp_budget DNS "$CFP_WORST_DNS"; cfp_dns_phase;;
         esac
     done
     cfp_teardown

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 
 
 def _load_rehearsal():
@@ -38,6 +39,7 @@ def _load_rehearsal():
     sys.dont_write_bytecode = True
     path = Path(__file__).resolve().with_name('first-rehearsal.py')
     spec = importlib.util.spec_from_file_location('couvre_feu_first_rehearsal', path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -58,6 +60,7 @@ PHASES = ('PAYLOAD', 'IDENTITY', 'PREREQ', 'SNAPSHOT', 'BASELINE', 'INSTALL', 'E
           'EXPIRY', 'DNS', 'UNINSTALL', 'RESTORE', 'CONNECTIVITY')
 PASS_LINE = 'PENN_PILOT_PASS'
 STOPPED_LINE = 'PENN_PILOT_STOPPED_RESTORED'
+STOPPED_NO_CONNECTIVITY_LINE = 'PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED'
 PERSON = 'penn'
 OPERATION_ID = 'penn-pilot-enroll-1'
 DNS_PROBE_NAME = 'example.com'
@@ -69,12 +72,19 @@ TIMING = {'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds'
 HOST_PROBE = {'intervalSeconds': 15, 'samples': 3, 'timeoutSeconds': 2, 'dnsMarginMs': 1500,
               'rttMarginMs': 500, 'consecutiveFailures': 2}
 # Worst-case allowances for the remote session; remoteTimeoutSeconds must cover them.
-CFCTL_CALLS = 8
+# The remote script re-checks each phase's worst case (and every observe/expiry
+# iteration) against the teardown reserve before starting it.
 SAFE_BAND_WAIT_SECONDS = 72
 CFCTL_ALLOWANCE_SECONDS = 45
 INSTALL_ALLOWANCE_SECONDS = 240
-PROBE_OVERRUN_SECONDS = 80
 TEARDOWN_RESERVE_SECONDS = 300
+# Router-side `timeout -s KILL` bound for each read-only iptables/ipset read.
+READ_TIMEOUT_SECONDS = 8
+# One counters snapshot: five chains, each read with -S and -nvxL.
+COUNTERS_WORST_SECONDS = 10 * READ_TIMEOUT_SECONDS
+# One adult-probe iteration before its poll sleep: nslookup (5 s), two pings
+# (8 s each) and one ipset read, rounded up.
+PROBE_ITERATION_SECONDS = 30
 # The tool cannot measure these; they are never reported otherwise.
 ALWAYS_UNMEASURED = {
     'service_key_confinement': 'not_exercised; no authorized_keys or service-key provisioning',
@@ -100,11 +110,33 @@ def validate_timing(timing):
         raise Refusal('timing polls and expiry pause must be at least one second')
 
 
+def iteration_worst_seconds(timing):
+    return PROBE_ITERATION_SECONDS + max(timing['pollSeconds'], timing['expiryPollSeconds'])
+
+
+def phase_worst_seconds(timing):
+    """Worst case of each post-install phase, as the remote script budgets it."""
+    call = SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS
+    snap, read, iteration = COUNTERS_WORST_SECONDS, READ_TIMEOUT_SECONDS, iteration_worst_seconds(timing)
+    return {
+        # rpc-status, rpc-sync, status; counters enrolled
+        'ENROLL': 3 * call + snap,
+        # counters prepause, pause, kernel read, counters pause0, observe, counters pause1
+        'PAUSE': snap + call + read + snap + timing['pauseObserveSeconds'] + iteration + snap,
+        # resume, kernel read, counters resume0, observe, counters resume1
+        'RESUME': call + read + snap + timing['resumeObserveSeconds'] + iteration + snap,
+        # pause, wait until expiry plus tolerance, counters expired, status
+        'EXPIRY': (call + timing['expirySeconds'] + timing['expiryToleranceSeconds'] + iteration + snap
+                   + call),
+        # counters final
+        'DNS': snap,
+    }
+
+
 def worst_case_seconds(timing):
-    return (timing['premutationBudgetSeconds'] + INSTALL_ALLOWANCE_SECONDS
-            + CFCTL_CALLS * (SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS)
-            + timing['pauseObserveSeconds'] + timing['resumeObserveSeconds'] + timing['expirySeconds']
-            + timing['expiryToleranceSeconds'] + PROBE_OVERRUN_SECONDS + TEARDOWN_RESERVE_SECONDS)
+    # The install waits for one safe band before running.
+    return (timing['premutationBudgetSeconds'] + SAFE_BAND_WAIT_SECONDS + INSTALL_ALLOWANCE_SECONDS
+            + sum(phase_worst_seconds(timing).values()) + TEARDOWN_RESERVE_SECONDS)
 
 
 def enrollment_policy(config):
@@ -148,7 +180,10 @@ def build_payload(config, commit, blobs, timing):
               'CFP_SAFE_BAND': f"{timing['safeBandStart']} {timing['safeBandEnd']}",
               'CFP_DNS_MARGIN_CS': timing['dnsMarginCs'], 'CFP_RTT_MARGIN_MS': timing['rttMarginMs'],
               'CFP_PREMUTATION_BUDGET': timing['premutationBudgetSeconds'],
-              'CFP_REMOTE_TIMEOUT': config['remoteTimeoutSeconds'], 'CFP_TEARDOWN_RESERVE': TEARDOWN_RESERVE_SECONDS}
+              'CFP_REMOTE_TIMEOUT': config['remoteTimeoutSeconds'], 'CFP_TEARDOWN_RESERVE': TEARDOWN_RESERVE_SECONDS,
+              'CFP_READ_TIMEOUT': READ_TIMEOUT_SECONDS, 'CFP_COUNTERS_WORST': COUNTERS_WORST_SECONDS,
+              'CFP_ITERATION_WORST': iteration_worst_seconds(timing)}
+    values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing).items()})
     values = {key: str(value) for key, value in values.items()}
     for value in values.values():
         if not PARAM_VALUE.fullmatch(value):
@@ -270,7 +305,7 @@ class HostProbes:
 
 def evaluate_host(samples):
     """Predeclared tolerance relative to the pre-session baseline."""
-    result = {'adultDisruption': False}
+    result: dict[str, Any] = {'adultDisruption': False}
     for metric, margin in (('pingMs', HOST_PROBE['rttMarginMs']), ('dnsMs', HOST_PROBE['dnsMarginMs'])):
         baseline = [s[metric] for s in samples if s['phase'] == 'before' and s.get(metric) is not None]
         if not baseline:
@@ -328,9 +363,13 @@ def classify(stdout_text, remote_exit, timed_out):
                and PASS_LINE not in lines and any(line.startswith('REFUSED_BEFORE_MUTATION ') for line in lines))
     if refused:
         return 'REFUSED', EXIT_REFUSED, phases
-    if (not timed_out and remote_exit == REMOTE_FAIL and stopped and lines and lines[-1] == STOPPED_LINE
-            and phases.get('UNINSTALL') == ['OK'] and phases.get('RESTORE') == ['OK']):
+    torn_down = (not timed_out and remote_exit == REMOTE_FAIL and stopped and bool(lines)
+                 and phases.get('UNINSTALL') == ['OK'] and phases.get('RESTORE') == ['OK'])
+    if torn_down and lines[-1] == STOPPED_LINE and phases.get('CONNECTIVITY') == ['OK']:
         return 'STOPPED', EXIT_FAIL, phases
+    if (torn_down and lines[-1] == STOPPED_NO_CONNECTIVITY_LINE
+            and any(result.startswith('FAIL') for result in phases.get('CONNECTIVITY', []))):
+        return 'STOPPED_CONNECTIVITY_FAILED', EXIT_FAIL, phases
     failed = any(result.startswith('FAIL') for results in phases.values() for result in results)
     if not timed_out and remote_exit in (REMOTE_FAIL, REMOTE_PASS) and (failed or remote_exit == REMOTE_PASS):
         return 'FAIL', EXIT_FAIL, phases
@@ -339,10 +378,13 @@ def classify(stdout_text, remote_exit, timed_out):
 
 MESSAGES = {'PASS': 'PASS: every phase passed; original state restored exactly. Packet blocking: {blocking}.',
             'STOPPED': 'STOPPED: a predeclared gate stopped the pilot; teardown ran and restored the original state exactly.',
+            'STOPPED_CONNECTIVITY_FAILED': ('STOPPED: a predeclared gate stopped the pilot; teardown restored the original '
+                                            'files and firewall exactly, but the post-teardown CONNECTIVITY check FAILED '
+                                            '(management or JD adult neighbor lost). Check adult connectivity now; do not retry.'),
             'REFUSED': 'REFUSED: the remote script refused before any router mutation.',
             'FAIL': 'FAIL: mutation may have begun or a gate failed. Preserve evidence; do not retry.',
             'UNKNOWN': FR.MESSAGES['UNKNOWN']}
-PRINTED = ('PHASE ', 'DIFF ', 'REFUSED_', 'FAIL_', 'STOP', 'MEASURE ', PASS_LINE)
+PRINTED = ('PHASE ', 'DIFF ', 'REFUSED_', 'FAIL_', 'STOP', 'MEASURE ', 'PENN_KERNEL_STATE ', PASS_LINE)
 
 
 def execute(config, expected_plan_sha, env, now_fn, probe):
