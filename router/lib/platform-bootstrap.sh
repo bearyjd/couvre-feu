@@ -204,7 +204,7 @@ platform_external_closure() {
     platform_verify_modules "$platform_release/lib"
     platform_private "$platform_release/release.sha256" 600
     # Outer reviewed manifest has exactly these direct files, no path escapes.
-    awk 'NF!=2||length($1)!=64||$1~/[^0-9a-f]/||$2!~/^(install.sh|uninstall.sh|cfctl|cfctl-ssh|lib\/(platform-bootstrap.sh|vendor-platform.sh|install-common.sh|core.sh|rpc.sh|firewall.sh|state.awk|rules.awk|json.awk))$/||seen[$2]++ {bad=1}END{exit bad||NR!=13}' "$platform_release/release.sha256" || platform_fail release_manifest
+    awk 'NF!=2||length($1)!=64||$1~/[^0-9a-f]/||$2!~/^(install.sh|uninstall.sh|cfctl|cfctl-ssh|lib\/(platform-bootstrap.sh|vendor-platform.sh|install-common.sh|core.sh|rpc.sh|firewall.sh|state.awk|rules.awk|json.awk|activity.sh))$/||seen[$2]++ {bad=1}END{exit bad||NR!=14}' "$platform_release/release.sha256" || platform_fail release_manifest
     while read -r platform_digest platform_file; do
         platform_hash "$platform_release/$platform_file" "$platform_digest"
         case "$platform_file" in lib/*) platform_mode=644;; *) platform_mode=755;; esac
