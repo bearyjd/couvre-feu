@@ -669,6 +669,33 @@ esac
         self.assertEqual(full_snapshot(self.root), before)
         self.assert_no_touch()
 
+    def test_inexact_journal_original_after_rename_refuses_and_rolls_back(self):
+        # A rename that does not keep the original exact (e.g. a copy fallback)
+        # is caught right after the pair and the original goes back in place.
+        for change in ('mtime', 'bytes'):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                originals = self.write_originals()
+                target = self.root / 'etc/config/firewall'
+                alter = ({'mtime': f'{shlex.quote(shutil.which("touch"))} -m -d @1234567890 "$2"',
+                          'bytes': 'printf x >> "$2"'})[change]
+                wrapper = self.root / 'bin/mv'
+                wrapper.write_text(f'#!/bin/sh\n{shlex.quote(shutil.which("mv"))} "$@" || exit\n'
+                                   f'case "$1" in {target}) case "$2" in *.original) {alter};; esac;; esac\n')
+                wrapper.chmod(0o700)
+                result = self.install('--activate')
+                self.assertNotEqual(result.returncode, 0)
+                backup = self.root / 'etc/couvrefeu/backup'
+                self.assertIn(f'journal original is not exact after rename: {target}', result.stderr)
+                self.assertIn(f'manual recovery copy: {backup}/etc_config_firewall.copy', result.stderr)
+                # Rolled back: the path holds the (inexact) original again, never the new content.
+                self.assertFalse((backup / 'etc_config_firewall.original').exists())
+                self.assertNotEqual(signature(target), signature(backup / 'etc_config_firewall.staged'))
+                self.assertNotEqual(exact_signature(target), originals['etc/config/firewall'])
+                self.assertFalse((backup / 'complete').exists())
+                self.assert_no_touch()
+
     def test_tampered_journal_original_content_refuses_identically(self):
         # Same mode, owner and nanosecond mtime, other bytes: never renamed back.
         self.write_originals()
@@ -1483,36 +1510,108 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         self.assertFalse((self.root / 'etc').exists())
         self.assertFalse((self.root / 'usr').exists())
 
-    def test_failure_between_install_renames_recovers(self):
-        # Original moved into the journal, new content not yet renamed in: the
-        # managed path is absent. Resume and direct uninstall both recover exactly.
+    def mv_shim(self, script):
+        """`mv` wrapper: $script runs with the operands in "$@"; it may exit or fall through to the real mv."""
+        wrapper = self.root / 'bin/mv'
+        wrapper.write_text('#!/bin/sh\n' + script + '\nexec ' + shlex.quote(shutil.which('mv')) + ' "$@"\n')
+        wrapper.chmod(0o700)
+        self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
+
+    def check_recovery(self, scenario):
+        """Run scenario() fresh twice; from its state, resume+uninstall and direct uninstall restore exactly."""
         for resume in (False, True):
             with self.subTest(resume=resume):
                 self.tearDown()
                 self.setUp()
-                originals = InstallerTests.write_originals(self)
-                target = self.root / 'etc/config/firewall'
-                temp = Path(str(target) + '.couvrefeu-tmp')
-                self.tool_failure('mv', target)
-                before = {k: v for k, v in self.snapshot().items() if k != 'fail-tool'}
-                result = self.install('--activate')
-                self.assertNotEqual(result.returncode, 0)
-                backup = self.root / 'etc/couvrefeu/backup'
-                self.assertFalse(target.exists())
-                self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), originals['etc/config/firewall'])
-                self.assertEqual(signature(temp), signature(backup / 'etc_config_firewall.staged'))
-                self.assertFalse((backup / 'complete').exists())
-                (self.root / 'fail-tool').unlink()
+                before, originals = scenario()
+                (self.root / 'bin/mv').unlink(missing_ok=True)
+                (self.root / 'fail-tool').unlink(missing_ok=True)
                 if resume:
                     result = self.install('--activate')
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(signature(target), signature(backup / 'etc_config_firewall.staged'))
                 result = self.run_script('uninstall.sh')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse(temp.exists())
-                self.assertEqual({k: v for k, v in self.snapshot().items() if k != 'fail-tool'}, before)
+                self.assertFalse(Path(str(self.root / 'etc/config/firewall') + '.couvrefeu-tmp').exists())
+                self.assertEqual(self.snapshot(), before)
                 self.assertEqual(InstallerTests.originals_state(self), originals)
                 InstallerTests.assert_no_touch(self)
+
+    def test_install_rename_failure_rolls_the_original_back_in_place(self):
+        # ENOSPC-like failure of the second rename: the original is renamed
+        # straight back, so the managed path is never left absent.
+        def scenario():
+            originals = InstallerTests.write_originals(self)
+            before = self.snapshot()
+            target = self.root / 'etc/config/firewall'
+            self.mv_shim(f'case "$*" in *.couvrefeu-tmp" "{target}) echo "mv: No space left on device" >&2; exit 1;; esac')
+            result = self.install('--activate')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f'install rename failed: {target}; original restored in place, journal retained', result.stderr)
+            backup = self.root / 'etc/couvrefeu/backup'
+            self.assertEqual(exact_signature(target), originals['etc/config/firewall'])
+            self.assertFalse((backup / 'etc_config_firewall.original').exists())
+            self.assertFalse((backup / 'complete').exists())
+            return before, originals
+        self.check_recovery(scenario)
+
+    def test_install_rename_and_rollback_failure_names_manual_copy(self):
+        # Both renames onto the path fail: the journaled original and the owned
+        # temporary file are the recovery state; the message names .copy.
+        def scenario():
+            originals = InstallerTests.write_originals(self)
+            before = self.snapshot()
+            target = self.root / 'etc/config/firewall'
+            self.tool_failure('mv', target)
+            result = self.install('--activate')
+            self.assertNotEqual(result.returncode, 0)
+            backup = self.root / 'etc/couvrefeu/backup'
+            self.assertIn(f'install rename failed and original rollback failed: {target}; original journaled at {backup}/etc_config_firewall.original;'
+                          f' manual recovery copy: {backup}/etc_config_firewall.copy', result.stderr)
+            self.assertFalse(target.exists())
+            self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), originals['etc/config/firewall'])
+            self.assertEqual(signature(Path(str(target) + '.couvrefeu-tmp')), signature(backup / 'etc_config_firewall.staged'))
+            return before, originals
+        self.check_recovery(scenario)
+
+    def test_signal_between_install_renames_completes_the_pair(self):
+        # TERM/INT/HUP to the transaction while the original is journaled: the
+        # pair still completes, then the installer stops with the journal kept.
+        def scenario():
+            originals = InstallerTests.write_originals(self)
+            before = self.snapshot()
+            target = self.root / 'etc/config/firewall'
+            flag = self.root / 'signal-once'
+            flag.touch()
+            self.mv_shim(f'case "$*" in *{target}" "*.original) ;; *) exec {shlex.quote(shutil.which("mv"))} "$@";; esac\n'
+                         f'{shlex.quote(shutil.which("mv"))} "$@" || exit\n'
+                         f'if [ -f {shlex.quote(str(flag))} ]; then rm -f {shlex.quote(str(flag))}\n'
+                         '    main=$(awk \'{print $4}\' /proc/$PPID/stat)\n'
+                         '    for sig in HUP INT TERM; do kill -s $sig $PPID $main; done\nfi\nexit 0')
+            result = self.install('--activate')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(flag.exists())
+            backup = self.root / 'etc/couvrefeu/backup'
+            self.assertEqual(signature(target), signature(backup / 'etc_config_firewall.staged'))
+            self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), originals['etc/config/firewall'])
+            self.assertFalse((backup / 'complete').exists())
+            return before, originals
+        self.check_recovery(scenario)
+
+    def test_deleted_installed_path_is_drift_not_crash_state(self):
+        # Absent path + journaled original is crash state only with the owned
+        # temporary file. A user deletion after install refuses as drift.
+        originals = InstallerTests.write_originals(self)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / 'etc/config/firewall').unlink()
+        before = full_snapshot(self.root)
+        for script in ('uninstall.sh', 'install.sh'):
+            with self.subTest(script=script):
+                result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('drift at /etc/config/firewall', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual(exact_signature(self.root / 'etc/couvrefeu/backup/etc_config_firewall.original'), originals['etc/config/firewall'])
 
     def test_restore_rename_failure_resumes_owned_original(self):
         target = self.root / 'etc/config/firewall'
@@ -1858,6 +1957,36 @@ class OverlayIdentityTests(unittest.TestCase):
                     before, release, f'original, journal and recovery journal are not on one filesystem: /{first}; no installation made')
                 self.assertEqual(self.copy_ups(), [])
                 self.assert_no_touch()
+
+    def test_same_device_bind_mount_refuses_before_first_write(self):
+        # A bind mount shares %d and may share %m, but rename(2) across it is
+        # EXDEV and BusyBox mv would copy; mountinfo mount IDs tell them apart.
+        release = self.enable_release()
+        (self.root / 'etc/couvrefeu').mkdir(mode=0o750)
+        (self.root / 'etc/couvrefeu').chmod(0o750)
+        self.model({rel: 'lower' for rel in EXISTING_ORIGINALS})
+        mountinfo = self.root / 'bin/mountinfo'
+        lines = {'single': ['1 0 0:2 / / rw - rootfs rootfs rw', f'30 1 0:19 / {self.root} rw - overlay overlay rw'],
+                 'bind': ['1 0 0:2 / / rw - rootfs rootfs rw', f'30 1 0:19 / {self.root} rw - overlay overlay rw',
+                          f'31 30 0:19 /etc/crontabs {self.root}/etc/crontabs rw - overlay overlay rw'],
+                 'malformed': ['garbage line']}
+        self.env['CF_TEST_MOUNTINFO'] = str(mountinfo)
+        for name, rows in lines.items():
+            with self.subTest(mountinfo=name):
+                mountinfo.write_text('\n'.join(rows) + '\n')
+                if name == 'single':
+                    continue
+                before = full_snapshot(self.root)
+                message = ('original, journal and recovery journal are not on one filesystem: /'
+                           + ('etc/crontabs/root' if name == 'bind' else 'etc/config/firewall') + '; no installation made')
+                self.assert_refused_identically(before, release, message)
+                self.assertEqual(self.copy_ups(), [])
+        # The modeled single mount installs and restores exactly.
+        mountinfo.write_text('\n'.join(lines['single']) + '\n')
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_cross_filesystem_restore_refuses_before_any_write(self):
         originals = {rel: 'origin' for rel in EXISTING_ORIGINALS}

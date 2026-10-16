@@ -194,12 +194,33 @@ exact_file() {
 # lower-only file preserves them too). Nothing re-applies a timestamp: the
 # target's BusyBox touch truncates nanoseconds. BusyBox mv silently falls back
 # to copy and unlink across filesystems, so both ends must first be proved on
-# one filesystem: the device and mount point of the nearest existing directory
-# (directories report the overlay's own device; files may not).
+# one filesystem *and* one mount: the device and mount point of the nearest
+# existing directory (directories report the overlay's own device; files may
+# not), and its mount ID from mountinfo, longest mount-point prefix of the
+# physical path, last entry winning. A same-device bind mount shares %d and
+# may share %m but has its own mount ID (rename across it is EXDEV).
+# Unreadable or malformed output refuses.
+mount_dir() {
+    md_dir=$1
+    while [ -n "$md_dir" ] && { [ ! -d "$md_dir" ] || [ -L "$md_dir" ]; }; do md_dir=${md_dir%/*}; done
+    (CDPATH='' cd -- "${md_dir:-/}" && pwd -P)
+}
+mountinfo_path() {
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ -n "${CF_TEST_MOUNTINFO:-}" ]; then
+        case "$CF_TEST_MOUNTINFO" in "$ROOT"/*) printf '%s\n' "$CF_TEST_MOUNTINFO";; *) fail 'fixture mountinfo must be below fixture root';; esac
+    else printf '%s\n' /proc/self/mountinfo; fi
+}
 mount_of() {
-    mo_dir=$1
-    while [ -n "$mo_dir" ] && { [ ! -d "$mo_dir" ] || [ -L "$mo_dir" ]; }; do mo_dir=${mo_dir%/*}; done
-    stat -c '%d %m' "${mo_dir:-/}" | awk 'NR==1 && NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^\// {print; good=1} END {exit !good || NR!=1}'
+    mo_dir=$(mount_dir "$1") || return 1
+    mo_info=$(mountinfo_path) || return 1
+    mo_id=$(awk -v p="$mo_dir" '
+        NF < 10 || $1 !~ /^[0-9]+$/ || $5 !~ /^\// {bad=1; exit}
+        {
+            m=$5; gsub(/\\040/, " ", m); gsub(/\\011/, "\t", m); gsub(/\\012/, "\n", m); gsub(/\\134/, "\\", m)
+            if ((m == "/" || p == m || index(p, m "/") == 1) && length(m) >= best) {best=length(m); id=$1}
+        }
+        END {if (bad || id == "") exit 1; print id}' "$mo_info") || return 1
+    stat -c '%d %m' "$mo_dir" | awk -v id="$mo_id" 'NR==1 && NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^\// {print id, $0; good=1} END {exit !good || NR!=1}'
 }
 same_mount() {
     sm_first=$(mount_of "$1") && sm_second=$(mount_of "$2") && [ "$sm_first" = "$sm_second" ]
@@ -346,9 +367,11 @@ preflight() {
                 fail 'runtime state metadata drift'
             fi
         else
-            # Absent only between the two install renames, with the original journaled.
+            # Absent is crash state only between the two install renames: the
+            # original journaled and the owned temporary file still present
+            # (owned_temp below proves it). A later deletion is drift.
             [ "$current" = "$before" ] || [ "$current" = "$after" ] || [ "$current" = "$tx_old" ] || [ "$current" = "$tx_new" ] ||
-                { [ "$current" = absent ] && [ -e "$saved" ]; } || fail "drift at /$rel; preserved current file and backup; resolve explicitly"
+                { [ "$current" = absent ] && [ -e "$saved" ] && [ -f "$ROOT/$rel.couvrefeu-tmp" ]; } || fail "drift at /$rel; preserved current file and backup; resolve explicitly"
         fi
         # The exact original is journaled (renamed in, or a legacy copy), or
         # still in place: not yet renamed by install, or already restored.
@@ -432,22 +455,34 @@ original_intact() {
 }
 # Publish an owned, verified temporary file. With a journal key whose existing
 # original is not yet journaled, first rename the original into the journal
-# (same filesystem, proved again here), then immediately rename the temporary
-# file over the path: nothing runs between the two renames, during which the
-# path is briefly absent. A crash there leaves the journaled original plus an
-# owned temporary file, which install resume publishes and uninstall restores.
+# (same filesystem and mount, proved again here), then immediately rename the
+# temporary file over the path. HUP/INT/TERM are ignored across the pair so no
+# signal leaves the path absent; if the second rename fails, or the journaled
+# original is not exact afterwards, the original is renamed straight back and
+# proved. Only SIGKILL or a failed rollback leave the path absent, with the
+# journaled original and the owned temporary file as recovery state (install
+# resume publishes it, uninstall renames the original back).
 publish_temp() {
     if [ -n "${3:-}" ]; then
         original_intact "$3" "${2#"$ROOT"/}"
         pt_saved=$BACKUP/$3.original
-        if [ ! -e "$pt_saved" ] && [ ! -L "$pt_saved" ] && [ "$(awk 'NR==1 {print; exit}' "$BACKUP/$3.before")" != absent ]; then
+        pt_before=$(awk 'NR==1 {print; exit}' "$BACKUP/$3.before")
+        pt_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$3.mtime")
+        if [ ! -e "$pt_saved" ] && [ ! -L "$pt_saved" ] && [ "$pt_before" != absent ]; then
             same_mount "$2" "$BACKUP" || fail "original and journal are not on one filesystem: $2; journal retained"
             platform_initial_write
-            mv "$2" "$pt_saved" || fail "original rename into journal failed: $2; journal retained"
-            mv -f "$1" "$2" || fail "install rename failed: $2; original journaled, journal retained; retry install or uninstall"
+            trap '' 1 2 15
+            if ! mv "$2" "$pt_saved"; then trap 'exit 1' 1 2 15; fail "original rename into journal failed: $2; journal retained"; fi
+            mv -f "$1" "$2" || pt_rollback "$pt_saved" "$2" "$3" 'install rename failed'
+            if ! exact_file "$pt_saved" "$pt_before" "$pt_mtime"; then
+                if [ "$(signature "$2")" = "$(signature "$BACKUP/$3.staged")" ]; then
+                    pt_rollback "$pt_saved" "$2" "$3" 'journal original is not exact after rename'
+                fi
+                trap 'exit 1' 1 2 15
+                fail "journal original is not exact after rename: $2; journal retained; manual recovery copy: $BACKUP/$3.copy"
+            fi
+            trap 'exit 1' 1 2 15
             sync "$pt_saved" "$2" 2>/dev/null
-            exact_file "$pt_saved" "$(awk 'NR==1 {print; exit}' "$BACKUP/$3.before")" "$(awk 'NR==1 {print; exit}' "$BACKUP/$3.mtime")" ||
-                fail "journal original is not exact after rename: $2; journal retained"
             [ "$(signature "$2")" = "$(signature "$BACKUP/$3.staged")" ] ||
                 fail "installed file mismatch after rename: $2; original journaled, journal retained"
             return 0
@@ -455,6 +490,17 @@ publish_temp() {
     fi
     platform_initial_write
     mv -f "$1" "$2"
+}
+# Rename journaled original $1 back over path $2 (journal key $3), prove it and
+# refuse with reason $4. Never returns.
+pt_rollback() {
+    if mv -f "$1" "$2"; then
+        trap 'exit 1' 1 2 15
+        if exact_file "$2" "$pt_before" "$pt_mtime"; then fail "$4: $2; original restored in place, journal retained"; fi
+        fail "$4: $2; original renamed back in place but not exact; journal retained; manual recovery copy: $BACKUP/$3.copy"
+    fi
+    trap 'exit 1' 1 2 15
+    fail "$4 and original rollback failed: $2; original journaled at $1; manual recovery copy: $BACKUP/$3.copy"
 }
 # Rename in the same directory; do not write through existing files. Installed
 # content needs exact bytes/mode/owner only; its timestamp is never restored.
