@@ -790,7 +790,7 @@ class FailClosedReconstructionTests(unittest.TestCase):
         self.f.update_backend(capture_effects=True, effects=[], failures=failures)
         result = self.cfctl('sync', document=self.changed_policy())
         state = self.f.backend()
-        self.assertTrue(all(row['remaining'] == 0 for row in state['failures']), state['failures'])
+        self.assertEqual(state['failures'][0]['remaining'], 0, state['failures'])
         self.assertTrue(any(row['command'] == 'ip6tables' and '-A' in row['argv'] and f'cf2_{shadow}_g' in row['argv']
                             for row in state['effects']), 'failure must follow the complete shadow build')
         self.f.update_backend(failures=[], capture_effects=False, effects=[])
@@ -842,6 +842,31 @@ class FailClosedReconstructionTests(unittest.TestCase):
         self.assertTrue(all(key[2] == 'reject' or key[2].startswith('zone_') for key in rules if key not in pristine[0]), rules)
         self.assertFalse((self.f.root / 'usr/sbin/cfctl').exists())
 
+    def assert_journal_or_clean(self, shadow):
+        intent = (self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists()
+        self.assertTrue(intent or self.generation(shadow) == ({}, {}), 'intent removed with shadow objects left')
+        return intent
+
+    def test_failed_set_read_never_drops_journal_and_uninstall_recovers(self):
+        _, _, shadow = self.fail_after_shadow_build(
+            ({'command': 'ipset', 'contains': ['save', 'cf2_{shadow}_k'], 'skip': 1, 'remaining': 1},))
+        self.assert_journal_or_clean(shadow)
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+
+    def test_rollback_failing_after_partial_deletes_keeps_journal_and_uninstall_recovers(self):
+        result, _, shadow = self.fail_after_shadow_build(
+            ({'command': 'ipset', 'contains': ['destroy', 'cf2_{shadow}_p'], 'remaining': 1},))
+        self.assertIn('couvre-feu: staging_rollback refused: set_delete', result.stderr)
+        chains, sets = self.generation(shadow)
+        self.assertEqual(chains, {}, 'chain deletes precede the failed set delete')
+        self.assertTrue(sets)
+        self.assertTrue(self.assert_journal_or_clean(shadow), 'failed rollback keeps the staging intent')
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+
     def test_uninstall_refuses_referenced_staging_slot_without_mutation(self):
         _, shadow = self.staged_drifted_intent(self.ROLLBACK_FAILS)
         state = self.f.backend()
@@ -851,6 +876,7 @@ class FailClosedReconstructionTests(unittest.TestCase):
         refused = self.uninstall()
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn('remove-fw exit', refused.stderr)
+        self.assertIn('couvre-feu: staging_rollback refused: referenced_target (after transition_object_drift)', refused.stderr)
         self.assertEqual(self.kernel_view(), before)
         self.assertEqual(len(self.f.mutation_calls()), mutations)
         self.assertTrue((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())

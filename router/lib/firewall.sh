@@ -776,7 +776,9 @@ $CF_GUARD_PLAN" && cf_transition_inventory_check; };then
         # Never leave a half-built shadow slot behind a staging intent. A failed
         # rollback keeps the intent; the original error remains the diagnosis.
         cf_tp_error=$CF_ERROR
-        if [ -n "$cf_tp_owned" ] && [ "${CF_REBASE_READY:-0}" != 1 ];then cf_staging_rollback "$cf_tp_owned" "$CF_BEFORE" || :;fi
+        if [ -n "$cf_tp_owned" ] && [ "${CF_REBASE_READY:-0}" != 1 ] && ! cf_staging_rollback "$cf_tp_owned" "$CF_BEFORE";then
+            printf '%s\n' "couvre-feu: staging_rollback refused: ${CF_SB_STEP:-unknown} (after ${cf_tp_error:-apply_failed})" >&2
+        fi
         CF_ERROR=$cf_tp_error;return 1
     fi
     cf_transition_phase staged
@@ -784,36 +786,42 @@ $CF_GUARD_PLAN" && cf_transition_inventory_check; };then
 # Staging debris removal without the transition inventory check: only literal
 # cf2_<target>_* objects of a staging intent whose target is not the owned
 # slot, that no rule or set outside the target references, and whose removal
-# leaves exactly $2 (a snapshot). Any doubt refuses before the first mutation.
+# leaves exactly $2 (a snapshot). Existence comes only from complete successful
+# reads, and the intent is removed only after a fresh snapshot proves $2.
+# A refusal names its step in CF_SB_STEP.
+cf_sb_refuse() { CF_SB_STEP=$1;return 1; }
 cf_staging_rollback() {
-    cf_sb_owned=$1;cf_sb_baseline=$2;cf_sb_slot=$CF_SLOT
-    case $cf_sb_owned:$cf_sb_slot in a:b|b:a);;*)return 1;;esac
-    [ ! -e "$CF_RUNTIME/firewall.cleanup" ] && [ ! -L "$CF_RUNTIME/firewall.cleanup" ] || return 1
+    cf_sb_owned=$1;cf_sb_baseline=$(printf '%s\n' "$2" | awk '$1!="SCHEDULE"&&NF{print}');cf_sb_slot=$CF_SLOT;CF_SB_STEP=
+    case $cf_sb_owned:$cf_sb_slot in a:b|b:a);;*)cf_sb_refuse target_is_owned;return 1;;esac
+    [ ! -e "$CF_RUNTIME/firewall.cleanup" ] && [ ! -L "$CF_RUNTIME/firewall.cleanup" ] || { cf_sb_refuse cleanup_record;return 1; }
     printf '%s\n' "$CF_TRANSITION" | awk -v s="$cf_sb_slot" '$1=="PHASE"&&$2=="staging"{stage=1}/^REPAIR\t/{bad=1}
-        $1=="BEFORE"&&($2=="RULE"&&$5~("^cf2_" s "_")||($2=="SETDEF"||$2=="SET")&&$3~("^cf2_" s "_")){bad=1}END{exit !stage||bad}' || return 1
-    cf_sb_now=$(cf_snapshot) || return 1
+        $1=="BEFORE"&&($2=="RULE"&&$5~("^cf2_" s "_")||($2=="SETDEF"||$2=="SET")&&$3~("^cf2_" s "_")){bad=1}END{exit !stage||bad}' || { cf_sb_refuse not_plain_staging;return 1; }
+    cf_sb_now=$(cf_snapshot) || { cf_sb_refuse snapshot_read;return 1; }
     cf_sb_rest=$(printf '%s\n' "$cf_sb_now" | awk -v s="$cf_sb_slot" '$1=="SCHEDULE"||$1=="RULE"&&$4~("^cf2_" s "_[figd]$")||($1=="SETDEF"||$1=="SET")&&$2~("^cf2_" s "_(k|p|d4|d6|u)$"){next}NF{print}')
-    [ "$cf_sb_rest" = "$(printf '%s\n' "$cf_sb_baseline" | awk '$1!="SCHEDULE"&&NF{print}')" ] || return 1
+    [ "$cf_sb_rest" = "$cf_sb_baseline" ] || { cf_sb_refuse baseline_drift;return 1; }
     for cf_sb_f in 4 6;do
         for cf_sb_t in filter nat mangle raw;do
-            cf_sb_rules=$(cf_table "$cf_sb_f" -t "$cf_sb_t" -S) || return 1
-            printf '%s\n' "$cf_sb_rules" | awk -v s="$cf_sb_slot" '$1=="-A"&&$2!~("^cf2_" s "_[figd]$"){for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&$(i+1)~("^cf2_" s "_[figd]$")||$i=="--match-set"&&$(i+1)~("^cf2_" s "_(k|p|d4|d6|u)$"))exit 1}' || return 1
+            cf_sb_rules=$(cf_table "$cf_sb_f" -t "$cf_sb_t" -S) || { cf_sb_refuse rule_read;return 1; }
+            printf '%s\n' "$cf_sb_rules" | awk -v s="$cf_sb_slot" '$1=="-A"&&$2!~("^cf2_" s "_[figd]$"){for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&$(i+1)~("^cf2_" s "_[figd]$")||$i=="--match-set"&&$(i+1)~("^cf2_" s "_(k|p|d4|d6|u)$"))exit 1}' || { cf_sb_refuse referenced_target;return 1; }
         done
     done
-    cf_sb_sets=$(cf_backend ipset save) || return 1
-    printf '%s\n' "$cf_sb_sets" | awk -v s="$cf_sb_slot" '$1=="add"&&$3~("^cf2_" s "_(k|p|d4|d6|u)$"){exit 1}' || return 1
+    cf_sb_sets=$(cf_backend ipset save) || { cf_sb_refuse set_read;return 1; }
+    printf '%s\n' "$cf_sb_sets" | awk -v s="$cf_sb_slot" '$1=="add"&&$3~("^cf2_" s "_(k|p|d4|d6|u)$"){exit 1}' || { cf_sb_refuse referenced_target_set;return 1; }
+    cf_sb_present=$(printf '%s\n' "$cf_sb_sets" | awk -v s="$cf_sb_slot" '$1=="create"&&$2~("^cf2_" s "_(k|p|d4|d6|u)$"){print $2}')
     for cf_sb_op in -F -X;do
         while read -r cf_sb_f cf_sb_t cf_sb_c;do
-            cf_sb_all=$(cf_table "$cf_sb_f" -t "$cf_sb_t" -S) || return 1
+            cf_sb_all=$(cf_table "$cf_sb_f" -t "$cf_sb_t" -S) || { cf_sb_refuse chain_read;return 1; }
             printf '%s\n' "$cf_sb_all" | awk -v c="$cf_sb_c" '$1=="-N"&&$2==c{yes=1}END{exit !yes}' || continue
-            cf_table "$cf_sb_f" -t "$cf_sb_t" "$cf_sb_op" "$cf_sb_c" || return 1
+            cf_table "$cf_sb_f" -t "$cf_sb_t" "$cf_sb_op" "$cf_sb_c" || { cf_sb_refuse chain_delete;return 1; }
         done <<EOS
 $(cf_slot_chains "$cf_sb_slot")
 EOS
     done
-    for cf_sb_set in $(cf_slot_sets "$cf_sb_slot");do if cf_backend ipset save "$cf_sb_set" >/dev/null 2>&1;then cf_backend ipset destroy "$cf_sb_set" || return 1;fi;done
+    for cf_sb_set in $cf_sb_present;do cf_backend ipset destroy "$cf_sb_set" || { cf_sb_refuse set_delete;return 1; };done
+    cf_sb_after=$(cf_snapshot) || { cf_sb_refuse final_snapshot_read;return 1; }
+    [ "$(printf '%s\n' "$cf_sb_after" | awk '$1!="SCHEDULE"&&NF{print}')" = "$cf_sb_baseline" ] || { cf_sb_refuse final_snapshot_drift;return 1; }
     platform_initial_write
-    rm -f "$CF_RUNTIME/firewall.intent" && cf_backend sync || return 1
+    rm -f "$CF_RUNTIME/firewall.intent" && cf_backend sync || { cf_sb_refuse intent_removal;return 1; }
     CF_TRANSITION=;cf_slot_load
 }
 cf_dispatch_rules() {
@@ -1162,7 +1170,13 @@ EOZ
             # Only an exact recorded snapshot plus unreferenced staging debris
             # may proceed; the drifted intent is otherwise preserved.
             cf_rf_error=$CF_ERROR
-            cf_safe_file "$CF_RUNTIME/firewall.snapshot" && cf_staging_rollback "$cf_rf_owned" "$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")" || { CF_ERROR=$cf_rf_error;return 1; }
+            CF_SB_STEP=snapshot_record
+            cf_safe_file "$CF_RUNTIME/firewall.snapshot" && cf_staging_rollback "$cf_rf_owned" "$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")" || {
+                printf '%s\n' "couvre-feu: staging_rollback refused: ${CF_SB_STEP:-unknown} (after ${cf_rf_error:-unknown})" >&2
+                CF_ERROR=$cf_rf_error;return 1
+            }
+            # A later refusal reports its own code; keep the original diagnosis visible.
+            printf '%s\n' "couvre-feu: staging debris rolled back after ${cf_rf_error:-unknown}" >&2
         fi
     fi
     cf_reference_guard_v2 || return 1
