@@ -100,7 +100,7 @@ cf_state_load() {
     cf_policy_records=$(awk -f "$CF_LIB/state.awk" "$CF_STATE") || { cf_fail invalid_state;return 1; }
     CF_METADATA=$(awk -v mode=meta -f "$CF_LIB/state.awk" "$CF_STATE") || { cf_fail invalid_state;return 1; }
     [ "${#cf_policy_records}" -lt 65536 ] || { cf_fail state_too_large;return 1; }
-    cf_raw=$(printf '%s\n' "$cf_policy_records" | cf_state_json /dev/stdin) || { cf_fail invalid_state; return 1; }
+    cf_raw=$(printf '%s\n' "$cf_policy_records" | cf_state_json -) || { cf_fail invalid_state; return 1; }
     cf_validated=$(printf '%s\n' "$cf_raw" | awk -f "$CF_LIB/json.awk") || { cf_fail invalid_state;return 1; }
     CF_POLICY=$(printf '%s\n' "$cf_validated" | cf_canonical)
     [ -n "$CF_POLICY" ] && [ "$CF_POLICY" = "$(printf '%s\n' "$cf_policy_records" | cf_canonical)" ] || { cf_fail invalid_state; return 1; }

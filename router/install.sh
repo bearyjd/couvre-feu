@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=e917038d0c6d4a7456df356d9dcfc7f780072f1d95369ac5d0d63a4508eb84f9
+CF_BOOTSTRAP_PIN=1c977ee67590e922e2ade14bed63404b9d88ce7d8231436f005e0b030723afc3
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -221,7 +221,7 @@ if [ -n "$RPC_ALLOW" ];then
         # shellcheck disable=SC1091
         . "$SOURCE/lib/core.sh"
         stage_records=$(awk -f "$SOURCE/lib/state.awk" "$STAGE/state") || exit 1
-        stage_json=$(printf '%s\n' "$stage_records" | cf_state_json /dev/stdin) || exit 1
+        stage_json=$(printf '%s\n' "$stage_records" | cf_state_json -) || exit 1
         stage_valid=$(printf '%s\n' "$stage_json" | awk -f "$SOURCE/lib/json.awk") || exit 1
         [ "$(printf '%s\n' "$stage_valid" | cf_canonical)" = "$(printf '%s\n' "$stage_records" | cf_canonical)" ] || exit 1
         printf '%s\n' "$stage_records" | awk -F '\t' -v mac="$RPC_ALLOW" '$1=="P"&&$3!="-"&&$3!=mac{exit 1}' || exit 1
