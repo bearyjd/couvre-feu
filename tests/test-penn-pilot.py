@@ -379,7 +379,7 @@ class PilotPlanTests(PilotBase):
         body = body[:body.index('\n}\n')]
         self.assertLess(body.index("trap '' INT TERM"), body.index('\n    CFP_TEARDOWN=1\n'))
         self.assertLess(body.index("trap '' INT TERM"), body.index('[ "$CFP_TEARDOWN" = 0 ]'))
-        self.assertEqual(body.count('PENN_KERNEL_STATE $(cfp_penn_state)'), 2)
+        self.assertEqual(body.count('PENN_KERNEL_STATE $(cfp_kernel_state)'), 2)
         self.assertIn('PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED', body)
 
     def test_every_pause_is_timed_and_no_open_ended_pause(self):

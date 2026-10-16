@@ -730,7 +730,8 @@ cf_transition_prepare() {
         [ "$cf_tp_now" = "$cf_tp_old" ] || printf '%s\n' "$cf_tp_now" | awk -v known="$cf_tp_old" 'BEGIN{n=split(known,a,"\n");for(i=1;i<=n;i++)ok[a[i]]=1}NF&&!ok[$0]{exit 1}' || { cf_fail owned_rule_drift;return 1; }
     fi
     cf_transition_identity || return 1
-    if cf_ownership_valid;then if [ "$CF_SLOT" = a ];then CF_SLOT=b;else CF_SLOT=a;fi;fi
+    cf_tp_owned=
+    if cf_ownership_valid;then cf_tp_owned=$CF_SLOT;if [ "$CF_SLOT" = a ];then CF_SLOT=b;else CF_SLOT=a;fi;fi
     CF_ADDRESS_DATA=$CF_UNION_ADDRESSES
     cf_stale_plan || return 1
     CF_EXPECTED=$(cf_plan) || return 1
@@ -770,9 +771,50 @@ $(printf '%s\n' "$CF_AFTER" | awk 'NF{print "AFTER " $0}')"
     cf_rpc_checkpoint after_initial_intent
     if ! cf_ownership_valid;then cf_durable_record firewall.owned "couvrefeu-owned-v2
 $CF_SLOT" || return 1;fi
-    cf_stale_repair && cf_build_sets && cf_build_plan "$CF_EXPECTED
-$CF_GUARD_PLAN" && cf_transition_inventory_check || return 1
+    if ! { cf_stale_repair && cf_build_sets && cf_build_plan "$CF_EXPECTED
+$CF_GUARD_PLAN" && cf_transition_inventory_check; };then
+        # Never leave a half-built shadow slot behind a staging intent. A failed
+        # rollback keeps the intent; the original error remains the diagnosis.
+        cf_tp_error=$CF_ERROR
+        if [ -n "$cf_tp_owned" ] && [ "${CF_REBASE_READY:-0}" != 1 ];then cf_staging_rollback "$cf_tp_owned" "$CF_BEFORE" || :;fi
+        CF_ERROR=$cf_tp_error;return 1
+    fi
     cf_transition_phase staged
+}
+# Staging debris removal without the transition inventory check: only literal
+# cf2_<target>_* objects of a staging intent whose target is not the owned
+# slot, that no rule or set outside the target references, and whose removal
+# leaves exactly $2 (a snapshot). Any doubt refuses before the first mutation.
+cf_staging_rollback() {
+    cf_sb_owned=$1;cf_sb_baseline=$2;cf_sb_slot=$CF_SLOT
+    case $cf_sb_owned:$cf_sb_slot in a:b|b:a);;*)return 1;;esac
+    [ ! -e "$CF_RUNTIME/firewall.cleanup" ] && [ ! -L "$CF_RUNTIME/firewall.cleanup" ] || return 1
+    printf '%s\n' "$CF_TRANSITION" | awk -v s="$cf_sb_slot" '$1=="PHASE"&&$2=="staging"{stage=1}/^REPAIR\t/{bad=1}
+        $1=="BEFORE"&&($2=="RULE"&&$5~("^cf2_" s "_")||($2=="SETDEF"||$2=="SET")&&$3~("^cf2_" s "_")){bad=1}END{exit !stage||bad}' || return 1
+    cf_sb_now=$(cf_snapshot) || return 1
+    cf_sb_rest=$(printf '%s\n' "$cf_sb_now" | awk -v s="$cf_sb_slot" '$1=="SCHEDULE"||$1=="RULE"&&$4~("^cf2_" s "_[figd]$")||($1=="SETDEF"||$1=="SET")&&$2~("^cf2_" s "_(k|p|d4|d6|u)$"){next}NF{print}')
+    [ "$cf_sb_rest" = "$(printf '%s\n' "$cf_sb_baseline" | awk '$1!="SCHEDULE"&&NF{print}')" ] || return 1
+    for cf_sb_f in 4 6;do
+        for cf_sb_t in filter nat mangle raw;do
+            cf_sb_rules=$(cf_table "$cf_sb_f" -t "$cf_sb_t" -S) || return 1
+            printf '%s\n' "$cf_sb_rules" | awk -v s="$cf_sb_slot" '$1=="-A"&&$2!~("^cf2_" s "_[figd]$"){for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&$(i+1)~("^cf2_" s "_[figd]$")||$i=="--match-set"&&$(i+1)~("^cf2_" s "_(k|p|d4|d6|u)$"))exit 1}' || return 1
+        done
+    done
+    cf_sb_sets=$(cf_backend ipset save) || return 1
+    printf '%s\n' "$cf_sb_sets" | awk -v s="$cf_sb_slot" '$1=="add"&&$3~("^cf2_" s "_(k|p|d4|d6|u)$"){exit 1}' || return 1
+    for cf_sb_op in -F -X;do
+        while read -r cf_sb_f cf_sb_t cf_sb_c;do
+            cf_sb_all=$(cf_table "$cf_sb_f" -t "$cf_sb_t" -S) || return 1
+            printf '%s\n' "$cf_sb_all" | awk -v c="$cf_sb_c" '$1=="-N"&&$2==c{yes=1}END{exit !yes}' || continue
+            cf_table "$cf_sb_f" -t "$cf_sb_t" "$cf_sb_op" "$cf_sb_c" || return 1
+        done <<EOS
+$(cf_slot_chains "$cf_sb_slot")
+EOS
+    done
+    for cf_sb_set in $(cf_slot_sets "$cf_sb_slot");do if cf_backend ipset save "$cf_sb_set" >/dev/null 2>&1;then cf_backend ipset destroy "$cf_sb_set" || return 1;fi;done
+    platform_initial_write
+    rm -f "$CF_RUNTIME/firewall.intent" && cf_backend sync || return 1
+    CF_TRANSITION=;cf_slot_load
 }
 cf_dispatch_rules() {
     cf_dispatch_raw=$(cf_table "$1" -t "$2" -S "$3") || return 1
@@ -1113,7 +1155,16 @@ EOZ
         cf_rpc_checkpoint after_zero_owned_proof
         CF_ZERO_OWNED=true;return 0
     fi
-    if [ -e "$CF_RUNTIME/firewall.intent" ];then cf_transition_read && cf_transition_inventory_check || return 1;fi
+    if [ -e "$CF_RUNTIME/firewall.intent" ];then
+        cf_rf_owned=$(awk 'NR==2{print}' "$CF_RUNTIME/firewall.owned") || return 1
+        cf_transition_read || return 1
+        if ! cf_transition_inventory_check;then
+            # Only an exact recorded snapshot plus unreferenced staging debris
+            # may proceed; the drifted intent is otherwise preserved.
+            cf_rf_error=$CF_ERROR
+            cf_safe_file "$CF_RUNTIME/firewall.snapshot" && cf_staging_rollback "$cf_rf_owned" "$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")" || { CF_ERROR=$cf_rf_error;return 1; }
+        fi
+    fi
     cf_reference_guard_v2 || return 1
     if [ -e "$CF_RUNTIME/firewall.cleanup" ];then cf_cleanup_verify || return 1;else
         if [ ! -e "$CF_RUNTIME/firewall.intent" ];then

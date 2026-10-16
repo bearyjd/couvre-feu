@@ -440,9 +440,8 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
                    'startedUtc': started.strftime('%Y-%m-%dT%H:%M:%SZ'),
                    'finishedUtc': now_fn().strftime('%Y-%m-%dT%H:%M:%SZ')}
         FR.write_evidence(directory, 'summary.json', json.dumps(summary, indent=2, sort_keys=True) + '\n')
-        for line in stdout_text.splitlines():
-            if line.startswith(PRINTED):
-                print(line)
+        for line in FR.console_lines(directory, stdout_text, PRINTED):
+            print(line)
         if reasons:
             print('Host-side adult probes exceeded the predeclared tolerance: ' + ', '.join(reasons))
         print(MESSAGES[outcome].format(blocking=measured['packet_blocking_summary']['detail']))

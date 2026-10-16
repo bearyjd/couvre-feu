@@ -323,7 +323,8 @@ cfr_verify() {
     cfr_ok VERIFY
 }
 
-# Print DIFF lines between snapshot.before and snapshot.after (both present).
+# Print every DIFF line between snapshot.before and snapshot.after (both
+# present). The host tool saves them all to diff.txt and caps the console.
 cfr_diff() {
     { awk 'NR==FNR{before[$1 " " $2]=$0;order[++n]=$1 " " $2;next}
         {after[$1 " " $2]=$0; if(!($1 " " $2 in before))order[++n]=$1 " " $2}
@@ -331,9 +332,9 @@ cfr_diff() {
         "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"
     for cfr_kind in iptables ip6tables ipset ipsetsave uci cron; do
         cmp -s "$CFR_STAGE/text.before.$cfr_kind" "$CFR_STAGE/text.after.$cfr_kind" && continue
-        awk -v kind="$cfr_kind" 'NR==FNR{b[$0]++;next}{a[$0]++;if(a[$0]>b[$0]&&shown<40){print "DIFF " kind " + " $0;shown++}}' \
+        awk -v kind="$cfr_kind" 'NR==FNR{b[$0]++;next}{a[$0]++;if(a[$0]>b[$0])print "DIFF " kind " + " $0}' \
             "$CFR_STAGE/text.before.$cfr_kind" "$CFR_STAGE/text.after.$cfr_kind"
-        awk -v kind="$cfr_kind" 'NR==FNR{a[$0]++;next}{b[$0]++;if(b[$0]>a[$0]&&shown<40){print "DIFF " kind " - " $0;shown++}}' \
+        awk -v kind="$cfr_kind" 'NR==FNR{a[$0]++;next}{b[$0]++;if(b[$0]>a[$0])print "DIFF " kind " - " $0}' \
             "$CFR_STAGE/text.after.$cfr_kind" "$CFR_STAGE/text.before.$cfr_kind"
     done; } > "$CFR_STAGE/diff.txt"
     while IFS= read -r cfr_line; do cfr_out "$cfr_line"; done < "$CFR_STAGE/diff.txt"

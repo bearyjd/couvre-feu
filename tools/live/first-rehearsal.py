@@ -440,6 +440,30 @@ def write_evidence(directory, name, text):
         handle.write(text)
 
 
+DIFF_CONSOLE_LINES = 40
+
+
+def console_lines(directory, stdout_text, prefixes):
+    """Save every remote DIFF line to diff.txt; return the console lines with DIFF capped."""
+    lines = stdout_text.splitlines()
+    diff = [line for line in lines if line.startswith('DIFF ')]
+    if diff:
+        write_evidence(directory, 'diff.txt', '\n'.join(diff) + '\n')
+    shown, printed = 0, []
+    for line in lines:
+        if not line.startswith(prefixes):
+            continue
+        if line.startswith('DIFF '):
+            shown += 1
+            if shown == DIFF_CONSOLE_LINES + 1:
+                printed.append(f'DIFF ... {len(diff) - DIFF_CONSOLE_LINES} more lines in '
+                               + os.path.join(directory, 'diff.txt'))
+            if shown > DIFF_CONSOLE_LINES:
+                continue
+        printed.append(line)
+    return printed
+
+
 def run_ssh(argv, payload, env, stdout_fd, stderr_fd, timeout):
     """Exactly one invocation. The child group is always killed and reaped."""
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout_fd, stderr=stderr_fd,
@@ -550,9 +574,8 @@ def execute(config, expected_plan_sha, env, now_fn):
                    'sourceCommit': details['sourceCommit'], 'startedUtc': started.strftime('%Y-%m-%dT%H:%M:%SZ'),
                    'finishedUtc': now_fn().strftime('%Y-%m-%dT%H:%M:%SZ')}
         write_evidence(directory, 'summary.json', json.dumps(summary, indent=2, sort_keys=True) + '\n')
-        for line in stdout_text.splitlines():
-            if line.startswith(('PHASE ', 'DIFF ', 'REFUSED_', 'FAIL_', PASS_LINE)):
-                print(line)
+        for line in console_lines(directory, stdout_text, ('PHASE ', 'DIFF ', 'REFUSED_', 'FAIL_', PASS_LINE)):
+            print(line)
         print(MESSAGES[outcome])
         return code
     except BaseException as error:
