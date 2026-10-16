@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -316,6 +317,30 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertFalse(self.installer_ran())
         self.assertEqual(self.router_snapshot(), before)
         self.assertTrue(self.cp_log.read_text().strip())
+
+    def shell_status_check(self, line):
+        script = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        program = re.search(r"awk '(/\^\\\{\"ok\":true.*?\$/\{n\+\+\}END\{exit !\(NR==1&&n==1\)\})'", script).group(1)
+        awk = shutil.which('busybox') and [shutil.which('busybox'), 'awk'] or ['awk']
+        return subprocess.run(awk + [program], input=line + '\n', text=True, capture_output=True).returncode == 0
+
+    def test_empty_install_status_line_gates_agree_and_shell_is_order_strict(self):
+        healthy = ('{"ok":true,"desiredRevision":0,"confirmedRevision":0,"desiredPauses":[],"effectivePauses":[],'
+                   '"observed":{"kids":[],"paused":[]},"drift":false,"capabilities":{"ipv6":false,"conntrack":false,'
+                   '"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":[]}')
+        # Same printf shape as router/lib/core.sh cf_status.
+        self.assertIn('{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,'
+                      '"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,',
+                      (REPO / 'router/lib/core.sh').read_text())
+        verdicts = lambda line: (self.shell_status_check(line), self.tool.status_healthy(['INFO status ' + line]))  # noqa: E731
+        self.assertEqual(verdicts(healthy), (True, True))
+        fields = json.loads(healthy)
+        extra = json.dumps(dict(fields, extra=1), separators=(',', ':'))
+        self.assertEqual(verdicts(extra), (False, False))
+        reordered = json.dumps({key: fields[key] for key in reversed(list(fields))}, separators=(',', ':'))
+        self.assertEqual(verdicts(reordered), (False, True))
+        missing = json.dumps({k: v for k, v in fields.items() if k != 'capabilities'}, separators=(',', ':'))
+        self.assertEqual(verdicts(missing), (False, False))
 
     def test_identity_mac_mismatch_refused_before_install(self):
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'),
