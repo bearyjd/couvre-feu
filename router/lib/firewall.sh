@@ -20,8 +20,9 @@ cf_network() {
     function valid(s,a,n,i,t,k){if(s!~/^[0-9a-f:]+$/||length(s)>39||index(s,":::")||!index(s,":"))return 0;k=index(s,"::");if(k&&index(substr(s,k+2),"::"))return 0;if((substr(s,1,1)==":"&&substr(s,1,2)!="::")||(substr(s,length(s),1)==":"&&substr(s,length(s)-1,2)!="::"))return 0;n=split(s,a,":");for(i=1;i<=n;i++)if(a[i]!=""){if(length(a[i])>4)return 0;t++}return k?t<8:t==8}
     {for(i=1;i<NF;i++)if($i=="inet6"){split($(i+1),a,"/");if(valid(a[1])&&a[1]!="::1"&&a[1]!="::")print a[1]}}' | sort -u)
 }
-cf_schedule_specs() {
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' '
+cf_schedule_specs() { cf_enforced_policy | cf_schedule_rows; }
+cf_schedule_rows() {
+    awk -F '\t' '
     function secs(t,a){split(t,a,":");return (a[1]+0)*3600+(a[2]+0)*60}
     function clock(s){return sprintf("%02d:%02d:%02d",int(s/3600),int(s/60)%60,s%60)}
     function rotate(days,a,n,i,j,d,out,mark,sep){n=split(days,a,",");split("Mon Tue Wed Thu Fri Sat Sun",d," ");for(i=1;i<=n;i++)for(j=1;j<=7;j++)if(a[i]==d[j])mark[j%7+1]=1;for(j=1;j<=7;j++)if(mark[j]){sep="";if(out!="")sep=",";out=out sep d[j]}return out}
@@ -48,6 +49,7 @@ cf_policy_plan() {
                 printf '%s\tfilter\tcf_fwd\t-o br-lan -d %s -m time --weekdays %s --timestart %s --timestop %s --kerneltz -m comment --comment cf:v1 -j REJECT\n' "$cf_family" "$cf_schedule_ip" "$cf_days" "$cf_start" "$cf_stop"
             done
         done
+        cf_gated_plan "$cf_family" || return 1
         for cf_proto in tcp udp; do
             printf '%s\tfilter\tcf_fwd\t-i br-lan -m set --match-set cf_kids src -p %s --dport 853 -m comment --comment cf:v1 -j REJECT\n' "$cf_family" "$cf_proto"
         done
@@ -73,7 +75,7 @@ cf_policy_plan() {
     done
 }
 cf_effective_macs() {
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" '$1=="P"&&$3!="-"{mac[$2]=mac[$2] " " $3}$1=="A"&&($3==0||$3>now){paused[$2]=1}END{for(p in paused){n=split(mac[p],a," ");for(i=1;i<=n;i++)if(a[i]!="")print a[i]}}' | sort -u
+    cf_enforced_policy | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" '$1=="P"&&$3!="-"{mac[$2]=mac[$2] " " $3}$1=="A"&&($3==0||$3>now){paused[$2]=1}END{for(p in paused){n=split(mac[p],a," ");for(i=1;i<=n;i++)if(a[i]!="")print a[i]}}' | sort -u
 }
 cf_kids() { printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="P"&&$3!="-"{print $3}' | sort -u; }
 cf_desired_set() {
@@ -421,7 +423,7 @@ cf_transition_read() {
     cf_safe_file "$CF_RUNTIME/firewall.intent" && [ "$(wc -c < "$CF_RUNTIME/firewall.intent")" -le 524288 ] || { cf_fail unsafe_transition;return 1; }
     CF_TRANSITION=$(awk '
     function chain(c,f,t){return t=="filter"&&f~/^[46]$/&&c~/^(cf_fwd|cf_input|cf2_[ab]_[fig])$/||f==4&&t=="nat"&&c~/^(cf_dns|cf2_[ab]_d)$/}
-    function rule(s,a,n,i){if(s!~/^[a-zA-Z0-9_:.,! \/-]+$/)return 0;n=split(s,a," ");for(i=1;i<=n;i++)if(substr(a[i],1,1)=="-"&&!index(" -i -o -d -p -m --match-set --comment -j --dport --mac-source --weekdays --timestart --timestop --kerneltz --to-destination "," " a[i] " "))return 0;return index(s,"--comment cf:v2")>0}
+    function rule(s,a,n,i){if(s!~/^[a-zA-Z0-9_:.,! \/-]+$/)return 0;n=split(s,a," ");for(i=1;i<=n;i++)if(substr(a[i],1,1)=="-"&&!index(" -i -o -d -p -m --match-set --comment -j --dport --mac-source --weekdays --timestart --timestop --kerneltz --datestart --to-destination "," " a[i] " "))return 0;return index(s,"--comment cf:v2")>0}
     NF==0{next}
     NR==1&&$0!="TRANSITION 2"{exit 2}
     $1=="SLOT"{if($2!~/^[ab]$/||NF!=2)exit 2;s=$2}

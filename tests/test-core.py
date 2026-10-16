@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Behavioral core fixtures. Passing is not packet/OpenWrt/live-router proof."""
 import copy
+import datetime
 import ipaddress
 import json
 import os
@@ -63,6 +64,9 @@ def evaluate_fixture_chain(chains, chain, packet, sets, depth=0):
                 valid = packet["time"] >= value
             elif token == "--timestop":
                 valid = packet["time"] <= value
+            elif token == "--datestart":
+                # xt_time default (UTC) absolute gate; ISO strings compare chronologically.
+                valid = packet["datetime"] >= value
             elif token == "--ctstate":
                 valid = packet["ctstate"] in value.split(",")
             elif token == "--dports":
@@ -85,6 +89,9 @@ def evaluate_fixture_chain(chains, chain, packet, sets, depth=0):
         else:
             raise AssertionError(f"unmodeled fixture target: {target!r}")
     return None
+
+
+ALLOWANCE_DEADLINE = 240
 
 
 class CoreTests(unittest.TestCase):
@@ -330,6 +337,223 @@ class CoreTests(unittest.TestCase):
         self.fixture.env["CF_NOW"] = str(initial)
         self.success(self.fixture.run("apply-fw"))
         self.assertEqual(self.paused(), [])
+
+    # Allowances: router-local temporary unblocking that expires without the service.
+    SCHOOL_NIGHT = {"person": "alice", "id": "night", "weekdays": ["Mon"], "start": "22:00", "stop": "06:30"}
+
+    def allowance_sync(self, document):
+        # Fixture commands can be slow under host load; allowance tests use a wider deadline.
+        return self.success(self.fixture.run("sync", document=document, timeout=ALLOWANCE_DEADLINE))
+
+    @staticmethod
+    def utc(epoch):
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def gated_rules(self):
+        tables = self.fixture.backend()["tables"]
+        return [row for family in ("iptables", "ip6tables") for rows in tables[family]["filter"].values() for row in rows if "--datestart" in row]
+
+    def kid_inbound_blocked(self, epoch, family="iptables"):
+        state = self.fixture.backend()
+        destination = "2001:db8::20" if family == "ip6tables" else "192.168.1.20"
+        source = "2001:db8:ffff::1" if family == "ip6tables" else "198.51.100.1"
+        packet = {"in": "eth0", "out": "br-lan", "src": source, "dst": destination, "mac": "02:ff:ff:ff:ff:01", "protocol": "udp",
+                  "dport": "5000", "weekday": "Mon", "time": "23:00:00", "datetime": self.utc(epoch), "ctstate": "ESTABLISHED"}
+        return evaluate_fixture_chain(state["tables"][family]["filter"], "FORWARD", packet, state["sets"]) in ("DROP", "REJECT")
+
+    def kid_outbound_blocked(self, family="iptables", epoch=None):
+        state = self.fixture.backend()
+        source = "2001:db8::20" if family == "ip6tables" else "192.168.1.20"
+        target = "2001:db8:ffff::1" if family == "ip6tables" else "198.51.100.1"
+        # Fixture CF_NOW is Monday 23:00 UTC, inside SCHOOL_NIGHT.
+        packet = {"in": "br-lan", "out": "eth0", "src": source, "dst": target, "mac": KID, "protocol": "tcp",
+                  "dport": "443", "weekday": "Mon", "time": "23:00:00", "ctstate": "NEW",
+                  "datetime": self.utc(epoch if epoch is not None else int(self.fixture.env["CF_NOW"]))}
+        return evaluate_fixture_chain(state["tables"][family]["filter"], "FORWARD", packet, state["sets"]) in ("DROP", "REJECT")
+
+    def test_allowance_unblocks_schedule_and_local_expiry_reblocks_without_service(self):
+        now = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["schedules"] = [dict(self.SCHOOL_NIGHT)]
+        self.allowance_sync(document)
+        self.assertTrue(self.kid_outbound_blocked())
+        until = now + 120
+        document = policy(2)
+        document["schedules"] = [dict(self.SCHOOL_NIGHT)]
+        document["allowances"] = [{"person": "alice", "until": until}]
+        status = self.allowance_sync(document)
+        self.assertEqual(status["desiredAllowances"], [{"person": "alice", "until": until}])
+        self.assertEqual(status["effectiveAllowances"], [{"person": "alice", "until": until, "remaining": 120}])
+        for family in ("iptables", "ip6tables"):
+            with self.subTest(family=family):
+                self.assertFalse(self.kid_outbound_blocked(family))
+        firewall = self.fixture.root / "etc/config/firewall"
+        self.assertNotIn("cf_sched_alice", firewall.read_text(), "an active allowance must suppress native schedule sections")
+        # Kernel-side expiry: gated schedule blocks are installed and fire at until without cron.
+        gated = self.gated_rules()
+        self.assertTrue(gated)
+        for row in gated:
+            self.assertEqual(row[row.index("--datestart") + 1], self.utc(until), row)
+            self.assertIn("--kerneltz", row)
+            self.assertIn("--weekdays", row)
+        for family in ("iptables", "ip6tables"):
+            with self.subTest(family=family, phase="kernel-gate"):
+                self.assertFalse(self.kid_outbound_blocked(family, epoch=until - 1))
+                self.assertTrue(self.kid_outbound_blocked(family, epoch=until))
+                self.assertFalse(self.kid_inbound_blocked(until - 1, family))
+                self.assertTrue(self.kid_inbound_blocked(until, family))
+        # DNS/DoT semantics are unchanged: the child remains a kid during an allowance.
+        self.assertCountEqual(status["observed"]["kids"], [KID, OTHER_KID])
+        nat = self.fixture.backend()["tables"]["iptables"]["nat"]
+        self.assertTrue(any("DNAT" in row and self.fixture.active_set("k") in row for rows in nat.values() for row in rows))
+        filters = self.fixture.backend()["tables"]["iptables"]["filter"]
+        self.assertTrue(any("853" in row and self.fixture.active_set("k") in row for rows in filters.values() for row in rows))
+        # No service: only the minute cron runs after the deadline.
+        self.fixture.env["CF_NOW"] = str(until + 1)
+        expired = self.success(self.fixture.run("expire", timeout=ALLOWANCE_DEADLINE))
+        self.assertEqual(expired["desiredRevision"], 2)
+        self.assertEqual(expired["effectiveAllowances"], [])
+        self.assertEqual(expired["desiredAllowances"], [{"person": "alice", "until": until}])
+        for family in ("iptables", "ip6tables"):
+            with self.subTest(family=family, phase="expired"):
+                self.assertTrue(self.kid_outbound_blocked(family))
+        self.assertIn("cf_sched_alice", firewall.read_text(), "cron expiry must restore native schedule sections")
+        self.assertEqual(self.gated_rules(), [], "expire must rebuild the ungated form")
+        # Same-revision replay stays idempotent and cannot resurrect the allowance.
+        replay = self.allowance_sync(document)
+        self.assertEqual(replay["desiredRevision"], 2)
+        self.assertEqual(replay["effectiveAllowances"], [])
+        self.assertTrue(self.kid_outbound_blocked())
+
+    def test_allowance_overrides_manual_pause_and_expiry_restores_it(self):
+        now = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        document["allowances"] = [{"person": "alice", "until": now + 60}]
+        status = self.allowance_sync(document)
+        self.assertEqual(self.paused(), [])
+        self.assertEqual(status["observed"]["paused"], [])
+        self.assertEqual(status["effectivePauses"], [{"person": "alice", "until": 0}])
+        self.assertFalse(self.kid_outbound_blocked())
+        gated = self.gated_rules()
+        self.assertTrue(gated)
+        self.assertTrue(all(row[row.index("--datestart") + 1] == self.utc(now + 60) and "--weekdays" not in row for row in gated), gated)
+        for family in ("iptables", "ip6tables"):
+            with self.subTest(family=family):
+                # No cron run: the kernel gate alone re-blocks at until, both directions.
+                self.assertTrue(self.kid_outbound_blocked(family, epoch=now + 60))
+                self.assertFalse(self.kid_inbound_blocked(now + 59, family))
+                self.assertTrue(self.kid_inbound_blocked(now + 60, family))
+        unchanged = self.success(self.fixture.run("expire", timeout=ALLOWANCE_DEADLINE))
+        self.assertEqual(unchanged["observed"]["paused"], [])
+        self.fixture.env["CF_NOW"] = str(now + 61)
+        before = len(self.fixture.mutation_calls())
+        expired = self.success(self.fixture.run("expire", timeout=ALLOWANCE_DEADLINE))
+        self.assertGreater(len(self.fixture.mutation_calls()), before, "an elapsed allowance must defeat the no-op shortcut")
+        self.assertCountEqual(self.paused(), [KID, OTHER_KID])
+        self.assertCountEqual(expired["observed"]["paused"], [KID, OTHER_KID])
+        self.assertEqual(expired["desiredRevision"], 1)
+        self.assertTrue(self.kid_outbound_blocked())
+        self.assertEqual(self.gated_rules(), [])
+
+    def test_cli_pause_is_an_emergency_block_that_clears_the_allowance(self):
+        now = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["allowances"] = [{"person": "alice", "until": now + 60}]
+        self.allowance_sync(document)
+        self.assertEqual(self.paused(), [])
+        paused = self.success(self.fixture.run("pause", "alice", timeout=ALLOWANCE_DEADLINE))
+        self.assertEqual(paused["desiredRevision"], 2)
+        self.assertEqual(paused["desiredAllowances"], [])
+        self.assertEqual(paused["effectiveAllowances"], [])
+        self.assertCountEqual(self.paused(), [KID, OTHER_KID])
+        self.assertEqual(self.gated_rules(), [])
+        self.assertTrue(self.kid_outbound_blocked())
+
+    def test_invalid_allowances_rejected_without_mutation(self):
+        self.sync()
+        now = int(self.fixture.env["CF_NOW"])
+        bad = [
+            [{"person": "alice", "until": now + 60}, {"person": "alice", "until": now + 90}],
+            [{"person": "bob", "until": now + 60}],
+            [{"person": "alice", "until": 0}],
+            [{"person": "alice", "until": 2147483648}],
+            [{"person": "alice", "until": now + 14401}],
+            [{"person": "alice", "until": "1736204460"}],
+            [{"person": "alice", "until": now + 60.5}],
+            [{"person": "alice", "until": now + 60, "extra": 1}],
+            [{"person": "alice"}],
+            [{"person": "Alice", "until": now + 60}],
+            {"person": "alice", "until": now + 60},
+            [{"person": "alice", "until": now + 60}] * 65,
+        ]
+        for value in bad:
+            document = policy(2)
+            document["allowances"] = value
+            with self.subTest(value=str(value)[:80]):
+                self.reject_without_mutation(document=document)
+        self.reject_without_mutation(raw=json.dumps(policy(2)).replace('"pauses"', '"allowances":[],"allowances":[],"pauses"'))
+
+    def test_allowance_horizon_boundary_and_expired_allowance_is_inert(self):
+        now = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["allowances"] = [{"person": "alice", "until": now + 14400}]
+        status = self.allowance_sync(document)
+        self.assertEqual(status["effectiveAllowances"], [{"person": "alice", "until": now + 14400, "remaining": 14400}])
+        document = policy(2)
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        document["allowances"] = [{"person": "alice", "until": now - 1}]
+        status = self.allowance_sync(document)
+        self.assertEqual(status["effectiveAllowances"], [])
+        self.assertCountEqual(self.paused(), [KID, OTHER_KID])
+
+    def test_pause_ending_before_allowance_installs_no_gated_block(self):
+        now = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": now + 30}]
+        document["allowances"] = [{"person": "alice", "until": now + 60}]
+        self.allowance_sync(document)
+        self.assertEqual(self.gated_rules(), [])
+        self.assertFalse(self.kid_outbound_blocked(epoch=now + 60))
+
+    def test_allowance_without_allowances_key_keeps_legacy_shape(self):
+        status = self.sync()
+        self.assertEqual(status["desiredAllowances"], [])
+        self.assertEqual(status["effectiveAllowances"], [])
+        state = (self.fixture.root / "etc/couvrefeu/state").read_text()
+        self.assertNotIn("\nU\t", "\n" + state)
+
+    def test_invalid_clock_never_honors_allowance(self):
+        now = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        document["allowances"] = [{"person": "alice", "until": now + 60}]
+        self.allowance_sync(document)
+        for clock in ("not-an-epoch;id", "1500000000"):
+            self.fixture.env["CF_NOW"] = clock
+            with self.subTest(clock=clock):
+                result = self.fixture.run("status", "--json", timeout=ALLOWANCE_DEADLINE)
+                status = json.loads(result.stdout)
+                self.assertIs(status["ok"], False)
+                self.assertEqual(status["effectiveAllowances"], [])
+                self.assertNotEqual(self.fixture.run("expire", timeout=ALLOWANCE_DEADLINE).returncode, 0)
+                fresh = policy(2)
+                fresh["allowances"] = [{"person": "alice", "until": now + 60}]
+                self.reject_without_mutation(document=fresh)
+
+    def test_backward_clock_jump_does_not_resurrect_expired_allowance(self):
+        initial = int(self.fixture.env["CF_NOW"])
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        document["allowances"] = [{"person": "alice", "until": initial + 30}]
+        self.allowance_sync(document)
+        self.assertEqual(self.paused(), [])
+        self.fixture.env["CF_NOW"] = str(initial + 31)
+        self.success(self.fixture.run("expire", timeout=ALLOWANCE_DEADLINE))
+        self.fixture.env["CF_NOW"] = str(initial)
+        status = self.success(self.fixture.run("apply-fw", timeout=ALLOWANCE_DEADLINE))
+        self.assertEqual(status["effectiveAllowances"], [])
+        self.assertCountEqual(self.paused(), [KID, OTHER_KID])
 
     def test_invalid_test_clock_refuses_before_mutation(self):
         self.fixture.env["CF_NOW"] = "not-an-epoch;id"

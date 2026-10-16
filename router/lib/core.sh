@@ -75,6 +75,69 @@ cf_clock() {
         [ "$cf_highwater" -le "$CF_EXPIRY_NOW" ] || CF_EXPIRY_NOW=$cf_highwater
     fi
 }
+# Allowances: router-local temporary unblocking. Honored only with a valid
+# (post-2020, highwater-monotonic) clock and only within the admission horizon,
+# so an uncertain clock or out-of-bound record blocks (fails closed).
+CF_ALLOWANCE_HORIZON=14400
+cf_active_allowances() {
+    # Conservative recovery must replay the immutable prepared generation, so it
+    # evaluates at the prepared epoch like pauses. That replay cannot fail open:
+    # the generation carries the person's blocks gated by --datestart <until>,
+    # which the kernel already enforces once until has passed.
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="${CF_PREPARED_EPOCH:-$CF_EXPIRY_NOW}" -v horizon="$CF_ALLOWANCE_HORIZON" '
+    BEGIN{valid=now~/^[1-9][0-9]*$/&&length(now)<=10&&now+0>=1577836800}
+    valid&&$1=="U"&&NF==3&&$3~/^[1-9][0-9]*$/&&length($3)<=10&&$3+0>now+0&&$3+0<=now+horizon{print $2 "\t" $3 "\t" ($3-now)}'
+}
+# Enforcement view of the policy: an active allowance overrides (never deletes)
+# the person's pauses and schedules, so they re-apply when it expires.
+cf_enforced_policy() {
+    cf_ep_allowed=$(cf_active_allowances | awk -F '\t' '{print $1}')
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v allowed="$cf_ep_allowed" 'BEGIN{n=split(allowed,a,"\n");for(i=1;i<=n;i++)if(a[i]!="")skip[a[i]]=1}($1=="A"||$1=="S")&&skip[$2]{next}{print}'
+}
+# Kernel-side expiry: while an allowance is active, the person's pause and
+# schedule blocks stay installed, gated by xt_time --datestart (UTC) at
+# `until`, so they re-apply at the deadline even if cron or the shell clock
+# fails afterwards. `cfctl expire` later rebuilds the ungated form.
+cf_allowance_gates() {
+    cf_active_allowances | while IFS="$(printf '\t')" read -r cf_ag_person cf_ag_until cf_ag_rest; do
+        [ -n "$cf_ag_person" ] || continue
+        cf_ag_date=$(date -u -d "@$cf_ag_until" +%Y-%m-%dT%H:%M:%S) || return 1
+        case $cf_ag_date in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;; *) return 1;; esac
+        printf '%s\t%s\t%s\n' "$cf_ag_person" "$cf_ag_until" "$cf_ag_date"
+    done
+}
+cf_gated_ips() {
+    printf '%s\n' "$CF_ADDRESS_DATA" | awk -F '\t' -v m="$1" -v f="$2" 'NF==2&&$2==m&&((index($1,":")>0)==(f==6)){print $1}'
+}
+cf_gated_plan() {
+    cf_gp_family=$1
+    cf_gp_gates=$(cf_allowance_gates) || { cf_fail allowance_gate_failed;return 1; }
+    printf '%s\n' "$cf_gp_gates" | while IFS="$(printf '\t')" read -r cf_gp_person cf_gp_until cf_gp_date; do
+        [ -n "$cf_gp_person" ] || continue
+        # Pauses still in force at the gate, plus every schedule, for this person only.
+        cf_gp_policy=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_gp_person" -v g="$cf_gp_until" '$2!=p{next}$1=="P"||$1=="S"||($1=="A"&&($3==0||$3>g)){print}')
+        cf_gp_paused=$(printf '%s\n' "$cf_gp_policy" | awk -F '\t' '$1=="P"&&$3!="-"{m[++n]=$3}$1=="A"{a=1}END{if(a)for(i=1;i<=n;i++)print m[i]}')
+        for cf_gp_mac in $cf_gp_paused;do
+            printf '%s\tfilter\tcf_fwd\t-i br-lan -m mac --mac-source %s -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_mac" "$cf_gp_date"
+            for cf_gp_ip in $(cf_gated_ips "$cf_gp_mac" "$cf_gp_family");do
+                printf '%s\tfilter\tcf_fwd\t-o br-lan -d %s -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_ip" "$cf_gp_date"
+            done
+        done
+        printf '%s\n' "$cf_gp_policy" | cf_schedule_rows | while IFS="$(printf '\t')" read -r cf_gp_name cf_gp_p cf_gp_mac cf_gp_days cf_gp_start cf_gp_stop;do
+            [ -n "$cf_gp_name" ] || continue
+            # Schedule windows keep --kerneltz like the ungated mirrors; the gate is a separate UTC time match.
+            printf '%s\tfilter\tcf_fwd\t-i br-lan -m mac --mac-source %s -m time --weekdays %s --timestart %s --timestop %s --kerneltz -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_mac" "$cf_gp_days" "$cf_gp_start" "$cf_gp_stop" "$cf_gp_date"
+            for cf_gp_ip in $(cf_gated_ips "$cf_gp_mac" "$cf_gp_family");do
+                printf '%s\tfilter\tcf_fwd\t-o br-lan -d %s -m time --weekdays %s --timestart %s --timestop %s --kerneltz -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_ip" "$cf_gp_days" "$cf_gp_start" "$cf_gp_stop" "$cf_gp_date"
+            done
+        done
+    done
+}
+cf_allowance_admissible() {
+    # Newly staged policy only ($1, default CF_POLICY); retained expired allowances stay inert for replay equality.
+    cf_number_valid "${CF_EXPIRY_NOW-}" && [ "$CF_EXPIRY_NOW" -ge 1577836800 ] || { cf_fail invalid_clock;return 1; }
+    printf '%s\n' "${1-$CF_POLICY}" | awk -F '\t' -v now="$CF_EXPIRY_NOW" -v horizon="$CF_ALLOWANCE_HORIZON" '$1=="U"&&$3+0>now+0&&$3+0>now+horizon{exit 1}' || { cf_fail allowance_beyond_horizon;return 1; }
+}
 cf_protected_valid() {
     cf_safe_file "$CF_PROTECTED" && [ -s "$CF_PROTECTED" ] || { cf_fail unsafe_protected_file; return 1; }
     awk 'length($0)!=17 {exit 1} {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00" || seen[$0]++)exit 1}' "$CF_PROTECTED" || { cf_fail invalid_protected_mac; return 1; }
@@ -88,11 +151,12 @@ cf_state_json() {
     $1=="R"{if(NF!=2||r++)bad();revision=$2;next}
     $1=="P"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[-0-9a-f:]+$/)bad();person[$2]=1;if($3!="-"){mac[$2]=mac[$2] (mac[$2]==""?"":",") "\"" $3 "\""}next}
     $1=="A"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[0-9]+$/)bad();sep="";if(pauses!="")sep=",";pauses=pauses sep "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
+    $1=="U"{if(NF!=3||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[1-9][0-9]*$/)bad();sep="";if(allow!="")sep=",";allow=allow sep "{\"person\":\"" $2 "\",\"until\":" $3 "}";next}
     $1=="S"{if(NF!=6||$2!~/^[a-z][a-z0-9_]*$/||$3!~/^[a-z][a-z0-9_]*$/||$4!~/^[A-Za-z,]+$/||$5!~/^[0-9:]+$/||$6!~/^[0-9:]+$/)bad();n=split($4,a,",");days="";for(i=1;i<=n;i++){sep="";if(i!=1)sep=",";days=days sep "\"" a[i] "\""}sep="";if(sched!="")sep=",";sched=sched sep "{\"person\":\"" $2 "\",\"id\":\"" $3 "\",\"weekdays\":[" days "],\"start\":\"" $5 "\",\"stop\":\"" $6 "\"}";next}
     $1=="D4"{if(NF!=2||$2!~/^[0-9.]+$/)bad();sep="";if(d4!="")sep=",";d4=d4 sep "\"" $2 "\"";next}
     $1=="D6"{if(NF!=2||$2!~/^[0-9a-f:]+$/)bad();sep="";if(d6!="")sep=",";d6=d6 sep "\"" $2 "\"";next}
     {bad()}
-    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person){sep="";if(people!="")sep=",";people=people sep "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}"}print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "],\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
+    END{if(v!=1||r!=1||version!~/^[0-9]+$/||revision!~/^[0-9]+$/)exit 2;for(p in person){sep="";if(people!="")sep=",";people=people sep "{\"id\":\"" p "\",\"macs\":[" mac[p] "]}"}print "{\"version\":" version ",\"revision\":" revision ",\"people\":[" people "],\"pauses\":[" pauses "]" (allow==""?"":",\"allowances\":[" allow "]") ",\"schedules\":[" sched "],\"doh\":{\"ipv4\":[" d4 "],\"ipv6\":[" d6 "]}}"}' "$1"
 }
 cf_state_load() {
     cf_safe_file "$CF_STATE" || { cf_fail unsafe_state_file; return 1; }
@@ -317,7 +381,8 @@ cf_pause_edit() {
     [ "$cf_until" = 0 ] || [ "$cf_until" -gt "$CF_EXPIRY_NOW" ] || { cf_fail expired_until; return 1; }
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&$2==p{next}{print}END{print "A",p,u}' | cf_canonical)
+    # An explicit local pause is an emergency block: it also clears the person's allowance.
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&$2==p{next}{print}END{print "A",p,u}' | cf_canonical)
 }
 cf_resume_edit() {
     cf_person=$1
@@ -391,6 +456,7 @@ cf_sync_read() {
     cf_new_rev=$(printf '%s\n' "$cf_new" | awk -F '\t' '$1=="R"{print $2}')
     [ "$cf_new_rev" -ge "$CF_REVISION" ] || { cf_fail stale_revision;return 1; }
     if [ "$cf_new_rev" = "$CF_REVISION" ] && [ "$cf_new" != "$CF_POLICY" ];then cf_fail conflicting_revision;return 1;fi
+    cf_allowance_admissible "$cf_new" || return 1
     CF_POLICY=$cf_new;CF_REVISION=$cf_new_rev
 }
 cf_check() {
@@ -427,7 +493,7 @@ cf_status() {
     CF_REVISION=0; CF_POLICY=; CF_DIGEST=
     cf_control_dirs || cf_ok=false
     cf_state_load || cf_ok=false
-    cf_clock || cf_ok=false
+    cf_clock || { cf_ok=false;CF_EXPIRY_NOW=;unset CF_PREPARED_EPOCH; }
     cf_protected_valid || cf_ok=false
     [ "$cf_ok" = false ] || cf_policy_safe || cf_ok=false
     cf_kids_json='[]';cf_paused_json='[]'
@@ -458,14 +524,16 @@ cf_status() {
     [ -z "$cf_status_error" ] || { CF_ERROR=$cf_status_error;cf_ok=false; }
     cf_desired=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' 'BEGIN{printf "["}$1=="A"{printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
     cf_effective=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" 'BEGIN{printf "["}$1=="A"&&($3==0||$3>now){printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
+    cf_desired_allow=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' 'BEGIN{printf "["}$1=="U"{printf "%s{\"person\":\"%s\",\"until\":%s}",sep,$2,$3;sep=","}END{print "]"}')
+    cf_effective_allow=$(cf_active_allowances | awk -F '\t' 'BEGIN{printf "["}{printf "%s{\"person\":\"%s\",\"until\":%s,\"remaining\":%s}",sep,$1,$2,$3;sep=","}END{print "]"}')
     cf_errors='[]'
     if [ -n "$CF_ERROR" ]; then cf_errors=$(printf '%s\n' "$CF_ERROR" | cf_json_strings); fi
-    printf '{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,"nativeKernelConfirmed":%s,"addressCoverageComplete":%s,"routerCompatibilityVerified":false},"errors":%s}\n' "$cf_ok" "$CF_REVISION" "$cf_confirmed" "$cf_desired" "$cf_effective" "$cf_kids_json" "$cf_paused_json" "$cf_drift" "${CF_IPV6_OK:-false}" "${CF_CONNTRACK_OK:-false}" "${CF_NATIVE_OK:-false}" "${CF_ADDRESS_OK:-false}" "$cf_errors"
+    printf '{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":%s,"effectivePauses":%s,"desiredAllowances":%s,"effectiveAllowances":%s,"observed":{"kids":%s,"paused":%s},"drift":%s,"capabilities":{"ipv6":%s,"conntrack":%s,"nativeKernelConfirmed":%s,"addressCoverageComplete":%s,"routerCompatibilityVerified":false},"errors":%s}\n' "$cf_ok" "$CF_REVISION" "$cf_confirmed" "$cf_desired" "$cf_effective" "$cf_desired_allow" "$cf_effective_allow" "$cf_kids_json" "$cf_paused_json" "$cf_drift" "${CF_IPV6_OK:-false}" "${CF_CONNTRACK_OK:-false}" "${CF_NATIVE_OK:-false}" "${CF_ADDRESS_OK:-false}" "$cf_errors"
     [ "$cf_ok" = true ]
 }
 cf_json_strings() { awk 'BEGIN{printf "["}NF{gsub(/\\/,"\\\\");gsub(/"/,"\\\"");gsub(/[[:cntrl:]]/,"?");printf "%s\"%s\"",sep,$0;sep=","}END{print "]"}'; }
 cf_busy_result() {
-    printf '{"ok":false,"desiredRevision":%s,"confirmedRevision":null,"desiredPauses":[],"effectivePauses":[],"observed":{"kids":[],"paused":[]},"drift":true,"capabilities":{"ipv6":false,"conntrack":false,"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":["%s"]}\n' "${CF_REVISION:-0}" "${CF_ERROR:-locked}"
+    printf '{"ok":false,"desiredRevision":%s,"confirmedRevision":null,"desiredPauses":[],"effectivePauses":[],"desiredAllowances":[],"effectiveAllowances":[],"observed":{"kids":[],"paused":[]},"drift":true,"capabilities":{"ipv6":false,"conntrack":false,"nativeKernelConfirmed":false,"addressCoverageComplete":false,"routerCompatibilityVerified":false},"errors":["%s"]}\n' "${CF_REVISION:-0}" "${CF_ERROR:-locked}"
 }
 cf_main() {
     platform_deadline_check

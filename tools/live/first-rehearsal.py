@@ -459,7 +459,7 @@ def run_ssh(argv, payload, env, stdout_fd, stderr_fd, timeout):
 
 
 HEALTHY_STATUS = {'ok': True, 'drift': False, 'errors': [], 'desiredRevision': 0, 'confirmedRevision': 0,
-                  'desiredPauses': [], 'effectivePauses': [], 'observed': {'kids': [], 'paused': []}}
+                  'desiredPauses': [], 'effectivePauses': [], 'desiredAllowances': [], 'effectiveAllowances': [], 'observed': {'kids': [], 'paused': []}}
 
 
 def status_healthy(lines):

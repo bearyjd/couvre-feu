@@ -11,6 +11,18 @@ export interface Pause {
     person: string;
     until: number;
 }
+/** Router-local temporary unblocking; overrides pauses and schedules until `until`. */
+export interface Allowance {
+    person: string;
+    until: number;
+}
+export interface EffectiveAllowance extends Allowance {
+    remaining: number;
+}
+/** Router admission horizon: a new allowance may end at most this many seconds after router time. */
+export const MAX_ALLOWANCE_SECONDS = 14400;
+/** Router clocks before 2020 are invalid; allowances are never honored without a valid clock. */
+export const MIN_VALID_ROUTER_TIME = 1577836800;
 export interface Schedule {
     person: string;
     id: string;
@@ -23,6 +35,8 @@ export interface RouterPolicy {
     revision: number;
     people: RouterPerson[];
     pauses: Pause[];
+    /** Omitted when empty, matching the router's state JSON. */
+    allowances?: Allowance[];
     schedules: Schedule[];
     doh: {
         ipv4: string[];
@@ -35,6 +49,8 @@ export interface RouterStatus {
     confirmedRevision: number | null;
     desiredPauses: Pause[];
     effectivePauses: Pause[];
+    desiredAllowances?: Allowance[];
+    effectiveAllowances?: EffectiveAllowance[];
     observed: {
         kids: string[];
         paused: string[];
@@ -124,7 +140,7 @@ function unique<T>(items: T[]): T[] {
 }
 /** Normalization matches the router's policy equality, including retained expired pauses. */
 export function normalizePolicy(input: unknown, protectedMacs: string[] = []): RouterPolicy {
-    const root = object(input, ['version', 'revision', 'people', 'pauses', 'schedules'], ['doh']);
+    const root = object(input, ['version', 'revision', 'people', 'pauses', 'schedules'], ['allowances', 'doh']);
     if (root.version !== 1) {
         bad('invalid_version');
     }
@@ -155,6 +171,20 @@ export function normalizePolicy(input: unknown, protectedMacs: string[] = []): R
         };
     }).sort((a, b) => compare(a.person, b.person));
     unique(pauses.map(p => p.person));
+    const allowances = root.allowances === undefined ? [] : array(root.allowances, 64).map(item => {
+        const p = object(item, ['person', 'until']);
+        const person = id(p.person), until = integer(p.until);
+        if (!names.has(person)) {
+            bad('undefined_person');
+        }
+        if (until < 1) {
+            bad('invalid_allowance');
+        }
+        return {
+            person, until
+        };
+    }).sort((a, b) => compare(a.person, b.person));
+    unique(allowances.map(a => a.person));
     let expanded = 0;
     const schedules = array(root.schedules, 256).map(item => {
         const p = object(item, ['person', 'id', 'weekdays', 'start', 'stop']);
@@ -188,7 +218,7 @@ export function normalizePolicy(input: unknown, protectedMacs: string[] = []): R
         ipv4: [], ipv6: []
     } : object(root.doh, ['ipv4', 'ipv6']);
     const result: RouterPolicy = {
-        version: 1, revision, people, pauses, schedules, doh: {
+        version: 1, revision, people, pauses, ...(allowances.length ? {allowances} : {}), schedules, doh: {
             ipv4: unique(array(doh.ipv4, 256).map(ipv4)).sort(), ipv6: unique(array(doh.ipv6, 256).map(canonicalIPv6)).sort()
         }
     };
@@ -205,6 +235,17 @@ export function policyJSON(policy: RouterPolicy): string {
 export function effectivePauses(policy: RouterPolicy, now: number): Pause[] {
     return policy.pauses.filter(p => p.until === 0 || p.until > now);
 }
+/** Mirrors router cf_active_allowances: valid clock, unexpired, and within the horizon. */
+export function effectiveAllowances(policy: RouterPolicy, now: number): EffectiveAllowance[] {
+    if (!Number.isInteger(now) || now < MIN_VALID_ROUTER_TIME) {
+        return [];
+    }
+    return (policy.allowances ?? []).filter(a => a.until > now && a.until <= now + MAX_ALLOWANCE_SECONDS).map(a => ({...a, remaining: a.until - now}));
+}
+/** True when a new allowance ending at `until` is admissible at router time `now`. */
+export function allowanceWithinHorizon(until: number, now: number): boolean {
+    return Number.isInteger(now) && now >= MIN_VALID_ROUTER_TIME && Number.isInteger(until) && until > now && until <= now + MAX_ALLOWANCE_SECONDS;
+}
 export function scheduleBlocked(policy: RouterPolicy, person: string, now: number): boolean {
     // Fictional router explicitly uses UTC; deployment timezone/DST compatibility is not claimed.
     const date = new Date(now * 1000), day = (date.getUTCDay() + 6) % 7, previous = (day + 6) % 7;
@@ -215,9 +256,14 @@ export function scheduleBlocked(policy: RouterPolicy, person: string, now: numbe
 }
 export function healthyConfirmation(status: RouterStatus, policy: RouterPolicy, now: number, requireIPv6 = true): boolean {
     const kids = policy.people.flatMap(p => p.macs).sort();
-    const paused = effectivePauses(policy, now).flatMap(p => policy.people.find(person => person.id === p.person)!.macs).sort();
+    const allowed = new Set(effectiveAllowances(policy, now).map(a => a.person));
+    const paused = effectivePauses(policy, now).filter(p => !allowed.has(p.person)).flatMap(p => policy.people.find(person => person.id === p.person)!.macs).sort();
+    // The router derives `remaining` from its highwater epoch, so only person/until must agree.
+    const reported = (status.effectiveAllowances ?? []).map(a => ({person: a.person, until: a.until}));
+    const expected = effectiveAllowances(policy, now).map(a => ({person: a.person, until: a.until}));
     return status.ok === true && status.desiredRevision === policy.revision && status.confirmedRevision === policy.revision && status.drift === false && status.errors.length === 0
         && (!requireIPv6 || status.capabilities.ipv6) && status.capabilities.conntrack && status.capabilities.nativeKernelConfirmed && status.capabilities.addressCoverageComplete
         && JSON.stringify([...status.observed.kids].sort()) === JSON.stringify(kids) && JSON.stringify([...status.observed.paused].sort()) === JSON.stringify(paused)
-        && JSON.stringify(status.desiredPauses) === JSON.stringify(policy.pauses) && JSON.stringify(status.effectivePauses) === JSON.stringify(effectivePauses(policy, now));
+        && JSON.stringify(status.desiredPauses) === JSON.stringify(policy.pauses) && JSON.stringify(status.effectivePauses) === JSON.stringify(effectivePauses(policy, now))
+        && JSON.stringify(status.desiredAllowances ?? []) === JSON.stringify(policy.allowances ?? []) && JSON.stringify(reported) === JSON.stringify(expected);
 }
