@@ -10,8 +10,9 @@
 # time bound, so cron `cfctl expire` bounds them if the session is lost.
 # Never touches dnsmasq, the WAN zone, offload or firmware; DNS probes only
 # read. Exit codes: 0 pass, 10 refused before mutation, 20 after mutation.
-# shellcheck disable=SC2034,SC2153,SC2154,SC2329
-# CFR_* variables and cfr_* functions come from first-rehearsal.sh.
+# shellcheck disable=SC2034,SC2153,SC2154,SC2317,SC2329
+# CFR_* variables and cfr_* functions come from first-rehearsal.sh; cfp_cleanup
+# and the cfr_install_args override are invoked indirectly (trap, rehearsal).
 # @CF_PILOT_PARAMETERS_BEGIN@
 CFP_ROUTER_IP=
 CFP_PERSON=
@@ -337,7 +338,7 @@ cfp_enroll() {
     cfp_cfctl rpc-status --json > "$CFP_DIR/rpc-status.json" || cfp_stop ENROLL rpc_status_failed
     cfp_gen=$(sed -n 's/^{"rpc_version":1,"generation":"\([0-9a-f]\{64\}\)",.*/\1/p' "$CFP_DIR/rpc-status.json")
     cfp_digest=$(sed -n 's/.*,"policyDigest":"\([0-9a-f]\{64\}\)",.*/\1/p' "$CFP_DIR/rpc-status.json")
-    [ "${#cfp_gen}" = 64 ] && [ "${#cfp_digest}" = 64 ] || cfp_stop ENROLL rpc_status_unparsed
+    if [ "${#cfp_gen}" != 64 ] || [ "${#cfp_digest}" != 64 ]; then cfp_stop ENROLL rpc_status_unparsed; fi
     # Fresh scoped activation only: revision 0 and nobody enrolled.
     grep -q '"acceptedPolicy":{"version":1,"revision":0,"people":\[\],' "$CFP_DIR/rpc-status.json" || cfp_stop ENROLL activation_not_fresh
     printf '{"rpc_version":1,"generation":"%s","operation_id":"%s","expected_revision":0,"expected_digest":"%s","policy":%s}\n' \
