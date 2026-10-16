@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=d980da93454ac4d757c002996075f6cb7f7d5f0e5804dcf2fb074a686617a7b4
+CF_BOOTSTRAP_PIN=e917038d0c6d4a7456df356d9dcfc7f780072f1d95369ac5d0d63a4508eb84f9
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -75,14 +75,23 @@ finish_cleanup() {
     platform_valid_done "$DONE" || fail 'unsafe/legacy recovery completion record; preserved'
     if [ -e "$BACKUP" ]; then
         journal_preflight cleanup
-        # Remove a journal original only while the managed path still holds
-        # an exact copy of it (bytes, mode, owner and nanosecond mtime).
+        # Remove the journal only while each managed path still holds its
+        # exact original (bytes, mode, owner and nanosecond mtime): a legacy
+        # journal copy, or the remaining records of one renamed back.
         for rel in $FILES etc/couvrefeu/rpc-allowed; do
             k=$(key "$rel")
-            [ -e "$BACKUP/$k.original" ] || continue
-            if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] &&
-                [ "$(signature "$ROOT/$rel")" = "$(signature "$BACKUP/$k.original")" ] && [ "$(mtime "$ROOT/$rel")" = "$(mtime "$BACKUP/$k.original")" ]; }; then
-                fail "original backup is not restored at /$rel; journal preserved"
+            if [ -e "$BACKUP/$k.original" ]; then
+                if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] &&
+                    [ "$(signature "$ROOT/$rel")" = "$(signature "$BACKUP/$k.original")" ] && [ "$(mtime "$ROOT/$rel")" = "$(mtime "$BACKUP/$k.original")" ]; }; then
+                    fail "original backup is not restored at /$rel; journal preserved"
+                fi
+            elif [ -f "$BACKUP/$k.before" ] && [ -f "$BACKUP/$k.mtime" ]; then
+                cleanup_before=$(awk 'NR==1 {print; exit}' "$BACKUP/$k.before")
+                [ "$cleanup_before" = absent ] && continue
+                if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] &&
+                    exact_file "$ROOT/$rel" "$cleanup_before" "$(awk 'NR==1 {print; exit}' "$BACKUP/$k.mtime")"; }; then
+                    fail "original backup is not restored at /$rel; journal preserved"
+                fi
             fi
         done
         platform_initial_write
@@ -114,6 +123,17 @@ if [ ! -e "$BACKUP" ]; then
     exit 0
 fi
 preflight
+# Originals return by rename only (never a cross-filesystem mv, which BusyBox
+# would turn into a copy): prove one filesystem before the first change.
+if [ "$BACKUP" != "$RECOVERY" ]; then
+    same_mount "$BACKUP" "$RECOVERY" || fail 'journal and recovery journal are not on one filesystem; no changes made'
+fi
+for rel in $FILES; do
+    k=$(key "$rel")
+    if [ -e "$BACKUP/$k.original" ] && ! same_mount "$ROOT/$rel" "$BACKUP"; then
+        fail "journal original and /$rel are not on one filesystem; no changes made"
+    fi
+done
 runtime_preflight
 platform_deadline_check
 # Persist successful kernel removal before touching helpers or executables.
@@ -167,7 +187,7 @@ if [ ! -f "$BACKUP/restored" ]; then
         if [ "$before" = absent ]; then
             if [ -e "$ROOT/$rel" ]; then platform_initial_write; rm -f "$ROOT/$rel"; fi
         elif ! { [ -e "$ROOT/$rel" ] && exact_file "$ROOT/$rel" "$before" "$original_mtime"; }; then
-            # Verified copy with explicit owner, mode and mtime, then rename.
+            # Proved journal original renamed back over the path.
             restore_original "$BACKUP/$k.original" "$ROOT/$rel" "$before" "$original_mtime"
             # Successful restoration always attempted a protected write.
             CF_PLATFORM_INITIAL_WRITE=1

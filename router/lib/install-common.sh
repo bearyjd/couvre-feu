@@ -68,7 +68,7 @@ if [ "$PROFILE_INVENTORY" = 1 ]; then
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
-for dep in sha256sum stat cp mv mkdir rmdir chmod chown touch awk sed cmp dd od tr sync wc; do
+for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
     command -v "$dep" >/dev/null 2>&1 || fail "missing dependency: $dep"
 done
 
@@ -182,22 +182,48 @@ exact_mtime() {
     [ "$observed_mtime" = "$2" ]
 }
 key() { printf '%s' "$1" | sed 's|/|_|g'; }
-# Identity is exact content and metadata, never dev:ino. Without index=on,
-# overlayfs reports a copied-up file with an origin xattr as the overlay dev
-# plus the lower inode, while a new hard link to it reports another identity
-# (GL-XE3000, OpenWrt 21.02). Journals therefore hold independent byte copies.
+# Identity is exact content and metadata, never dev:ino, ctime or link count.
+# Without index=on, overlayfs reports a copied-up file with an origin xattr as
+# the overlay dev plus the lower inode, while a new hard link to it reports
+# another identity (GL-XE3000, OpenWrt 21.02).
 exact_file() {
     [ "$(signature "$1")" = "$2" ] && exact_mtime "$1" "$3"
 }
-# Byte-copy $1 to $2 with $1's owner, mode and mtime (touch -r), then prove the
-# copy is the recorded signature $3 and mtime $4. A touch that truncates the
-# nanoseconds fails the proof; the caller refuses with the journal retained.
-copy_exact() {
-    cp "$1" "$2" || return 1
-    chown "$(stat -c %u:%g "$1")" "$2" || return 1
-    chmod "$(stat -c %a "$1")" "$2" || return 1
-    touch -r "$1" "$2" || return 1
-    exact_file "$2" "$3" "$4"
+# Originals move into and out of the journal by rename(2) only; the kernel
+# keeps bytes, owner, mode and nanosecond mtime (an overlay copy-up of a
+# lower-only file preserves them too). Nothing re-applies a timestamp: the
+# target's BusyBox touch truncates nanoseconds. BusyBox mv silently falls back
+# to copy and unlink across filesystems, so both ends must first be proved on
+# one filesystem *and* one mount: the device and mount point of the nearest
+# existing directory (directories report the overlay's own device; files may
+# not), and its mount ID from mountinfo, longest mount-point prefix of the
+# physical path, last entry winning. A same-device bind mount shares %d and
+# may share %m but has its own mount ID (rename across it is EXDEV).
+# Unreadable or malformed output refuses.
+mount_dir() {
+    md_dir=$1
+    while [ -n "$md_dir" ] && { [ ! -d "$md_dir" ] || [ -L "$md_dir" ]; }; do md_dir=${md_dir%/*}; done
+    (CDPATH='' cd -- "${md_dir:-/}" && pwd -P)
+}
+mountinfo_path() {
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ -n "${CF_TEST_MOUNTINFO:-}" ]; then
+        case "$CF_TEST_MOUNTINFO" in "$ROOT"/*) printf '%s\n' "$CF_TEST_MOUNTINFO";; *) fail 'fixture mountinfo must be below fixture root';; esac
+    else printf '%s\n' /proc/self/mountinfo; fi
+}
+mount_of() {
+    mo_dir=$(mount_dir "$1") || return 1
+    mo_info=$(mountinfo_path) || return 1
+    mo_id=$(awk -v p="$mo_dir" '
+        NF < 10 || $1 !~ /^[0-9]+$/ || $5 !~ /^\// {bad=1; exit}
+        {
+            m=$5; gsub(/\\040/, " ", m); gsub(/\\011/, "\t", m); gsub(/\\012/, "\n", m); gsub(/\\134/, "\\", m)
+            if ((m == "/" || p == m || index(p, m "/") == 1) && length(m) >= best) {best=length(m); id=$1}
+        }
+        END {if (bad || id == "") exit 1; print id}' "$mo_info") || return 1
+    stat -c '%d %m' "$mo_dir" | awk -v id="$mo_id" 'NR==1 && NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^\// {print id, $0; good=1} END {exit !good || NR!=1}'
+}
+same_mount() {
+    sm_first=$(mount_of "$1") && sm_second=$(mount_of "$2") && [ "$sm_first" = "$sm_second" ]
 }
 valid_inode_record() {
     awk '$0 ~ /^[0-9]+$/ && length($0) <= 20 {good=1} END {exit !good || NR!=1}' "$1"
@@ -329,6 +355,7 @@ preflight() {
                 fail 'corrupt firewall transaction'
             fi
         fi
+        saved=$BACKUP/$k.original
         if [ "$rel" = etc/couvrefeu/protected ] && [ "$current" != "$before" ]; then
             if ! { [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
                 fail 'protected metadata drift'
@@ -340,11 +367,21 @@ preflight() {
                 fail 'runtime state metadata drift'
             fi
         else
-            [ "$current" = "$before" ] || [ "$current" = "$after" ] || [ "$current" = "$tx_old" ] || [ "$current" = "$tx_new" ] || fail "drift at /$rel; preserved current file and backup; resolve explicitly"
+            # Absent is crash state only between the two install renames: the
+            # original journaled and the owned temporary file still present
+            # (owned_temp below proves it). A later deletion is drift.
+            [ "$current" = "$before" ] || [ "$current" = "$after" ] || [ "$current" = "$tx_old" ] || [ "$current" = "$tx_new" ] ||
+                { [ "$current" = absent ] && [ -e "$saved" ] && [ -f "$ROOT/$rel.couvrefeu-tmp" ]; } || fail "drift at /$rel; preserved current file and backup; resolve explicitly"
         fi
+        # The exact original is journaled (renamed in, or a legacy copy), or
+        # still in place: not yet renamed by install, or already restored.
         if [ "$before" != absent ]; then
-            [ "$(signature "$BACKUP/$k.original")" = "$before" ] || fail "corrupt original backup: $rel"
-            exact_mtime "$BACKUP/$k.original" "$original_mtime" || fail "corrupt original backup mtime: $rel"
+            if [ -e "$saved" ] || [ -L "$saved" ]; then
+                [ "$(signature "$saved")" = "$before" ] || fail "corrupt original backup: $rel"
+                exact_mtime "$saved" "$original_mtime" || fail "corrupt original backup mtime: $rel"
+            elif ! exact_file "$ROOT/$rel" "$before" "$original_mtime"; then
+                fail "original neither journaled nor in place: /$rel; preserved current file and journal; manual recovery copy: $BACKUP/$k.copy"
+            fi
         fi
         # Legacy hard-link journals (7676637) also recorded an inode number.
         # It is validated as a record only: overlayfs inode numbers are not
@@ -391,9 +428,10 @@ owned_temp() (
         [ "$temp_sig" = "$(signature "$BACKUP/firewall.pending")" ]
 )
 # Immediately before the install rename, the managed path must still be what
-# preflight accepted: the exact original, or content this journal owns. An
-# in-place writer's change is never silently replaced. The journal original is
-# an independent copy and must also be intact (sha256 also fixes its size).
+# preflight accepted. Not yet journaled, it must be the exact original (it is
+# about to be renamed into the journal). Journaled, the journal original must
+# be exact and the path absent (between the two renames), owned content or a
+# legacy in-place original. An in-place writer's change is never replaced.
 original_intact() {
     oi_before=$(awk 'NR==1 {print; exit}' "$BACKUP/$1.before")
     oi_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$1.mtime")
@@ -403,12 +441,66 @@ original_intact() {
         oi_tx_old=$(awk 'NR==1 {print}' "$BACKUP/firewall.transaction")
         oi_tx_new=$(awk 'NR==2 {print}' "$BACKUP/firewall.transaction")
     fi
-    if ! { { [ "$oi_current" = "$oi_before" ] && exact_mtime "$ROOT/$2" "$oi_mtime"; } ||
-        [ "$oi_current" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.after")" ] ||
-        [ "$oi_current" = "$oi_tx_old" ] || [ "$oi_current" = "$oi_tx_new" ]; } ||
-        { [ -e "$BACKUP/$1.original" ] && ! exact_file "$BACKUP/$1.original" "$oi_before" "$oi_mtime"; }; then
+    oi_exact=0
+    if [ "$oi_current" = "$oi_before" ] && exact_mtime "$ROOT/$2" "$oi_mtime"; then oi_exact=1; fi
+    if [ -e "$BACKUP/$1.original" ] || [ -L "$BACKUP/$1.original" ]; then
+        exact_file "$BACKUP/$1.original" "$oi_before" "$oi_mtime" &&
+            { [ "$oi_exact" = 1 ] || [ "$oi_current" = absent ] || [ "$oi_current" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.after")" ] ||
+                [ "$oi_current" = "$oi_tx_old" ] || [ "$oi_current" = "$oi_tx_new" ]; }
+    elif [ "$oi_before" = absent ]; then
+        [ "$oi_current" = absent ] || [ "$oi_current" = "$(awk 'NR==1 {print; exit}' "$BACKUP/$1.after")" ] ||
+            [ "$oi_current" = "$oi_tx_old" ] || [ "$oi_current" = "$oi_tx_new" ]
+    else [ "$oi_exact" = 1 ]; fi ||
         fail "original changed in place before install rename: /$2; installation refused, journal retained; manual recovery copy: $BACKUP/$1.copy"
+}
+# Publish an owned, verified temporary file. With a journal key whose existing
+# original is not yet journaled, first rename the original into the journal
+# (same filesystem and mount, proved again here), then immediately rename the
+# temporary file over the path. HUP/INT/TERM are ignored across the pair so no
+# signal leaves the path absent; if the second rename fails, or the journaled
+# original is not exact afterwards, the original is renamed straight back and
+# proved. Only SIGKILL or a failed rollback leave the path absent, with the
+# journaled original and the owned temporary file as recovery state (install
+# resume publishes it, uninstall renames the original back).
+publish_temp() {
+    if [ -n "${3:-}" ]; then
+        original_intact "$3" "${2#"$ROOT"/}"
+        pt_saved=$BACKUP/$3.original
+        pt_before=$(awk 'NR==1 {print; exit}' "$BACKUP/$3.before")
+        pt_mtime=$(awk 'NR==1 {print; exit}' "$BACKUP/$3.mtime")
+        if [ ! -e "$pt_saved" ] && [ ! -L "$pt_saved" ] && [ "$pt_before" != absent ]; then
+            same_mount "$2" "$BACKUP" || fail "original and journal are not on one filesystem: $2; journal retained"
+            platform_initial_write
+            trap '' 1 2 15
+            if ! mv "$2" "$pt_saved"; then trap 'exit 1' 1 2 15; fail "original rename into journal failed: $2; journal retained"; fi
+            mv -f "$1" "$2" || pt_rollback "$pt_saved" "$2" "$3" 'install rename failed'
+            if ! exact_file "$pt_saved" "$pt_before" "$pt_mtime"; then
+                if [ "$(signature "$2")" = "$(signature "$BACKUP/$3.staged")" ]; then
+                    pt_rollback "$pt_saved" "$2" "$3" 'journal original is not exact after rename'
+                fi
+                trap 'exit 1' 1 2 15
+                fail "journal original is not exact after rename: $2; journal retained; manual recovery copy: $BACKUP/$3.copy"
+            fi
+            trap 'exit 1' 1 2 15
+            sync "$pt_saved" "$2" 2>/dev/null
+            [ "$(signature "$2")" = "$(signature "$BACKUP/$3.staged")" ] ||
+                fail "installed file mismatch after rename: $2; original journaled, journal retained"
+            return 0
+        fi
     fi
+    platform_initial_write
+    mv -f "$1" "$2"
+}
+# Rename journaled original $1 back over path $2 (journal key $3), prove it and
+# refuse with reason $4. Never returns.
+pt_rollback() {
+    if mv -f "$1" "$2"; then
+        trap 'exit 1' 1 2 15
+        if exact_file "$2" "$pt_before" "$pt_mtime"; then fail "$4: $2; original restored in place, journal retained"; fi
+        fail "$4: $2; original renamed back in place but not exact; journal retained; manual recovery copy: $BACKUP/$3.copy"
+    fi
+    trap 'exit 1' 1 2 15
+    fail "$4 and original rollback failed: $2; original journaled at $1; manual recovery copy: $BACKUP/$3.copy"
 }
 # Rename in the same directory; do not write through existing files. Installed
 # content needs exact bytes/mode/owner only; its timestamp is never restored.
@@ -420,9 +512,7 @@ atomic_copy() (
         owned_temp "$dst" || fail "temporary path collision: $tmp"
         # Write barriers follow the blocking proofs.
         if [ "$(signature "$tmp")" = "$(signature "$src")" ]; then
-            if [ -n "$original_key" ]; then original_intact "$original_key" "${dst#"$ROOT"/}"; fi
-            platform_initial_write
-            mv -f "$tmp" "$dst"
+            publish_temp "$tmp" "$dst" "$original_key"
             exit 0
         fi
         platform_initial_write
@@ -435,25 +525,20 @@ atomic_copy() (
     # Flush data before the rename publishes it (BusyBox without
     # FEATURE_SYNC_FANCY ignores the operand and syncs everything).
     if [ "$durable" = durable ]; then sync "$tmp" 2>/dev/null; fi
-    if [ -n "$original_key" ]; then original_intact "$original_key" "${dst#"$ROOT"/}"; fi
-    mv -f "$tmp" "$dst"
+    publish_temp "$tmp" "$dst" "$original_key"
 )
-# Exact restoration copies the journal original to a sibling temporary file,
-# sets owner, mode and mtime, proves the recorded signature and nanosecond
-# mtime, flushes it, and only then renames within the directory (never a
-# cross-filesystem mv). The journal original remains until final cleanup.
+# Exact restoration proves the journal original, then renames it over the
+# managed path (one atomic replace on one filesystem). Nothing is copied or
+# re-timestamped. A path that already holds the exact original (never
+# installed, or a legacy copy journal) is left as it is.
 restore_original() (
-    src=$1 dst=$2 tmp=$2.couvrefeu-tmp before=$3 original_mtime=$4
+    src=$1 dst=$2 before=$3 original_mtime=$4
     if [ -e "$dst" ] && exact_file "$dst" "$before" "$original_mtime"; then exit 0; fi
-    if [ -e "$tmp" ] || [ -L "$tmp" ]; then
-        owned_temp "$dst" || fail "temporary path collision: $tmp"
-        platform_initial_write
-        rm -f "$tmp"
-    fi
+    exact_file "$src" "$before" "$original_mtime" || fail "journal original is not exact: $dst; nothing restored, journal retained"
+    same_mount "$dst" "$src" || fail "journal original and $dst are not on one filesystem; nothing restored, journal retained"
     platform_initial_write
-    copy_exact "$src" "$tmp" "$before" "$original_mtime" || fail "exact original copy mismatch: $dst; journal retained"
-    sync "$tmp" 2>/dev/null
-    mv -f "$tmp" "$dst"
+    mv -f "$src" "$dst" || fail "exact original rename failed: $dst; journal retained"
+    sync "$dst" 2>/dev/null
     exact_file "$dst" "$before" "$original_mtime" || fail "exact original rename mismatch: $dst; journal retained"
 )
 

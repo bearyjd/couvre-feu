@@ -272,6 +272,9 @@ platform_lock_recover;printf unsafe'''
         self.assertIn('else platform_initial_write; chmod "$mode"',uninstall)
         common=(REPO/'router/lib/install-common.sh').read_text();start=common.index('atomic_copy() (');stop=common.index('\n)\n',start)+3
         fn=common[start:stop]
+        # atomic_copy publishes through publish_temp; both carry the write barrier.
+        start=common.index('publish_temp() {');stop=common.index('\n}\n',start)+3
+        fn=common[start:stop]+fn
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-copy-') as folder:
             root=Path(folder);src=root/'src';dst=root/'dst';tmp=root/'dst.couvrefeu-tmp'
             src.write_text('expected');dst.write_text('original');tmp.write_text('expected')

@@ -20,9 +20,15 @@ Model, applied by a `stat` shim to every `%d`/`%i` query:
   link's exact value is not.
 - `upper`: real dev:ino, unchanged.
 - `absent`: no file.
-A `lower` file is additionally copied up by any metadata or link operation;
-`ln`, `chmod`, `chown` and `touch` shims log such an operation on a `lower`
-managed path as `copy-up <path>` (a write to a managed path).
+A `lower` file is additionally copied up by any metadata, link or rename
+operation; `ln`, `chmod`, `chown`, `touch` and `mv` (source operands only)
+shims log such an operation on a `lower` managed path as `copy-up <path> <tool>`
+(a write to a managed path).
+
+Directories (`stat -c '%d %m'`, the installer's same-filesystem proof) report
+the overlay dev and mount point `/` of the merged root. `mounts` may split a
+subtree onto another filesystem; only directories are modeled, and the query
+is logged as `mount <path> <dev> <mount point>`.
 """
 import os
 from pathlib import Path
@@ -33,10 +39,11 @@ OVERLAY_DEV = 19
 STATES = ('lower', 'origin', 'upper', 'absent')
 
 
-def install(bin_dir, log, entries):
-    """Front `stat`, `ln`, `chmod`, `chown`, `touch` in bin_dir with the model.
+def install(bin_dir, log, entries, root, mounts=None):
+    """Front `stat`, `ln`, `chmod`, `chown`, `touch`, `mv` in bin_dir with the model.
 
     entries: {absolute path: (state, lower inode)} for existing originals.
+    root: the merged overlay root; mounts: {absolute subtree: (dev, mount point)}.
     """
     bin_dir = Path(bin_dir)
     table = bin_dir / 'overlay.table'
@@ -48,13 +55,27 @@ def install(bin_dir, log, entries):
             st = os.lstat(path)
             lines.append(f'{st.st_dev}:{st.st_ino} {path} {lower_ino} {state}\n')
     table.write_text(''.join(lines))
+    mount_table = bin_dir / 'overlay.mounts'
+    splits = dict(mounts or {})
+    mount_table.write_text(''.join(f'{prefix} {dev} {point}\n' for prefix, (dev, point) in
+                                   [(str(root), (OVERLAY_DEV, '/')), *splits.items()]))
     real_stat = shutil.which('stat')
     q = shlex.quote
     stat_shim = f'''#!/bin/sh
 # Overlay identity shim; every other stat format runs the real tool.
-case "${{1:-}}:${{2:-}}" in -c:*%d*|-c:*%i*) ;; *) exec {q(real_stat)} "$@";; esac
+case "${{1:-}}:${{2:-}}" in -c:*%d*|-c:*%i*|-c:*%m*) ;; *) exec {q(real_stat)} "$@";; esac
 fmt=$2
 shift 2
+if [ "$fmt" = '%d %m' ]; then
+    status=0
+    for path do
+        [ -d "$path" ] && [ ! -L "$path" ] || {{ printf 'overlay stat: only directories are modeled: %s\\n' "$path" >&2; exit 97; }}
+        reported=$(awk -v path="$path" '(path==$1 || index(path, $1 "/")==1) && length($1)>=best {{best=length($1); r=$2 " " $3}} END {{if(r=="") exit 1; print r}}' {q(str(mount_table))}) || {{ status=1; continue; }}
+        printf 'mount %s %s\\n' "$path" "$reported" >> {q(str(log))}
+        printf '%s\\n' "$reported"
+    done
+    exit $status
+fi
 case "$fmt" in '%d:%i'|'%i'|'%d') ;; *) printf 'overlay stat: unmodeled format %s\\n' "$fmt" >&2; exit 97;; esac
 status=0
 for path do
@@ -69,7 +90,7 @@ exit $status
 '''
     (bin_dir / 'stat').write_text(stat_shim)
     (bin_dir / 'stat').chmod(0o700)
-    for tool in ('ln', 'chmod', 'chown', 'touch'):
+    for tool in ('ln', 'chmod', 'chown', 'touch', 'mv'):
         target = bin_dir / tool
         # Wrap an existing fixture wrapper (e.g. a truncating touch) if present.
         real = str(target.with_name(tool + '.overlay-real')) if target.exists() else shutil.which(tool)
@@ -77,11 +98,13 @@ exit $status
             target.rename(real)
         target.write_text(f'''#!/bin/sh
 # A metadata or link operation on a lower-only file copies it up first.
-skip=0
+skip=0 left=$#
 for operand do
-    # touch -r only reads its reference file.
+    left=$((left - 1))
+    # touch -r only reads its reference file; mv renames (copies up) its sources only.
     if [ "$skip" = 1 ]; then skip=0; continue; fi
     case "$operand" in -r) skip=1; continue;; -*) continue;; esac
+    if [ {tool} = mv ] && [ "$left" = 0 ]; then continue; fi
     if awk -v p="$operand" '$2==p && $4=="lower" {{found=1}} END {{exit !found}}' {q(str(table))}; then
         printf 'copy-up %s {tool}\\n' "$operand" >> {q(str(log))}
     fi

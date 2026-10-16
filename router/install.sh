@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=d980da93454ac4d757c002996075f6cb7f7d5f0e5804dcf2fb074a686617a7b4
+CF_BOOTSTRAP_PIN=e917038d0c6d4a7456df356d9dcfc7f780072f1d95369ac5d0d63a4508eb84f9
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -144,7 +144,8 @@ ROLLBACK_BASE=absent
 ROLLBACK_ETC=absent
 # Until the new journal is ready (and before any release directory exists),
 # every exit removes exactly what the journal step created. Managed targets
-# are untouched in this window; each journal original is an independent copy.
+# are untouched in this window: originals are renamed into the journal only
+# later, at their own install rename.
 journal_rollback() {
     [ "$JOURNAL_ROLLBACK" = 1 ] || return 0
     JOURNAL_ROLLBACK=0
@@ -164,7 +165,7 @@ journal_rollback() {
 cleanup() {
     journal_rollback
     for file in cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
-    for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size" "$STAGE/$k.touch"; done
+    for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
@@ -276,18 +277,17 @@ if [ "${CF_TEST_MODE:-0}" != 1 ] || [ "${CF_TEST_RELEASE_DIR:-0}" = 1 ]; then
     if [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ]; then RELEASE_ABSENT=1
     else platform_recovery_prepare "$HERE" "$ROOT"; fi
 fi
-# Copy one existing original into the new journal as an independent file with
-# its owner, mode and mtime, and prove the pre-recorded exact signature, size
-# and nanosecond mtime. Reading never copies an overlay lower file up, so no
-# managed path is written; hard links are not used (their overlay identity is
-# not the original's; see exact_file in install-common.sh).
+# The exact original itself is renamed into the journal at its install step
+# (publish_temp in install-common.sh): rename keeps bytes, owner, mode and
+# nanosecond mtime with no copy or touch, and hard links are not used (their
+# overlay identity is not the original's; see exact_file). Here, before ready,
+# only a byte copy is journaled and the live original is proved unchanged.
+# Reading never copies an overlay lower file up, so no managed path is written.
 preserve_original() {
-    po_src=$ROOT/$1 po_dst=$BACKUP/$2.original
+    po_src=$ROOT/$1
     po_before=$(awk 'NR==1 {print; exit}' "$STAGE/$2.before")
     po_mtime=$(awk 'NR==1 {print; exit}' "$STAGE/$2.mtime")
     po_size=$(awk 'NR==1 {print; exit}' "$STAGE/$2.size")
-    copy_exact "$po_src" "$po_dst" "$po_before" "$po_mtime" || fail "cannot preserve exact original: $1; no installation made"
-    [ "$(stat -c %s "$po_dst")" = "$po_size" ] || fail "cannot preserve exact original: $1; no installation made"
     # Non-authoritative byte copy for manual recovery, read from the live path.
     cp "$po_src" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; no installation made"
     [ "$(sha256sum "$BACKUP/$2.copy" | awk '{print $1}')" = "${po_before%%:*}" ] || fail "original recovery copy mismatch: $1; no installation made"
@@ -312,12 +312,11 @@ if [ ! -e "$BACKUP" ]; then
         signature "$ROOT/$rel" > "$STAGE/$k.before"
         if [ -e "$ROOT/$rel" ]; then
             stat -c %s "$ROOT/$rel" > "$STAGE/$k.size"
-            # Read-only capability proof outside managed paths: touch -r must
-            # carry this original's exact nanosecond mtime (BusyBox -d cannot).
-            : > "$STAGE/$k.touch"
-            touch -r "$ROOT/$rel" "$STAGE/$k.touch" || fail "touch -r unavailable: $rel; no installation made"
-            exact_mtime "$STAGE/$k.touch" "$(awk 'NR==1 {print; exit}' "$STAGE/$k.mtime")" || fail "touch -r cannot restore exact nanosecond mtime: $rel; no installation made"
-            rm -f "$STAGE/$k.touch"
+            # The original will be renamed into the journal and, on uninstall,
+            # from the recovery journal back. A cross-filesystem mv would copy.
+            if ! { same_mount "$ROOT/$rel" "$BACKUP" && same_mount "$ROOT/$rel" "$RECOVERY"; }; then
+                fail "original, journal and recovery journal are not on one filesystem: /$rel; no installation made"
+            fi
         fi
     done
     # Capture directory modes before creating anything in managed paths.
