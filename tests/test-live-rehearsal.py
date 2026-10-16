@@ -643,6 +643,29 @@ class LiveRehearsalTests(unittest.TestCase):
             result = subprocess.run(check, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, check[0] + result.stdout + result.stderr)
 
+    def rehearsal_var(self, name):
+        text = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        match = re.search(r"^%s='([^']*)'$" % name, text, re.M)
+        self.assertIsNotNone(match, name)
+        return set(match.group(1).split())
+
+    def test_rehearsal_file_lists_cover_release_and_install(self):
+        release = {line.split()[1] for line in (REPO / 'router/release.sha256').read_text().splitlines() if line.strip()}
+        # release.sha256 cannot list itself; the rehearsal inventories it explicitly.
+        self.assertEqual(self.rehearsal_var('CFR_RELEASE_FILES'), release | {'release.sha256'})
+        installed = set(re.findall(r'^\s+((?:usr|etc)/\S+?\))\s', (REPO / 'router/install.sh').read_text(), re.M))
+        installed = {item.rstrip(')') for item in installed}
+        installed |= set(re.findall(r'; ((?:usr|etc)/\S+?)\) staged=', (REPO / 'router/install.sh').read_text()))
+        self.assertTrue(installed)
+        self.assertEqual(installed - self.rehearsal_var('CFR_FILES'), set())
+
+    def test_busy_result_status_keys_match_cf_status(self):
+        lines = [line for line in (REPO / 'router/lib/core.sh').read_text().splitlines()
+                 if line.lstrip().startswith("printf '{\"ok\":") and 'desiredRevision' in line]
+        self.assertEqual(len(lines), 2)
+        keys = [re.findall(r'"(\w+)":', line) for line in lines]
+        self.assertEqual(keys[0], keys[1])
+
 
 if __name__ == '__main__':
     unittest.main()
