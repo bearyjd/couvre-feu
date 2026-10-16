@@ -410,7 +410,7 @@ def volatile_location(path):
     return fstype is None or fstype in VOLATILE_FILESYSTEMS
 
 
-def evidence_directory(config, now):
+def evidence_directory(config, now, suffix='first-rehearsal'):
     parent = config['evidenceDir']
     try:
         info = os.lstat(parent)
@@ -420,7 +420,7 @@ def evidence_directory(config, now):
         raise Refusal('evidenceDir must be an owned, non-symlink directory without group/other write')
     if volatile_location(parent):
         raise Refusal('evidenceDir must be on persistent storage, not /tmp, /run, /dev/shm or tmpfs')
-    path = os.path.join(parent, now.strftime('%Y%m%dT%H%M%SZ') + '-first-rehearsal')
+    path = os.path.join(parent, now.strftime('%Y%m%dT%H%M%SZ') + '-' + suffix)
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:

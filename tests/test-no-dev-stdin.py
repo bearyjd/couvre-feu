@@ -42,7 +42,10 @@ def guard_dir(name):
 class NoDevStdinTests(unittest.TestCase):
     def test_static_no_dev_fd_operands(self):
         pattern = re.compile(r'/dev/(stdin|fd)|/proc/self/fd')
-        hits = [f'{p.relative_to(REPO)}:{n}' for p in sorted((REPO / 'router').rglob('*')) if p.is_file()
+        # Live tools run the same router shell remotely, so their scripts are in scope too.
+        files = [p for p in sorted((REPO / 'router').rglob('*')) if p.is_file()] + sorted((REPO / 'tools/live').glob('*.sh'))
+        self.assertIn(REPO / 'tools/live/penn-pilot.sh', files)
+        hits = [f'{p.relative_to(REPO)}:{n}' for p in files
                 for n, line in enumerate(p.read_text(errors='replace').splitlines(), 1) if pattern.search(line)]
         self.assertEqual(hits, [])
 
