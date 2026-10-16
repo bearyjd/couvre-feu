@@ -629,6 +629,46 @@ esac
         self.assertEqual((self.root / 'etc/couvrefeu/backup/etc_config_firewall.copy').read_bytes(),
                          EXISTING_ORIGINALS['etc/config/firewall'])
 
+    def test_stat_without_mount_point_refuses_before_first_write(self):
+        # A stat that cannot report %m (BusyBox prints '?') must not make both
+        # sides look like one filesystem.
+        release = self.enable_release()
+        self.write_originals()
+        wrapper = self.root / 'bin/stat'
+        wrapper.write_text('#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = "%d %m" ]; then shift 2; for p do echo "19 ?"; done; exit 0; fi\n'
+                           f'exec {shlex.quote(shutil.which("stat"))} "$@"\n')
+        wrapper.chmod(0o700)
+        before = full_snapshot(self.root)
+        self.assert_refused_identically(
+            before, release, 'original, journal and recovery journal are not on one filesystem: /etc/config/firewall; no installation made')
+        self.assert_no_touch()
+
+    def test_installed_content_is_proved_after_the_install_rename(self):
+        # A write landing on the new file right after the second rename is
+        # not the staged content: refuse with the original journaled.
+        originals = self.write_originals()
+        target = self.root / 'etc/config/firewall'
+        flag = self.root / 'tamper-once'
+        flag.touch()
+        wrapper = self.root / 'bin/mv'
+        wrapper.write_text(f'#!/bin/sh\n{shlex.quote(shutil.which("mv"))} "$@" || exit\n'
+                           f'case "$*" in *.couvrefeu-tmp" "{target}) ;; *) exit 0;; esac\n'
+                           f'if [ -f {shlex.quote(str(flag))} ]; then rm -f {shlex.quote(str(flag))}; printf "#\\n" >> {shlex.quote(str(target))}; fi\n')
+        wrapper.chmod(0o700)
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f'installed file mismatch after rename: {target}; original journaled, journal retained', result.stderr)
+        backup = self.root / 'etc/couvrefeu/backup'
+        self.assertFalse((backup / 'complete').exists())
+        self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), originals['etc/config/firewall'])
+        # The changed path is drift: uninstall refuses and keeps everything.
+        before = full_snapshot(self.root)
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('drift at /etc/config/firewall', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+        self.assert_no_touch()
+
     def test_tampered_journal_original_content_refuses_identically(self):
         # Same mode, owner and nanosecond mtime, other bytes: never renamed back.
         self.write_originals()

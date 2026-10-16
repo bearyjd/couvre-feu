@@ -448,6 +448,8 @@ publish_temp() {
             sync "$pt_saved" "$2" 2>/dev/null
             exact_file "$pt_saved" "$(awk 'NR==1 {print; exit}' "$BACKUP/$3.before")" "$(awk 'NR==1 {print; exit}' "$BACKUP/$3.mtime")" ||
                 fail "journal original is not exact after rename: $2; journal retained"
+            [ "$(signature "$2")" = "$(signature "$BACKUP/$3.staged")" ] ||
+                fail "installed file mismatch after rename: $2; original journaled, journal retained"
             return 0
         fi
     fi
