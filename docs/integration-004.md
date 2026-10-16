@@ -209,6 +209,9 @@ Apply requires an approved cached exact-base/runtime observation within 30 secon
    service-key provisioning and runtime confinement checks. Admit only the supplied
    network MAC after unique fresh attribution. Run the disclosed finite status,
    pause, resume, timed-pause and service-off-expiry sequence with child/adult probes.
+   The single-session tool is [`tools/live/penn-pilot.py`](../tools/live/README.md#one-device-penn-pilot-penn-pilotpy).
+   It does not provision a service key, and pause rules have no kernel time bound,
+   so it uses only timed pauses and always tears down.
 4. **Resilience:** reload, reboot and recovery each need their own approved script
    and evidence. Upgrade is outside this pilot and remains unperformed.
 
