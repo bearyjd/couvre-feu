@@ -540,6 +540,8 @@ cf_main() {
     cf_action=${1-}
     case $cf_action in
         rpc-sync|rpc-status) cf_rpc_main "$@";return $?;;
+        activity|rpc-activity) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; }
+            if [ "$cf_action" = activity ];then cf_activity;else cf_rpc_activity;fi;return $?;;
         check) [ "$#" = 1 ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_check;return $?;;
         status) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_status;return 0;;
         pause) if [ "$#" = 2 ]; then cf_until=0;elif [ "$#" = 4 ] && [ "$3" = --until ];then cf_until=$4;else cf_action=invalid;fi;;

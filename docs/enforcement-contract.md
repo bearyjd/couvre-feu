@@ -61,6 +61,22 @@ Changed policy needs a newer revision; identical normalized same-revision sync i
 - **Recovery.** Conservative transition recovery replays the immutable prepared generation, so it evaluates allowances at the prepared epoch, the same as pauses. Evaluating them at a later epoch would contradict the staged sets and make recovery fail with `set_drift`. The replay cannot fail open, because of one invariant: any generation that leaves a person out of the paused set or the schedule rules because of an allowance also carries that person's blocks gated by `--datestart <until>`, computed at the same epoch. Once `until` has passed, the kernel enforces those gated blocks during the replay, and the rebase that follows produces the ungated form. A fixture test checks every captured recovery effect.
 - **Residual gaps.** The gate follows the kernel's real-time clock: if the clock is set backwards across `until`, the gate deactivates until the clock passes `until` again. Accelerated (offloaded) flows are evicted only by the next cron run. A full firewall restart without the include drops all owned rules, as before.
 
+## Activity counters
+
+`cfctl activity --json` and `cfctl rpc-activity --json` are read-only and lockless. `cfctl-ssh` admits both, and `--rpc-only` admits only `rpc-activity`. The output contract is exactly:
+
+`{"version":1,"router_epoch":<int>,"counter_epoch":<int>,"offload":"on|off|unknown","devices":[{"person":"<id>","mac":"aa:bb:..","ip":"<ipv4>"|null,"neighbor":"REACHABLE|STALE|DELAY|PROBE|FAILED|ABSENT","tx_bytes":<int>,"rx_bytes":<int>,"tx_packets":<int>,"rx_packets":<int>,"blocked_packets":<int>}],"errors":[...]}`
+
+- Devices are sorted by person, then by MAC, with at most 256.
+- Only MACs assigned to a person are counted, never protected or unknown MACs.
+- Counting uses target-less rules in the owned mangle chain `cf_acct`. It is hooked first in mangle FORWARD in both families, so traffic is counted before any filter verdict, including Couvre-feu rejects.
+- The confirmed-apply path updates the chain idempotently, and `remove-fw` removes it.
+- `counter_epoch` is a persisted monotonic generation (`runtime/activity.epoch`, journaled and removed by `remove-fw`). It never repeats and changes whenever counters were reset. Deltas are valid only within one epoch and only between samples without errors.
+- Counts are bytes and packets only, with no content, apps, URLs or screen time.
+- Flow offloading bypasses the counters.
+
+The [activity counters document](activity-counters.md) defines placement, epochs, error codes and privacy limits.
+
 ## Durable state and safety
 
 One atomically replaced normalized TSV file, `/etc/couvrefeu/state`, stores version/revision, person-to-MAC ownership, manual pause metadata, schedules and DoH addresses. This replaces the PRP's raw MAC/expiry format. Record kinds are `V`, `R`, `P`, `A`, `U` (allowance), `S`, `D4`, `D6`; clients use JSON rather than editing TSV. Expired pause metadata can remain for replay equality, while effective membership excludes it.

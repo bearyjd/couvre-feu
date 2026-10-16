@@ -15,7 +15,7 @@ if args not in ([], ['--check']):
     sys.exit('usage: freeze-router-release.py [--check]')
 check = args == ['--check']
 router = Path(__file__).resolve().parents[1] / 'router'
-names = ['core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'state.awk', 'rules.awk', 'json.awk', 'vendor-platform.sh']
+names = ['core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'state.awk', 'rules.awk', 'json.awk', 'vendor-platform.sh', 'activity.sh']
 pairs = [name + ':' + hashlib.sha256((router / 'lib' / name).read_bytes()).hexdigest() for name in names]
 identity = hashlib.sha256(('\n'.join(pairs) + '\n').encode()).hexdigest()
 expected = {}

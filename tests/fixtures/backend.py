@@ -50,6 +50,8 @@ def main():
         except (KeyError, ValueError, IndexError) as error:
             print(f"unsupported fixture call {command} {args!r}: {error}", file=sys.stderr)
             return 97
+        if "counters" in state:
+            prune_counters(state)
         mutating = (command in ("iptables", "ip6tables") and any(x in args for x in ("-A", "-I", "-R", "-D", "-N", "-F", "-X"))
                     or command == "ipset" and args[0] in ("create", "add", "destroy", "flush")
                     or command == "conntrack" or command in ("fw3", "firewall") and "reload" in args)
@@ -285,6 +287,22 @@ def iptables(command, args, state):
     operation = args[0]
     chain = args[1] if len(args) > 1 else None
     rule = args[2:]
+    if operation.startswith("-") and operation.endswith("L") and set(operation[1:]) <= set("nvxL") and len(operation) > 2:
+        # Columnar counter listing (iptables -nvxL); counters live in backend state.
+        if chain not in chains:
+            return 1, ""
+        return 0, list_counters(command, table, chain, chains, state)
+    counters = state.setdefault("counters", {})
+    prefix = f"{command}|{table}|{chain}|"
+    if operation in ("-N", "-F", "-X"):
+        for key in [key for key in counters if key.startswith(prefix)]:
+            del counters[key]
+    elif operation == "-R" and chain in chains and rule and rule[0].isdigit() and 0 < int(rule[0]) <= len(chains[chain]):
+        counters.pop(prefix + json.dumps(chains[chain][int(rule[0]) - 1]), None)
+    elif operation in ("-A", "-I") and chain in chains:
+        inserted = rule[1:] if operation == "-I" and rule and rule[0].isdigit() else rule
+        if inserted not in chains[chain]:
+            counters.pop(prefix + json.dumps(inserted), None)
     if operation == "-N":
         if chain in chains:
             return 1, ""
@@ -319,6 +337,8 @@ def iptables(command, args, state):
             return 1, ""
         if operation == "-D":
             chains[chain].remove(found)
+            if found not in chains[chain]:
+                state.setdefault("counters", {}).pop(f"{command}|{table}|{chain}|" + json.dumps(found), None)
     elif operation in ("-S", "-L"):
         if chain and chain not in chains:
             return 1, ""
@@ -333,6 +353,57 @@ def iptables(command, args, state):
     else:
         raise ValueError("unknown iptables operation")
     return 0, ""
+
+
+def counter_key(command, table, chain, row):
+    return f"{command}|{table}|{chain}|" + json.dumps(row)
+
+
+def list_counters(command, table, chain, chains, state):
+    """Model iptables -nvxL columns; counter-only rules leave the target blank."""
+    builtin = {"INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING"}
+    references = sum(1 for rows in chains.values() for row in rows
+                     if any(row[i] in ("-j", "-g") and row[i + 1] == chain for i in range(len(row) - 1)))
+    lines = [f"Chain {chain} (policy ACCEPT 0 packets, 0 bytes)" if chain in builtin else f"Chain {chain} ({references} references)",
+             "    pkts      bytes target     prot opt in     out     source               destination"]
+    any4, any6 = "0.0.0.0/0", "::/0"
+    for row in chains[chain]:
+        packets, octets = state.get("counters", {}).get(counter_key(command, table, chain, row), [0, 0])
+        fields = {"-i": "*", "-o": "*", "-s": any6 if command == "ip6tables" else any4,
+                  "-d": any6 if command == "ip6tables" else any4, "-p": "all", "-j": ""}
+        extras, index = [], 0
+        while index < len(row):
+            token = row[index]
+            if token in fields:
+                fields[token] = row[index + 1]
+                index += 2
+            elif token == "-m":
+                index += 2
+            elif token == "--mac-source":
+                extras.append("MAC " + row[index + 1].upper())
+                index += 2
+            elif token == "--match-set":
+                extras.append(f"match-set {row[index + 1]} {row[index + 2]}")
+                index += 3
+            elif token == "--comment":
+                extras.append(f"/* {row[index + 1]} */")
+                index += 2
+            elif token == "--kerneltz":
+                index += 1
+            else:
+                extras.append(token.lstrip("-") + ":" + row[index + 1])
+                index += 2
+        opt = "" if command == "ip6tables" else "--"
+        lines.append(f"{packets:8d} {octets:10d} {fields['-j']:<10} {fields['-p']:<4} {opt:<3} {fields['-i']:<6} {fields['-o']:<6} "
+                     f"{fields['-s']:<20} {fields['-d']:<20} {' '.join(extras)}".rstrip())
+    return "\n".join(lines)
+
+
+def prune_counters(state):
+    live = {counter_key(command, table, chain, row)
+            for command, family in state.get("tables", {}).items() for table, chains in family.items()
+            for chain, rows in chains.items() for row in rows}
+    state["counters"] = {key: value for key, value in state.get("counters", {}).items() if key in live}
 
 
 def rule_identity(row):
@@ -468,6 +539,16 @@ def uci(args, state):
                 del values[existing]
         state["uci_dirty"][namespace] = True
     elif op == "get":
+        import re
+        anonymous = re.fullmatch(r"([a-z]+)\.@([a-z_]+)\[([0-9]+)\](\..+)?", key)
+        if anonymous:
+            # UCI anonymous-section syntax: the nth section of a type, in file order.
+            config, kind, position, option = anonymous.groups()
+            names = [name for name, value in values.items()
+                     if name.count(".") == 1 and name.startswith(config + ".") and value == kind]
+            if int(position) >= len(names):
+                return 1, ""
+            key = names[int(position)] + (option or "")
         return (0, values[key]) if key in values else (1, "")
     elif op in ("show", "export"):
         if directory == Path(os.environ["CF_ROOT"]) / "etc/config":

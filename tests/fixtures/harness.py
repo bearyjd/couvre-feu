@@ -117,7 +117,8 @@ class RouterFixture:
                 "INPUT": [["-j", "input_rule"], ["-j", "GL_DNS_LEAK"]],
                 "forwarding_rule": [], "input_rule": []},
                 "nat": {"PREROUTING": [["-j", "prerouting_rule"], ["-j", "dns_dispatcher"]],
-                        "prerouting_rule": []}}
+                        "prerouting_rule": []},
+                "mangle": {"FORWARD": []}}
                        for name in ("iptables", "ip6tables")},
             "neighbors": [{"ip": "192.168.1.10", "mac": PROTECTED},
                           {"ip": "2001:db8::10", "mac": PROTECTED},

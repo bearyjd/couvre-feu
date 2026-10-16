@@ -64,7 +64,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=1ec8418b05d4ab0d9dfc0fda5e0d4d4ab4455dd6081d674bd4a26a7702b78579
+CF_BOOTSTRAP_PIN=5979557bd4c7833d48e4409d2c1475c090cbf153c08b4f2f1fccf1b563b41ae1
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || cf_bootstrap_refuse
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
@@ -95,5 +95,6 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 . "$CF_LIB/rpc.sh"
 . "$CF_LIB/firewall.sh"
+. "$CF_LIB/activity.sh"
 platform_deadline_check
 cf_main "$@"

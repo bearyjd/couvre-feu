@@ -720,6 +720,21 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(self.f.durable_snapshot(), before)
         self.assertEqual(len(self.f.mutation_calls()), count)
 
+    def test_rpc_activity_is_scoped_lockless_and_readonly(self):
+        self.accept(self.request())
+        before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
+        result = self.f.run('rpc-activity', '--json')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(list(document), ['version', 'router_epoch', 'counter_epoch', 'offload', 'devices', 'errors'])
+        self.assertEqual([(d['person'], d['mac']) for d in document['devices']], [('alice', KID)])
+        self.assertEqual(document['errors'], [])
+        self.assertGreater(document['counter_epoch'], 0)
+        self.assertNotIn(PROTECTED, result.stdout)
+        self.assertEqual(self.f.durable_snapshot(), before)
+        self.assertEqual(len(self.f.mutation_calls()), count)
+        self.assertNotEqual(self.f.run('rpc-activity').returncode, 0)
+
     def test_ssh_rpc_only_grammar_excludes_legacy_commands(self):
         target = self.f.bin / 'cfctl'
         target.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n');target.chmod(0o700)
@@ -728,7 +743,10 @@ class RpcTests(unittest.TestCase):
                                     ('cfctl status --json', False), ('cfctl pause alice', False),
                                     ('cfctl expire', False), ('cfctl apply-fw', False),
                                     ('cfctl rpc-status --json -', False), ('cfctl rpc-sync; id', False),
-                                    ('cfctl rpc-sync\n', False), ('cfctl rpc-status --json --rpc-only', True)):
+                                    ('cfctl rpc-sync\n', False), ('cfctl rpc-status --json --rpc-only', True),
+                                    ('cfctl rpc-activity --json', True), ('cfctl rpc-activity', False),
+                                    ('cfctl rpc-activity --json op-1', False), ('cfctl activity --json', False),
+                                    ('cfctl rpc-activity --json; id', False)):
             with self.subTest(original=original):
                 result = self.script('cfctl-ssh', '--rpc-only', env=dict(self.f.env, SSH_ORIGINAL_COMMAND=original))
                 self.assertEqual(result.returncode == 0, permitted, result.stdout + result.stderr)

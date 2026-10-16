@@ -271,6 +271,9 @@ cf_confirm_apply() {
     fi
     cf_durable_record confirmed "$CF_REVISION $CF_DIGEST $(cf_effective_digest)" || return 1
     cf_rpc_checkpoint after_confirmation
+    # BEGIN activity hook: counters only, isolated in a subshell; failure is reported by `cfctl activity`.
+    (cf_activity_apply) || :
+    # END activity hook
     [ ! -e "$CF_RUNTIME/error" ] || { cf_safe_file "$CF_RUNTIME/error" && rm -f "$CF_RUNTIME/error"; } || return 1
     if [ -e "$CF_RUNTIME/firewall.intent" ] || [ -L "$CF_RUNTIME/firewall.intent" ];then
         cf_safe_file "$CF_RUNTIME/firewall.intent" && rm -f "$CF_RUNTIME/firewall.intent" || return 1
@@ -1038,7 +1041,7 @@ cf_zero_owned_kernel() {
     for cf_zk_f in 4 6;do
         for cf_zk_t in filter nat mangle raw;do
             cf_zk_rules=$(cf_table "$cf_zk_f" -t "$cf_zk_t" -S) || return 1
-            printf '%s\n' "$cf_zk_rules" | awk 'function owned(s){return s~/^(cf_fwd|cf_input|cf_dns|cf2_[ab]_[figd])$/}$1=="-N"&&owned($2){exit 1}$1=="-A"{if(owned($2))exit 1;for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&owned($(i+1))||$i=="--match-set"&&$(i+1)~/^(cf_kids|cf_paused|cf_doh|cf_doh6|cf2_[ab]_(k|p|d4|d6|u))$/)exit 1}' || return 1
+            printf '%s\n' "$cf_zk_rules" | awk -v t="$cf_zk_t" 'function owned(s){return s~/^(cf_fwd|cf_input|cf_dns|cf2_[ab]_[figd])$/||t!="mangle"&&s=="cf_acct"}$1=="-N"&&owned($2){exit 1}$1=="-A"{if(owned($2))exit 1;for(i=3;i<NF;i++)if(($i=="-j"||$i=="-g")&&owned($(i+1))||$i=="--match-set"&&$(i+1)~/^(cf_kids|cf_paused|cf_doh|cf_doh6|cf2_[ab]_(k|p|d4|d6|u))$/)exit 1}' || return 1
         done
     done
     cf_zk_sets=$(cf_backend ipset save) || return 1
@@ -1055,6 +1058,7 @@ cf_zero_owned_runtime() (
         [ -e "$cf_zr_file" ] || [ -L "$cf_zr_file" ] || continue
         case ${cf_zr_file##*/} in
             error|expiry|schedule.clock)cf_safe_file "$cf_zr_file" || return 1;;
+            activity.epoch)cf_safe_file "$cf_zr_file" || return 1;printf '%s\n' "$cf_zr_file";; # activity hook: owned, removed after proofs
             firewall.intent)[ "${CF_ZERO_DESCRIPTOR:-0}" = 1 ] && cf_safe_file "$cf_zr_file" || return 1;printf '%s\n' "$cf_zr_file";;
             firewall.preflight)[ "${CF_ZERO_BASELINE:-0}" = 1 ] && cf_safe_file "$cf_zr_file" || return 1;;
             .intent.*)
@@ -1094,7 +1098,10 @@ cf_remove_fw() {
             CF_ZERO_DESCRIPTOR=1
         fi
         cf_rf_zero_files=$(cf_zero_owned_runtime) || { cf_fail unsafe_zero_owned_runtime;return 1; }
-        if [ "$CF_ZERO_BASELINE" != 1 ];then cf_zero_owned_kernel || { cf_fail zero_owned_kernel_unproven;return 1; };fi
+        if [ "$CF_ZERO_BASELINE" != 1 ];then
+            cf_zero_owned_kernel || { cf_fail zero_owned_kernel_unproven;return 1; }
+            cf_activity_remove_kernel || return 1 # activity hook: only after both zero proofs pass
+        fi
         while IFS= read -r cf_rf_file;do
             [ -z "$cf_rf_file" ] && continue
             platform_initial_write
@@ -1115,12 +1122,13 @@ EOZ
         fi
         cf_cleanup_begin || return 1
     fi
+    cf_activity_remove_kernel || return 1 # activity hook: only after drift refusal checks
     for cf_rf_f in 4 6;do cf_remove_one "$cf_rf_f" filter forwarding_rule cf_fwd && cf_remove_one "$cf_rf_f" filter input_rule cf_input || return 1;done
     cf_remove_one 4 nat prerouting_rule cf_dns || return 1
     cf_slot_delete a && cf_slot_delete b || return 1
     cf_rf_remaining=$(cf_cleanup_inventory) || return 1
     [ "$cf_rf_remaining" = 'CLEANUP 1' ] || { cf_fail cleanup_incomplete;return 1; }
-    rm -f "$CF_RUNTIME/firewall.owned" "$CF_RUNTIME/firewall.snapshot" "$CF_RUNTIME/confirmed" "$CF_RUNTIME/error" "$CF_RUNTIME/expiry" "$CF_RUNTIME/firewall.intent" "$CF_RUNTIME/firewall.cleanup" "$CF_RUNTIME/schedule.clock" && cf_backend sync
+    rm -f "$CF_RUNTIME/firewall.owned" "$CF_RUNTIME/firewall.snapshot" "$CF_RUNTIME/confirmed" "$CF_RUNTIME/error" "$CF_RUNTIME/expiry" "$CF_RUNTIME/firewall.intent" "$CF_RUNTIME/firewall.cleanup" "$CF_RUNTIME/schedule.clock" "$CF_RUNTIME/activity.epoch" && cf_backend sync
 }
 
 # Journal helper inherits shell-local admission in an isolated subshell. An

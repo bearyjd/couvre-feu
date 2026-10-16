@@ -55,7 +55,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=1ec8418b05d4ab0d9dfc0fda5e0d4d4ab4455dd6081d674bd4a26a7702b78579
+CF_BOOTSTRAP_PIN=5979557bd4c7833d48e4409d2c1475c090cbf153c08b4f2f1fccf1b563b41ae1
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -83,7 +83,7 @@ fi
 if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
 fi
-for file in cfctl cfctl-ssh lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh; do
+for file in cfctl cfctl-ssh lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh; do
     if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
         fail "missing/unsafe source: $file"
     fi
@@ -352,6 +352,7 @@ if [ ! -e "$BACKUP" ]; then
             usr/lib/couvrefeu/firewall.sh) staged=lib/firewall.sh;;
             usr/lib/couvrefeu/json.awk) staged=lib/json.awk;;
             usr/lib/couvrefeu/rules.awk) staged=lib/rules.awk;;
+            usr/lib/couvrefeu/activity.sh) staged=lib/activity.sh;;
             usr/lib/couvrefeu/install-common.sh) staged=lib/install-common.sh;;
             usr/sbin/cfctl) staged=cfctl;; usr/sbin/cfctl-ssh) staged=cfctl-ssh;;
             etc/firewall.couvrefeu) staged=include;; etc/config/firewall) staged=firewall;;

@@ -224,7 +224,7 @@ class FirstWriteRegressionTests(unittest.TestCase):
     def test_zero_owned_cleanup_checks_after_kernel_proof_and_empty_proof_does_not_disarm(self):
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-zero-') as folder:
             root=Path(folder);record=root/'error';record.write_text('owned')
-            body=f'''. "{REPO}/router/lib/core.sh";. "{REPO}/router/lib/rpc.sh";. "{REPO}/router/lib/firewall.sh";
+            body=f'''. "{REPO}/router/lib/core.sh";. "{REPO}/router/lib/rpc.sh";. "{REPO}/router/lib/firewall.sh";. "{REPO}/router/lib/activity.sh";
 CF_RUNTIME={root};fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 cf_ownership_valid() {{ return 1; }};cf_zero_owned_runtime() {{ printf '%s\\n' "{record}"; }};
 cf_zero_owned_kernel() {{ fixture_tick=1400; }};cf_backend() {{ :; }};cf_remove_fw;printf unsafe'''

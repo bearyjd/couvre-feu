@@ -215,7 +215,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), original)
 
 
-NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile')
+NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh')
 
 
 class InstallerTests(unittest.TestCase):
@@ -244,7 +244,7 @@ check) [ "${CF_TEST_CHECK_FAIL:-0}" != 1 ];;
 esac
 ''')
         (self.source / 'cfctl-ssh').write_text('#!/bin/sh\nexit 0\n')
-        for lib in ('core.sh', 'rpc.sh', 'firewall.sh'):
+        for lib in ('core.sh', 'rpc.sh', 'firewall.sh', 'activity.sh'):
             (self.source / 'lib' / lib).write_text(':\n')
         for lib in ('json.awk', 'state.awk', 'rules.awk'):
             (self.source / 'lib' / lib).write_text('BEGIN {exit 0}\n')
@@ -1362,7 +1362,8 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         # the legacy journal has no timestamp records and trusts DONE=1.
         adapter_files = ('usr/lib/couvrefeu/platform-bootstrap.sh',
                          'usr/lib/couvrefeu/vendor-platform.sh',
-                         'etc/couvrefeu/platform-profile')
+                         'etc/couvrefeu/platform-profile',
+                         'usr/lib/couvrefeu/activity.sh')
         for rel in FILES + adapter_files:
             key = rel.replace('/', '_')
             original = backup / (key + '.original')

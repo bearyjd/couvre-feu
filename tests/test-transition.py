@@ -63,11 +63,11 @@ class TransitionTests(unittest.TestCase):
         doc['doh'] = {'ipv4': ['1.1.1.1'], 'ipv6': ['2606:4700:4700::1111']}
         self.success(self.f.run('sync', document=doc))
         effects = self.f.backend()['effects']
-        switches = [row for row in effects if '-R' in row['argv']]
+        switches = [row for row in effects if '-R' in row['argv'] and 'cf_acct' not in row['argv']]
         self.assertEqual(len(switches), 5)
         for row in effects:
             self.verify_reachability(row)
-            if '-R' in row['argv']:
+            if '-R' in row['argv'] and 'cf_acct' not in row['argv']:
                 for family in ('iptables', 'ip6tables'):
                     first = row['tables'][family]['filter']['cf_fwd'][0]
                     self.assertTrue(first[first.index('-j') + 1].endswith('_g'))
@@ -483,7 +483,7 @@ class FailClosedReconstructionTests(unittest.TestCase):
         return old, 'b' if old == 'a' else 'a'
 
     def assert_switches_guarded(self, effects, new):
-        switches = [row for row in effects if '-R' in row['argv']]
+        switches = [row for row in effects if '-R' in row['argv'] and 'cf_acct' not in row['argv']]
         self.assertEqual(len(switches), 5)
         for row in switches:
             for family in ('iptables', 'ip6tables'):
@@ -661,7 +661,7 @@ class FailClosedReconstructionTests(unittest.TestCase):
             state = fixture.backend()
             outcome = dict(returncode=result.returncode, ok=json.loads(result.stdout)['ok'],
                            injected=state['failures'][0]['remaining'] == 0,
-                           switched=any('-R' in row['argv'] for row in state['effects']),
+                           switched=any('-R' in row['argv'] and 'cf_acct' not in row['argv'] for row in state['effects']),
                            dispatch=self.generation_targets(state) == self.generation_targets(before),
                            guard_only=all(target in (rows[-1], f'cf2_{new}_g') for rows in self.dispatch_targets(state).values()
                                           for target in rows),

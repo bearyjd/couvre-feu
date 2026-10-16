@@ -290,7 +290,7 @@ class ActivatedLegacyRecoveryTests(unittest.TestCase):
                 shutil.copy2(installed,staged)
                 (backup/(key+'.after')).write_text(fixtures.signature(staged)+'\n')
                 (backup/(key+'.after')).chmod(0o600)
-        for rel in ['usr/lib/couvrefeu/platform-bootstrap.sh','usr/lib/couvrefeu/vendor-platform.sh','etc/couvrefeu/platform-profile']:
+        for rel in ['usr/lib/couvrefeu/platform-bootstrap.sh','usr/lib/couvrefeu/vendor-platform.sh','etc/couvrefeu/platform-profile','usr/lib/couvrefeu/activity.sh']:
             (self.root/rel).unlink()
             for suffix in ['before','after','mtime','staged','original']:
                 path=backup/(rel.replace('/','_')+'.'+suffix)
