@@ -77,7 +77,10 @@ coverage or ambiguous receipts stay visibly unhealthy.
 
 ## Installation and scope fences
 
-Scoped activation uses `--rpc-allow <TEST_NETWORK_MAC>` plus protected identities.
+Scoped activation uses `--rpc-allow <MAC>` (repeatable; 1-256 unique canonical unicast
+MACs, stored LC_ALL=C sorted one per line) plus protected identities. A single option
+stages the same bytes as before. Reinstall must name the same set (any order); a
+different set requires uninstall then install, i.e. a fresh generation.
 The scope is installer-owned, root-private and journaled; RPC cannot choose it.
 Every admission path, including legacy mutations, rejects other enrolled MACs,
 protected overlap and ambiguous control-client attribution before writes.
