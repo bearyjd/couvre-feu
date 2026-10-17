@@ -294,6 +294,40 @@ test('operator token: the active-passkey check runs at enrollment, and two racin
     } finally { f.close(); }
 });
 
+test('a stale operator token issued for an enrolled account never yields an active passkey, even after that passkey is removed', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd');
+        await act(f, jd, 'account_role', 'bryn', {role: 'admin'});
+        const bryn = await bootstrap(f, 'bryn');
+        // Issued while bryn is enrolled: not a first enrollment, recorded at issuance.
+        const stale = issueOperatorBootstrap(f.store, 'bryn', f.now());
+        assert.equal(f.store.get<{first_enrollment: number}>('SELECT first_enrollment FROM bootstrap_tokens WHERE hash=?', digest(stale))!.first_enrollment, 0);
+        const options = await f.auth.registrationOptions({token: stale}, newBrowser());
+        assert.ok(options.challengeId);
+        // Removing a passkey voids the account's outstanding tokens.
+        await act(f, bryn, 'own_passkey_revoke', bryn.key.credentialId.toString('base64url'));
+        await assert.rejects(f.auth.registrationOptions({token: stale}, newBrowser()), code('token_used_or_expired'));
+        // Even if the token survived the removal (belt and braces), its passkey stays pending.
+        const survived = issueOperatorBootstrap(f.store, 'jd', f.now());
+        f.store.run("UPDATE bootstrap_tokens SET account_id='bryn',first_enrollment=0 WHERE hash=?", digest(survived));
+        assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='bryn' AND state='active'"), 0);
+        const device = await addDevice(f, survived);
+        assert.ok('pending' in device.result);
+        assert.equal(f.count("SELECT count(*) n FROM sessions WHERE account_id='bryn' AND revoked=0"), 0);
+        // An admin's passkey_revoke voids outstanding tokens too.
+        const deviceId = (device.result as {pending: {credentialId: string}}).pending.credentialId;
+        await act(f, jd, 'passkey_approve', deviceId);
+        const other = issueOperatorBootstrap(f.store, 'bryn', f.now());
+        await act(f, jd, 'passkey_revoke', deviceId);
+        await assert.rejects(f.auth.registrationOptions({token: other}, newBrowser()), code('token_used_or_expired'));
+        // A fresh operator token for the now unenrolled account is a first enrollment again.
+        const fresh = issueOperatorBootstrap(f.store, 'bryn', f.now());
+        assert.equal(f.store.get<{first_enrollment: number}>('SELECT first_enrollment FROM bootstrap_tokens WHERE hash=?', digest(fresh))!.first_enrollment, 1);
+        assert.ok('token' in (await addDevice(f, fresh)).result);
+    } finally { f.close(); }
+});
+
 test('a new add-device or operator token rejects the account\'s pending passkeys, and the rejection is audited', async () => {
     const f = fixture();
     try {

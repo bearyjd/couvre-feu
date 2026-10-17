@@ -48,7 +48,7 @@ export class Store {
                 const required: Record<string, string> = {
                     accounts: 'id,display_name,role,person_ids,permission_version,active,webauthn_user_id',
                     credentials: 'id,account_id,public_key,counter,transports,label,state,created_at,last_used_at',
-                    bootstrap_tokens: 'hash,account_id,expires_at,consumed,purpose,created_by,label',
+                    bootstrap_tokens: 'hash,account_id,expires_at,consumed,purpose,created_by,label,first_enrollment',
                     auth_contexts: 'browser_hash,epoch,generation',
                     challenges: 'id,challenge,kind,account_id,account_version,bootstrap_hash,credential_ids,browser_hash,browser_epoch,browser_generation,expires_at,consumed',
                     sessions: 'hash,account_id,csrf,permission_version,expires_at,revoked,browser_hash,browser_epoch,credential_id',

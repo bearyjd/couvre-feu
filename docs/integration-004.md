@@ -60,9 +60,11 @@ per-sign-in credential snapshot; raise them there if ever needed.
   removing a passkey ends exactly those sessions. Disabling an account or changing its
   role bumps its permission version and ends all of its sessions.
 - `integration:bootstrap` looks the account up in the database (not the manifest). The
-  passkey it enrolls is active only if the account has no active passkey yet (first
-  enrollment, checked in the enrollment transaction). For an enrolled account it is
-  *pending*, like an add-device passkey. The token is 32 random bytes, stored hashed, one
+  passkey it enrolls is active only if the token was issued while the account had no
+  active passkey (`first_enrollment`, recorded at issuance) *and* the account still has
+  none at enrollment (checked in the enrollment transaction). Otherwise the passkey is
+  *pending*, like an add-device passkey. Removing any passkey voids the account's
+  outstanding tokens and step-ups. The token is 32 random bytes, stored hashed, one
   use, ten minutes. A new token consumes the old one and rejects the account's pending
   passkeys (audited `passkey_pending_rejected`).
 - The token may cross the cleartext proxy hop. First enrollment over that hop stays

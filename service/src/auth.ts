@@ -119,7 +119,7 @@ export function issueBootstrap(store: Store, accountId: string, now = Math.floor
     const token = secret();
     store.transaction(() => {
         store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', accountId);
-        store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at) VALUES(?,?,?)', digest(token), accountId, now + 600);
+        store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), accountId, now + 600);
     });
     return token;
 }
@@ -134,7 +134,9 @@ export function issueOperatorBootstrap(store: Store, accountId: string, now = Ma
         rejectPendingPasskeys(store, accountId, 'operator', now);
         if (store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', accountId)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
         store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', accountId);
-        store.run("INSERT INTO bootstrap_tokens(hash,account_id,expires_at,purpose,created_by) VALUES(?,?,?,'bootstrap','operator')", digest(token), accountId, now + 600);
+        // Recorded at issuance: a token issued for an enrolled account can never enroll an active passkey later.
+        const first = store.get("SELECT 1 FROM credentials WHERE account_id=? AND state='active'", accountId) ? 0 : 1;
+        store.run("INSERT INTO bootstrap_tokens(hash,account_id,expires_at,purpose,created_by,first_enrollment) VALUES(?,?,?,'bootstrap','operator',?)", digest(token), accountId, now + 600, first);
     });
     return token;
 }
@@ -272,6 +274,7 @@ export class Auth {
                 consumed: number;
                 purpose: 'bootstrap' | 'add_device';
                 label: string;
+                first_enrollment: number;
             }>('SELECT * FROM bootstrap_tokens WHERE hash=?', challenge.bootstrap_hash);
             if (!bootstrap || bootstrap.account_id !== challenge.account_id || bootstrap.consumed || bootstrap.expires_at <= this.now()) {
                 throw tokenUnusable();
@@ -284,10 +287,10 @@ export class Auth {
                 throw new AppError(409, 'credential_already_bound');
             }
             if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', account.id)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
-            // Every token may cross a cleartext proxy hop. Only the first passkey of an account (no active one yet, checked in
-            // this transaction) is active at once; any later passkey, and every add-device passkey, waits for admin approval.
+            // Every token may cross a cleartext proxy hop. A passkey is active only for a token issued as a first enrollment
+            // while the account still has no active passkey (checked in this transaction); every other passkey waits for approval.
             const enrolled = Boolean(this.store.get("SELECT 1 FROM credentials WHERE account_id=? AND state='active'", account.id));
-            const state = bootstrap.purpose === 'add_device' || enrolled ? 'pending' : 'active';
+            const state = bootstrap.purpose === 'bootstrap' && bootstrap.first_enrollment === 1 && !enrolled ? 'active' : 'pending';
             this.store.run('INSERT INTO credentials(id,account_id,public_key,counter,transports,label,state,created_at) VALUES(?,?,?,?,?,?,?,?)', credential.id, account.id, credential.publicKey, credential.counter, JSON.stringify(credential.transports ?? []), bootstrap.label, state, this.now());
             this.store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', account.id);
             this.store.run('UPDATE challenges SET consumed=1 WHERE account_id=?', account.id);

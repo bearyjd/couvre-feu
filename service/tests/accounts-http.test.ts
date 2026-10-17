@@ -27,7 +27,7 @@ test('account and passkey routes over HTTP: admin-only, CSRF and Origin enforced
     const key = new TestAuthenticator(), operator = client(), parent = client();
     async function enroll(who: ReturnType<typeof client>, account: string, authenticator: TestAuthenticator) {
         const token = randomBytes(32).toString('base64url');
-        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at) VALUES(?,?,?)', digest(token), account, f.now() + 600);
+        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), account, f.now() + 600);
         const options = await who.call('/auth/register/options', {token});
         return who.call('/auth/register/verify', {challengeId: options.body.challengeId, response: authenticator.register(options.body.options, origin)});
     }

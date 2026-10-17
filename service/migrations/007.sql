@@ -21,6 +21,9 @@ UPDATE sessions SET revoked=1 WHERE credential_id IS NULL;
 ALTER TABLE bootstrap_tokens ADD COLUMN purpose TEXT NOT NULL DEFAULT 'bootstrap' CHECK(purpose IN ('bootstrap','add_device'));
 ALTER TABLE bootstrap_tokens ADD COLUMN created_by TEXT;
 ALTER TABLE bootstrap_tokens ADD COLUMN label TEXT NOT NULL DEFAULT '' CHECK(length(label)<=64);
+-- 1 only when issued for an account without an active passkey. A passkey is active only if its token says so AND the
+-- account still has no active passkey at enrollment. Existing tokens default to 0 (pending), the safe side.
+ALTER TABLE bootstrap_tokens ADD COLUMN first_enrollment INTEGER NOT NULL DEFAULT 0 CHECK(first_enrollment IN (0,1));
 -- Fresh passkey confirmation for one exact account/passkey change, bound to the session and a digest of that change.
 CREATE TABLE step_ups (
  id TEXT PRIMARY KEY, challenge TEXT NOT NULL, session_hash TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES accounts(id),

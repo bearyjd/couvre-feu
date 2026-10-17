@@ -27,7 +27,7 @@ function assertMigrated(store: Store, version: number) {
     assert.deepEqual({...store.get('SELECT id,account_id,counter,transports,label,state,created_at,last_used_at FROM credentials')!},
         {id: 'cred_owner', account_id: 'owner', counter: 7, transports: '["internal"]', label: '', state: 'active', created_at: 0, last_used_at: null});
     assert.equal(store.get<{credential_id: string}>("SELECT credential_id FROM sessions WHERE hash='s1'")!.credential_id, 'cred_owner');
-    assert.deepEqual({...store.get('SELECT purpose,created_by,label FROM bootstrap_tokens')!}, {purpose: 'bootstrap', created_by: null, label: ''});
+    assert.deepEqual({...store.get('SELECT purpose,created_by,label,first_enrollment FROM bootstrap_tokens')!}, {purpose: 'bootstrap', created_by: null, label: '', first_enrollment: 0});
     // UNIQUE(account_id) is gone: a second passkey for the same account is now admissible.
     store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state,created_at) VALUES('cred_two','owner',x'02',0,'[]','pending',1)");
     assert.throws(() => store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES('cred_bad','owner',x'03',0,'[]','revoked')"), /CHECK/);

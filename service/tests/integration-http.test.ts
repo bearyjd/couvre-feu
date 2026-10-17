@@ -47,7 +47,7 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
         assert.equal(auth.rpID, enabled ? 'parent.example.test' : 'localhost');
         assert.equal((await request('/people')).status, 401);
         const token = randomBytes(32).toString('base64url');
-        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at) VALUES(?,?,?)', digest(token), 'parent', f.now() + 600);
+        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), 'parent', f.now() + 600);
         assert.equal((await request('/auth/register/options', {token, role: 'admin'})).status, 400);
         const options = await request('/auth/register/options', {token}), key = new TestAuthenticator(); assert.equal(options.status, 200);
         assert.equal(options.body.options.rp.name, 'Private integration test');

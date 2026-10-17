@@ -168,6 +168,9 @@ export class AccountAdmin {
             if (kind === 'passkey_revoke') this.managed(actor, revoked.account_id);
             this.store.run('DELETE FROM credentials WHERE id=?', target);
             this.store.run('UPDATE sessions SET revoked=1 WHERE credential_id=?', target);
+            // A token issued before the removal must not outlive it (it might otherwise meet an account left without passkeys).
+            this.store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=? AND consumed=0', revoked.account_id);
+            this.store.run('UPDATE step_ups SET consumed=1 WHERE account_id=? AND consumed=0', revoked.account_id);
             return {body: {revoked: target}, audit: target};
         }
         }

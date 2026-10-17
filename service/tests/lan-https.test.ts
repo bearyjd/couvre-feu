@@ -112,7 +112,7 @@ test('HTTPS server serves with a generated cert, sets HSTS and Secure cookies, a
         assert.equal((await get('/', {Host: NAME})).status, 403);
         assert.equal((await get('/people', {Origin: 'https://evil.example.test'})).status, 403);
         const token = randomBytes(32).toString('base64url');
-        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at) VALUES(?,?,?)', digest(token), 'parent', f.now() + 600);
+        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), 'parent', f.now() + 600);
         const post = (headers: Record<string, string>) => call('https', port, material.cert, '/auth/register/options', {Host: host, 'Content-Type': 'application/json', ...headers}, JSON.stringify({token}));
         assert.equal((await post({Origin: 'https://evil.example.test'})).status, 403);
         assert.equal((await post({Origin: `http://${host}`})).status, 403);
@@ -136,7 +136,7 @@ test('demo and loopback HTTP path is unchanged: plain HTTP, no HSTS, no Secure c
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     try {
         const token = randomBytes(32).toString('base64url');
-        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at) VALUES(?,?,?)', digest(token), 'parent', f.now() + 600);
+        f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), 'parent', f.now() + 600);
         const page = await call('http', port, undefined, '/', {Host: host});
         assert.equal(page.status, 200); assert.equal(page.headers['strict-transport-security'], undefined);
         const ok = await call('http', port, undefined, '/auth/register/options', {Host: host, Origin: origin, 'Content-Type': 'application/json'}, JSON.stringify({token}));

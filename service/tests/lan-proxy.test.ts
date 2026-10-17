@@ -178,7 +178,7 @@ test('lan-proxy HTTP from the trusted proxy keeps Host, Origin, cookie and HSTS 
         assert.equal((await get('/people', {'Sec-Fetch-Site': 'cross-site'})).status, 403);
         assert.equal((await get('/people', {'X-Forwarded-User': 'operator'})).status, 400);
         const token = randomBytes(32).toString('base64url');
-        s.f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at) VALUES(?,?,?)', digest(token), 'parent', s.f.now() + 600);
+        s.f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), 'parent', s.f.now() + 600);
         const post = (headers: Record<string, string>) => call(s.port, '/auth/register/options', {Host: s.host, 'Content-Type': 'application/json', ...headers}, JSON.stringify({token}));
         assert.equal((await post({Origin: 'https://evil.example.invalid'})).status, 403);
         assert.equal((await post({Origin: `http://${NAME}`})).status, 403);
