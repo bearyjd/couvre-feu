@@ -221,7 +221,8 @@ cfp_safe_band() {
 }
 # Wall seconds of one cfctl call since $1 (epoch); remembers the slowest call seen.
 cfp_lat_note() {
-    cfp_lat=$(($(cfp_now) - $1))
+    cfp_lat_now=$(cfp_now)
+    cfp_lat=$((${cfp_lat_now:-$1} - $1))
     [ "$cfp_lat" -le "$CFP_LAT_MAX" ] || CFP_LAT_MAX=$cfp_lat
 }
 cfp_cfctl() {
@@ -246,8 +247,8 @@ cfp_cfctl_input() {
 # its own cfctl call: on a loaded host a call takes tens of seconds, and a pause
 # that lapses inside `cfctl pause` leaves effectivePauses empty (set_drift, exit 1).
 # So the predeclared length is extended by the slowest cfctl call measured so far,
-# capped at the disclosed cfctl allowance (already inside the EXPIRY/PAUSE budgets,
-# since the call runs within the pause's own window). The call itself runs once.
+# capped at the disclosed cfctl allowance (added to the EXPIRY worst case).
+# The call itself runs once.
 # Optional $2: counters tag snapshotted just before the safe-band wait and the
 # pause apply (same slot instance until that apply).
 cfp_pause() {
