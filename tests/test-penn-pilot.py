@@ -152,7 +152,19 @@ class PilotBase(unittest.TestCase):
             'ping': "printf '%s\\n' \"PING $5\" '3 packets transmitted, 3 packets received, 0% packet loss' "
                     "'round-trip min/avg/max = 0.400/0.500/0.600 ms'\n",
             'nslookup': f'[ ! -e {shlex.quote(str(self.dns_fail))} ] || exit 1\nprintf "Name: %s\\n" "$1"\n',
-            'pgrep': "printf '4242\\n'\n"}
+            'pgrep': "printf '4242\\n4243\\n4244\\n4245\\n'\n"}
+        # Fake /proc: GL firmware crond, crond on the (symlinked) default dir, crond on /etc/crontabs;
+        # pid 4245 has no /proc entry (exited between pgrep and the read) and must not be counted.
+        self.proc = self.work / 'proc'
+        self.etc_cron = self.work / 'etc-crontabs'
+        self.etc_cron.mkdir()
+        self.default_cron = self.work / 'spool-crontabs'
+        self.default_cron.symlink_to(self.etc_cron)
+        for pid, args in (('4242', ['/usr/sbin/crond', '-f', '-c', str(self.work / 'gl_crontabs'), '-l', '10']),
+                          ('4243', ['/usr/sbin/crond', '-f', f'-c{self.etc_cron}', '-l', '5']),
+                          ('4244', ['/usr/sbin/crond', '-f'])):
+            (self.proc / pid).mkdir(parents=True)
+            (self.proc / pid / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in args) + b'\0')
         for family in ('iptables', 'ip6tables'):
             backend = shlex.quote(str(self.fixture.bin / family))
             tools[family] = (f'out=$({backend} "$@") || {{ status=$?; printf "%s\\n" "$out"; exit $status; }}\n'
@@ -165,6 +177,8 @@ class PilotBase(unittest.TestCase):
             path.chmod(0o700)
         env = dict(self.fixture.env, CF_TEST_INSTALL_KERNEL='1', CF_TEST_RELEASE_DIR='1',
                    PATH=str(self.rbin) + os.pathsep + self.fixture.env['PATH'])
+        env.update(CFP_PROC_DIR=str(self.proc), CFP_ETC_CRONTABS=str(self.etc_cron),
+                   CFP_DEFAULT_CRONTABS=str(self.default_cron))
         env.pop('CF_NOW', None)  # the pilot needs a moving clock for timed expiry
         self.ssh_log = self.work / 'ssh-argv.jsonl'
         self.spec_path = self.work / 'fake-ssh.json'
@@ -415,7 +429,9 @@ class PilotFixtureTests(PilotBase):
         self.assertEqual(measured['timed_expiry']['label'], 'measured')
         self.assertEqual(measured['service_key_confinement']['label'], 'unmeasured')
         self.assertEqual(measured['dns_rule_doh']['label'], 'unmeasured')
-        self.assertIn('during_expiry=1', measured['crond_processes']['detail'])
+        # etc= counts crond on /etc/crontabs (explicit -c/dir and default dir); GL's own crond is other.
+        self.assertIn('baseline=etc2,other1 after_install=etc2,other1 during_expiry=etc2,other1 duplicate_etc_crond',
+                      measured['crond_processes']['detail'])
         self.assertFalse(summary['pauseRulesKernelTimeBound'])
         argv = [json.loads(line) for line in self.ssh_log.read_text().splitlines()]
         self.assertEqual(len(argv), 1)

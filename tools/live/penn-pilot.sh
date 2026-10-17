@@ -148,13 +148,33 @@ cfp_adult_probe() {
         [ "$1" -gt 0 ] || { CFP_ADULT_REASON=jd_adult_ping_lost; return 1; }
     fi
 }
+# Crontab directory of one crond pid: arg after -c (or -c/dir), else the BusyBox default;
+# empty when the pid has gone.
+cfp_crond_dir() {
+    tr '\000' '\n' < "${CFP_PROC_DIR:-/proc}/$1/cmdline" 2>/dev/null | awk -v d="${CFP_DEFAULT_CRONTABS:-/var/spool/cron/crontabs}" '
+        p { d = $0; p = 0; next }
+        $0 == "-c" { p = 1; next }
+        substr($0, 1, 2) == "-c" { d = substr($0, 3) }
+        END { if (NR) print d }'
+}
+# GL firmware runs its own crond (-c /tmp/gl_crontabs); only crond on /etc/crontabs is Couvre-feu's.
 cfp_crond_count() {
-    if command -v pgrep >/dev/null 2>&1; then cfp_n=$(pgrep crond </dev/null 2>/dev/null | wc -l)
-    else cfp_n=$(ps w 2>/dev/null | awk '$0~/crond/&&$0!~/awk/{n++}END{print n+0}'); fi
-    cfr_info "crond_processes $1 $cfp_n"
+    if command -v pgrep >/dev/null 2>&1; then cfp_pids=$(pgrep crond </dev/null 2>/dev/null)
+    else cfp_pids=$(ps w 2>/dev/null | awk '$0~/crond/&&$0!~/awk/{print $1}'); fi
+    cfp_etc=0 cfp_other=0 cfp_want=$(readlink -f "${CFP_ETC_CRONTABS:-/etc/crontabs}" 2>/dev/null)
+    for cfp_pid in $cfp_pids; do
+        cfp_cdir=$(cfp_crond_dir "$cfp_pid")
+        [ -n "$cfp_cdir" ] || continue  # pid exited before its cmdline was read
+        if [ -n "$cfp_want" ] && [ "$(readlink -f "$cfp_cdir" 2>/dev/null)" = "$cfp_want" ]; then
+            cfp_etc=$((cfp_etc + 1))
+        else cfp_other=$((cfp_other + 1)); fi
+    done
+    cfr_info "crond_processes $1 etc=$cfp_etc other=$cfp_other"
     case $1 in
-        baseline) CFP_CROND_BASELINE=$cfp_n;; after_install) CFP_CROND_INSTALL=$cfp_n;;
-        during_expiry) CFP_CROND_EXPIRY=$cfp_n;; after_uninstall) CFP_CROND_UNINSTALL=$cfp_n;;
+        baseline) CFP_CROND_BASELINE=$cfp_etc CFP_CROND_OTHER_BASELINE=$cfp_other;;
+        after_install) CFP_CROND_INSTALL=$cfp_etc CFP_CROND_OTHER_INSTALL=$cfp_other;;
+        during_expiry) CFP_CROND_EXPIRY=$cfp_etc CFP_CROND_OTHER_EXPIRY=$cfp_other;;
+        after_uninstall) CFP_CROND_UNINSTALL=$cfp_etc CFP_CROND_OTHER_UNINSTALL=$cfp_other;;
     esac
 }
 
@@ -478,7 +498,9 @@ cfp_expiry_phase() {
     cfp_counters expired || cfr_info 'counters expired unavailable'
     cfr_out "MEASURE timed_expiry measured latency_s=$((cfp_t - CFP_UNTIL)) tolerance_s=$CFP_EXPIRY_TOLERANCE poll_s=$CFP_EXPIRY_POLL"
     cfp_status '"effectivePauses":[]' '"paused":[]' || cfp_stop EXPIRY status_not_clean_after_expiry
-    cfr_out "MEASURE crond_processes measured baseline=$CFP_CROND_BASELINE after_install=$CFP_CROND_INSTALL during_expiry=$CFP_CROND_EXPIRY"
+    cfp_dup=
+    [ "${CFP_CROND_INSTALL:-0}" -le 1 ] && [ "${CFP_CROND_EXPIRY:-0}" -le 1 ] || cfp_dup=' duplicate_etc_crond'
+    cfr_out "MEASURE crond_processes measured baseline=etc$CFP_CROND_BASELINE,other$CFP_CROND_OTHER_BASELINE after_install=etc$CFP_CROND_INSTALL,other$CFP_CROND_OTHER_INSTALL during_expiry=etc$CFP_CROND_EXPIRY,other$CFP_CROND_OTHER_EXPIRY$cfp_dup"
     cfr_ok EXPIRY
 }
 cfp_dns_phase() {
