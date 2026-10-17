@@ -71,6 +71,9 @@ per-sign-in credential snapshot; raise them there if ever needed.
   This keeps a cleartext proxy-hop sniffer holding cookies and CSRF from escalating.
 - At least one active admin must keep an active passkey (`last_admin_required`).
 - There is no password login and no QR code yet; the token is shown once as text.
+- Upgrading applies migration `007` (integration `user_version` 5). Older code refuses the
+  upgraded database (`unsupported_database_version`) and there is no down-migration: stop the
+  service and copy `integration.sqlite` (with `-wal`/`-shm`) privately before deploying.
 
 ### Rebinding to a later manifest
 
