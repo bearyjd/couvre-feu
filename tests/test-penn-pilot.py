@@ -387,6 +387,47 @@ class PilotPlanTests(PilotBase):
             self.assertIn(f"CFP_WORST_{phase}='{seconds}'\n", payload)
             self.assertIn(f'cfp_budget {phase} "$CFP_WORST_{phase}"', payload)
 
+    def pause_lead(self, prior_call_s, pause_s=45, allowance=45):
+        """Seconds between the clock at the pause call and CFP_UNTIL after one prior `prior_call_s` cfctl call."""
+        clock = self.work / 'fake-clock'
+        body = (f'CLK={shlex.quote(str(clock))}\necho 1000 > "$CLK"\n'
+                'cfp_now() { cat "$CLK"; }\ncfp_safe_band() { return 0; }\n'
+                f'cfr_run_sh() {{ echo $(($(cat "$CLK") + {prior_call_s})) > "$CLK"; }}\n'
+                f'CFR_CFCTL=cfctl\nCFP_PERSON=penn\nCFP_DIR={shlex.quote(str(self.work))}\nCFP_CFCTL_ALLOWANCE={allowance}\n'
+                f'{"cfp_cfctl status --json > /dev/null\n" if prior_call_s else ""}'
+                'cfp_before=$(cfp_now)\ncfp_pause ' + str(pause_s) + '\nprintf "%s\\n" "$((CFP_UNTIL - cfp_before))"\n')
+        code, out = self.pilot_shell(body)
+        self.assertEqual(code, 0, out)
+        return int(out.split()[-1])
+
+    def test_timed_pause_outlasts_measured_cfctl_latency(self):
+        # Root cause of the load flake: a 45 s pause was issued while cfctl calls took 40-46 s on a loaded host,
+        # so the pause lapsed inside its own `cfctl pause` (effectivePauses empty, set_drift, exit 1).
+        self.assertEqual(self.pause_lead(0), 45)       # nothing measured yet: the predeclared length
+        self.assertEqual(self.pause_lead(40), 45 + 40)  # outlasts the slowest prior call by its own duration
+        self.assertEqual(self.pause_lead(100), 45 + 45)  # margin capped at the disclosed cfctl allowance
+        self.assertEqual(self.pause_lead(3, pause_s=120), 123)
+
+    def test_expiry_worst_case_includes_pause_extension_and_is_disclosed(self):
+        timing, tool = self.tool.TIMING, self.tool
+        call = tool.SAFE_BAND_WAIT_SECONDS + tool.CFCTL_ALLOWANCE_SECONDS
+        expected = (call + timing['expirySeconds'] + tool.CFCTL_ALLOWANCE_SECONDS + timing['expiryToleranceSeconds']
+                    + tool.iteration_worst_seconds(timing) + tool.COUNTERS_WORST_SECONDS + call)
+        self.assertEqual(tool.phase_worst_seconds(timing)['EXPIRY'], expected)
+        # The shipped timing: 2917 before the pause extension, 2962 with it.
+        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **{
+            'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds': 20, 'expirySeconds': 120,
+            'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5})), 2962)
+        details = self.plan_details(self.write_config())
+        self.assertEqual(details['timing']['cfctlAllowanceSeconds'], 45)
+        config = tool.FR.load_config(self.write_config())
+        commit, blobs = tool.FR.head_source()
+        self.assertIn("CFP_CFCTL_ALLOWANCE='45'\n", tool.build_payload(config, commit, blobs, timing)[0].decode())
+
+    def test_latency_guard_treats_empty_clock_as_zero(self):
+        code, out = self.pilot_shell('cfp_now() { :; }\ncfp_lat_note 1000\necho "$cfp_lat $CFP_LAT_MAX"\n')
+        self.assertEqual((code, out), (0, '0 0\n'))
+
     def test_teardown_ignores_signals_before_marking_itself(self):
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()
         body = script[script.index('cfp_teardown() {'):]
