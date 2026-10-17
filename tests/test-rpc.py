@@ -875,13 +875,17 @@ class MultiScopeRpcTests(unittest.TestCase):
     def test_install_refuses_protected_duplicate_malformed_and_oversized_scope(self):
         self.assertEqual(self.script('uninstall.sh').returncode, 0)
         too_many = ['02:00:00:00:{:02x}:{:02x}'.format(i // 256, i % 256) for i in range(1, 258)]
-        for args in (scope_args(KID, PROTECTED), scope_args(PROTECTED), scope_args(KID, KID),
-                     scope_args(KID, '02:00:00:00:00:0G'), scope_args(KID, '02:00:00:00:00:0A'),
-                     scope_args(KID, '03:00:00:00:00:01'), scope_args(KID, '00:00:00:00:00:00'),
-                     scope_args(KID, ''), scope_args(KID + '\n' + THIRD_KID), ['--rpc-allow'],
-                     scope_args(*too_many)):
+        protected = 'RPC allowed MAC is protected'
+        invalid = '--rpc-allow requires 1-256 unique canonical unicast MACs'
+        argument = '--rpc-allow requires one canonical MAC'
+        for args, text in ((scope_args(KID, PROTECTED), protected), (scope_args(PROTECTED), protected),
+                           (scope_args(KID, KID), invalid),
+                           (scope_args(KID, '02:00:00:00:00:0G'), invalid), (scope_args(KID, '02:00:00:00:00:0A'), invalid),
+                           (scope_args(KID, '03:00:00:00:00:01'), invalid), (scope_args(KID, '00:00:00:00:00:00'), invalid),
+                           (scope_args(KID, ''), argument), (scope_args(KID + '\n' + THIRD_KID), argument),
+                           (['--rpc-allow'], argument), (scope_args(*too_many), invalid)):
             with self.subTest(args=args[:6]):
-                self.refused_install(*args)
+                self.refused_install(*args, text=text)
 
     def test_maximum_scope_of_256_installs_and_binds(self):
         self.assertEqual(self.script('uninstall.sh').returncode, 0)

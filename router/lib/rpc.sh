@@ -26,7 +26,8 @@ cf_rpc_binding() {
     fi
     cf_safe_file "$CF_DIR/rpc-allowed" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_state.staged" || { cf_fail invalid_rpc_scope;return 1; }
     cmp -s "$CF_DIR/rpc-allowed" "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" || { cf_fail invalid_rpc_scope;return 1; }
-    # Read once: later checks use this validated value, never the file again.
+    # Validated only after cmp against the signed staged copy; later policy and
+    # activity checks use this in-memory value, never the file again.
     CF_SCOPE=$(cf_scope_file "$CF_DIR/rpc-allowed") && [ -n "$CF_SCOPE" ] || { CF_SCOPE=;cf_fail invalid_rpc_scope;return 1; }
     [ "$(wc -c < "$CF_DIR/backup/etc_couvrefeu_state.staged")" -le 131072 ] || { cf_fail inactive_generation;return 1; }
     cf_binding_meta=$(awk -v mode=meta -f "$CF_LIB/state.awk" "$CF_DIR/backup/etc_couvrefeu_state.staged") || { cf_fail inactive_generation;return 1; }
