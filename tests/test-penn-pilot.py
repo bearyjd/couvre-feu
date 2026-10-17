@@ -152,8 +152,9 @@ class PilotBase(unittest.TestCase):
             'ping': "printf '%s\\n' \"PING $5\" '3 packets transmitted, 3 packets received, 0% packet loss' "
                     "'round-trip min/avg/max = 0.400/0.500/0.600 ms'\n",
             'nslookup': f'[ ! -e {shlex.quote(str(self.dns_fail))} ] || exit 1\nprintf "Name: %s\\n" "$1"\n',
-            'pgrep': "printf '4242\\n4243\\n4244\\n'\n"}
-        # Fake /proc: GL firmware crond, crond on the (symlinked) default dir, crond on /etc/crontabs.
+            'pgrep': "printf '4242\\n4243\\n4244\\n4245\\n'\n"}
+        # Fake /proc: GL firmware crond, crond on the (symlinked) default dir, crond on /etc/crontabs;
+        # pid 4245 has no /proc entry (exited between pgrep and the read) and must not be counted.
         self.proc = self.work / 'proc'
         self.etc_cron = self.work / 'etc-crontabs'
         self.etc_cron.mkdir()

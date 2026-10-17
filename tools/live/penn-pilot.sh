@@ -148,13 +148,14 @@ cfp_adult_probe() {
         [ "$1" -gt 0 ] || { CFP_ADULT_REASON=jd_adult_ping_lost; return 1; }
     fi
 }
-# Crontab directory of one crond pid: arg after -c (or -c/dir), else the BusyBox default.
+# Crontab directory of one crond pid: arg after -c (or -c/dir), else the BusyBox default;
+# empty when the pid has gone.
 cfp_crond_dir() {
     tr '\000' '\n' < "${CFP_PROC_DIR:-/proc}/$1/cmdline" 2>/dev/null | awk -v d="${CFP_DEFAULT_CRONTABS:-/var/spool/cron/crontabs}" '
         p { d = $0; p = 0; next }
         $0 == "-c" { p = 1; next }
         substr($0, 1, 2) == "-c" { d = substr($0, 3) }
-        END { print d }'
+        END { if (NR) print d }'
 }
 # GL firmware runs its own crond (-c /tmp/gl_crontabs); only crond on /etc/crontabs is Couvre-feu's.
 cfp_crond_count() {
@@ -163,6 +164,7 @@ cfp_crond_count() {
     cfp_etc=0 cfp_other=0 cfp_want=$(readlink -f "${CFP_ETC_CRONTABS:-/etc/crontabs}" 2>/dev/null)
     for cfp_pid in $cfp_pids; do
         cfp_cdir=$(cfp_crond_dir "$cfp_pid")
+        [ -n "$cfp_cdir" ] || continue  # pid exited before its cmdline was read
         if [ -n "$cfp_want" ] && [ "$(readlink -f "$cfp_cdir" 2>/dev/null)" = "$cfp_want" ]; then
             cfp_etc=$((cfp_etc + 1))
         else cfp_other=$((cfp_other + 1)); fi
