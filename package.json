@@ -11,6 +11,7 @@
     "integration:bootstrap": "node service/src/integration-bootstrap.ts",
     "integration:dispatch": "node service/src/integration-dispatch.ts",
     "integration:rebind": "node service/src/integration-rebind-cli.ts",
+    "integration:revoke-passkeys": "node service/src/integration-revoke-cli.ts",
     "demo:router": "node demo-router/src/main.ts",
     "demo:bootstrap": "node service/src/bootstrap.ts",
     "demo:scenario": "node demo-router/src/scenario-cli.ts",

@@ -129,10 +129,10 @@ export function issueBootstrap(store: Store, accountId: string, now = Math.floor
  */
 export function issueOperatorBootstrap(store: Store, accountId: string, now = Math.floor(Date.now() / 1000)): string {
     if (!store.get('SELECT id FROM accounts WHERE id=? AND active=1', accountId)) throw new AppError(404, 'unknown_private_account');
-    if (store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', accountId)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
     const token = secret();
     store.transaction(() => {
         rejectPendingPasskeys(store, accountId, 'operator', now);
+        if (store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', accountId)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
         store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', accountId);
         store.run("INSERT INTO bootstrap_tokens(hash,account_id,expires_at,purpose,created_by) VALUES(?,?,?,'bootstrap','operator')", digest(token), accountId, now + 600);
     });

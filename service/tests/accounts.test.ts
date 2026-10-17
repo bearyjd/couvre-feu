@@ -219,9 +219,25 @@ test('defensive account and passkey limits are generous constants enforced at th
         await assert.rejects(act(f, jd, 'account_create', '', {displayName: 'One too many', role: 'parent', personIds: ['alex']}), (e: {status: number; code: string}) => e.status === 409 && e.code === 'account_limit_reached');
         for (let i = 1; i < PASSKEYS_PER_ACCOUNT - 1; i++) f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES(?,'jd',?,0,'[]','active')", `filler_${i}`, new Uint8Array([1]));
         const last = await act(f, jd, 'token_issue', 'jd', {label: ''}) as {token: string};
-        await addDevice(f, last.token);
+        const lastDevice = await addDevice(f, last.token);
         assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd'"), PASSKEYS_PER_ACCOUNT);
+        // A pending passkey would be rejected by the next token; an approved one counts against the limit.
+        await act(f, jd, 'passkey_approve', (lastDevice.result as {pending: {credentialId: string}}).pending.credentialId);
         await assert.rejects(act(f, jd, 'token_issue', 'jd', {label: ''}), code('passkey_limit_reached'));
+    } finally { f.close(); }
+});
+
+test('reissuing a token first rejects pending passkeys, then counts against the passkey limit', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd');
+        for (let i = 1; i < PASSKEYS_PER_ACCOUNT; i++) f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES(?,'jd',?,0,'[]','pending')", `filler_${i}`, new Uint8Array([1]));
+        assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd'"), PASSKEYS_PER_ACCOUNT);
+        await act(f, jd, 'token_issue', 'jd', {label: ''});
+        assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd'"), 1);
+        for (let i = 1; i < PASSKEYS_PER_ACCOUNT; i++) f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES(?,'jd',?,0,'[]','pending')", `filler_${i}`, new Uint8Array([1]));
+        issueOperatorBootstrap(f.store, 'jd', f.now());
+        assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd'"), 1);
     } finally { f.close(); }
 });
 

@@ -71,6 +71,10 @@ per-sign-in credential snapshot; raise them there if ever needed.
   pairing-code comparison, a step-up and an admin approval. An unknown, used or expired
   token gets one answer (`token_used_or_expired`) that asks the user to have an admin
   check the pending devices.
+- `integration:revoke-passkeys` (operator, on the host) removes every passkey of one
+  account and ends its sessions. It refuses to leave no active admin with a passkey unless
+  `--allow-no-admin` is passed (sole-admin recovery; the next bootstrap is then an active
+  first enrollment). See the recovery section of `docs/runbooks/http-behind-proxy.md`.
 - An admin-issued add-device token (same properties) enrolls a *pending* passkey that
   cannot sign in. The device shows a pairing code (first 6 base32 characters of
   sha256(credential id)); the admin compares it before approving.
@@ -241,6 +245,7 @@ values; `execute` needs the exact invocation approval before it can be used:
 npm run integration:start -- "<PRIVATE_MANIFEST>"
 npm run integration:bootstrap -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>"
 npm run integration:rebind -- "<OLD_MANIFEST>" "<NEW_MANIFEST>" "<OLD_SHA256>" "<NEW_SHA256>"
+npm run integration:revoke-passkeys -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>" [--allow-no-admin]
 npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" observe
 npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" apply "<OPERATION_ID>"
 npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" receipt "<OPERATION_ID>"
