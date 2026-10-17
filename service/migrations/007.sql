@@ -15,6 +15,8 @@ CREATE INDEX credentials_account ON credentials(account_id);
 ALTER TABLE sessions ADD COLUMN credential_id TEXT;
 -- Before 007 an account held at most one passkey, so every existing session came from that passkey.
 UPDATE sessions SET credential_id=(SELECT id FROM credentials WHERE credentials.account_id=sessions.account_id);
+-- A session that no passkey can account for could never be ended by passkey removal.
+UPDATE sessions SET revoked=1 WHERE credential_id IS NULL;
 -- 'bootstrap' (operator CLI) yields an active passkey; 'add_device' (admin UI) yields a pending one that an admin must approve.
 ALTER TABLE bootstrap_tokens ADD COLUMN purpose TEXT NOT NULL DEFAULT 'bootstrap' CHECK(purpose IN ('bootstrap','add_device'));
 ALTER TABLE bootstrap_tokens ADD COLUMN created_by TEXT;

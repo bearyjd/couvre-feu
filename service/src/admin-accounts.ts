@@ -74,7 +74,7 @@ export class AccountAdmin {
     }
     list(actor: Actor): {accounts: AccountDTO[]} {
         this.allowed(actor, 'account_create');
-        return {accounts: this.store.all<AccountRow>('SELECT * FROM accounts ORDER BY id').map(row => this.dto(row))};
+        return {accounts: this.store.all<AccountRow>('SELECT * FROM accounts ORDER BY id').filter(row => this.covers(actor, row)).map(row => this.dto(row))};
     }
     mine(session: AuthSession): {passkeys: (PasskeyDTO & {current: boolean})[]} {
         return {passkeys: this.passkeys(session.dto.actor.id).map(p => ({...p, current: p.id === session.credentialId}))};
@@ -106,6 +106,15 @@ export class AccountAdmin {
     private adminsWithPasskey(): number {
         return this.store.get<{n: number}>("SELECT count(DISTINCT a.id) n FROM accounts a JOIN credentials c ON c.account_id=a.id WHERE a.role='admin' AND a.active=1 AND c.state='active'")!.n;
     }
+    /** An admin may manage only accounts whose people all lie inside the admin's own scope. */
+    private covers(actor: Actor, row: AccountRow): boolean {
+        return (JSON.parse(row.person_ids) as string[]).every(person => actor.personIds.includes(person));
+    }
+    private managed(actor: Actor, id: string): AccountRow {
+        const row = this.account(id);
+        if (!this.covers(actor, row)) throw new AppError(403, 'outside_scope');
+        return row;
+    }
     private account(id: string): AccountRow {
         const row = this.store.get<AccountRow>('SELECT * FROM accounts WHERE id=?', id);
         if (!row) throw new AppError(404, 'account_not_found');
@@ -126,7 +135,7 @@ export class AccountAdmin {
             return {body: {account: this.dto(this.account(id))}, audit: id};
         }
         case 'token_issue': {
-            if (!this.account(target).active) throw new AppError(409, 'account_disabled');
+            if (!this.managed(actor, target).active) throw new AppError(409, 'account_disabled');
             if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', target)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached', `This account already has ${PASSKEYS_PER_ACCOUNT} passkeys; remove one first.`);
             // One outstanding token per account: a new one consumes the old.
             const token = randomBytes(32).toString('base64url');
@@ -136,20 +145,23 @@ export class AccountAdmin {
         }
         case 'account_role':
         case 'account_active': {
-            this.account(target);
+            this.managed(actor, target);
             // Bumping the permission version ends every session of that account at its next request.
             if (kind === 'account_role') this.store.run('UPDATE accounts SET role=?,permission_version=permission_version+1 WHERE id=?', params.role as string, target);
             else this.store.run('UPDATE accounts SET active=?,permission_version=permission_version+1 WHERE id=?', params.active ? 1 : 0, target);
             return {body: {account: this.dto(this.account(target))}, audit: kind === 'account_role' ? `${target}:${params.role}` : `${target}:${params.active ? 'enabled' : 'disabled'}`};
         }
         case 'passkey_approve': {
-            if (this.credential(target).state !== 'pending') throw new AppError(409, 'passkey_not_pending');
+            const pending = this.credential(target);
+            this.managed(actor, pending.account_id);
+            if (pending.state !== 'pending') throw new AppError(409, 'passkey_not_pending');
             this.store.run("UPDATE credentials SET state='active' WHERE id=?", target);
             return {body: {passkey: this.passkeys(this.credential(target).account_id).find(p => p.id === target)}, audit: target};
         }
         case 'passkey_revoke':
         case 'own_passkey_revoke': {
-            this.credential(target, kind === 'own_passkey_revoke' ? actor.id : undefined);
+            const revoked = this.credential(target, kind === 'own_passkey_revoke' ? actor.id : undefined);
+            if (kind === 'passkey_revoke') this.managed(actor, revoked.account_id);
             this.store.run('DELETE FROM credentials WHERE id=?', target);
             this.store.run('UPDATE sessions SET revoked=1 WHERE credential_id=?', target);
             return {body: {revoked: target}, audit: target};

@@ -14,6 +14,7 @@ const equal = (a: string, b: string) => {
     return left.length === right.length && timingSafeEqual(left, right);
 };
 const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const STEP_UPS_PER_MINUTE = 10;
 /** Short code an enrolling device shows and an approving admin compares: first 6 base32 characters of sha256(credential id). */
 export function pairingCode(credentialId: string): string {
     let bits = 0, value = 0, code = '';
@@ -128,6 +129,8 @@ export class Auth {
     readonly rpID: string;
     readonly now: () => number;
     private attempts: number[] = [];
+    /** Per-account, so one signed-in account cannot exhaust the shared sign-in limiter. Bounded by ACCOUNT_LIMIT keys. */
+    private stepUpAttempts = new Map<string, number[]>();
     readonly provenance: Provenance;
     readonly rpName: string;
     constructor(store: Store, origin: string, now = () => Math.floor(Date.now() / 1000), context: {provenance?: Provenance; rpName?: string} = {}) {
@@ -394,7 +397,10 @@ export class Auth {
     }
     /** A fresh assertion challenge limited to the session account's own active passkeys and bound to one exact change. */
     async stepUpChallenge(session: AuthSession, binding: string) {
-        this.rateLimit();
+        const now = this.now(), recent = (this.stepUpAttempts.get(session.dto.actor.id) ?? []).filter(timestamp => timestamp > now - 60);
+        if (recent.length >= STEP_UPS_PER_MINUTE) throw new AppError(429, 'step_up_rate_limited');
+        this.stepUpAttempts.set(session.dto.actor.id, [...recent, now]);
+        this.store.run('DELETE FROM step_ups WHERE expires_at<? OR consumed=1', now);
         const credentials = this.store.all<{id: string; transports: string}>("SELECT id,transports FROM credentials WHERE account_id=? AND state='active'", session.dto.actor.id);
         if (!credentials.length) throw new AppError(403, 'step_up_unavailable');
         const options = await generateAuthenticationOptions({

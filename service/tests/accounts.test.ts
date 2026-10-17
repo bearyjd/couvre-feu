@@ -239,3 +239,33 @@ test('operator CLI bootstrap looks the account up in the database and can add an
         assert.throws(() => issueOperatorBootstrap(f.store, 'parent_db', f.now()), /unknown_private_account/);
     } finally { f.cleanup(); }
 });
+
+test('step-up has its own per-account limiter, so one account cannot exhaust sign-in for everyone', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd'), bryn = await bootstrap(f, 'bryn');
+        const own = {action: 'own_passkey_revoke' as const, target: bryn.key.credentialId.toString('base64url'), params: {}};
+        for (let i = 0; i < 10; i++) await f.admin.stepUpOptions(bryn.session(), own);
+        await assert.rejects(f.admin.stepUpOptions(bryn.session(), own), (e: {status: number; code: string}) => e.status === 429 && e.code === 'step_up_rate_limited');
+        await f.auth.loginOptions({}, newBrowser());
+        await f.admin.stepUpOptions(jd.session(), {action: 'account_active', target: 'bryn', params: {active: false}});
+        f.advance(61);
+        await f.admin.stepUpOptions(bryn.session(), own);
+    } finally { f.close(); }
+});
+
+test('an admin can act only on accounts whose people are all inside the admin scope', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd');
+        await act(f, jd, 'account_role', 'bryn', {role: 'admin'});
+        const bryn = await bootstrap(f, 'bryn');
+        // bryn is an admin for alex only; jd also covers blair.
+        assert.deepEqual(f.admin.list(bryn.session().dto.actor).accounts.map(a => a.id), ['bryn']);
+        for (const [kind, params] of [['token_issue', {label: ''}], ['account_role', {role: 'parent'}], ['account_active', {active: false}]] as const) {
+            await assert.rejects(act(f, bryn, kind, 'jd', params), code('outside_scope'));
+        }
+        await assert.rejects(act(f, bryn, 'passkey_revoke', jd.key.credentialId.toString('base64url')), code('outside_scope'));
+        assert.equal(jd.session().dto.actor.role, 'admin');
+    } finally { f.close(); }
+});
