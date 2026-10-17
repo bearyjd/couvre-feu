@@ -428,6 +428,14 @@ class PilotPlanTests(PilotBase):
         code, out = self.pilot_shell('cfp_now() { :; }\ncfp_lat_note 1000\necho "$cfp_lat $CFP_LAT_MAX"\n')
         self.assertEqual((code, out), (0, '0 0\n'))
 
+    def test_empty_clock_stops_safely_instead_of_arithmetic_error(self):
+        empty = 'cfp_now() { :; }\nCFR_START=1000\nCFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\n'
+        self.assertEqual(self.pilot_shell(empty + 'cfp_elapsed_ok 0 || echo not_ok\n'), (0, 'not_ok\n'))
+        self.assertEqual(self.pilot_shell(empty + 'cfp_observe 5 paused PAUSE\n'),
+                         (20, 'STOP PAUSE clock_unavailable\n'))
+        body = empty + 'cfp_safe_band() { return 0; }\nCFP_LAT_MAX=0\nCFP_CFCTL_ALLOWANCE=45\ncfp_pause 45 || echo pause_refused\n'
+        self.assertEqual(self.pilot_shell(body), (0, 'pause_refused\n'))
+
     def test_teardown_ignores_signals_before_marking_itself(self):
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()
         body = script[script.index('cfp_teardown() {'):]

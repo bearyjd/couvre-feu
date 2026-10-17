@@ -658,6 +658,13 @@ class LiveRehearsalTests(unittest.TestCase):
         installed |= set(re.findall(r'; ((?:usr|etc)/\S+?)\) staged=', (REPO / 'router/install.sh').read_text()))
         self.assertTrue(installed)
         self.assertEqual(installed - self.rehearsal_var('CFR_FILES'), set())
+        # install-common.sh's own FILES inventory (initial list plus every appended path, activity.sh included).
+        common = (REPO / 'router/lib/install-common.sh').read_text()
+        common_files = set(re.findall(r"^FILES='([^']*)'$", common, re.M)[0].split())
+        for appended in re.findall(r'^\s*FILES="\$FILES ([^"]*)"$', common, re.M):
+            common_files |= set(appended.split())
+        self.assertIn('usr/lib/couvrefeu/activity.sh', common_files)
+        self.assertEqual(common_files - self.rehearsal_var('CFR_FILES'), set())
 
     def test_busy_result_status_keys_match_cf_status(self):
         lines = [line for line in (REPO / 'router/lib/core.sh').read_text().splitlines()
