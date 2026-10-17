@@ -22,7 +22,7 @@ prune();
 const pruneTimer = setInterval(prune, 3600000);
 const server = appServer(auth, new IntegrationPolicy(store), config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config, undefined, activity);
 server.listen(config.port, config.listen?.host ?? '127.0.0.1', () => {
-    const where = config.listen ? `private LAN HTTPS ${config.origin}` : 'loopback';
+    const where = config.trustedProxies ? `private LAN proxy HTTP ${config.origin} via ${config.trustedProxies.length} trusted proxies` : config.listen ? `private LAN HTTPS ${config.origin}` : 'loopback';
     process.stdout.write(automatic ? `Private integration listening on ${where}; manifest-enabled automatic dispatch active.\n` : `Private integration listening on ${where}; dispatch requires an exact one-use operator permit.\n`);
     automatic?.start();
 });

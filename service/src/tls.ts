@@ -22,12 +22,16 @@ export function loadTLS(files: TLSFiles): TLSMaterial {
     return {cert, key};
 }
 
-/** RFC 1918 private IPv4 or Tailscale CGNAT (100.64.0.0/10); never wildcard, loopback or public. */
-export function privateListenHost(value: unknown): string {
+/** One specific RFC 1918 IPv4 literal (plus Tailscale CGNAT 100.64.0.0/10 when allowed); never wildcard, loopback, public, CIDR, IPv6 or a name. */
+export function privateIPv4(value: unknown, options: {allowTailnet: boolean}): string {
     const m = typeof value === 'string' ? /^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$/.exec(value) : null;
     const o = m ? m.slice(1).map(Number) : [];
     if (!m || o.some(n => n > 255)) throw new Error('invalid_listen_host');
     const [a, b] = o;
-    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) return value as string;
+    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (options.allowTailnet && a === 100 && b >= 64 && b <= 127)) return value as string;
     throw new Error('listen_host_not_private');
+}
+/** RFC 1918 private IPv4 or Tailscale CGNAT (100.64.0.0/10); never wildcard, loopback or public. */
+export function privateListenHost(value: unknown): string {
+    return privateIPv4(value, {allowTailnet: true});
 }

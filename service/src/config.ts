@@ -6,6 +6,8 @@ export interface DemoConfig {
     dataDir: string;
     /** Present only for the LAN HTTPS integration listener. */
     tlsMaterial?: {cert: Buffer; key: Buffer};
+    /** Present only for the plain-HTTP LAN listener behind a TLS-terminating proxy: exact allowed source IPv4 addresses. */
+    trustedProxies?: readonly string[];
 }
 export function demoConfig(env: NodeJS.ProcessEnv = process.env): DemoConfig {
     // No production mode or transport exists. Only a local port and data directory are configurable.

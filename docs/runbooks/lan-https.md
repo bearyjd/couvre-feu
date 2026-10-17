@@ -16,7 +16,7 @@ Add all three to the private integration manifest (they are all-or-nothing, and 
 - `publicOrigin` is `https://name[:port]` with a lowercase DNS name that contains a dot. It becomes the WebAuthn origin and `rpId` (the hostname). Requests whose `Host` or `Origin` differ are rejected with 403. Use the exact name you will type on the phone; changing it later invalidates enrolled passkeys.
 - Paths are absolute, normalized, and use only `[A-Za-z0-9_./-]`.
 
-The service then uses `node:https` (TLS 1.2+), sends `Strict-Transport-Security`, and marks cookies `Secure` in addition to `HttpOnly; SameSite=Strict`. Without these fields behavior is unchanged (loopback HTTP).
+The service then uses `node:https` (TLS 1.2+), sends `Strict-Transport-Security`, and marks cookies `Secure` in addition to `HttpOnly; SameSite=Strict`. Without these fields behavior is unchanged (loopback HTTP). For a TLS-terminating proxy on another LAN host forwarding plain HTTP, see `http-behind-proxy.md`.
 
 ## File permissions
 

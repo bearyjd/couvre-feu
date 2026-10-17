@@ -8,18 +8,20 @@ import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import { hexDigest, sha256 } from '../../shared/src/router-rpc.ts';
 import type { Role, Provenance } from '../../shared/src/contracts.ts';
 import { scheduleClockReader } from './schedule-clock.ts';
-import { loadTLS, privateListenHost } from './tls.ts';
+import { loadTLS, privateIPv4, privateListenHost } from './tls.ts';
 import type { TLSFiles } from './tls.ts';
 
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
     origin?: string;
     tls?: TLSFiles; listen?: {host: string; port: number}; publicOrigin?: string;
+    /** Plain-HTTP LAN listener behind a TLS-terminating proxy: only these exact source addresses may connect. */
+    trustedProxies?: string[];
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
     /** Child time requests are off unless the owner enables them here. */
     timeRequests?: {enabled: boolean};
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
-    router: {host: string; user: 'root'; port: 22; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
+    router: {host: string; user: 'root'; port: number; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
     person: {id: string; name: string; device: {id: string; label: string; mac: string}};
     protectedMacs: string[];
     accounts: {id: string; displayName: string; role: Role; personIds: string[]}[];
@@ -64,7 +66,8 @@ export function validateTransportFiles(config: Pick<IntegrationManifest, 'router
     const known = readFileSync(r.knownHosts, 'utf8');
     if (Buffer.byteLength(known) > 8192) bad('invalid_pinned_host_key');
     const match = /^(\S+) (ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) ([A-Za-z0-9+/]+={0,2})\n?$/.exec(known);
-    if (!match || match[1] !== r.host || fingerprint(match[3]) !== r.hostFingerprint) bad('invalid_pinned_host_key');
+    // OpenSSH names non-default ports as [host]:port in known_hosts.
+    if (!match || match[1] !== (r.port === 22 ? r.host : `[${r.host}]:${r.port}`) || fingerprint(match[3]) !== r.hostFingerprint) bad('invalid_pinned_host_key');
     const identity = readFileSync(r.publicIdentity, 'utf8');
     if (Buffer.byteLength(identity) > 8192) bad('invalid_public_identity');
     const key = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]*)?\n?$/.exec(identity);
@@ -75,14 +78,12 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
     const r = object(m.router, ['host', 'user', 'port', 'knownHosts', 'hostFingerprint', 'agentSocket', 'publicIdentity', 'publicKeyFingerprint', 'generation']);
-    // The authorized pilot target is fixed; accepting arbitrary destinations would widen its scope.
-    if (r.host !== '192.168.1.1' || r.user !== 'root' || r.port !== 22) bad('pilot_target_rejected');
-    const router: IntegrationManifest['router'] = {host: '192.168.1.1', user: 'root', port: 22, knownHosts: safePath(r.knownHosts), hostFingerprint: expectedFingerprint(r.hostFingerprint), agentSocket: safePath(r.agentSocket), publicIdentity: safePath(r.publicIdentity), publicKeyFingerprint: expectedFingerprint(r.publicKeyFingerprint), generation: hexDigest(r.generation)};
+    const router: IntegrationManifest['router'] = {...routerTarget(r), knownHosts: safePath(r.knownHosts), hostFingerprint: expectedFingerprint(r.hostFingerprint), agentSocket: safePath(r.agentSocket), publicIdentity: safePath(r.publicIdentity), publicKeyFingerprint: expectedFingerprint(r.publicKeyFingerprint), generation: hexDigest(r.generation)};
     const p = object(m.person, ['id', 'name', 'device']), d = object(p.device, ['id', 'label', 'mac']);
     const person = {id: id(p.id), name: text(p.name), device: {id: id(d.id), label: text(d.label), mac: mac(d.mac)}};
     if (!Array.isArray(m.protectedMacs) || !m.protectedMacs.length || m.protectedMacs.length > 64) bad('protected_identities_required');
@@ -96,7 +97,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     });
     if (new Set(accounts.map(a => a.id)).size !== accounts.length || !accounts.some(a => a.role === 'admin')) bad('admin_account_required');
     const enrollment = normalizePolicy(m.enrollment, protectedMacs);
-    const lan = lanHTTPS(m, m.port as number);
+    const lan = m.trustedProxies === undefined ? lanHTTPS(m, m.port as number) : lanProxy(m, m.port as number);
     const origin = lan ? lan.publicOrigin : m.origin === undefined ? `http://localhost:${m.port}` : privateHTTPSOrigin(m.origin);
     let dispatch: IntegrationManifest['dispatch'];
     if (m.dispatch !== undefined) {
@@ -118,17 +119,43 @@ export function integrationConfig(path: string): IntegrationConfig {
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort()}));
     return {...manifest, origin, host: new URL(origin).host, manifestDigest: sha256(raw), targetDigest, provenance: {source: 'real-router-integration', routerCompatibilityVerified: false, integrationScope: sha256(`${targetDigest}\n${sha256(raw)}`)}};
 }
+/** The router is a private IPv4 literal reached as root (Dropbear forced command) on an explicit port; names, tailnet and public addresses are refused. */
+function routerTarget(r: Record<string, unknown>): {host: string; user: 'root'; port: number} {
+    let host: string;
+    try { host = privateIPv4(r.host, {allowTailnet: false}); } catch { return bad('router_target_rejected'); }
+    if (r.user !== 'root' || typeof r.port !== 'number' || !Number.isInteger(r.port) || r.port < 1 || r.port > 65535) bad('router_target_rejected');
+    return {host, user: 'root', port: r.port as number};
+}
+function listenOn(value: unknown, port: number): {host: string; port: number} {
+    const l = object(value, ['host', 'port']);
+    let host: string;
+    try { host = privateListenHost(l.host); } catch (error) { return bad((error as Error).message); }
+    if (integer(l.port) !== port) bad('listen_port_mismatch');
+    return {host, port};
+}
+/**
+ * Plain HTTP on a private address for a TLS-terminating proxy. listen, publicOrigin and trustedProxies are all required and
+ * exclude tls and the loopback-proxy origin. The origin is portless because proxies forward Host without a port.
+ */
+function lanProxy(m: Record<string, unknown>, port: number): {listen: {host: string; port: number}; publicOrigin: string; trustedProxies: string[]} {
+    if (m.listen === undefined || m.publicOrigin === undefined || m.tls !== undefined || m.origin !== undefined) bad('lan_proxy_requires_listen_public_origin_trusted_proxies');
+    const listen = listenOn(m.listen, port), publicOrigin = privateHTTPSOrigin(m.publicOrigin);
+    if (new URL(publicOrigin).port !== '') bad('lan_proxy_public_origin_must_be_portless');
+    const proxies = m.trustedProxies;
+    if (!Array.isArray(proxies) || proxies.length < 1 || proxies.length > 8) bad('invalid_trusted_proxies');
+    const trustedProxies = (proxies as unknown[]).map(value => { try { return privateListenHost(value); } catch { return bad('invalid_trusted_proxies'); } });
+    // A proxy on the app host itself must use the loopback-proxy origin mode instead.
+    if (new Set(trustedProxies).size !== trustedProxies.length || trustedProxies.includes(listen.host)) bad('invalid_trusted_proxies');
+    return {listen, publicOrigin, trustedProxies};
+}
 /** tls, listen and publicOrigin are all-or-nothing and exclude the proxy-mode origin; without them the service stays loopback HTTP. */
 function lanHTTPS(m: Record<string, unknown>, port: number): {tls: TLSFiles; listen: {host: string; port: number}; publicOrigin: string} | undefined {
     if (m.tls === undefined && m.listen === undefined && m.publicOrigin === undefined) return undefined;
     if (m.tls === undefined || m.listen === undefined || m.publicOrigin === undefined || m.origin !== undefined) bad('lan_https_requires_tls_listen_public_origin');
-    const t = object(m.tls, ['certPath', 'keyPath']), l = object(m.listen, ['host', 'port']);
-    let host: string;
-    try { host = privateListenHost(l.host); } catch (error) { return bad((error as Error).message); }
-    if (integer(l.port) !== port) bad('listen_port_mismatch');
+    const t = object(m.tls, ['certPath', 'keyPath']), listen = listenOn(m.listen, port);
     const tls = {certPath: safePath(t.certPath), keyPath: safePath(t.keyPath)};
     loadTLS(tls);
-    return {tls, listen: {host, port}, publicOrigin: privateHTTPSOrigin(m.publicOrigin)};
+    return {tls, listen, publicOrigin: privateHTTPSOrigin(m.publicOrigin)};
 }
 /** The TLS proxy owns the private network boundary; this service only binds loopback. */
 export function privateHTTPSOrigin(value: unknown): string {
