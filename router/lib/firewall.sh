@@ -256,7 +256,7 @@ cf_unchanged_verified() {
     cf_prior_confirmation=$(awk 'NR!=1||NF!=3||$1!~/^(0|[1-9][0-9]*)$/||length($1)>10||$1+0>2147483647||length($2)!=64||$2~/[^0-9a-f]/||length($3)!=64||$3~/[^0-9a-f]/{exit 2}{print}END{if(NR!=1)exit 2}' "$CF_RUNTIME/confirmed") || return 1
     [ "$cf_prior_confirmation" = "$CF_REVISION $CF_DIGEST $(cf_effective_digest)" ] || return 1
     cf_noop_snapshot=$(cf_snapshot) || return 1
-    [ "$cf_noop_snapshot" = "$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")" ] || return 1
+    [ "$cf_noop_snapshot" = "$(cf_snapshot_canon "$CF_RUNTIME/firewall.snapshot")" ] || return 1
     # Private metadata is only eligibility. Verify all actual kernel objects,
     # hook ordering and native persistent/kernel witnesses under the lock.
     cf_verify
@@ -400,11 +400,20 @@ cf_rules_snapshot() {
         printf '%s\n' "$cf_rs_lines" | cf_normal_rules | awk -v f="$1" -v t="$2" '($1=="-A"||$1=="-N")&&((t=="filter"&&$2~/^(cf_fwd|cf_input|cf2_[ab]_[fig])$/)||(f==4&&t=="nat"&&$2~/^(cf_dns|cf2_[ab]_d)$/)){print f " " t " " $2 " " $0}'
     done
 }
+# Snapshot rows in one order on every sort implementation and locale: RULE and
+# other rows keep their recorded order, set rows group by name with SETDEF before
+# its members (byte order), SCHEDULE rows last. Stored snapshots and intents were
+# written in older router orders, so every comparison canonicalizes both sides.
+cf_snapshot_canon() {
+    awk '$1=="SET"||$1=="SETDEF"{printf "1 %s %d %s %s\n",($2==""?"-":$2),($1=="SET"),($1=="SET"&&$3!=""?$3:"-"),$0;next}
+    $1=="SCHEDULE"{printf "2 %010d - - %s\n",NR,$0;next}
+    NF{printf "0 %010d - - %s\n",NR,$0}' "$@" | LC_ALL=C sort | awk '{sub(/^[^ ]+ [^ ]+ [^ ]+ [^ ]+ /,"");print}'
+}
 cf_snapshot() {
     cf_ss_rules=$(cf_rules_snapshot) || return 1
     printf '%s\n' "$cf_ss_rules" | awk 'NF{print "RULE " $0}'
     cf_ss_sets=$(cf_backend ipset save) || return 1
-    printf '%s\n' "$cf_ss_sets" | awk '$1=="create"&&$2~/^cf2_[ab]_(k|p|d4|d6|u)$/{type[$2]=$3;family[$2]="inet";for(i=4;i<NF;i++)if($i=="family")family[$2]=$(i+1)}$1=="add"&&$2~/^cf2_[ab]_(k|p|d4|d6|u)$/{member[$2]=member[$2] tolower($3) "\n"}END{for(s in type){print "SETDEF " s " " type[s] " " family[s];n=split(member[s],a,"\n");for(i=1;i<=n;i++)if(a[i]!="")print "SET " s " " a[i]}}' | sort -k2,2 -k1,1r -k3,3
+    printf '%s\n' "$cf_ss_sets" | awk '$1=="create"&&$2~/^cf2_[ab]_(k|p|d4|d6|u)$/{type[$2]=$3;family[$2]="inet";for(i=4;i<NF;i++)if($i=="family")family[$2]=$(i+1)}$1=="add"&&$2~/^cf2_[ab]_(k|p|d4|d6|u)$/{member[$2]=member[$2] tolower($3) "\n"}END{for(s in type){print "SETDEF " s " " type[s] " " family[s];n=split(member[s],a,"\n");for(i=1;i<=n;i++)if(a[i]!="")print "SET " s " " a[i]}}' | cf_snapshot_canon
     cf_schedule_specs | awk -F '\t' 'NF{print "SCHEDULE " $0}'
 }
 cf_durable_record() {
@@ -472,10 +481,10 @@ cf_dispatch_plan() {
 }
 cf_transition_inventory_check() {
     cf_tic_current=$(cf_snapshot) || return 1
-    cf_tic_before=$(printf '%s\n' "$CF_TRANSITION" | awk '/^BEFORE /{sub(/^BEFORE /,"");print}')
-    cf_tic_repair_before=$(printf '%s\n' "$CF_TRANSITION" | awk '/^REPAIR_BEFORE /{sub(/^REPAIR_BEFORE /,"");print}')
-    cf_tic_repaired=$(printf '%s\n' "$CF_TRANSITION" | awk '/^REPAIRED /{sub(/^REPAIRED /,"");print}')
-    cf_tic_after=$(printf '%s\n' "$CF_TRANSITION" | awk '/^AFTER /{sub(/^AFTER /,"");print}')
+    cf_tic_before=$(printf '%s\n' "$CF_TRANSITION" | awk '/^BEFORE /{sub(/^BEFORE /,"");print}' | cf_snapshot_canon)
+    cf_tic_repair_before=$(printf '%s\n' "$CF_TRANSITION" | awk '/^REPAIR_BEFORE /{sub(/^REPAIR_BEFORE /,"");print}' | cf_snapshot_canon)
+    cf_tic_repaired=$(printf '%s\n' "$CF_TRANSITION" | awk '/^REPAIRED /{sub(/^REPAIRED /,"");print}' | cf_snapshot_canon)
+    cf_tic_after=$(printf '%s\n' "$CF_TRANSITION" | awk '/^AFTER /{sub(/^AFTER /,"");print}' | cf_snapshot_canon)
     # Only exactly recorded chain bodies, ordered staging prefixes and complete
     # dispatch targets can survive a crash. Foreign additions never authorize cleanup.
     printf '%s' "$cf_tic_current" | awk -v before="$cf_tic_before" -v repaired="$cf_tic_repaired" -v repair_before="$cf_tic_repair_before" -v after="$cf_tic_after" -v slot="$CF_SLOT" -v phase="$(printf '%s\n' "$CF_TRANSITION" | awk '$1=="PHASE"{print $2}')" '
@@ -595,6 +604,8 @@ cf_transition_fresh() {
     cf_tf_recorded=$(printf '%s\n' "$CF_TRANSITION" | awk '/^ADDRESS /{sub(/^ADDRESS /,"");print}')
     if [ "$cf_tf_observed" != "$cf_tf_recorded" ];then
         [ -z "$(cf_effective_blocked_macs)" ] && [ "${CF_CONSERVATIVE_RECOVERY:-0}" != 1 ] || { cf_fail transition_address_changed;return 1; }
+        # Status only observes: never record repair evidence or delete selectors.
+        [ "${CF_STATUS_READ_ONLY:-0}" != 1 ] || { cf_fail transition_address_changed;return 1; }
         cf_transition_repair_evidence "$cf_tf_observed" || return 1
     fi
     cf_tf_protection=$(printf '%s\n' "$CF_TRANSITION" | awk '$1=="PROTECTION"{print $2}')
@@ -602,6 +613,8 @@ cf_transition_fresh() {
 }
 cf_transition_repair_evidence() {
     cf_te_fresh=$1
+    # PLAN/GUARD rows are rewritten from CF_EXPECTED; it must be the intent's slot plan.
+    [ "$(printf '%s\n' "$CF_TRANSITION" | awk '$1=="SLOT"{print $2}')" = "$CF_SLOT" ] || { cf_fail unsafe_transition;return 1; }
     cf_te_current=$(cf_snapshot) || return 1
     cf_te_unsafe=$(printf '%s\n' "$cf_te_current" | awk -v fresh="$cf_te_fresh" -v kids="$CF_UNION" '
     BEGIN{n=split(kids,a,"\n");for(i=1;i<=n;i++)m[a[i]]=1;n=split(fresh,a,"\n");for(i=1;i<=n;i++){split(a[i],b,"\t");if(b[2] in m)safe[b[1]]=1}}
@@ -723,7 +736,7 @@ cf_transition_prepare() {
     fi
     CF_BEFORE=$(cf_snapshot) || return 1
     if cf_safe_file "$CF_RUNTIME/firewall.snapshot";then
-        cf_tp_saved=$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")
+        cf_tp_saved=$(cf_snapshot_canon "$CF_RUNTIME/firewall.snapshot")
         cf_tp_now=$(printf '%s\n' "$CF_BEFORE" | awk '$1!="SCHEDULE"{print}')
         cf_tp_old=$(printf '%s\n' "$cf_tp_saved" | awk '$1!="SCHEDULE"{print}')
         # A complete absent kernel is degraded restoration, never continuity evidence.
@@ -791,7 +804,7 @@ $CF_GUARD_PLAN" && cf_transition_inventory_check; };then
 # A refusal names its step in CF_SB_STEP.
 cf_sb_refuse() { CF_SB_STEP=$1;return 1; }
 cf_staging_rollback() {
-    cf_sb_owned=$1;cf_sb_baseline=$(printf '%s\n' "$2" | awk '$1!="SCHEDULE"&&NF{print}');cf_sb_slot=$CF_SLOT;CF_SB_STEP=
+    cf_sb_owned=$1;cf_sb_baseline=$(printf '%s\n' "$2" | cf_snapshot_canon | awk '$1!="SCHEDULE"&&NF{print}');cf_sb_slot=$CF_SLOT;CF_SB_STEP=
     case $cf_sb_owned:$cf_sb_slot in a:b|b:a);;*)cf_sb_refuse target_is_owned;return 1;;esac
     [ ! -e "$CF_RUNTIME/firewall.cleanup" ] && [ ! -L "$CF_RUNTIME/firewall.cleanup" ] || { cf_sb_refuse cleanup_record;return 1; }
     printf '%s\n' "$CF_TRANSITION" | awk -v s="$cf_sb_slot" '$1=="PHASE"&&$2=="staging"{stage=1}/^REPAIR\t/{bad=1}
@@ -1183,7 +1196,7 @@ EOZ
     if [ -e "$CF_RUNTIME/firewall.cleanup" ];then cf_cleanup_verify || return 1;else
         if [ ! -e "$CF_RUNTIME/firewall.intent" ];then
             cf_rf_now=$(cf_snapshot) || return 1
-            cf_safe_file "$CF_RUNTIME/firewall.snapshot" && [ "$cf_rf_now" = "$(awk '{print}' "$CF_RUNTIME/firewall.snapshot")" ] || { cf_fail cleanup_drift;return 1; }
+            cf_safe_file "$CF_RUNTIME/firewall.snapshot" && [ "$cf_rf_now" = "$(cf_snapshot_canon "$CF_RUNTIME/firewall.snapshot")" ] || { cf_fail cleanup_drift;return 1; }
         fi
         cf_cleanup_begin || return 1
     fi

@@ -558,6 +558,63 @@ class FailClosedReconstructionTests(unittest.TestCase):
     def test_removed_child_stays_blocked_until_switch_completes(self):
         self.child_set_transition([KID, OTHER_KID], [KID])
 
+    def test_router_sort_order_enrolled_transition_and_uninstall(self):
+        # Live BusyBox 1.33 ordering (SET before SETDEF) must not read as object drift.
+        self.f.router_sort()
+        self.install()
+        self.success(self.cfctl('sync', document=self.paused_policy()))
+        self.assertTrue(self.f.backend()['sets'][self.f.active_set('k')])
+        self.success(self.cfctl('sync', document=self.changed_policy()))
+        self.assert_only_active_generation()
+        self.success(self.cfctl('apply-fw'))
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+
+    def test_router_order_stored_snapshot_is_accepted(self):
+        # Routers keep snapshots written in the old order: each SETDEF after its SET rows.
+        self.install()
+        self.success(self.cfctl('sync', document=self.paused_policy()))
+        snapshot = self.f.root / 'etc/couvrefeu/runtime/firewall.snapshot'
+        lines = snapshot.read_text().splitlines()
+        sets = [line for line in lines if line.split(' ')[0] in ('SET', 'SETDEF')]
+        old = sorted(sets, key=lambda line: (line.split(' ')[1], line.split(' ')[0] == 'SETDEF', line))
+        self.assertNotEqual(old, sets)
+        rest = [line for line in lines if line not in sets]
+        rules = [line for line in rest if not line.startswith('SCHEDULE ')]
+        snapshot.write_text('\n'.join(rules + old + [line for line in rest if line not in rules]) + '\n')
+        snapshot.chmod(0o600)
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+
+    def test_status_after_refused_command_never_rewrites_shadow_intent(self):
+        # A refused command reports status; status must not repair or re-plan the intent.
+        self.install()
+        self.success(self.cfctl('sync', document=policy()))
+        active = self.f.slot()
+        self.f.update_backend(failures=[{'command': 'ip6tables', 'contains': ['-R', 'cf_fwd'], 'remaining': 1}])
+        doc = policy(2)
+        doc['doh'] = {'ipv4': ['1.1.1.2'], 'ipv6': []}
+        self.assertNotEqual(self.cfctl('sync', document=doc).returncode, 0)
+        intent = self.f.root / 'etc/couvrefeu/runtime/firewall.intent'
+        recorded = intent.read_bytes()
+        self.assertIn(b'\nSLOT ' + ('b' if active == 'a' else 'a').encode() + b'\n', recorded)
+        self.assertEqual(self.f.slot(), active)
+        state = self.f.backend()
+        for row in state['neighbors']:
+            if row['ip'] == '192.168.1.20':
+                row['ip'] = '192.168.1.30'
+        self.f.update_backend(neighbors=state['neighbors'], failures=[])
+        mutations = len(self.f.mutation_calls())
+        result = self.cfctl('sync', document=policy(3))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(intent.read_bytes(), recorded)
+        self.assertEqual(len(self.f.mutation_calls()), mutations)
+        self.success(self.cfctl('apply-fw'))
+        self.assertFalse(intent.exists())
+        self.assert_only_active_generation()
+
     def test_swapped_child_mac_keeps_union_blocked_through_switch(self):
         self.child_set_transition([KID], [OTHER_KID])
 

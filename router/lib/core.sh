@@ -489,6 +489,9 @@ cf_status() {
         return 1
     fi
     cf_status_error=$CF_ERROR
+    # Status is the last step of every command and must stay read-only, even
+    # after a refused command left CF_TRANSITION/CF_SLOT loaded.
+    CF_STATUS_READ_ONLY=1
     cf_ok=true; cf_drift=false; cf_confirmed=null
     CF_REVISION=0; CF_POLICY=; CF_DIGEST=
     cf_control_dirs || cf_ok=false

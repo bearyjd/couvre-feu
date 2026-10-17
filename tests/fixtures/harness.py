@@ -175,6 +175,21 @@ class RouterFixture:
     def close(self):
         self.tmp.cleanup()
 
+    def router_sort(self):
+        """Opt-in BusyBox 1.33 router ordering: `-k` keys are ignored, whole lines sort.
+
+        The live router sorted `sort -k2,2 -k1,1r -k3,3` snapshot set rows as
+        SET before SETDEF; desktop sort and BusyBox 1.35 put SETDEF first."""
+        real = shutil.which("sort")
+        if real is None:
+            raise RuntimeError("sort is unavailable")
+        wrapper = self.bin / "sort"
+        wrapper.write_text("#!/bin/sh\nn=$#; skip=0\nfor a in \"$@\"; do\n"
+                           "  if [ \"$skip\" = 1 ]; then skip=0; elif [ \"$a\" = -k ]; then skip=1\n"
+                           "  else case $a in -k*) ;; *) set -- \"$@\" \"$a\";; esac; fi\ndone\n"
+                           "shift \"$n\"; LC_ALL=C; export LC_ALL\nexec " + shlex.quote(real) + ' "$@"\n')
+        wrapper.chmod(0o700)
+
     # Hundreds of Python backend processes need headroom on shared CI hosts.
     # Explicit caller deadlines and router input deadlines remain independent.
     def run(self, *args, document=None, raw=None, timeout=60, env=None, started=None):
