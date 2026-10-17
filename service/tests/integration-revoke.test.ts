@@ -31,17 +31,18 @@ test('sole-admin recovery: revoking every passkey needs --allow-no-admin, fences
         const pending = await enroll('operator');
         assert.ok('pending' in pending.result);
         const outstanding = issueOperatorBootstrap(f.store, 'operator', f.now());
+        f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES('operator_tablet','operator',?,0,'[]','pending')", new Uint8Array([1]));
         // Without the flag the only admin with a passkey is never stripped of it.
         assert.throws(() => revokeAccountPasskeys(f.store, 'operator', f.now(), false), code('last_admin_required'));
-        assert.equal(n("SELECT count(*) n FROM credentials WHERE account_id='operator'"), 1);
+        assert.equal(n("SELECT count(*) n FROM credentials WHERE account_id='operator'"), 2);
         assert.equal(auth.session(lostToken, lost.browser).dto.actor.id, 'operator');
-        assert.equal(revokeAccountPasskeys(f.store, 'operator', f.now(), true), 1);
+        assert.equal(revokeAccountPasskeys(f.store, 'operator', f.now(), true), 2);
         assert.equal(n("SELECT count(*) n FROM credentials WHERE account_id='operator'"), 0);
         assert.throws(() => auth.session(lostToken, lost.browser));
         assert.equal(n("SELECT count(*) n FROM sessions WHERE account_id='operator' AND revoked=0"), 0);
         await assert.rejects(auth.registrationOptions({token: outstanding}, newBrowser()), code('token_used_or_expired'));
         assert.equal(n("SELECT count(*) n FROM audit WHERE actor_id='operator' AND action='passkey_operator_revoke' AND outcome=?", `operator:${lost.key.credentialId.toString('base64url')}`), 1);
-        assert.equal(n("SELECT count(*) n FROM audit WHERE actor_id='operator' AND action='account_passkeys_revoked' AND outcome='operator:1:allow_no_admin'"), 1);
+        assert.equal(n("SELECT count(*) n FROM audit WHERE actor_id='operator' AND action='account_passkeys_revoked' AND outcome='operator:2:allow_no_admin'"), 1);
         // The account now has no active passkey, so the next operator token enrolls an active first passkey.
         const recovered = await enroll('operator');
         assert.ok('token' in recovered.result && recovered.result.dto.actor.role === 'admin');
