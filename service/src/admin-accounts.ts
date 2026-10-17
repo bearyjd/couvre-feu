@@ -97,7 +97,7 @@ export class AccountAdmin {
             this.allowed(actor, kind);
             const before = this.adminsWithPasskey();
             const result = this.apply(actor, kind, change.target, change.params);
-            if (before > 0 && this.adminsWithPasskey() === 0) throw new AppError(409, 'last_admin_required');
+            if (before > 0 && this.adminsWithPasskey() === 0) throw new AppError(409, 'last_admin_required', 'At least one active admin must keep a working passkey.');
             this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, kind === 'own_passkey_revoke' ? 'passkey_self_revoke' : `admin_${kind}`, this.auth.now(), result.audit);
             return result.body;
         });
@@ -120,14 +120,14 @@ export class AccountAdmin {
         const now = this.auth.now();
         switch (kind) {
         case 'account_create': {
-            if (this.store.get<{n: number}>('SELECT count(*) n FROM accounts')!.n >= ACCOUNT_LIMIT) throw new AppError(409, 'account_limit_reached');
+            if (this.store.get<{n: number}>('SELECT count(*) n FROM accounts')!.n >= ACCOUNT_LIMIT) throw new AppError(409, 'account_limit_reached', `The defensive limit of ${ACCOUNT_LIMIT} accounts is reached.`);
             const id = `parent_${randomBytes(6).toString('hex')}`;
             this.store.run('INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES(?,?,?,?,?)', id, params.displayName as string, params.role as string, JSON.stringify(params.personIds), randomBytes(32).toString('base64url'));
             return {body: {account: this.dto(this.account(id))}, audit: id};
         }
         case 'token_issue': {
             if (!this.account(target).active) throw new AppError(409, 'account_disabled');
-            if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', target)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
+            if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', target)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached', `This account already has ${PASSKEYS_PER_ACCOUNT} passkeys; remove one first.`);
             // One outstanding token per account: a new one consumes the old.
             const token = randomBytes(32).toString('base64url');
             this.store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', target);

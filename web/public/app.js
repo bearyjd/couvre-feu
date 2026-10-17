@@ -4,6 +4,7 @@ import { createScheduleEditor, actionVerb } from './schedule-editor.js';
 import { createParentAlerts } from './parent-alerts.js';
 import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
+import { createAccounts } from './accounts.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -18,6 +19,7 @@ const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
+const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [], signedOut: () => { resetView(); announce('This session ended. Sign in again; local status has been cleared.', true); } });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
@@ -194,6 +196,14 @@ async function authenticate(kind, token) {
     if (generation !== state.generation || controller.signal.aborted) return;
     const session = await api(`/auth/${kind}/verify`, { method: 'POST', body: { challengeId: start.challengeId, response }, signal: controller.signal });
     if (generation !== state.generation) return;
+    if (session.pending) {
+      // An admin-issued add-device token: the passkey exists but signs in only after an admin approves this code.
+      $('#pairing-code').textContent = session.pairingCode;
+      $('#pairing').hidden = false;
+      announce(`Passkey created and waiting for approval. Pairing code ${session.pairingCode}: ask an admin to approve it, then sign in with your passkey.`);
+      return;
+    }
+    $('#pairing').hidden = true;
     acceptSession(session);
     state.busy = false;
     await refresh({ quiet: true });
@@ -446,6 +456,7 @@ function render() {
   renderAlerts();
   parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
   timeRequests.update();
+  accounts.update();
 }
 
 function tick() {

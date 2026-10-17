@@ -33,10 +33,16 @@ export class Store {
                 throw new Error('unsupported_database_version');
             }
             for (let index = version; index < migrations.length; index++) {
-                this.transaction(() => {
-                    this.db.exec(migrations[index]);
-                    this.db.exec(`PRAGMA user_version=${index + 1}`);
-                });
+                try {
+                    this.transaction(() => {
+                        this.db.exec(migrations[index]);
+                        this.db.exec(`PRAGMA user_version=${index + 1}`);
+                    });
+                } catch (error) {
+                    // A table rebuild (007) reads the old shape; a foreign shape is refused, never half-migrated.
+                    if (error instanceof Error && /no such (?:table|column)|has no column/.test(error.message)) throw new Error('unsupported_database_schema');
+                    throw error;
+                }
             }
             if (migrationSQL === undefined) {
                 const required: Record<string, string> = {

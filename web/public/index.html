@@ -33,6 +33,7 @@
             <input id="enrollment-token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="token-help" required maxlength="256">
             <button id="enroll" class="button secondary" type="submit">Create a demo passkey</button>
           </form>
+          <div id="pairing" class="pairing" role="status" hidden><p>Waiting for approval. Ask an admin to approve this pairing code, then sign in with your passkey.</p><strong id="pairing-code" class="pairing-code"></strong></div>
           <p class="fine-print">Passkeys require a supported browser and secure context. This local prototype uses localhost.</p>
         </div>
       </section>
@@ -50,6 +51,7 @@
         </section>
         <section id="activity-panel" class="activity-panel" aria-label="Estimated network activity" hidden></section>
         <section id="time-requests" class="alert-panel" aria-labelledby="time-requests-title" hidden></section>
+        <section id="accounts-panel" class="alert-panel" aria-labelledby="accounts-title" hidden></section>
         <section id="operational-alerts" class="alert-panel" aria-labelledby="alerts-title" hidden>
           <h2 id="alerts-title">Recent alerts in this browser</h2>
           <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>
