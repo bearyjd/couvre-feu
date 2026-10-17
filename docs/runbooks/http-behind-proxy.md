@@ -45,6 +45,7 @@ Startup prints `private LAN proxy HTTP https://cf.example.invalid via 1 trusted 
 4. **Source address:** `trustedProxies` must be the address the service actually sees, normally the NPM host's LAN IP.
    - If NPM runs in Docker with a bridged network, outbound traffic is NATed to the Docker host's LAN IP. List that address.
    - Confirm it on the service host while loading the page: `ss -tn sport = :4273` shows the peer address.
+   - If the **service** runs in a container behind Docker's userland proxy or NAT, peers can appear as the bridge gateway (for example `172.17.0.1`). That address passes private-IP validation, but listing it would admit every host that reaches the published port. `trustedProxies` must be the address that `ss` and the service actually see for NPM. Never list a Docker gateway; run the service with host networking or without the userland proxy instead.
 5. **DNS:** `cf.example.invalid` must resolve to NPM for parent devices, through a LAN DNS entry or public DNS for a public-CA certificate. Do not change dnsmasq on the pilot router without the approvals in `AGENTS.md`.
 
 ## Host hardening
@@ -67,7 +68,7 @@ PrivateTmp=yes
 
 ## Verify
 
-1. From the NPM host: `curl -sI -H 'Host: cf.example.invalid' http://<APP_IP>:4273/` returns 200 with `Strict-Transport-Security`. Without the Host header it returns 403.
+1. From the NPM host: `curl -s -o /dev/null -D - -H 'Host: cf.example.invalid' http://<APP_IP>:4273/`. This sends a GET and prints only the response headers. Expect `HTTP/1.1 200` and a `Strict-Transport-Security` header. Do not use `curl -I`: it sends HEAD, which the service answers with 405. Without the Host header the GET returns 403.
 2. From any other LAN host: `curl -sv http://<APP_IP>:4273/` gets a connection reset with no HTTP response.
 3. From a parent phone: `https://cf.example.invalid` shows a valid lock. Sign-in works, and `rpId` equals `cf.example.invalid`.
 

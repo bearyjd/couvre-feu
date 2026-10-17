@@ -152,6 +152,20 @@ test('lan-proxy HTTP destroys connections from any non-allowlisted source before
     } finally { await s.close(); }
 });
 
+test('lan-proxy HTTP closes a silent untrusted connection at accept time, without waiting for a request', async () => {
+    const s = await proxyServer(['10.0.0.30']);
+    try {
+        const socket = connect(s.port, '127.0.0.1'); let received = 0;
+        socket.on('data', chunk => { received += chunk.length; });
+        socket.on('error', () => {});
+        // Writes nothing: only the pre-parse connection guard can close it (the per-request check never runs).
+        const closed = new Promise<boolean>(resolve => { socket.on('close', () => resolve(true)); setTimeout(() => resolve(false), 1000).unref(); });
+        assert.equal(await closed, true, 'untrusted silent socket closed within 1s');
+        assert.equal(received, 0);
+        socket.destroy();
+    } finally { await s.close(); }
+});
+
 test('lan-proxy HTTP from the trusted proxy keeps Host, Origin, cookie and HSTS rules and ignores X-Forwarded-*', async () => {
     const s = await proxyServer(['127.0.0.1']), get = (path: string, headers: Record<string, string> = {}) => call(s.port, path, {Host: s.host, ...headers});
     try {
