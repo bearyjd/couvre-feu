@@ -886,6 +886,72 @@ class FailClosedReconstructionTests(unittest.TestCase):
 
     ROLLBACK_FAILS = ({'command': 'iptables', 'contains': ['-F', 'cf2_{shadow}_f'], 'remaining': 1},)
 
+    def test_child_address_change_repairs_stale_selector_with_iptables_delete_order(self):
+        # REPAIR rows hold normalised bodies; real iptables -D needs -m comment
+        # before --comment, and -S output carries quoted comments and REJECT options.
+        pristine = self.kernel_view()
+        self.install()
+        self.f.update_backend(canonical_rules=True)
+        self.success(self.cfctl('sync', document=self.paused_policy()))
+        old, new = self.slots(self.f)
+        def stale(state):
+            return [(chain, row) for chain, rows in state['tables']['iptables']['filter'].items() for row in rows
+                    if '-d' in row and row[row.index('-d') + 1] == '192.168.1.20' and 'REJECT' in row]
+        self.assertTrue(any(chain == f'cf2_{old}_f' for chain, _ in stale(self.f.backend())))
+        state = self.f.backend()
+        neighbors = [dict(row, ip='192.168.1.30') if row['ip'] == '192.168.1.20' else row for row in state['neighbors']]
+        (self.f.root / 'tmp/dhcp.leases').write_text(f'0 {KID} 192.168.1.30 fixture *\n0 {OTHER_KID} 192.168.1.22 fixture2 *\n')
+        self.f.update_backend(neighbors=neighbors, capture_effects=True, effects=[])
+        self.success(self.cfctl('sync', document=self.changed_policy()))
+        state = self.f.backend()
+        deletes = [row['argv'] for row in state['effects'] if '-D' in row['argv'] and '192.168.1.20' in row['argv']]
+        self.assertEqual(len(deletes), 1, deletes)
+        self.assertLess(deletes[0].index('-m'), deletes[0].index('--comment'), deletes[0])
+        self.assertEqual(stale(state), [])
+        self.assertTrue(any('-d' in row and row[row.index('-d') + 1] == '192.168.1.30' and 'REJECT' in row
+                            for row in state['tables']['iptables']['filter'][f'cf2_{new}_f']))
+        self.assert_only_active_generation()
+        self.f.update_backend(capture_effects=False, effects=[])
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+        rules, sets = self.kernel_view()
+        self.assertEqual(({key: rows for key, rows in rules.items() if key in pristine[0]}, sets), pristine)
+        self.assertTrue(all(key[2] == 'reject' or key[2].startswith('zone_') for key in rules if key not in pristine[0]), rules)
+
+    def test_interrupted_transition_address_change_repairs_with_iptables_delete_order(self):
+        # The intent path: repair evidence rewrites an interrupted staged intent.
+        pristine = self.kernel_view()
+        self.install()
+        self.f.update_backend(canonical_rules=True)
+        self.success(self.cfctl('sync', document=policy()))
+        expiry = int(self.f.env['CF_NOW']) + 30
+        doc = self.paused_policy(2)
+        doc['pauses'][0]['until'] = expiry
+        self.f.update_backend(failures=[{'command': 'ip6tables', 'contains': ['-R', 'cf_fwd'], 'remaining': 1}])
+        self.assertNotEqual(self.cfctl('sync', document=doc).returncode, 0)
+        self.assertTrue((self.f.root / 'etc/couvrefeu/runtime/firewall.intent').exists())
+        state = self.f.backend()
+        neighbors = [dict(row, ip='192.168.1.30') if row['ip'] == '192.168.1.20' else row for row in state['neighbors']]
+        (self.f.root / 'tmp/dhcp.leases').write_text(f'0 {KID} 192.168.1.30 fixture *\n0 {OTHER_KID} 192.168.1.22 fixture2 *\n')
+        self.f.update_backend(neighbors=neighbors, failures=[], capture_effects=True, effects=[])
+        self.f.env['CF_NOW'] = str(expiry + 1)
+        self.success(self.cfctl('expire'))
+        state = self.f.backend()
+        deletes = [row['argv'] for row in state['effects'] if '-D' in row['argv'] and '192.168.1.20' in row['argv']]
+        self.assertTrue(deletes)
+        for argv in deletes:
+            self.assertLess(argv.index('-m'), argv.index('--comment'), argv)
+        self.assertFalse([row for rows in state['tables']['iptables']['filter'].values() for row in rows
+                          if '-d' in row and row[row.index('-d') + 1] == '192.168.1.20' and ('REJECT' in row or 'DROP' in row)])
+        self.f.update_backend(capture_effects=False, effects=[])
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_no_owned_kernel_objects()
+        rules, sets = self.kernel_view()
+        self.assertEqual(({key: rows for key, rows in rules.items() if key in pristine[0]}, sets), pristine)
+        self.assertTrue(all(key[2] == 'reject' or key[2].startswith('zone_') for key in rules if key not in pristine[0]), rules)
+
     def test_uninstall_from_drifted_staging_intent_restores_exactly(self):
         pristine = self.kernel_view()
         self.staged_drifted_intent(self.ROLLBACK_FAILS)
