@@ -5,6 +5,7 @@ import { Store } from './db.ts';
 import { requirePrivatePath } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { policyJSON } from '../../shared/src/router-schema.ts';
+import { AppError } from '../../shared/src/errors.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 
 export interface IntegrationState {
@@ -64,6 +65,11 @@ export class IntegrationStore extends Store {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS dispatch_live_claims ON dispatch_steps(state,lease_until)`);
         // Startup never releases an uncertain claim or starts dispatch.
+    }
+    /** A rebind can rewrite the marker under a running process. Mutate and dispatch transactions re-check it and fail closed. */
+    assertIdentity(): void {
+        const m = this.get<{target_digest: string; manifest_digest: string; generation: string}>('SELECT target_digest,manifest_digest,generation FROM integration_state WHERE singleton=1');
+        if (!m || m.target_digest !== this.config.targetDigest || m.manifest_digest !== this.config.manifestDigest || m.generation !== this.config.router.generation) throw new AppError(503, 'integration_database_identity_mismatch');
     }
     integrationState(): IntegrationState { return this.get<IntegrationState>('SELECT * FROM integration_state WHERE singleton=1')!; }
     observation(): {value: RPCObservation | null; observedAt: number | null} {

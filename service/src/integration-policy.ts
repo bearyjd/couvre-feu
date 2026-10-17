@@ -69,6 +69,7 @@ export class IntegrationPolicy {
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) throw new AppError(428, 'revision_precondition_required');
         const request = JSON.stringify({person, action, until, precondition, permissionVersion: actor.permissionVersion});
         const op = this.store.transaction(() => {
+            this.store.assertIdentity();
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
             if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
             if (until !== null && until !== 0 && until <= this.now()) throw new AppError(400, 'pause_expiry_must_be_future');

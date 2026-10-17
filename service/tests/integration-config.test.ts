@@ -10,6 +10,7 @@ import { integrationConfig, privateHTTPSOrigin } from '../src/integration-config
 import { IntegrationStore } from '../src/integration-db.ts';
 import { Store } from '../src/db.ts';
 import { testConfig } from './fixtures/integration.ts';
+import { ACCOUNT_LIMIT } from '../src/account-limits.ts';
 
 test('private manifest validates explicit real bindings, pinned public keys and agent; rejects unsafe or fictional mode', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cf-private-config-test-')), sample = testConfig(dir), socket = createServer();
@@ -23,6 +24,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
     const save = (value: unknown) => writeFileSync(path, JSON.stringify(value), {mode: 0o600});
     try {
         save(manifest); const c = integrationConfig(path);
+        // No 16-account product cap: manifest accounts only seed a fresh database, bounded by the defensive ACCOUNT_LIMIT.
+        const seeded = Array.from({length: 40}, (_, i) => ({id: `parent_${i}`, displayName: `Parent ${i}`, role: 'parent', personIds: ['pilot']}));
+        save({...manifest, accounts: [...manifest.accounts, ...seeded]}); assert.equal(integrationConfig(path).accounts.length, 42);
+        save({...manifest, accounts: [...manifest.accounts, ...Array.from({length: ACCOUNT_LIMIT}, (_, i) => ({id: `p${i}`, displayName: 'P', role: 'parent', personIds: ['pilot']}))]}); assert.throws(() => integrationConfig(path), /invalid_integration_manifest|body_too_large/); // the 64 KiB manifest bound may bind first
         assert.equal(c.dispatch, undefined);
         assert.equal(c.timeRequests, undefined, 'time requests are off unless explicitly enabled');
         save({...manifest, timeRequests: {enabled: true}}); assert.equal(integrationConfig(path).timeRequests?.enabled, true);
