@@ -15,6 +15,17 @@ const equal = (a: string, b: string) => {
 };
 const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const STEP_UPS_PER_MINUTE = 10;
+/** One answer for unknown, used, expired and replaced tokens, so the endpoint is no token oracle. */
+const tokenUnusable = () => new AppError(401, 'token_used_or_expired', 'This enrollment token is unknown, expired or has already been used. Ask your admin for a new token, and to check the pending devices and not approve any they do not recognise.');
+/** A new token for an account rejects that account's pending passkeys: only the newest token's device can be approved. */
+export function rejectPendingPasskeys(store: Store, accountId: string, actorId: string, now: number): void {
+    const pending = store.all<{id: string}>("SELECT id FROM credentials WHERE account_id=? AND state='pending' ORDER BY id", accountId);
+    for (const {id} of pending) {
+        store.run('DELETE FROM credentials WHERE id=?', id);
+        store.run('UPDATE sessions SET revoked=1 WHERE credential_id=?', id);
+        store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actorId, 'passkey_pending_rejected', now, `${accountId}:${id}`);
+    }
+}
 /** Short code an enrolling device shows and an approving admin compares: first 6 base32 characters of sha256(credential id). */
 export function pairingCode(credentialId: string): string {
     let bits = 0, value = 0, code = '';
@@ -112,12 +123,16 @@ export function issueBootstrap(store: Store, accountId: string, now = Math.floor
     });
     return token;
 }
-/** Operator CLI issuance for the private integration: any active database account, also one that already has passkeys. */
+/**
+ * Operator CLI issuance for the private integration: any active database account. The passkey it enrolls is active only
+ * while the account has no active passkey (first enrollment); otherwise it is pending and needs an admin's approval.
+ */
 export function issueOperatorBootstrap(store: Store, accountId: string, now = Math.floor(Date.now() / 1000)): string {
     if (!store.get('SELECT id FROM accounts WHERE id=? AND active=1', accountId)) throw new AppError(404, 'unknown_private_account');
     if (store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', accountId)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
     const token = secret();
     store.transaction(() => {
+        rejectPendingPasskeys(store, accountId, 'operator', now);
         store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', accountId);
         store.run("INSERT INTO bootstrap_tokens(hash,account_id,expires_at,purpose,created_by) VALUES(?,?,?,'bootstrap','operator')", digest(token), accountId, now + 600);
     });
@@ -210,7 +225,7 @@ export class Auth {
             consumed: number;
         }>('SELECT * FROM bootstrap_tokens WHERE hash=?', hash);
         if (!bootstrap || bootstrap.consumed || bootstrap.expires_at <= this.now()) {
-            throw new AppError(401, 'invalid_bootstrap');
+            throw tokenUnusable();
         }
         const account = this.account(bootstrap.account_id);
         const existing = this.store.all<{id: string; transports: string}>('SELECT id,transports FROM credentials WHERE account_id=?', account.id);
@@ -227,7 +242,7 @@ export class Auth {
             challengeId: this.challenge('register', options.challenge, context, account.id, hash, {}), options
         };
     }
-    /** Operator-issued (bootstrap) enrollment only; an add-device token yields a pending passkey, reported as an error here. */
+    /** First enrollment of an account only; a pending passkey (add-device token or an already enrolled account) is reported as an error here. */
     async registrationVerify(input: unknown, browserToken: string, oldSessionToken?: string): Promise<{token: string; dto: SessionDTO}> {
         const result = await this.enroll(input, browserToken, oldSessionToken);
         if ('pending' in result) throw new AppError(409, 'enrollment_pending_approval');
@@ -259,7 +274,7 @@ export class Auth {
                 label: string;
             }>('SELECT * FROM bootstrap_tokens WHERE hash=?', challenge.bootstrap_hash);
             if (!bootstrap || bootstrap.account_id !== challenge.account_id || bootstrap.consumed || bootstrap.expires_at <= this.now()) {
-                throw new AppError(401, 'invalid_bootstrap');
+                throw tokenUnusable();
             }
             const account = this.account(bootstrap.account_id);
             if (account.permission_version !== challenge.account_version) {
@@ -269,8 +284,10 @@ export class Auth {
                 throw new AppError(409, 'credential_already_bound');
             }
             if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', account.id)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
-            // Operator CLI tokens are trusted; admin-UI tokens may cross a cleartext proxy hop, so their passkey waits for approval.
-            const state = bootstrap.purpose === 'add_device' ? 'pending' : 'active';
+            // Every token may cross a cleartext proxy hop. Only the first passkey of an account (no active one yet, checked in
+            // this transaction) is active at once; any later passkey, and every add-device passkey, waits for admin approval.
+            const enrolled = Boolean(this.store.get("SELECT 1 FROM credentials WHERE account_id=? AND state='active'", account.id));
+            const state = bootstrap.purpose === 'add_device' || enrolled ? 'pending' : 'active';
             this.store.run('INSERT INTO credentials(id,account_id,public_key,counter,transports,label,state,created_at) VALUES(?,?,?,?,?,?,?,?)', credential.id, account.id, credential.publicKey, credential.counter, JSON.stringify(credential.transports ?? []), bootstrap.label, state, this.now());
             this.store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', account.id);
             this.store.run('UPDATE challenges SET consumed=1 WHERE account_id=?', account.id);

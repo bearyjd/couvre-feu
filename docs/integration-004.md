@@ -59,9 +59,18 @@ per-sign-in credential snapshot; raise them there if ever needed.
 - An account may hold many passkeys. A session records the passkey that created it;
   removing a passkey ends exactly those sessions. Disabling an account or changing its
   role bumps its permission version and ends all of its sessions.
-- `integration:bootstrap` looks the account up in the database (not the manifest) and
-  enrolls an active passkey, also as an extra passkey of an enrolled account. The token is
-  32 random bytes, stored hashed, one use, ten minutes; a new token consumes the old one.
+- `integration:bootstrap` looks the account up in the database (not the manifest). The
+  passkey it enrolls is active only if the account has no active passkey yet (first
+  enrollment, checked in the enrollment transaction). For an enrolled account it is
+  *pending*, like an add-device passkey. The token is 32 random bytes, stored hashed, one
+  use, ten minutes. A new token consumes the old one and rejects the account's pending
+  passkeys (audited `passkey_pending_rejected`).
+- The token may cross the cleartext proxy hop. First enrollment over that hop stays
+  hijackable: do it over loopback or an encrypted path, then check that the account lists
+  only your passkey (`docs/runbooks/http-behind-proxy.md`). Every later device needs a
+  pairing-code comparison, a step-up and an admin approval. An unknown, used or expired
+  token gets one answer (`token_used_or_expired`) that asks the user to have an admin
+  check the pending devices.
 - An admin-issued add-device token (same properties) enrolls a *pending* passkey that
   cannot sign in. The device shows a pairing code (first 6 base32 characters of
   sha256(credential id)); the admin compares it before approving.

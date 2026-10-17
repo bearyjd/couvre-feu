@@ -210,7 +210,10 @@ async function authenticate(kind, token) {
     if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
   } catch (error) {
     if (generation !== state.generation) return;
-    const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.' : error.message;
+    const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.'
+      // Unknown, used and expired tokens get one answer; a used one may mean someone else enrolled with it.
+      : error.code === 'token_used_or_expired' ? 'This enrollment token is unknown, expired or has already been used. Ask your admin for a new token, and to check the pending devices and not approve any they do not recognise.'
+      : error.message;
     announce(message || 'Passkey sign-in could not be completed.', true);
   } finally {
     token = undefined;

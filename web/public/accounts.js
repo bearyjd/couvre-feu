@@ -60,14 +60,14 @@ export function createAccounts({ session, people }) {
   function ownRow(passkey) {
     return el('li', { class: 'passkey-row', 'data-passkey': passkey.id },
       el('span', {}, `${name(passkey)}${passkey.current ? ' · this device' : ''}`),
-      el('span', { class: 'fine-print' }, passkey.state === 'pending' ? `Waiting for approval · pairing code ${passkey.pairingCode}` : `Added ${when(passkey.createdAt)} · last used ${when(passkey.lastUsedAt)}`),
+      el('span', { class: 'fine-print' }, passkey.state === 'pending' ? `Waiting for approval · added ${when(passkey.createdAt)} · pairing code ${passkey.pairingCode}` : `Added ${when(passkey.createdAt)} · last used ${when(passkey.lastUsedAt)}`),
       el('button', { class: 'button secondary', type: 'button', disabled: busy, 'aria-label': `Remove my passkey ${name(passkey)}${passkey.current ? ' (this device)' : ''}`,
         onclick: () => void confirmed('own_passkey_revoke', passkey.id, {}, `/account/passkeys/${passkey.id}/revoke`, () => passkey.current ? 'This device’s passkey was removed.' : 'Passkey removed.') }, 'Remove'));
   }
   function accountCard(account) {
     const who = account.displayName;
     const passkeys = account.passkeys.map((passkey) => el('li', { class: 'passkey-row', 'data-passkey': passkey.id },
-      el('span', {}, passkey.state === 'pending' ? `${name(passkey)} · pending · pairing code ` : `${name(passkey)} · last used ${when(passkey.lastUsedAt)}`,
+      el('span', {}, passkey.state === 'pending' ? `${name(passkey)} · pending · added ${when(passkey.createdAt)} · pairing code ` : `${name(passkey)} · last used ${when(passkey.lastUsedAt)}`,
         ...(passkey.state === 'pending' ? [el('strong', { class: 'pairing-code' }, passkey.pairingCode)] : [])),
       ...(passkey.state === 'pending' ? [el('button', { class: 'button primary', type: 'button', disabled: busy, 'aria-label': `Approve passkey with pairing code ${passkey.pairingCode} for ${who}`,
         onclick: () => void confirmed('passkey_approve', passkey.id, {}, `/admin/passkeys/${passkey.id}/approve`, () => `Approved the device for ${who}.`) }, 'Approve')] : []),

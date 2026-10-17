@@ -26,6 +26,15 @@ test('admin adds a parent and a device: token shown once, pending device shows i
     await device.getByRole('button', { name: 'Create a demo passkey' }).click();
     await expect(device.locator('#pairing-code')).toHaveText(/^[A-Z2-7]{6}$/);
     const pairing = (await device.locator('#pairing-code').textContent())!;
+    // The token is spent: a second device using it is told so and warned not to let unknown devices be approved.
+    const reuse = await context.newPage();
+    await reuse.goto(demo.origin);
+    await expect(reuse.getByRole('button', { name: 'Create a demo passkey' })).toBeEnabled();
+    await reuse.getByLabel('One-use enrollment token').fill(token);
+    await reuse.getByRole('button', { name: 'Create a demo passkey' }).click();
+    await expect(reuse.locator('#notice')).toContainText('has already been used');
+    await expect(reuse.locator('#notice')).toContainText('not approve any they do not recognise');
+    await reuse.close();
     await expect(device.locator('#status-view')).toBeHidden();
     // Pending: the passkey cannot sign in yet.
     await device.getByRole('button', { name: 'Sign in with a passkey' }).click();
@@ -33,6 +42,7 @@ test('admin adds a parent and a device: token shown once, pending device shows i
 
     await page.bringToFront();
     await panel.getByRole('button', { name: 'Refresh devices' }).click();
+    await expect(card).toContainText(/pending · added .+ · pairing code/);
     await card.getByRole('button', { name: `Approve passkey with pairing code ${pairing} for Casey (fictional)` }).click();
     await expect(card.getByRole('button', { name: /Remove passkey Passkey of Casey/ })).toBeVisible();
     await expect(card).not.toContainText('pending');

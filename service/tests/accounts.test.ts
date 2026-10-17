@@ -72,7 +72,7 @@ test('admin creates an account, issues a one-use add-device token; the passkey s
         const offered = await f.auth.loginOptions({}, newBrowser());
         assert.ok(!Object.hasOwn(JSON.parse(f.store.get<{credential_ids: string}>('SELECT credential_ids FROM challenges WHERE id=?', offered.challengeId)!.credential_ids), pending.credentialId));
         // One use: the token cannot enroll a second device.
-        await assert.rejects(f.auth.registrationOptions({token: issued.token}, newBrowser()), /invalid_bootstrap/);
+        await assert.rejects(f.auth.registrationOptions({token: issued.token}, newBrowser()), code('token_used_or_expired'));
         const listed = f.admin.list(jd.session().dto.actor).accounts.find(a => a.id === created.account.id)!;
         assert.deepEqual(listed.passkeys.map(p => [p.state, p.pairingCode, p.label]), [['pending', pending.pairingCode, 'Casey phone']]);
         await act(f, jd, 'passkey_approve', pending.credentialId);
@@ -192,7 +192,7 @@ test('add-device tokens: reissue consumes the old one, expiry after ten minutes,
         const jd = await bootstrap(f, 'jd');
         const first = await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string};
         const second = await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string};
-        await assert.rejects(f.auth.registrationOptions({token: first.token}, newBrowser()), /invalid_bootstrap/);
+        await assert.rejects(f.auth.registrationOptions({token: first.token}, newBrowser()), code('token_used_or_expired'));
         const keyA = new TestAuthenticator(), keyB = new TestAuthenticator();
         const browserA = newBrowser(), browserB = newBrowser();
         const optionsA = await f.auth.registrationOptions({token: second.token}, browserA), optionsB = await f.auth.registrationOptions({token: second.token}, browserB);
@@ -204,7 +204,7 @@ test('add-device tokens: reissue consumes the old one, expiry after ten minutes,
         assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='bryn'"), 1);
         const expiring = await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string};
         f.advance(601);
-        await assert.rejects(f.auth.registrationOptions({token: expiring.token}, newBrowser()), /invalid_bootstrap/);
+        await assert.rejects(f.auth.registrationOptions({token: expiring.token}, newBrowser()), code('token_used_or_expired'));
     } finally { f.close(); }
 });
 
@@ -217,7 +217,7 @@ test('defensive account and passkey limits are generous constants enforced at th
         for (let i = existing; i < ACCOUNT_LIMIT - 1; i++) f.store.run("INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES(?,?,'parent','[\"alex\"]',?)", `filler_${i}`, `Filler ${i}`, randomBytes(32).toString('base64url'));
         await act(f, jd, 'account_create', '', {displayName: 'Last', role: 'parent', personIds: ['alex']});
         await assert.rejects(act(f, jd, 'account_create', '', {displayName: 'One too many', role: 'parent', personIds: ['alex']}), (e: {status: number; code: string}) => e.status === 409 && e.code === 'account_limit_reached');
-        for (let i = 1; i < PASSKEYS_PER_ACCOUNT - 1; i++) f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES(?,'jd',?,0,'[]','pending')", `filler_${i}`, new Uint8Array([1]));
+        for (let i = 1; i < PASSKEYS_PER_ACCOUNT - 1; i++) f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES(?,'jd',?,0,'[]','active')", `filler_${i}`, new Uint8Array([1]));
         const last = await act(f, jd, 'token_issue', 'jd', {label: ''}) as {token: string};
         await addDevice(f, last.token);
         assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd'"), PASSKEYS_PER_ACCOUNT);
@@ -225,22 +225,101 @@ test('defensive account and passkey limits are generous constants enforced at th
     } finally { f.close(); }
 });
 
-test('operator CLI bootstrap looks the account up in the database and can add an active passkey to an enrolled account', async () => {
-    const f = integrationFixture();
+test('operator CLI bootstrap: the first passkey of an account is active; once it has an active passkey, an operator token only yields a pending one', async () => {
+    const f = integrationFixture(), intOrigin = 'http://localhost:4273';
     try {
-        const auth = new Auth(f.store, 'http://localhost:4273', f.now, {provenance: f.config.provenance});
+        const auth = new Auth(f.store, intOrigin, f.now, {provenance: f.config.provenance});
+        const enrollWith = async (accountId: string) => {
+            const browser = newBrowser(), options = await auth.registrationOptions({token: issueOperatorBootstrap(f.store, accountId, f.now())}, browser);
+            return auth.enroll({challengeId: options.challengeId, response: new TestAuthenticator().register(options.options, intOrigin)}, browser);
+        };
         assert.throws(() => issueOperatorBootstrap(f.store, 'nobody', f.now()), /unknown_private_account/);
+        // The manifest's only admin, not yet enrolled, can always bootstrap: there is no lockout path.
+        const admin = await enrollWith('operator');
+        assert.ok('token' in admin && admin.dto.actor.id === 'operator' && admin.dto.actor.role === 'admin');
         // An account created through the admin UI exists only in the database, never in the manifest.
         f.store.run("INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES('parent_db','DB parent','parent','[\"pilot\"]','u_db')");
-        for (const _ of [1, 2]) {
-            const browser = newBrowser(), options = await auth.registrationOptions({token: issueOperatorBootstrap(f.store, 'parent_db', f.now())}, browser);
-            const session = await auth.registrationVerify({challengeId: options.challengeId, response: new TestAuthenticator().register(options.options, 'http://localhost:4273')}, browser);
-            assert.equal(session.dto.actor.id, 'parent_db');
-        }
-        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id='parent_db' AND state='active'")!.n, 2);
+        const first = await enrollWith('parent_db');
+        assert.ok('token' in first && first.dto.actor.id === 'parent_db');
+        // A token seen on the cleartext proxy hop must not take over an enrolled account: the new passkey waits for approval.
+        const later = await enrollWith('parent_db');
+        assert.ok('pending' in later);
+        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id='parent_db' AND state='active'")!.n, 1);
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM credentials WHERE id=?', later.pending.credentialId)!.state, 'pending');
+        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM sessions WHERE account_id='parent_db'")!.n, 1);
+        const offered = await auth.loginOptions({}, newBrowser());
+        assert.ok(!Object.hasOwn(JSON.parse(f.store.get<{credential_ids: string}>('SELECT credential_ids FROM challenges WHERE id=?', offered.challengeId)!.credential_ids), later.pending.credentialId));
         f.store.run("UPDATE accounts SET active=0 WHERE id='parent_db'");
         assert.throws(() => issueOperatorBootstrap(f.store, 'parent_db', f.now()), /unknown_private_account/);
     } finally { f.cleanup(); }
+});
+
+test('operator token: the active-passkey check runs at enrollment, and two racing browsers bind exactly one active passkey', async () => {
+    const f = fixture();
+    try {
+        // Issued while bryn had no passkey; an active passkey appears before the token is used.
+        const browser = newBrowser(), options = await f.auth.registrationOptions({token: issueOperatorBootstrap(f.store, 'bryn', f.now())}, browser);
+        f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES('bryn_phone','bryn',?,0,'[]','active')", new Uint8Array([1]));
+        const late = await f.auth.enroll({challengeId: options.challengeId, response: new TestAuthenticator().register(options.options, origin)}, browser);
+        assert.ok('pending' in late);
+        // Unenrolled account, one operator token, two browsers: one active passkey, the other gets a clear refusal.
+        const token = issueOperatorBootstrap(f.store, 'jd', f.now());
+        const keyA = new TestAuthenticator(), keyB = new TestAuthenticator(), browserA = newBrowser(), browserB = newBrowser();
+        const optionsA = await f.auth.registrationOptions({token}, browserA), optionsB = await f.auth.registrationOptions({token}, browserB);
+        const races = await Promise.allSettled([
+            f.auth.enroll({challengeId: optionsA.challengeId, response: keyA.register(optionsA.options, origin)}, browserA),
+            f.auth.enroll({challengeId: optionsB.challengeId, response: keyB.register(optionsB.options, origin)}, browserB),
+        ]);
+        const won = races.filter(r => r.status === 'fulfilled') as PromiseFulfilledResult<unknown>[], lost = races.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
+        assert.equal(won.length, 1);
+        assert.ok(won[0].value && typeof won[0].value === 'object' && 'token' in won[0].value);
+        assert.equal(lost[0].reason.code, 'token_used_or_expired');
+        assert.deepEqual(f.store.all<{state: string}>("SELECT state FROM credentials WHERE account_id='jd'").map(r => r.state), ['active']);
+    } finally { f.close(); }
+});
+
+test('a new add-device or operator token rejects the account\'s pending passkeys, and the rejection is audited', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd');
+        const before = await addDevice(f, (await act(f, jd, 'token_issue', 'bryn', {label: 'Unknown'}) as {token: string}).token);
+        const stale = (before.result as {pending: {credentialId: string}}).pending.credentialId;
+        await act(f, jd, 'token_issue', 'bryn', {label: 'Bryn phone'});
+        assert.equal(f.count('SELECT count(*) n FROM credentials WHERE id=?', stale), 0);
+        assert.deepEqual(f.store.all<{actor_id: string; outcome: string}>("SELECT actor_id,outcome FROM audit WHERE action='passkey_pending_rejected'").map(r => ({...r})), [{actor_id: 'jd', outcome: `bryn:${stale}`}]);
+        const listed = f.admin.list(jd.session().dto.actor).accounts.find(a => a.id === 'bryn')!;
+        assert.deepEqual(listed.passkeys, []);
+        const again = await addDevice(f, (await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string}).token);
+        const pending = (again.result as {pending: {credentialId: string}}).pending.credentialId;
+        assert.equal(f.admin.list(jd.session().dto.actor).accounts.find(a => a.id === 'bryn')!.passkeys[0].createdAt, f.now());
+        issueOperatorBootstrap(f.store, 'bryn', f.now());
+        assert.equal(f.count('SELECT count(*) n FROM credentials WHERE id=?', pending), 0);
+        assert.equal(f.count("SELECT count(*) n FROM audit WHERE action='passkey_pending_rejected' AND actor_id='operator' AND outcome=?", `bryn:${pending}`), 1);
+        // Active passkeys are never touched by a reissue.
+        await act(f, jd, 'token_issue', 'jd', {label: ''});
+        assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd' AND state='active'"), 1);
+    } finally { f.close(); }
+});
+
+test('an unknown, used, expired or replaced token gets one non-revealing refusal that tells the user to check pending devices', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd');
+        const used = code('token_used_or_expired');
+        const message = (e: {code?: string; message?: string}) => used(e) && /already been used/.test(e.message ?? '') && /approve/.test(e.message ?? '');
+        await assert.rejects(f.auth.registrationOptions({token: newBrowser()}, newBrowser()), message);
+        const issued = await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string};
+        await addDevice(f, issued.token);
+        await assert.rejects(f.auth.registrationOptions({token: issued.token}, newBrowser()), message);
+        const expiring = await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string};
+        f.advance(601);
+        await assert.rejects(f.auth.registrationOptions({token: expiring.token}, newBrowser()), message);
+        // Replaced between options and verify: refused at enrollment with the same code.
+        const replaced = await act(f, jd, 'token_issue', 'bryn', {label: ''}) as {token: string}, browser = newBrowser();
+        const options = await f.auth.registrationOptions({token: replaced.token}, browser);
+        await act(f, jd, 'token_issue', 'bryn', {label: ''});
+        await assert.rejects(f.auth.enroll({challengeId: options.challengeId, response: new TestAuthenticator().register(options.options, origin)}, browser), message);
+    } finally { f.close(); }
 });
 
 test('step-up has its own per-account limiter, so one account cannot exhaust sign-in for everyone', async () => {
@@ -269,6 +348,24 @@ test('an admin can act only on accounts whose people are all inside the admin sc
             await assert.rejects(act(f, bryn, kind, 'jd', params), code('outside_scope'));
         }
         await assert.rejects(act(f, bryn, 'passkey_revoke', jd.key.credentialId.toString('base64url')), code('outside_scope'));
+        // A pending passkey of an account outside bryn's scope cannot be approved by bryn.
+        const tablet = await addDevice(f, (await act(f, jd, 'token_issue', 'jd', {label: 'Tablet'}) as {token: string}).token);
+        const pending = (tablet.result as {pending: {credentialId: string}}).pending.credentialId;
+        await assert.rejects(act(f, bryn, 'passkey_approve', pending), code('outside_scope'));
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM credentials WHERE id=?', pending)!.state, 'pending');
         assert.equal(jd.session().dto.actor.role, 'admin');
+    } finally { f.close(); }
+});
+
+test('an empty person scope is refused at creation and never covered by any admin scope', async () => {
+    const f = fixture();
+    try {
+        const jd = await bootstrap(f, 'jd');
+        await assert.rejects(act(f, jd, 'account_create', '', {displayName: 'Nobody', role: 'parent', personIds: []}), code('invalid_person_scope'));
+        f.store.run("INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES('scopeless','Scopeless','parent','[]','u_scopeless')");
+        assert.ok(!f.admin.list(jd.session().dto.actor).accounts.some(a => a.id === 'scopeless'));
+        for (const [kind, params] of [['token_issue', {label: ''}], ['account_role', {role: 'admin'}], ['account_active', {active: false}]] as const) {
+            await assert.rejects(act(f, jd, kind, 'scopeless', params), code('outside_scope'));
+        }
     } finally { f.close(); }
 });

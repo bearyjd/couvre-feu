@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type { Actor, Role } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
-import { digest, pairingCode } from './auth.ts';
+import { digest, pairingCode, rejectPendingPasskeys } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
 import { ACCOUNT_LIMIT, PASSKEYS_PER_ACCOUNT } from './account-limits.ts';
 
@@ -108,7 +108,9 @@ export class AccountAdmin {
     }
     /** An admin may manage only accounts whose people all lie inside the admin's own scope. */
     private covers(actor: Actor, row: AccountRow): boolean {
-        return (JSON.parse(row.person_ids) as string[]).every(person => actor.personIds.includes(person));
+        const people = JSON.parse(row.person_ids) as string[];
+        // An empty scope would be vacuously covered by every admin; it is covered by none.
+        return people.length > 0 && people.every(person => actor.personIds.includes(person));
     }
     private managed(actor: Actor, id: string): AccountRow {
         const row = this.account(id);
@@ -137,8 +139,9 @@ export class AccountAdmin {
         case 'token_issue': {
             if (!this.managed(actor, target).active) throw new AppError(409, 'account_disabled');
             if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', target)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached', `This account already has ${PASSKEYS_PER_ACCOUNT} passkeys; remove one first.`);
-            // One outstanding token per account: a new one consumes the old.
+            // One outstanding token per account: a new one consumes the old and rejects the pending passkeys it left behind.
             const token = randomBytes(32).toString('base64url');
+            rejectPendingPasskeys(this.store, target, actor.id, now);
             this.store.run('UPDATE bootstrap_tokens SET consumed=1 WHERE account_id=?', target);
             this.store.run("INSERT INTO bootstrap_tokens(hash,account_id,expires_at,purpose,created_by,label) VALUES(?,?,?,'add_device',?,?)", digest(token), target, now + TOKEN_SECONDS, actor.id, params.label as string);
             return {body: {token, accountId: target, expiresAt: now + TOKEN_SECONDS}, audit: target};

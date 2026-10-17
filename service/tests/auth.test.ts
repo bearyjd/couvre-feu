@@ -109,7 +109,7 @@ test('bootstrap cannot select account/role/people; challenge browser and expirat
         f.advance(480);
         await assert.rejects(f.auth.registrationOptions({
             token
-        }, browser), /invalid_bootstrap/);
+        }, browser), (e: {code?: string}) => e.code === 'token_used_or_expired');
     }
     finally {
         f.close();
@@ -136,7 +136,7 @@ test('simultaneous enrollment challenges allow one credential; reissue invalidat
         issueBootstrap(f.store, 'bryn', f.now());
         await assert.rejects(f.auth.registrationVerify({
             challengeId: pending.challengeId, response: b.register(pending.options, origin)
-        }, browser), /invalid_bootstrap/);
+        }, browser), (e: {code?: string}) => e.code === 'token_used_or_expired');
     }
     finally {
         f.close();
