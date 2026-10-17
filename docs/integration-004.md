@@ -20,8 +20,12 @@ network MAC, protected recovery/adult identities and explicit account/person rol
 Never put a private key, passphrase, token or household inventory in the repository.
 The service selects an agent-held identity; it does not load private-key bytes.
 The known-hosts file must contain one exact pinned entry; the `.pub` identity and
-agent socket must pass owner/type/permissions checks. The pilot accepts only its
-predefined target; changing the host does not select an arbitrary router.
+agent socket must pass owner/type/permissions checks. The router target is no longer
+fixed, but it stays strict: `router.host` must be one RFC 1918 IPv4 literal (no DNS
+names, Tailscale or public addresses), `user` exactly `root` (the Dropbear forced
+command) and `port` an integer 1..65535, else `router_target_rejected`. The pinned
+known-hosts entry is `host` for port 22 and `[host]:port` otherwise. targetDigest
+still hashes host/user/port, so existing `192.168.1.1`/22 databases keep their binding.
 
 Use a separate integration entry and database. The demo remains fictional. Refuse
 missing identity/scope, protected overlap, unsafe files, demo/foreign databases,
@@ -151,7 +155,11 @@ installs no proxy, certificate or phone/network deployment.
 
 Alternatively, `tls`, `listen` and `publicOrigin` (together, instead of `origin`) make the
 service itself serve private HTTPS on one RFC 1918 or Tailscale address; see
-`docs/runbooks/lan-https.md`.
+`docs/runbooks/lan-https.md`. Or `listen`, a portless `publicOrigin` and a mandatory
+`trustedProxies` list (without `tls` or `origin`) serve plain HTTP on a private address
+to a TLS-terminating proxy on another LAN host; other source addresses are dropped
+before a request is read. That hop is cleartext; see `docs/runbooks/http-behind-proxy.md`
+for the proxy recipe and the residual risk.
 
 Any manifest edit changes its digest and existing database bindings refuse it.
 Restart is mandatory; use reviewed private backup/recovery or fresh explicit

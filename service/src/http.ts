@@ -76,6 +76,10 @@ function send(response: ServerResponse, status: number, value: unknown) {
 }
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
 type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
+/** Node reports IPv4 peers on dual-stack sockets as ::ffff:a.b.c.d; compare the plain IPv4 literal. */
+export function remoteIPv4(address: string | undefined): string | undefined {
+    return address?.startsWith('::ffff:') ? address.slice(7) : address;
+}
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService) {
     // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
@@ -87,9 +91,17 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const provenance = auth.provenance;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
+    // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
+    const trusted = config.trustedProxies;
+    const untrusted = (address: string | undefined) => trusted !== undefined && !trusted.includes(remoteIPv4(address) ?? '');
     const handler = async (request: IncomingMessage, response: ServerResponse) => {
+        if (untrusted(request.socket.remoteAddress)) {
+            request.socket.destroy();
+            return;
+        }
         response.setHeader('Cache-Control', 'no-store');
-        if (config.tlsMaterial) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
+        // Browsers honour HSTS only over HTTPS, i.e. the TLS listener or the TLS-terminating proxy in front of this one.
+        if (secure) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
         response.setHeader('X-Content-Type-Options', 'nosniff');
         response.setHeader('Referrer-Policy', 'no-referrer');
         response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
@@ -254,6 +266,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
         }
     };
     const server = config.tlsMaterial ? createSecureServer({...config.tlsMaterial, minVersion: 'TLSv1.2'}, handler) : createServer(handler);
+    // Drop any other source before a single request byte is parsed; nothing about the connection is logged.
+    if (trusted !== undefined) server.prependListener('connection', socket => { if (untrusted(socket.remoteAddress)) socket.destroy(); });
     // Allowance follow-ups (restoring a lifted pause) must not depend on a parent having the app open.
     let timer: NodeJS.Timeout | undefined;
     server.on('listening', () => {

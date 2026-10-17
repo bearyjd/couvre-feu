@@ -14,7 +14,7 @@ export class SSHRouter implements AsyncRouter {
     constructor(config: IntegrationConfig) { this.config = config; }
     invocation(kind: DispatchKind, envelope?: RPCEnvelope, operationId?: string): FrozenInvocation {
         const r = this.config.router;
-        const argv = ['-F', '/dev/null', '-T', '-p', '22', '-i', r.publicIdentity,
+        const argv = ['-F', '/dev/null', '-T', '-p', String(r.port), '-i', r.publicIdentity,
             '-o', 'BatchMode=yes', '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
             '-o', 'PreferredAuthentications=publickey', '-o', 'IdentitiesOnly=yes', '-o', `IdentityAgent=${r.agentSocket}`,
             '-o', `UserKnownHostsFile=${r.knownHosts}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'StrictHostKeyChecking=yes',
