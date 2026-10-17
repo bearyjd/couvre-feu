@@ -75,7 +75,12 @@ cfp_cs() {
 }
 cfp_now() { date +%s; }
 # True while elapsed time plus $1 more seconds still leaves the teardown reserve.
-cfp_elapsed_ok() { [ "$(($(cfp_now) - CFR_START + ${1:-0}))" -le "$((CFP_REMOTE_TIMEOUT - CFP_TEARDOWN_RESERVE))" ]; }
+# An empty clock (date failed) is never "ok": callers stop rather than guess.
+cfp_elapsed_ok() {
+    cfp_eo_now=$(cfp_now)
+    [ -n "$cfp_eo_now" ] || { cfr_info 'clock_unavailable'; return 1; }
+    [ "$((cfp_eo_now - CFR_START + ${1:-0}))" -le "$((CFP_REMOTE_TIMEOUT - CFP_TEARDOWN_RESERVE))" ]
+}
 
 # --- Read-only adult probes -------------------------------------------------
 # Prints "<replies> <avg_ms|-> " for three pings (BusyBox or iputils summary).
@@ -257,12 +262,13 @@ cfp_pause() {
     cfp_extra=$CFP_LAT_MAX
     [ "$cfp_extra" -le "$CFP_CFCTL_ALLOWANCE" ] || cfp_extra=$CFP_CFCTL_ALLOWANCE
     cfp_p_t0=$(cfp_now)
+    [ -n "$cfp_p_t0" ] || { cfr_info 'clock_unavailable'; return 1; }
     CFP_UNTIL=$((cfp_p_t0 + $1 + cfp_extra))
     cfr_info "pause $CFP_PERSON until=$CFP_UNTIL seconds=$1 latency_margin_s=$cfp_extra"
     # The printed status line is the gate (exit status alone is not evidence).
     cfr_run_sh "$CFR_CFCTL" pause "$CFP_PERSON" --until "$CFP_UNTIL" > "$CFP_DIR/status.json" || cfr_info "pause exit $?"
     cfp_lat_note "$cfp_p_t0"
-    cfr_info "pause_call latency_s=$cfp_lat remaining_s=$((CFP_UNTIL - $(cfp_now)))"
+    cfr_info "pause_call latency_s=$cfp_lat remaining_s=$((CFP_UNTIL - ${cfp_lat_now:-$CFP_UNTIL}))"
 }
 # $1 file, then literal substrings that the single status line must contain.
 cfp_status_has() {
@@ -379,9 +385,14 @@ cfp_state_check() {
     [ "$cfp_state" = unknown ] || [ -z "$1" ] || [ "$cfp_state" = "$1" ] || cfp_stop "$2" "penn_kernel_state_not_$1"
 }
 cfp_observe() {
-    cfp_end=$(($(cfp_now) + $1))
+    cfp_end=$(cfp_now)
+    [ -n "$cfp_end" ] || cfp_stop "$3" clock_unavailable
+    cfp_end=$((cfp_end + $1))
     CFP_UNKNOWN=0
-    while [ "$(cfp_now)" -lt "$cfp_end" ]; do
+    while :; do
+        cfp_o_now=$(cfp_now)
+        [ -n "$cfp_o_now" ] || cfp_stop "$3" clock_unavailable
+        [ "$cfp_o_now" -lt "$cfp_end" ] || break
         cfp_elapsed_ok "$CFP_ITERATION_WORST" || cfp_stop "$3" remote_budget_reserved_for_teardown
         cfp_adult_probe "$3" || cfp_stop "$3" "adult_disruption $CFP_ADULT_REASON"
         cfp_state_check "$2" "$3"
@@ -508,6 +519,7 @@ cfp_expiry_phase() {
     while :; do
         cfp_elapsed_ok "$CFP_ITERATION_WORST" || cfp_stop EXPIRY remote_budget_reserved_for_teardown
         cfp_t=$(cfp_now)
+        [ -n "$cfp_t" ] || cfp_stop EXPIRY clock_unavailable
         cfp_state_check '' EXPIRY
         if [ "$cfp_state" = clear ]; then
             [ "$cfp_t" -ge "$CFP_UNTIL" ] || cfp_stop EXPIRY "premature_unpause $((CFP_UNTIL - cfp_t))s_early"
