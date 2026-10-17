@@ -18,7 +18,7 @@ cf_acct_epoch_read() {
 
 # person<TAB>mac for MACs assigned to a person, never protected/management MACs.
 cf_acct_devices() {
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v scope="${CF_SCOPE-}" 'NR==FNR{if(NF)protected[$1]=1;next}$1=="P"&&$3!="-"&&!protected[$3]&&(scope==""||$3==scope){print $2 "\t" $3}' "$CF_PROTECTED" - | sort -u
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v scope="${CF_SCOPE-}" 'BEGIN{n=split(scope,s," ");for(i=1;i<=n;i++)allowed[s[i]]=1}NR==FNR{if(NF)protected[$1]=1;next}$1=="P"&&$3!="-"&&!protected[$3]&&(scope==""||($3 in allowed)){print $2 "\t" $3}' "$CF_PROTECTED" - | sort -u
 }
 # Fresh unique ip<TAB>mac pairs for enrolled MACs only (same attribution as enforcement).
 cf_acct_pairs() {

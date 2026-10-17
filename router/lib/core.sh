@@ -58,6 +58,21 @@ cf_mac_valid() {
     length($0)!=17 {exit 1}
     {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00")exit 1}'
 }
+# RPC scope file: 1..256 canonical unicast MACs, LF-terminated, unique and
+# LC_ALL=C sorted. Prints the space-joined set; never an empty (unscoped) value.
+cf_scope_file() {
+    cf_sf_list=$(awk '
+    length($0)!=17 {exit 1}
+    {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00")exit 1;printf "%s%s",(NR>1?" ":""),$0}
+    END {if(NR<1||NR>256)exit 1}' "$1") || return 1
+    cf_sf_count=$(printf '%s\n' "$cf_sf_list" | awk '{print NF}')
+    [ -n "$cf_sf_list" ] && [ "$cf_sf_count" -ge 1 ] && [ "$cf_sf_count" -le 256 ] || return 1
+    # Exact size rejects NUL, CR, blank lines and a missing final newline.
+    [ "$(wc -c < "$1")" -eq $((cf_sf_count * 18)) ] || return 1
+    # Order and uniqueness use the tool that produced the file, not awk comparisons.
+    LC_ALL=C sort -u "$1" | cmp -s - "$1" || return 1
+    printf '%s\n' "$cf_sf_list"
+}
 cf_id_valid() { case $1 in ''|*[!a-z0-9_]*|[!a-z]*) return 1;; esac; [ "${#1}" -le 32 ]; }
 cf_number_valid() {
     printf '%s\n' "$1" | awk '$0!~/^(0|[1-9][0-9]*)$/ || length($0)>10 || $0+0>2147483647 {exit 1}'

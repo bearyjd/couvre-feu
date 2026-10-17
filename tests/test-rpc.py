@@ -754,5 +754,207 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
 
 
+THIRD_KID = '02:00:00:00:00:03'
+
+
+def scope_args(*macs):
+    return [arg for mac in macs for arg in ('--rpc-allow', mac)]
+
+
+class MultiScopeRpcTests(unittest.TestCase):
+    """Repeatable --rpc-allow: an immutable, sorted per-generation set of MACs."""
+
+    def setUp(self):
+        self.f = RouterFixture()
+        self.install(OTHER_KID, KID)
+        self.base = self.observe()
+
+    def tearDown(self):
+        self.f.close()
+
+    script = RpcTests.script
+    observe = RpcTests.observe
+    accept = RpcTests.accept
+    reject = RpcTests.reject
+
+    def install(self, *macs, env=None, ok=True):
+        result = self.script('install.sh', '--activate', '--protect', PROTECTED, *scope_args(*macs), env=env)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def request(self, identifier='op_1', base=None, document=None):
+        base = base or self.base
+        document = document or self.two_people(base['acceptedPolicy']['revision'] + 1)
+        return dict(rpc_version=1, generation=base['generation'], operation_id=identifier,
+                    expected_revision=base['acceptedPolicy']['revision'], expected_digest=base['policyDigest'],
+                    policy=document)
+
+    @staticmethod
+    def two_people(revision=1, alice=(KID,), bob=(OTHER_KID,)):
+        result = policy(revision)
+        result['people'] = [{'id': 'alice', 'macs': list(alice)}, {'id': 'bob', 'macs': list(bob)}]
+        return result
+
+    def refused_install(self, *args, text=None):
+        before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
+        result = self.script('install.sh', '--activate', '--protect', PROTECTED, *args)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        if text:
+            self.assertIn(text, result.stderr)
+        self.assertEqual(self.f.durable_snapshot(), before)
+        self.assertEqual(len(self.f.mutation_calls()), count)
+
+    def test_scope_file_is_lc_all_c_sorted_and_staged(self):
+        expected = (KID + '\n' + OTHER_KID + '\n').encode()
+        self.assertEqual((self.f.root / 'etc/couvrefeu/rpc-allowed').read_bytes(), expected)
+        self.assertEqual((self.f.root / 'etc/couvrefeu/backup/etc_couvrefeu_rpc-allowed.staged').read_bytes(), expected)
+
+    def test_policy_across_people_within_scope_accepted_and_activity_reports_both(self):
+        accepted = self.accept(self.request())
+        self.assertTrue(accepted['receipt']['current'])
+        people = {p['id']: p['macs'] for p in accepted['acceptedPolicy']['people']}
+        self.assertEqual(people, {'alice': [KID], 'bob': [OTHER_KID]})
+        result = self.f.run('rpc-activity', '--json')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        devices = sorted((d['person'], d['mac']) for d in json.loads(result.stdout)['devices'])
+        self.assertEqual(devices, [('alice', KID), ('bob', OTHER_KID)])
+        self.assertNotIn(PROTECTED, result.stdout)
+        # A subset of the scope is admissible: scope bounds, never requires, enrollment.
+        self.accept(self.request('subset', base=accepted, document=self.two_people(
+            accepted['acceptedPolicy']['revision'] + 1, alice=(KID, OTHER_KID), bob=())))
+
+    def test_out_of_scope_or_protected_mac_rejected_for_rpc_and_legacy_sync(self):
+        for mac in (THIRD_KID, PROTECTED):
+            with self.subTest(mac=mac):
+                document = self.two_people(alice=(KID, mac))
+                self.reject(self.request(document=document),
+                            error='rpc_scope_overlap' if mac == THIRD_KID else None)
+                before = self.f.durable_snapshot()
+                result = self.f.run('sync', document=document)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.f.durable_snapshot(), before)
+                self.assertEqual(self.f.mutation_calls(), [])
+
+    def test_reinstall_with_same_set_in_any_order_keeps_generation(self):
+        self.install(KID, OTHER_KID)
+        self.assertEqual(self.observe()['generation'], self.base['generation'])
+
+    def test_reinstall_cannot_change_scope_subset_or_superset(self):
+        for macs in ((KID,), (OTHER_KID,), (KID, OTHER_KID, THIRD_KID)):
+            with self.subTest(macs=macs):
+                self.refused_install(*scope_args(*macs), text='cannot change RPC scope')
+        self.refused_install(text='requires explicit --rpc-allow')
+
+    def test_scope_change_is_uninstall_then_fresh_generation(self):
+        old = self.request()
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        self.assertFalse((self.f.root / 'etc/couvrefeu/rpc-allowed').exists())
+        self.install(THIRD_KID, KID)
+        new = self.observe()
+        self.assertNotEqual(new['generation'], self.base['generation'])
+        self.assertEqual((self.f.root / 'etc/couvrefeu/rpc-allowed').read_text(), KID + '\n' + THIRD_KID + '\n')
+        self.reject(old, error='generation_conflict')
+        self.reject(self.request('stale_scope', base=new), error='rpc_scope_overlap')
+        self.attach(THIRD_KID)
+        self.accept(self.request('fresh', base=new, document=self.two_people(
+            new['acceptedPolicy']['revision'] + 1, bob=(THIRD_KID,))))
+
+    def attach(self, *macs):
+        # rpc-sync fails closed without current address coverage for every enrolled MAC.
+        neighbors = self.f.backend()['neighbors']
+        leases = self.f.root / 'tmp/dhcp.leases'
+        lines = leases.read_text()
+        for index, mac in enumerate(macs):
+            ip = '192.168.{}.{}'.format(1 + (index + 30) // 250, 2 + (index + 30) % 250)
+            neighbors.append({'ip': ip, 'mac': mac})
+            lines += '0 {} {} host{} *\n'.format(mac, ip, index)
+        self.f.update_backend(neighbors=neighbors)
+        leases.write_text(lines)
+
+    def test_install_refuses_protected_duplicate_malformed_and_oversized_scope(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        too_many = ['02:00:00:00:{:02x}:{:02x}'.format(i // 256, i % 256) for i in range(1, 258)]
+        for args in (scope_args(KID, PROTECTED), scope_args(PROTECTED), scope_args(KID, KID),
+                     scope_args(KID, '02:00:00:00:00:0G'), scope_args(KID, '02:00:00:00:00:0A'),
+                     scope_args(KID, '03:00:00:00:00:01'), scope_args(KID, '00:00:00:00:00:00'),
+                     scope_args(KID, ''), scope_args(KID + '\n' + THIRD_KID), ['--rpc-allow'],
+                     scope_args(*too_many)):
+            with self.subTest(args=args[:6]):
+                self.refused_install(*args)
+
+    def test_maximum_scope_of_256_installs_and_binds(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        macs = ['02:00:00:01:{:02x}:{:02x}'.format(i // 256, i % 256) for i in range(256)]
+        self.install(*reversed(macs))
+        scope = (self.f.root / 'etc/couvrefeu/rpc-allowed').read_text()
+        self.assertEqual(scope, ''.join(mac + '\n' for mac in sorted(macs)))
+        observed = self.observe()
+        self.attach(*macs)
+        document = policy(observed['acceptedPolicy']['revision'] + 1)
+        document['people'] = [{'id': 'p{:02d}'.format(i), 'macs': macs[i * 32:(i + 1) * 32]} for i in range(8)]
+        result = self.f.run('rpc-sync', document=self.request('max', base=observed, document=document), timeout=600)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        accepted = json.loads(result.stdout)
+        self.assertEqual(sum(len(p['macs']) for p in accepted['acceptedPolicy']['people']), 256)
+
+    def resign(self, content):
+        directory = self.f.root / 'etc/couvrefeu'
+        staged = directory / 'backup/etc_couvrefeu_rpc-allowed.staged'
+        for path in (directory / 'rpc-allowed', staged):
+            path.write_bytes(content);path.chmod(0o600)
+        meta = staged.stat()
+        (directory / 'backup/etc_couvrefeu_rpc-allowed.after').write_text('{}:{:o}:{}:{}\n'.format(
+            hashlib.sha256(content).hexdigest(), meta.st_mode & 0o777, meta.st_uid, meta.st_gid))
+
+    def test_consistently_resigned_noncanonical_scope_fails_closed(self):
+        after = self.f.root / 'etc/couvrefeu/backup/etc_couvrefeu_rpc-allowed.after'
+        original = (self.f.root / 'etc/couvrefeu/rpc-allowed').read_bytes()
+        signature = after.read_bytes()
+        # Prove the helper reproduces the installer signature, so cmp/signature cannot mask the parser.
+        self.resign(original)
+        self.assertEqual(after.read_bytes(), signature)
+        many = ''.join('02:00:00:00:{:02x}:{:02x}\n'.format(i // 256, i % 256) for i in range(1, 258)).encode()
+        k, o = KID.encode(), OTHER_KID.encode()
+        for content in (b'', b'\n', o + b'\n' + k + b'\n', k + b'\n' + k + b'\n', b'0A' + k[2:] + b'\n',
+                        k + b'\n' + o, k + b'\r\n', k + b'\n\n' + o + b'\n', k + b'\x00\n', b' ' + k + b'\n',
+                        PROTECTED.encode() + b'\n', many):
+            with self.subTest(content=content[:40]):
+                self.resign(content)
+                response = self.reject(self.request())
+                self.assertTrue({'invalid_rpc_scope', 'protected_mac_overlap'} & set(response['errors']), response)
+                self.assertNotIn('acceptedPolicy', response)
+                result = self.f.run('rpc-activity', '--json')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(json.loads(result.stdout)['devices'], [])
+        self.resign(original)
+        self.accept(self.request())
+
+    def test_interrupted_multi_scope_activation_resumes_only_with_same_set(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        result = self.install(KID, OTHER_KID, env=dict(self.f.env, CF_TEST_INSTALL_FAIL_AFTER='6'), ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        staged = self.f.root / 'etc/couvrefeu/backup/etc_couvrefeu_state.staged'
+        content = staged.read_text()
+        generation = next(row.split('\t')[1] for row in content.splitlines() if row.startswith('G\t'))
+        result = self.install(KID, ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cannot change RPC scope', result.stderr)
+        self.install(OTHER_KID, KID)
+        self.assertEqual(self.observe()['generation'], generation)
+        self.assertEqual(staged.read_text(), content)
+
+    def test_exact_uninstall_restores_original_multi_line_scope_bytes_and_mode(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        original = self.f.root / 'etc/couvrefeu/rpc-allowed'
+        original.write_bytes((THIRD_KID + '\n' + KID + '\n').encode());original.chmod(0o640)
+        content = original.read_bytes()
+        self.install(KID, OTHER_KID)
+        self.assertEqual(original.read_text(), KID + '\n' + OTHER_KID + '\n')
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        self.assertEqual(original.read_bytes(), content)
+        self.assertEqual(original.stat().st_mode & 0o777, 0o640)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

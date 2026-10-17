@@ -26,8 +26,8 @@ cf_rpc_binding() {
     fi
     cf_safe_file "$CF_DIR/rpc-allowed" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_state.staged" || { cf_fail invalid_rpc_scope;return 1; }
     cmp -s "$CF_DIR/rpc-allowed" "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" || { cf_fail invalid_rpc_scope;return 1; }
-    CF_SCOPE=$(awk 'NR==1{print}END{if(NR!=1)exit 2}' "$CF_DIR/rpc-allowed") || { cf_fail invalid_rpc_scope;return 1; }
-    cf_mac_valid "$CF_SCOPE" && [ "$(wc -c < "$CF_DIR/rpc-allowed")" = 18 ] || { cf_fail invalid_rpc_scope;return 1; }
+    # Read once: later checks use this validated value, never the file again.
+    CF_SCOPE=$(cf_scope_file "$CF_DIR/rpc-allowed") && [ -n "$CF_SCOPE" ] || { CF_SCOPE=;cf_fail invalid_rpc_scope;return 1; }
     [ "$(wc -c < "$CF_DIR/backup/etc_couvrefeu_state.staged")" -le 131072 ] || { cf_fail inactive_generation;return 1; }
     cf_binding_meta=$(awk -v mode=meta -f "$CF_LIB/state.awk" "$CF_DIR/backup/etc_couvrefeu_state.staged") || { cf_fail inactive_generation;return 1; }
     [ "$(printf '%s\n' "$cf_binding_meta" | awk -F '\t' '$1=="G"{print $2}')" = "$CF_GENERATION" ] || { cf_fail inactive_generation;return 1; }
@@ -41,8 +41,9 @@ cf_rpc_binding() {
 }
 cf_scope_safe() {
     [ -n "$CF_SCOPE" ] || return 0
-    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v mac="$CF_SCOPE" '$1=="P"&&$3!="-"&&$3!=mac{exit 1}' || { cf_fail rpc_scope_overlap;return 1; }
-    awk -v mac="$CF_SCOPE" '$0==mac{exit 1}' "$CF_PROTECTED" || { cf_fail protected_mac_overlap;return 1; }
+    # CF_SCOPE is the validated space-joined set; membership, not equality.
+    printf '%s\n' "$CF_POLICY" | awk -F '\t' -v scope="$CF_SCOPE" 'BEGIN{n=split(scope,s," ");for(i=1;i<=n;i++)allowed[s[i]]=1}$1=="P"&&$3!="-"&&!($3 in allowed){exit 1}' || { cf_fail rpc_scope_overlap;return 1; }
+    awk -v scope="$CF_SCOPE" 'BEGIN{n=split(scope,s," ");for(i=1;i<=n;i++)allowed[s[i]]=1}$0 in allowed{exit 1}' "$CF_PROTECTED" || { cf_fail protected_mac_overlap;return 1; }
 }
 cf_receipt_json() {
     cf_receipt_id=$1

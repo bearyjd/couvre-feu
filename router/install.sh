@@ -24,14 +24,17 @@ while [ "$#" -gt 0 ]; do
 "
             shift 2;;
         --rpc-allow)
-            if [ "$#" -lt 2 ] || [ -n "$RPC_ALLOW" ];then
-                fail '--rpc-allow requires one canonical MAC'
-            fi
-            RPC_ALLOW=$2;shift 2;;
+            # Repeatable: one MAC per option; the staged scope is the sorted set.
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--rpc-allow requires one canonical MAC'
+            case "$2" in *"
+"*) fail '--rpc-allow requires one canonical MAC';; esac
+            RPC_ALLOW="$RPC_ALLOW$2
+"
+            shift 2;;
         --source-dir)
             [ "$#" -ge 2 ] || fail '--source-dir requires a directory'
             SOURCE=$2; shift 2;;
-        *) fail 'usage: install.sh [--activate] [--protect aa:bb:cc:dd:ee:ff] [--source-dir DIR]';;
+        *) fail 'usage: install.sh [--activate] [--protect aa:bb:cc:dd:ee:ff] [--rpc-allow aa:bb:cc:dd:ee:ff]... [--source-dir DIR]';;
     esac
 done
 # BEGIN authenticated bootstrap boundary
@@ -55,7 +58,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=392bef82333ca770e32356f8a8743382041b2eed149ff39c6a0feed3d4bee9f5
+CF_BOOTSTRAP_PIN=60467298c88e486426be135b89d075033064c6f761522a01af1be94bce8c42b0
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -193,9 +196,16 @@ chmod 600 "$STAGE/state"
 printf '%s\n' "$CF_PLATFORM_PROFILE" > "$STAGE/platform-profile"
 chmod 600 "$STAGE/platform-profile"
 if [ -n "$RPC_ALLOW" ];then
-    printf '%s\n' "$RPC_ALLOW" > "$STAGE/rpc-allowed"
-    valid_protection "$STAGE/rpc-allowed" || fail '--rpc-allow requires a canonical unicast MAC'
-    awk -v mac="$RPC_ALLOW" '$0==mac{exit 1}' "$STAGE/protected" || fail 'RPC allowed MAC is protected'
+    # Sorted without -u: duplicates are refused by the shared runtime validator.
+    printf '%s' "$RPC_ALLOW" | LC_ALL=C sort > "$STAGE/rpc-allowed"
+    (
+        # shellcheck disable=SC2034
+        CF_BASE=$ROOT CF_LIB=$SOURCE/lib
+        # shellcheck disable=SC1091
+        . "$SOURCE/lib/core.sh"
+        cf_scope_file "$STAGE/rpc-allowed" >/dev/null
+    ) || fail '--rpc-allow requires 1-256 unique canonical unicast MACs'
+    awk 'NR==FNR{protected[$0]=1;next}$0 in protected{exit 1}' "$STAGE/protected" "$STAGE/rpc-allowed" || fail 'RPC allowed MAC is protected'
     chmod 600 "$STAGE/rpc-allowed"
     if [ -e "$BACKUP" ];then
         [ -f "$BACKUP/etc_couvrefeu_rpc-allowed.staged" ] || fail 'scoped migration of a legacy installation is not supported'
@@ -224,7 +234,7 @@ if [ -n "$RPC_ALLOW" ];then
         stage_json=$(printf '%s\n' "$stage_records" | cf_state_json -) || exit 1
         stage_valid=$(printf '%s\n' "$stage_json" | awk -f "$SOURCE/lib/json.awk") || exit 1
         [ "$(printf '%s\n' "$stage_valid" | cf_canonical)" = "$(printf '%s\n' "$stage_records" | cf_canonical)" ] || exit 1
-        printf '%s\n' "$stage_records" | awk -F '\t' -v mac="$RPC_ALLOW" '$1=="P"&&$3!="-"&&$3!=mac{exit 1}' || exit 1
+        printf '%s\n' "$stage_records" | awk -F '\t' 'NR==FNR{allowed[$0]=1;next}$1=="P"&&$3!="-"&&!($3 in allowed){exit 1}' "$STAGE/rpc-allowed" - || exit 1
         printf '%s\n' "$stage_records" | awk -F '\t' 'NR==FNR{protected[$1]=1;next}$1=="P"&&protected[$3]{exit 1}' "$STAGE/protected" -
     ) || fail 'initial state violates scoped policy or protected identities'
 elif [ -e "$BACKUP/etc_couvrefeu_rpc-allowed.after" ];then
