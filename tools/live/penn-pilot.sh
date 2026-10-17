@@ -35,6 +35,7 @@ CFP_TEARDOWN_RESERVE=
 CFP_READ_TIMEOUT=
 CFP_COUNTERS_WORST=
 CFP_ITERATION_WORST=
+CFP_CFCTL_ALLOWANCE=
 CFP_WORST_ENROLL=
 CFP_WORST_PAUSE=
 CFP_WORST_RESUME=
@@ -43,6 +44,7 @@ CFP_WORST_DNS=
 # @CF_PILOT_PARAMETERS_END@
 
 CFP_DIR=
+CFP_LAT_MAX=0
 CFP_MUTATED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
@@ -217,26 +219,49 @@ cfp_safe_band() {
     done
     return 1
 }
+# Wall seconds of one cfctl call since $1 (epoch); remembers the slowest call seen.
+cfp_lat_note() {
+    cfp_lat=$(($(cfp_now) - $1))
+    [ "$cfp_lat" -le "$CFP_LAT_MAX" ] || CFP_LAT_MAX=$cfp_lat
+}
 cfp_cfctl() {
     cfp_safe_band || return 1
+    cfp_c_t0=$(cfp_now)
     cfr_run_sh "$CFR_CFCTL" "$@"
+    cfp_c_rc=$?
+    cfp_lat_note "$cfp_c_t0"
+    return "$cfp_c_rc"
 }
 cfp_cfctl_input() {
     cfp_input=$1; shift
     cfp_safe_band || return 1
+    cfp_c_t0=$(cfp_now)
     # shellcheck disable=SC2086
     $CFR_SH "$CFR_CFCTL" "$@" <"$cfp_input" 2>>"$CFR_STAGE/child.log"
+    cfp_c_rc=$?
+    cfp_lat_note "$cfp_c_t0"
+    return "$cfp_c_rc"
 }
-# Timed pause only; fails only if the safe band never opens.
+# Timed pause only; fails only if the safe band never opens. The pause outlasts
+# its own cfctl call: on a loaded host a call takes tens of seconds, and a pause
+# that lapses inside `cfctl pause` leaves effectivePauses empty (set_drift, exit 1).
+# So the predeclared length is extended by the slowest cfctl call measured so far,
+# capped at the disclosed cfctl allowance (already inside the EXPIRY/PAUSE budgets,
+# since the call runs within the pause's own window). The call itself runs once.
 # Optional $2: counters tag snapshotted just before the safe-band wait and the
 # pause apply (same slot instance until that apply).
 cfp_pause() {
     [ -z "$2" ] || cfp_counters "$2" || cfr_info "counters $2 unavailable"
     cfp_safe_band || return 1
-    CFP_UNTIL=$(($(cfp_now) + $1))
-    cfr_info "pause $CFP_PERSON until=$CFP_UNTIL seconds=$1"
+    cfp_extra=$CFP_LAT_MAX
+    [ "$cfp_extra" -le "$CFP_CFCTL_ALLOWANCE" ] || cfp_extra=$CFP_CFCTL_ALLOWANCE
+    cfp_p_t0=$(cfp_now)
+    CFP_UNTIL=$((cfp_p_t0 + $1 + cfp_extra))
+    cfr_info "pause $CFP_PERSON until=$CFP_UNTIL seconds=$1 latency_margin_s=$cfp_extra"
     # The printed status line is the gate (exit status alone is not evidence).
     cfr_run_sh "$CFR_CFCTL" pause "$CFP_PERSON" --until "$CFP_UNTIL" > "$CFP_DIR/status.json" || cfr_info "pause exit $?"
+    cfp_lat_note "$cfp_p_t0"
+    cfr_info "pause_call latency_s=$cfp_lat remaining_s=$((CFP_UNTIL - $(cfp_now)))"
 }
 # $1 file, then literal substrings that the single status line must contain.
 cfp_status_has() {
@@ -533,7 +558,7 @@ cfp_main() {
     printf 'BEGIN penn-pilot commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS" \
         "$CFP_ROUTER_IP" "$CFP_PERSON" "$CFP_OPERATION_ID" "$CFP_POLICY" "$CFP_DNS_NAME" "$CFP_SAFE_BAND" "$CFP_REMOTE_TIMEOUT" \
-        "$CFP_TEARDOWN_RESERVE" "$CFP_READ_TIMEOUT" "$CFP_COUNTERS_WORST" "$CFP_ITERATION_WORST" "$CFP_WORST_ENROLL" "$CFP_WORST_PAUSE" \
+        "$CFP_TEARDOWN_RESERVE" "$CFP_READ_TIMEOUT" "$CFP_COUNTERS_WORST" "$CFP_ITERATION_WORST" "$CFP_CFCTL_ALLOWANCE" "$CFP_WORST_ENROLL" "$CFP_WORST_PAUSE" \
         "$CFP_WORST_RESUME" "$CFP_WORST_EXPIRY" "$CFP_WORST_DNS"; do
         [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
     done

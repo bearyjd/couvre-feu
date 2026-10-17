@@ -182,7 +182,8 @@ def build_payload(config, commit, blobs, timing):
               'CFP_PREMUTATION_BUDGET': timing['premutationBudgetSeconds'],
               'CFP_REMOTE_TIMEOUT': config['remoteTimeoutSeconds'], 'CFP_TEARDOWN_RESERVE': TEARDOWN_RESERVE_SECONDS,
               'CFP_READ_TIMEOUT': READ_TIMEOUT_SECONDS, 'CFP_COUNTERS_WORST': COUNTERS_WORST_SECONDS,
-              'CFP_ITERATION_WORST': iteration_worst_seconds(timing)}
+              'CFP_ITERATION_WORST': iteration_worst_seconds(timing),
+              'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS}
     values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing).items()})
     values = {key: str(value) for key, value in values.items()}
     for value in values.values():
