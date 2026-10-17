@@ -12,6 +12,7 @@ import { ACCOUNT_LIMIT, PASSKEYS_PER_ACCOUNT } from '../src/account-limits.ts';
 import { TestAuthenticator } from './authenticator.ts';
 
 const origin = 'http://localhost:4173';
+const code = (expected: string) => (error: {code?: string}) => error.code === expected;
 const newBrowser = () => randomBytes(32).toString('base64url');
 interface Device { key: TestAuthenticator; browser: string; token: string; session: () => AuthSession }
 
@@ -163,9 +164,9 @@ test('disabling an account ends all its sessions; the last admin with a passkey 
         const jd = await bootstrap(f, 'jd'), bryn = await bootstrap(f, 'bryn'), brynElsewhere = await login(f, bryn.key);
         const jdCredential = jd.key.credentialId.toString('base64url');
         await assert.rejects(act(f, jd, 'own_passkey_revoke', jdCredential), (e: {status: number; code: string}) => e.status === 409 && e.code === 'last_admin_required');
-        await assert.rejects(act(f, jd, 'passkey_revoke', jdCredential), /last_admin_required/);
-        await assert.rejects(act(f, jd, 'account_role', 'jd', {role: 'parent'}), /last_admin_required/);
-        await assert.rejects(act(f, jd, 'account_active', 'jd', {active: false}), /last_admin_required/);
+        await assert.rejects(act(f, jd, 'passkey_revoke', jdCredential), code('last_admin_required'));
+        await assert.rejects(act(f, jd, 'account_role', 'jd', {role: 'parent'}), code('last_admin_required'));
+        await assert.rejects(act(f, jd, 'account_active', 'jd', {active: false}), code('last_admin_required'));
         assert.equal(jd.session().dto.actor.role, 'admin');
         await act(f, jd, 'account_active', 'bryn', {active: false});
         assert.throws(() => bryn.session(), /account_disabled|permissions_changed/);
@@ -217,7 +218,7 @@ test('defensive account and passkey limits are generous constants enforced at th
         const last = await act(f, jd, 'token_issue', 'jd', {label: ''}) as {token: string};
         await addDevice(f, last.token);
         assert.equal(f.count("SELECT count(*) n FROM credentials WHERE account_id='jd'"), PASSKEYS_PER_ACCOUNT);
-        await assert.rejects(act(f, jd, 'token_issue', 'jd', {label: ''}), /passkey_limit_reached/);
+        await assert.rejects(act(f, jd, 'token_issue', 'jd', {label: ''}), code('passkey_limit_reached'));
     } finally { f.close(); }
 });
 

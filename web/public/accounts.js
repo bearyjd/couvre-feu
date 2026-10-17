@@ -15,7 +15,7 @@ function el(tag, props = {}, ...children) {
   return node;
 }
 
-export function createAccounts({ session, people, signedOut }) {
+export function createAccounts({ session, people }) {
   const root = document.querySelector('#accounts-panel');
   let key = '', mine = null, accounts = null, notice = '', token = null, busy = false;
 
@@ -35,7 +35,8 @@ export function createAccounts({ session, people, signedOut }) {
       mine = (await call('/account/passkeys')).passkeys;
       accounts = session().actor.role === 'admin' ? (await call('/admin/accounts')).accounts : null;
     } catch (error) {
-      if (error.status === 401) { signedOut(); return; }
+      // Session expiry is the status view's job; this panel only hides itself.
+      if (error.status === 401) { mine = null; accounts = null; draw(); return; }
       notice = error.message;
     }
     draw();
@@ -51,7 +52,6 @@ export function createAccounts({ session, people, signedOut }) {
       notice = done(result) ?? '';
     } catch (error) {
       notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : error.message;
-      if (error.status === 401) { busy = false; signedOut(); return; }
     }
     busy = false;
     await load();

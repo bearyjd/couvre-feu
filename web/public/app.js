@@ -19,7 +19,7 @@ const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
-const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [], signedOut: () => { resetView(); announce('This session ended. Sign in again; local status has been cleared.', true); } });
+const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
