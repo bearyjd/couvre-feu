@@ -287,6 +287,9 @@ def iptables(command, args, state):
     operation = args[0]
     chain = args[1] if len(args) > 1 else None
     rule = args[2:]
+    if operation in ("-A", "-I", "-R", "-C", "-D") and not options_follow_modules(rule):
+        print(f"{command}: unknown option in {' '.join(rule)!r}", file=sys.stderr)
+        return 2, ""
     if operation.startswith("-") and operation.endswith("L") and set(operation[1:]) <= set("nvxL") and len(operation) > 2:
         # Columnar counter listing (iptables -nvxL); counters live in backend state.
         if chain not in chains:
@@ -406,6 +409,24 @@ def prune_counters(state):
     state["counters"] = {key: value for key, value in state.get("counters", {}).items() if key in live}
 
 
+MODULE_OPTIONS = {"--comment": "comment", "--match-set": "set", "--mac-source": "mac", "--ctstate": "conntrack",
+                  "--weekdays": "time", "--timestart": "time", "--timestop": "time", "--kerneltz": "time",
+                  "--datestart": "time", "--datestop": "time"}
+
+
+def options_follow_modules(row):
+    """Like iptables' getopt parsing, a match option is unknown until its module is loaded."""
+    loaded = set()
+    for i, token in enumerate(row):
+        if token in ("-m", "--match", "-p", "--protocol") and i + 1 < len(row):
+            loaded.add(row[i + 1])
+        elif token in MODULE_OPTIONS and MODULE_OPTIONS[token] not in loaded:
+            return False
+        elif token in ("--dport", "--sport") and not loaded & {"tcp", "udp"}:
+            return False
+    return True
+
+
 def rule_identity(row):
     """iptables compares parsed selectors, including equivalent option order."""
     parts, i, negate = [], 0, ""
@@ -453,6 +474,12 @@ def serialize_rule(row, canonical, command):
         selector = row[index:index + 2]
         del row[index:index + 2]
         row = selector + row
+    if "--comment" in row:
+        # xtables_save_string quotes any comment beyond [A-Za-z0-9._-].
+        index = row.index("--comment") + 1
+        if any(not (char.isalnum() or char in "._-") for char in row[index]):
+            row[index] = json.dumps(row[index])
+        return " ".join(row)
     return " ".join(json.dumps(value) if any(char.isspace() for char in value) else value for value in row)
 
 

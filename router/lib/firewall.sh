@@ -615,6 +615,8 @@ cf_transition_repair_evidence() {
     cf_te_fresh=$1
     # PLAN/GUARD rows are rewritten from CF_EXPECTED; it must be the intent's slot plan.
     [ "$(printf '%s\n' "$CF_TRANSITION" | awk '$1=="SLOT"{print $2}')" = "$CF_SLOT" ] || { cf_fail unsafe_transition;return 1; }
+    [ "$(printf '%s\n' "$CF_TRANSITION" | awk '/^PLAN\t/{sub(/^PLAN\t/,"");print}')" = "$CF_EXPECTED" ] || { cf_fail unsafe_transition;return 1; }
+    [ "$(printf '%s\n' "$CF_TRANSITION" | awk '/^GUARD\t/{sub(/^GUARD\t/,"");print}')" = "$CF_GUARD_PLAN" ] || { cf_fail unsafe_transition;return 1; }
     cf_te_current=$(cf_snapshot) || return 1
     cf_te_unsafe=$(printf '%s\n' "$cf_te_current" | awk -v fresh="$cf_te_fresh" -v kids="$CF_UNION" '
     BEGIN{n=split(kids,a,"\n");for(i=1;i<=n;i++)m[a[i]]=1;n=split(fresh,a,"\n");for(i=1;i<=n;i++){split(a[i],b,"\t");if(b[2] in m)safe[b[1]]=1}}
@@ -670,7 +672,18 @@ cf_stale_repair() {
 $(printf '%s\n' "$cf_sr_before" | awk 'NF{print "REPAIR_BEFORE " $0}')
 $(printf '%s\n' "$cf_sr_after" | awk 'NF{print "REPAIRED " $0}')"
             cf_durable_record firewall.intent "$CF_TRANSITION" || return 1
-            set -- $cf_sr_rule
+            # REPAIR rows hold the normalised (sorted) body, which iptables -D
+            # rejects (--comment before -m comment). Delete with the live -S
+            # form of the rule whose normalised identity is exact.
+            cf_sr_raw=$(cf_table "$cf_sr_f" -t "$cf_sr_t" -S "$cf_sr_c") || { cf_fail stale_selector_repair_failed;return 1; }
+            cf_sr_norm=$(printf '%s\n' "$cf_sr_raw" | cf_normal_rules)
+            cf_sr_args=$(awk -v raw="$cf_sr_raw" -v norm="$cf_sr_norm" -v exact="$cf_sr_exact" -v head="-A $cf_sr_c " 'BEGIN{
+                n=split(raw,r,"\n");if(split(norm,m,"\n")!=n)exit 1
+                for(i=1;i<=n;i++)if(m[i]==exact){s=r[i];gsub(/--comment "cf:v2"/,"--comment cf:v2",s)
+                    if(index(s,head)!=1)exit 1;s=substr(s,length(head)+1)
+                    if(s!~/^[a-zA-Z0-9_:.,! \/-]+$/)exit 1;print s;exit 0}
+                exit 1}') || { cf_fail stale_selector_repair_failed;return 1; }
+            set -- $cf_sr_args
             cf_table "$cf_sr_f" -t "$cf_sr_t" -D "$cf_sr_c" "$@" || { cf_fail stale_selector_repair_failed;return 1; }
         fi
     done <<EOR
@@ -715,7 +728,7 @@ cf_build_sets() {
         if ! cf_backend ipset save "$cf_bs_name" >/dev/null 2>&1;then
             if [ "$cf_bs_type" = hash:ip ];then cf_backend ipset create "$cf_bs_name" "$cf_bs_type" family "$cf_bs_family" || return 1;else cf_backend ipset create "$cf_bs_name" "$cf_bs_type" || return 1;fi
         fi
-        cf_bs_members=$(printf '%s\n' "$CF_TRANSITION" | awk -v s="$cf_bs_name" '$1=="AFTER"&&$2=="SET"&&$3==s{print $4}')
+        cf_bs_members=$(printf '%s\n' "$CF_TRANSITION" | awk -v s="$cf_bs_name" '$1=="AFTER"&&$2=="SET"&&$3==s{print $4}' | LC_ALL=C sort -u)
         for cf_bs_m in $cf_bs_members;do cf_backend ipset add "$cf_bs_name" "$cf_bs_m" -exist || return 1;done
     done
 }
@@ -1046,7 +1059,7 @@ cf_cleanup_inventory() {
     cf_ci_rules=$(cf_rules_snapshot) || return 1
     printf '%s\n' "$cf_ci_rules" | awk '$4=="-N"{print "CHAIN " $1 " " $2 " " $3}$4=="-A"{print "RULE " $0}'
     cf_ci_sets=$(cf_backend ipset save) || return 1
-    printf '%s\n' "$cf_ci_sets" | awk '($1=="create"||$1=="add")&&$2~/^cf2_[ab]_(k|p|d4|d6|u)$/{print "IPSET " $2 " " $0}' | sort
+    printf '%s\n' "$cf_ci_sets" | awk '($1=="create"||$1=="add")&&$2~/^cf2_[ab]_(k|p|d4|d6|u)$/{print "IPSET " $2 " " $0}' | LC_ALL=C sort
 }
 cf_kernel_baseline_digest() {
     # Capture raw complete inventories; counters do not occur in -S output.
