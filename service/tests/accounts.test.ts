@@ -68,6 +68,9 @@ test('admin creates an account, issues a one-use add-device token; the passkey s
         assert.equal(pending.pairingCode, pairingCode(device.key.credentialId.toString('base64url')));
         assert.equal(f.count("SELECT count(*) n FROM sessions WHERE account_id=?", created.account.id), 0);
         await assert.rejects(login(f, device.key), /credential_not_bound/);
+        // A pending passkey is not even offered to sign-in challenges.
+        const offered = await f.auth.loginOptions({}, newBrowser());
+        assert.ok(!Object.hasOwn(JSON.parse(f.store.get<{credential_ids: string}>('SELECT credential_ids FROM challenges WHERE id=?', offered.challengeId)!.credential_ids), pending.credentialId));
         // One use: the token cannot enroll a second device.
         await assert.rejects(f.auth.registrationOptions({token: issued.token}, newBrowser()), /invalid_bootstrap/);
         const listed = f.admin.list(jd.session().dto.actor).accounts.find(a => a.id === created.account.id)!;
