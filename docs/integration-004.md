@@ -47,6 +47,49 @@ Required manifest groups are `version: 1`, `mode: "integration"`, `port`, `dataD
 publicIdentity, publicKeyFingerprint and generation. `person` binds one device MAC;
 accounts bind explicit roles/person IDs. Sensitive values stay private.
 
+### Parent accounts and passkeys (design 008 PR-B)
+
+Manifest `accounts` only seed a fresh database (at least one admin). Afterwards the
+database is authoritative: admins add parents and devices in the web UI, so adding a
+parent never edits the manifest (which would change its digest and orphan every passkey).
+There is no product limit on parent accounts or devices. `service/src/account-limits.ts`
+holds two defensive bounds (1000 accounts, 32 passkeys per account) that only cap the
+per-sign-in credential snapshot; raise them there if ever needed.
+
+- An account may hold many passkeys. A session records the passkey that created it;
+  removing a passkey ends exactly those sessions. Disabling an account or changing its
+  role bumps its permission version and ends all of its sessions.
+- `integration:bootstrap` looks the account up in the database (not the manifest) and
+  enrolls an active passkey, also as an extra passkey of an enrolled account. The token is
+  32 random bytes, stored hashed, one use, ten minutes; a new token consumes the old one.
+- An admin-issued add-device token (same properties) enrolls a *pending* passkey that
+  cannot sign in. The device shows a pairing code (first 6 base32 characters of
+  sha256(credential id)); the admin compares it before approving.
+- Every account/passkey change (create account, issue token, approve, remove, role,
+  enable/disable, removing one's own passkey) needs a fresh passkey assertion bound to the
+  session and a digest of the exact change; it is one use and expires after 120 seconds.
+  This keeps a cleartext proxy-hop sniffer holding cookies and CSRF from escalating.
+- At least one active admin must keep an active passkey (`last_admin_required`).
+- There is no password login and no QR code yet; the token is shown once as text.
+
+### Rebinding to a later manifest
+
+Any manifest byte change normally refuses the database. To keep accounts and passkeys
+across a deliberate manifest change (new router generation, protected MAC change):
+
+```sh
+npm run integration:rebind -- "<OLD_MANIFEST>" "<NEW_MANIFEST>" "<OLD_SHA256>" "<NEW_SHA256>"
+```
+
+Stop the service first. The digests are `sha256sum` of each manifest file. It refuses
+unless dispatch is stopped (no automatic owner), no operation is pending/unknown, no RPC
+claim or dispatch step is live or uncertain, and no time request owes a restore. It refuses
+a changed origin (the passkey RP ID), person id or `dataDir`. It keeps accounts, passkeys
+and request links, resets the router observation and desired policy from the new
+enrollment, bumps the dispatch epoch and audits both digests. A process still running on
+the old manifest fails closed: every mutate and dispatch transaction re-reads the marker
+(`integration_database_identity_mismatch`).
+
 Owner schedules are the full normalized `enrollment.schedules` array, using existing
 v1 `{person, id, weekdays, start, stop}` records. Windows include the start minute and
 exclude the stop minute; cross-midnight windows use the weekday on which they start.
@@ -185,6 +228,7 @@ values; `execute` needs the exact invocation approval before it can be used:
 ```sh
 npm run integration:start -- "<PRIVATE_MANIFEST>"
 npm run integration:bootstrap -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>"
+npm run integration:rebind -- "<OLD_MANIFEST>" "<NEW_MANIFEST>" "<OLD_SHA256>" "<NEW_SHA256>"
 npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" observe
 npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" apply "<OPERATION_ID>"
 npm run integration:dispatch -- prepare "<PRIVATE_MANIFEST>" "<PRIVATE_PERMIT>" receipt "<OPERATION_ID>"
