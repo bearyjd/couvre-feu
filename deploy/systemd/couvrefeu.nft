@@ -3,6 +3,11 @@
 # It owns only `table inet couvrefeu` and leaves every other table alone (Docker, libvirt, ...).
 # Inbound: only <PROXY_IP> reaches the app port; admin SSH; ICMP/ICMPv6 (needed for IPv6 neighbor discovery).
 # Outbound: router SSH, DNS and NTP only. Everything else, IPv4 and IPv6, is dropped.
+# REQUIRES A STATIC ADDRESS: DHCP (udp 67/68) is dropped. If you must use DHCP, add
+#   udp dport { 67, 68 } accept
+# to both chains first. Allow rules are IPv4-only (admin SSH must use IPv4); ICMPv6 stays open for neighbor discovery.
+# Not combinable with tailscaled as written: see docs/runbooks/deploy.md.
+# Optional monitor push (see runbook), add to the output chain:  ip daddr <MONITOR_IP> tcp dport <MONITOR_PORT> accept
 # Apply safely: see docs/runbooks/deploy.md (nft -c -f first, then a rollback timer).
 add table inet couvrefeu
 delete table inet couvrefeu
