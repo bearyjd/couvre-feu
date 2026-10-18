@@ -1073,15 +1073,17 @@ class PilotFixtureTests(PilotBase):
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
                                                dict(PENN, state='DELAY'), ipv6,
                                                dict(ip='2001:db8::99', mac='02:00:00:00:00:99', state='STALE')])
-        program = shlex.split(self.spec['shell'])[0]
+        shell = shlex.split(self.spec['shell'])
+        program = shell[0]
         q = shlex.quote
         real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
+        real_shell = ' '.join([real, *map(q, shell[1:])])
         rpc_log, accepted = self.work / 'rpc-count', self.work / 'accepted.json'
         reply = q('{"ok":false,"errors":["incomplete_transition_address_coverage"],"receipt":null}')
         self.router_double(program, (
             f'case " $* " in *{q(" " + cfctl + " rpc-sync ")}*)\n'
             f'  cat >/dev/null; echo rpc-sync >> {q(str(rpc_log))}\n'
-            f'  {real} {q(cfctl)} rpc-status --json > {q(str(accepted))}\n'
+            f'  {real_shell} {q(cfctl)} rpc-status --json > {q(str(accepted))}\n'
             f'  echo {reply}\n'
             '  exit 1;; esac\n'
             f'exec {real} "$@"\n'))
