@@ -8,7 +8,9 @@ import { IntegrationStore } from './integration-db.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
 import { ActivityStore } from './activity-store.ts';
 import type { RouterActivity } from '../../shared/src/router-activity.ts';
-import { validatePilotPolicy } from './integration-config.ts';
+import { routerScopeOf } from './integration-config.ts';
+import type { IntegrationConfig } from './integration-config.ts';
+import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-children.ts';
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
@@ -18,9 +20,11 @@ export interface PreparedDispatch {
     preparedAt: number; expiresAt: number; invocation: FrozenInvocation; script: string; scriptSha256: string;
 }
 function quoted(s: string): string { return "'" + s.replace(/'/g, "'\\''") + "'"; }
-function renderScript(plan: Omit<PreparedDispatch, 'script' | 'scriptSha256'>, allowedMac: string): string {
+/** v1 manifests (no routerScope) keep the exact single-MAC header line; a declared scope lists every allowed MAC. */
+const scopeLine = (c: IntegrationConfig) => c.routerScope ? `# Allowed MACs: ${routerScopeOf(c).join(',')}` : `# Allowed MAC: ${c.person.device.mac}`;
+function renderScript(plan: Omit<PreparedDispatch, 'script' | 'scriptSha256'>, config: IntegrationConfig): string {
     const i = plan.invocation;
-    return `# Couvre-feu finite invocation, version 1\n# Target digest: ${plan.targetDigest}\n# Manifest digest: ${plan.manifestDigest}\n# Installation generation: ${plan.generation}\n# Allowed MAC: ${allowedMac}\n# Dispatch epoch: ${plan.dispatchEpoch}\n# Expires at: ${plan.expiresAt}\n# Kind: ${i.kind}; operation: ${i.operationId ?? 'none'}\n# Request digest: ${i.requestDigest}\n# Exactly one attempt; bounded ${i.deadlineMs}ms, stdout 131072 bytes, stderr 16384 bytes.\n# Abort on changed configuration/base, unsafe identity, timeout, or invalid response.\n# No automatic rollback/retry. Unknown delivery requires separately approved receipt or generation fence.\n# Review artifact: the dispatcher invokes this argv with shell=false and the exact stdin below.\n${[i.executable, ...i.argv].map(quoted).join(' ')}${i.stdin ? " <<'CF_RPC_INPUT'\n" + i.stdin + 'CF_RPC_INPUT\n' : ' < /dev/null\n'}`;
+    return `# Couvre-feu finite invocation, version 1\n# Target digest: ${plan.targetDigest}\n# Manifest digest: ${plan.manifestDigest}\n# Installation generation: ${plan.generation}\n${scopeLine(config)}\n# Dispatch epoch: ${plan.dispatchEpoch}\n# Expires at: ${plan.expiresAt}\n# Kind: ${i.kind}; operation: ${i.operationId ?? 'none'}\n# Request digest: ${i.requestDigest}\n# Exactly one attempt; bounded ${i.deadlineMs}ms, stdout 131072 bytes, stderr 16384 bytes.\n# Abort on changed configuration/base, unsafe identity, timeout, or invalid response.\n# No automatic rollback/retry. Unknown delivery requires separately approved receipt or generation fence.\n# Review artifact: the dispatcher invokes this argv with shell=false and the exact stdin below.\n${[i.executable, ...i.argv].map(quoted).join(' ')}${i.stdin ? " <<'CF_RPC_INPUT'\n" + i.stdin + 'CF_RPC_INPUT\n' : ' < /dev/null\n'}`;
 }
 export class IntegrationWorker {
     readonly store: IntegrationStore;
@@ -40,7 +44,7 @@ export class IntegrationWorker {
         const c = this.store.config, now = this.now();
         const base: Omit<PreparedDispatch, 'script' | 'scriptSha256'> = {version: 1, targetDigest: c.targetDigest, manifestDigest: c.manifestDigest,
             generation: c.router.generation, dispatchEpoch: this.store.integrationState().dispatch_epoch, preparedAt: now, expiresAt: now + 900, invocation};
-        const script = renderScript(base, c.person.device.mac);
+        const script = renderScript(base, c);
         return {...base, script, scriptSha256: sha256(script)};
     }
     private validate(plan: PreparedDispatch): FrozenInvocation {
@@ -53,7 +57,7 @@ export class IntegrationWorker {
         const expected = this.router.invocation(i.kind, i.kind === 'apply' ? this.policy.envelope(i.operationId!) : undefined, i.kind === 'receipt' ? i.operationId! : undefined);
         if (JSON.stringify(expected) !== JSON.stringify(i)) throw new AppError(409, 'dispatch_invocation_changed');
         const {script: _script, scriptSha256: _digest, ...base} = plan;
-        if (renderScript(base, c.person.device.mac) !== plan.script) throw new AppError(409, 'dispatch_script_changed');
+        if (renderScript(base, c) !== plan.script) throw new AppError(409, 'dispatch_script_changed');
         return i;
     }
     /** This CLI-only method consumes one exact permit durably before any possible spawn. */
@@ -87,7 +91,8 @@ export class IntegrationWorker {
                 if (owner) {
                     const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
                     const request = JSON.parse(op.request_json) as {permissionVersion?: string};
-                    if (!actor?.active || !['admin', 'parent'].includes(actor.role) || !JSON.parse(actor.person_ids).includes(op.person_id) || String(actor.permission_version) !== request.permissionVersion) {
+                    const roleAllowed = ['enroll', 'unenroll'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
+                    if (!actor?.active || !roleAllowed || !JSON.parse(actor.person_ids).includes(op.person_id) || String(actor.permission_version) !== request.permissionVersion) {
                         this.updateOperation(id, 'failed', 'actor_permission_changed_before_dispatch');
                         this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
                         this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
@@ -116,7 +121,8 @@ export class IntegrationWorker {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation));
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
-            validatePilotPolicy(o.acceptedPolicy, this.store.config);
+            try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
+            catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
             this.finish(batchId, token, epoch, invocation, o, null);
         } catch (error) {
@@ -176,7 +182,14 @@ export class IntegrationWorker {
                     return;
                 }
                 const rpc = this.store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active)!;
-                if (rpc.attempt_count === 0 && (o!.acceptedPolicy.revision !== e.expected_revision || o!.policyDigest !== e.expected_digest)) {
+                if (invocation.kind === 'apply' && invocation.operationId === active && this.refusedBeforeWrite(o!, e)) {
+                    // The router's own reply to this single attempt: refused under its lock before any policy write (a refused
+                    // transition still records runtime/error), base unchanged and no receipt. Nothing can apply later
+                    // (attempt_count is capped at 1), so the change failed; it is not unknown.
+                    this.updateOperation(active, 'failed', o!.errors[0]);
+                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
+                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+                } else if (rpc.attempt_count === 0 && (o!.acceptedPolicy.revision !== e.expected_revision || o!.policyDigest !== e.expected_digest)) {
                     // Positive local no-dispatch witness allows resolving a stale queued intent.
                     this.updateOperation(active, 'conflict', 'router_base_changed_before_dispatch');
                     this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
@@ -191,10 +204,35 @@ export class IntegrationWorker {
             }
         });
     }
+    private refusedBeforeWrite(o: RPCObservation, e: ReturnType<IntegrationPolicy['envelope']>): boolean {
+        return o.receipt === null && o.currentOperationId !== e.operation_id && o.generation === e.generation && o.acceptedPolicy.revision === e.expected_revision &&
+            o.policyDigest === e.expected_digest && o.errors.length > 0 && o.errors.every(code => PRE_WRITE_REJECTIONS.has(code));
+    }
     private updateOperation(id: string, state: 'confirmed' | 'unknown' | 'failed' | 'conflict', error: string | null, confirmedAt: number | null = null): void {
         const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id)!;
         if (op.state === state && op.error === error && (confirmedAt === null || op.confirmed_at === confirmedAt)) return;
+        this.settleDevices(op, state);
         this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, error, confirmedAt, this.now(), id);
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, id, op.action, op.revision, this.now(), state);
+    }
+    /**
+     * Device rows staged by an enroll/unenroll operation settle with it; an unknown outcome leaves them pending. A conflict
+     * may follow an accepted receipt that was later superseded, so it settles from the stored router observation instead.
+     */
+    private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): void {
+        if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return;
+        const pending = op.action === 'enroll' ? 'enrolling' : 'removing';
+        let held: boolean;
+        if (state === 'conflict') {
+            const o = this.store.observation().value;
+            if (!o) return;
+            for (const row of this.store.all<{id: string; identifier: string}>('SELECT id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
+                held = o.acceptedPolicy.people.some(p => p.id === op.person_id && p.macs.includes(row.identifier));
+                this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE id=?" : 'DELETE FROM devices WHERE id=?', row.id);
+            }
+            return;
+        }
+        held = (state === 'confirmed') === (op.action === 'enroll');
+        this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state=?" : 'DELETE FROM devices WHERE operation_id=? AND state=?', op.id, pending);
     }
 }

@@ -84,3 +84,26 @@ test('rebind keeps accounts, passkeys and links, resets router observation, fenc
         try { assert.equal(reopened.get<{n: number}>("SELECT count(*) n FROM accounts")!.n, 2); } finally { reopened.close(); }
     } finally { if (closed) rmSync(f.dir, {recursive: true, force: true}); else f.cleanup(); }
 });
+
+test('rebind refuses a manifest that would protect or leave out a stored device, so the service never wedges', async () => {
+    const f = integrationFixture();
+    try {
+        // Placeholder, locally administered unicast MACs only.
+        const seed = f.config.person.device.mac, tablet = '02:10:20:30:40:52';
+        f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d_tablet','pilot','Tablet','mac',?,'active',1)", tablet);
+        await f.observe(); f.store.stopDispatch(f.now());
+        const run = (config: IntegrationConfig) => rebindIntegration(f.store, config, f.config.manifestDigest, config.manifestDigest, f.now());
+        assert.throws(() => run(next(f.config, {protectedMacs: [...f.config.protectedMacs, tablet], routerScope: [seed, tablet]})), /rebind_device_protected/);
+        assert.throws(() => run(next(f.config, {routerScope: [seed]})), /rebind_device_outside_scope/);
+        // Absent routerScope means the seed MAC alone, which leaves the tablet out.
+        assert.throws(() => run(next(f.config, {routerScope: undefined})), /rebind_device_outside_scope/);
+        // A device still being enrolled or removed counts too.
+        f.store.run("UPDATE devices SET state='removing' WHERE id='d_tablet'");
+        assert.throws(() => run(next(f.config, {routerScope: [seed]})), /rebind_device_outside_scope/);
+        f.store.run("UPDATE devices SET state='active' WHERE id='d_tablet'");
+        assert.equal(f.store.get<{manifest_digest: string}>('SELECT manifest_digest FROM integration_state')!.manifest_digest, f.config.manifestDigest);
+        const target = next(f.config, {routerScope: [seed, tablet]});
+        run(target);
+        assert.equal(f.store.get<{manifest_digest: string}>('SELECT manifest_digest FROM integration_state')!.manifest_digest, target.manifestDigest);
+    } finally { f.cleanup(); }
+});

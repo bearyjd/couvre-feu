@@ -1,5 +1,6 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { policyJSON } from '../../shared/src/router-schema.ts';
+import { routerScopeOf } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
 
@@ -26,6 +27,11 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         if (state.active_operation_id !== null || store.get("SELECT id FROM operations WHERE state IN ('pending','unknown') LIMIT 1")) refuse('rebind_operation_in_progress');
         if (store.get("SELECT operation_id FROM operation_rpc WHERE phase IN ('queued','claimed','uncertain') LIMIT 1") || store.get("SELECT batch_id FROM dispatch_steps WHERE state IN ('consumed','uncertain') LIMIT 1")) refuse('rebind_uncertain_claim');
         if (store.get("SELECT id FROM time_requests WHERE state='approving' OR repause_state IN ('waiting','applying') LIMIT 1")) refuse('rebind_time_request_obligation');
+        // A stored device the new router installation protects or does not allow would invalidate every observation and
+        // block every change, including its own removal. Remove the device first, or list it in the new routerScope.
+        const macs = store.all<{identifier: string}>("SELECT identifier FROM devices WHERE identifier_kind='mac'").map(d => d.identifier), scope = routerScopeOf(next);
+        if (macs.some(m => next.protectedMacs.includes(m))) refuse('rebind_device_protected');
+        if (macs.some(m => !scope.includes(m))) refuse('rebind_device_outside_scope');
         store.run('UPDATE integration_state SET target_digest=?,manifest_digest=?,generation=?,dispatch_stopped=1,dispatch_epoch=dispatch_epoch+1,observation_error=NULL WHERE singleton=1', next.targetDigest, next.manifestDigest, next.router.generation);
         store.run('UPDATE automatic_dispatch SET enabled=0 WHERE singleton=1');
         store.run("UPDATE dispatch_batches SET state='revoked' WHERE state='running'");

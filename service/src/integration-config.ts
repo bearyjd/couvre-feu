@@ -23,8 +23,14 @@ export interface IntegrationManifest {
     timeRequests?: {enabled: boolean};
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
     router: {host: string; user: 'root'; port: number; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
+    /** Seeds the first child and device of a fresh database; children and devices are managed in the database afterwards. */
     person: {id: string; name: string; device: {id: string; label: string; mac: string}};
     protectedMacs: string[];
+    /**
+     * The router installation's fixed `--rpc-allow` set (install.sh; the router does not report it over RPC). A device can
+     * only be enrolled if its MAC is listed. Absent: exactly the seed device's MAC, i.e. a single-MAC installation.
+     */
+    routerScope?: string[];
     accounts: {id: string; displayName: string; role: Role; personIds: string[]}[];
     enrollment: RouterPolicy;
 }
@@ -79,7 +85,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -98,6 +104,7 @@ export function integrationConfig(path: string): IntegrationConfig {
         return {id: id(a.id), displayName: text(a.displayName), role: a.role as Role, personIds: [person.id]};
     });
     if (new Set(accounts.map(a => a.id)).size !== accounts.length || !accounts.some(a => a.role === 'admin')) bad('admin_account_required');
+    const routerScope = m.routerScope === undefined ? undefined : scopeList(m.routerScope, protectedMacs, person.device.mac);
     const enrollment = normalizePolicy(m.enrollment, protectedMacs);
     const lan = m.trustedProxies === undefined ? lanHTTPS(m, m.port as number) : lanProxy(m, m.port as number);
     const origin = lan ? lan.publicOrigin : m.origin === undefined ? `http://localhost:${m.port}` : privateHTTPSOrigin(m.origin);
@@ -115,12 +122,22 @@ export function integrationConfig(path: string): IntegrationConfig {
         timeRequests = {enabled: settings.enabled as boolean};
     }
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
-    const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort()}));
+    const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));
     return {...manifest, origin, host: new URL(origin).host, manifestDigest: sha256(raw), targetDigest, provenance: {source: 'real-router-integration', routerCompatibilityVerified: false, integrationScope: sha256(`${targetDigest}\n${sha256(raw)}`)}};
 }
+/** Mirrors install.sh: 1-256 unique canonical unicast MACs, none protected; it must contain the seed device. Stored sorted. */
+function scopeList(value: unknown, protectedMacs: string[], seed: string): string[] {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 256) bad('invalid_router_scope');
+    const scope = (value as unknown[]).map(entry => { try { return mac(entry); } catch { return bad('invalid_router_scope'); } }).sort();
+    if (new Set(scope).size !== scope.length || !scope.includes(seed)) bad('invalid_router_scope');
+    if (scope.some(entry => protectedMacs.includes(entry))) bad('protected_mac_overlap');
+    return scope;
+}
+/** MACs the router accepts for enrollment: the manifest routerScope, or the seed device alone. */
+export const routerScopeOf = (config: Pick<IntegrationManifest, 'routerScope' | 'person'>): string[] => config.routerScope ?? [config.person.device.mac];
 /** The router is a private IPv4 literal reached as root (Dropbear forced command) on an explicit port; names, tailnet and public addresses are refused. */
 function routerTarget(r: Record<string, unknown>): {host: string; user: 'root'; port: number} {
     let host: string;

@@ -24,6 +24,15 @@ test('private manifest validates explicit real bindings, pinned public keys and 
     const save = (value: unknown) => writeFileSync(path, JSON.stringify(value), {mode: 0o600});
     try {
         save(manifest); const c = integrationConfig(path);
+        // routerScope (the router's install-time --rpc-allow set) is optional: absent, the v1 target digest keeps its exact pre-008 form.
+        assert.equal(c.routerScope, undefined);
+        assert.equal(c.targetDigest, createHash('sha256').update(JSON.stringify({host: c.router.host, user: c.router.user, port: c.router.port, hostFingerprint: fp, publicKeyFingerprint: fp, generation: c.router.generation, allowedMac: c.person.device.mac, protectedMacs: [...c.protectedMacs].sort()})).digest('hex'));
+        save({...manifest, routerScope: ['02:10:20:30:40:52', manifest.person.device.mac]});
+        const scoped = integrationConfig(path); assert.deepEqual(scoped.routerScope, [manifest.person.device.mac, '02:10:20:30:40:52']); assert.notEqual(scoped.targetDigest, c.targetDigest);
+        for (const routerScope of [[], ['02:10:20:30:40:52'], [manifest.person.device.mac, manifest.person.device.mac], [manifest.person.device.mac, '03:10:20:30:40:52'], 'x', Array.from({length: 257}, (_, i) => `02:00:00:00:${(i >> 8).toString(16).padStart(2, '0')}:${(i & 255).toString(16).padStart(2, '0')}`)]) {
+            save({...manifest, routerScope}); assert.throws(() => integrationConfig(path), /invalid_router_scope/);
+        }
+        save({...manifest, routerScope: [manifest.person.device.mac, manifest.protectedMacs[0]]}); assert.throws(() => integrationConfig(path), /protected_mac_overlap/);
         // No 16-account product cap: manifest accounts only seed a fresh database, bounded by the defensive ACCOUNT_LIMIT.
         const seeded = Array.from({length: 40}, (_, i) => ({id: `parent_${i}`, displayName: `Parent ${i}`, role: 'parent', personIds: ['pilot']}));
         save({...manifest, accounts: [...manifest.accounts, ...seeded]}); assert.equal(integrationConfig(path).accounts.length, 42);

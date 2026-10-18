@@ -6,7 +6,7 @@ export class Store {
     readonly db: DatabaseSync;
     constructor(path: string, migrationSQL?: string, internalMode?: 'integration') {
         const migrations = migrationSQL === undefined
-            ? (internalMode === 'integration' ? ['001.sql', '002.sql', '005.sql', '006.sql', '007.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql', '007.sql']).map(name => {
+            ? (internalMode === 'integration' ? ['001.sql', '002.sql', '005.sql', '006.sql', '007.sql', '008.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql', '007.sql', '008.sql']).map(name => {
                 const sql = readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8');
                 // CAS allocates base+1. An explicitly never-delivered intent cannot reserve that router revision.
                 return internalMode === 'integration' && name === '001.sql' ? sql.replace('revision INTEGER NOT NULL UNIQUE', 'revision INTEGER NOT NULL') : sql;
@@ -46,7 +46,9 @@ export class Store {
             }
             if (migrationSQL === undefined) {
                 const required: Record<string, string> = {
-                    accounts: 'id,display_name,role,person_ids,permission_version,active,webauthn_user_id',
+                    accounts: 'id,display_name,role,person_ids,permission_version,active,webauthn_user_id,scope_all',
+                    people: 'id,name,kind,active,created_at',
+                    devices: 'id,person_id,label,identifier_kind,identifier,state,operation_id,created_at',
                     credentials: 'id,account_id,public_key,counter,transports,label,state,created_at,last_used_at',
                     bootstrap_tokens: 'hash,account_id,expires_at,consumed,purpose,created_by,label,first_enrollment',
                     auth_contexts: 'browser_hash,epoch,generation',

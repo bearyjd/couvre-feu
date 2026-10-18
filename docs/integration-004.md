@@ -90,6 +90,91 @@ per-sign-in credential snapshot; raise them there if ever needed.
   upgraded database (`unsupported_database_version`) and there is no down-migration: stop the
   service and copy `integration.sqlite` (with `-wal`/`-shm`) privately before deploying.
 
+### Children, device groups and devices (design 008 PR-C)
+
+Children and their devices now live in the database. The manifest `person` (one child,
+one device MAC) only seeds a fresh or upgraded database once (migration `008`; integration
+`user_version` 6, demo 8). Seeding is deterministic and uses the manifest's own ids and
+names; manifest **admins** get `scope_all` (they see every entry, including ones added
+later), manifest **parents** keep their explicit `personIds`. Existing one-child manifests
+keep working unchanged: same manifest digest, same target digest, same dispatch script.
+
+**Back up before upgrading.** Migration `008` is one-way: after it runs, an older binary
+refuses the database (`unsupported_database_version`) and there is no down-migration.
+Before deploying this version, stop the service and privately copy the whole `dataDir`
+database — `integration.sqlite` together with `integration.sqlite-wal` and
+`integration.sqlite-shm` — so a rollback restores that copy with the older binary.
+
+- **Entries.** Each entry is a `child` or a `device_group` (a named set of shared devices
+  such as a living-room TV, paused and scheduled exactly like a child; the UI labels it
+  "Device group", never as a child). Router-side both are just a policy person id
+  (`[a-z][a-z0-9_]*`, at most 32 characters; ids are server-generated `child_…`/`group_…`).
+- **Limits** are the router's own (`router/lib/json.awk`): 64 entries, 32 MACs per entry,
+  256 MACs in total, 256 expanded schedule rows. Refusals: `child_limit_reached`,
+  `child_device_limit_reached`, `device_limit_reached`.
+- **Admin-only, step-up, scoped.** Adding/removing an entry or a device is an admin action
+  that needs a fresh passkey step-up bound to the exact change (`/step-up/options` with
+  `child_create`, `child_remove`, `device_add`, `device_remove`). An admin manages only
+  entries in its own scope; only a `scope_all` admin can create entries (the new id is
+  appended to every `scope_all` account and the creator). `account_create` accepts
+  `scopeAll: true` only from a `scope_all` admin. Parents never see MACs
+  (`GET /admin/children` and `GET /devices` are admin-only).
+- **MAC rules.** Canonical unicast (upper case and `-` accepted, locally administered
+  allowed, multicast/zero refused), never a `protectedMacs` entry (`device_mac_protected`;
+  adults' devices can never be added — changing protection stays a manifest edit plus
+  rebind), never already managed by any entry (`device_already_enrolled`, without naming
+  the owner).
+- **Router scope.** The router's `--rpc-allow` set is fixed at install time and is **not**
+  reported over RPC (the `rpc-status` reply has no scope field). The manifest therefore
+  carries an optional `routerScope` list that the operator must keep identical to the
+  installed `--rpc-allow` set; a device outside it is refused with
+  `device_outside_router_scope` before anything is queued. Absent, the scope is the seed
+  device alone (a single-MAC installation). Adding `routerScope` changes the manifest and
+  target digest: use `integration:rebind`. The dispatch script header then reads
+  `# Allowed MACs: …` instead of `# Allowed MAC: …`.
+- **Same router path.** A device add/remove is an `enroll`/`unenroll` operation through the
+  existing CAS rpc-sync pipeline (revision token, one change at a time, receipts, audit,
+  automatic or operator dispatch; automatic dispatch re-checks that the actor is still an
+  admin with the entry in scope). The next policy is built from the router's accepted
+  policy. The device row is `enrolling`/`removing` until the router confirms; a failed or
+  conflicting change reverts it, an unknown one leaves it pending. Removing the last
+  device takes the entry off the router together with its pause, allowance and schedules.
+  A device the router never accepted is removed locally without a sync.
+- **Fail-closed observation.** A router policy naming a person/MAC that no database entry
+  owns is `router_policy_foreign`; protected MACs and manifest-owned schedules are checked
+  as before.
+
+**Offline devices block every sync (router behaviour, not changed here).** For
+`rpc-sync` the router requires a DHCP lease or neighbour entry for **every** MAC of the old
+and the new policy (`cf_transition_identity`, `incomplete_transition_address_coverage`),
+and for pausing/scheduled entries also `incomplete_address_coverage`. One offline device
+therefore refuses every add, remove, pause and resume — including removing that offline
+device, because it is still in the old policy. The router names no device. The service now
+records such a reply to its single apply attempt (no receipt, base unchanged, one of these
+pre-write codes) as `failed` instead of `unknown`, so it does not wedge; the admin panel
+lists the devices the refused change needed (labels only, in scope; others counted) and
+parents see a generic message. The transition refusal also leaves the router's
+`runtime/error`, so status stays unhealthy (`router_runtime_unconfirmed`) until the router
+reconfirms.
+
+In plain terms (a product limitation to accept before enrolling more devices): **while any
+one enrolled device is offline, the router refuses every policy change for every entry** —
+including "pause now" for a different child, resume, allowance changes and device add or
+remove. Nothing already on the router is lost: existing pauses and schedules keep being
+enforced exactly as last accepted; only new changes are refused (`failed`, never applied).
+
+Operator procedure when a change fails this way:
+
+1. Open the admin panel and read the refusal banner; it names the devices (child and
+   device label) the refused change needed.
+2. Bring each named device online (powered on, joined to the network, holding a DHCP lease)
+   and wait for the router to reconfirm (status healthy again), then retry the change.
+3. If a device is gone for good, it cannot be removed through the service while it is
+   offline (it is still in the router's current policy); have the router operator remove
+   it on the router itself, then remove the row locally ("not on the router").
+
+Rehearse this live before relying on it.
+
 ### Rebinding to a later manifest
 
 Any manifest byte change normally refuses the database. To keep accounts and passkeys
@@ -102,8 +187,14 @@ npm run integration:rebind -- "<OLD_MANIFEST>" "<NEW_MANIFEST>" "<OLD_SHA256>" "
 Stop the service first. The digests are `sha256sum` of each manifest file. It refuses
 unless dispatch is stopped (no automatic owner), no operation is pending/unknown, no RPC
 claim or dispatch step is live or uncertain, and no time request owes a restore. It refuses
-a changed origin (the passkey RP ID), person id or `dataDir`. It keeps accounts, passkeys
-and request links, resets the router observation and desired policy from the new
+a changed origin (the passkey RP ID), person id or `dataDir`. It also refuses a new manifest whose
+`protectedMacs` contain a stored device (`rebind_device_protected`) or whose router scope
+(`routerScope`, or the seed device alone when absent) leaves one out
+(`rebind_device_outside_scope`): such a device would make every observation invalid and
+block every change, including its own removal. Remove the device first, or list it in the
+new `routerScope`. It keeps accounts, passkeys,
+children/devices and request links (devices the new installation does not hold show "not on
+the router" and can be removed locally), resets the router observation and desired policy from the new
 enrollment, bumps the dispatch epoch and audits both digests. A process still running on
 the old manifest fails closed: every mutate and dispatch transaction re-reads the marker
 (`integration_database_identity_mismatch`).

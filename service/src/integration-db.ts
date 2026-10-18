@@ -7,6 +7,7 @@ import type { IntegrationConfig } from './integration-config.ts';
 import { policyJSON } from '../../shared/src/router-schema.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
+import { seedChildren } from './integration-children.ts';
 
 export interface IntegrationState {
     generation: string; dispatch_epoch: number; dispatch_stopped: number; active_operation_id: string | null;
@@ -51,6 +52,21 @@ export class IntegrationStore extends Store {
         if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatch_steps'")!.sql.includes("'activity'")) {
             this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/integration-002.sql', import.meta.url), 'utf8')));
         }
+        // integration-003 widens operations.action for device enrollment. operations is a parent table, so the rebuild runs with
+        // foreign keys off (a no-op inside a transaction) and must leave no dangling reference behind before it commits.
+        if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='operations'")!.sql.includes("'enroll'")) {
+            this.db.exec('PRAGMA foreign_keys=OFF');
+            try {
+                this.transaction(() => {
+                    this.db.exec(readFileSync(new URL('../migrations/integration-003.sql', import.meta.url), 'utf8'));
+                    if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
+                });
+            } catch (error) { this.close(); throw error; }
+            finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
+        }
+        // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
+        // deterministic and ordered before anything an admin adds later.
+        this.transaction(() => seedChildren(this, config, 0));
         // Separate additive state keeps existing manifest-bound databases readable.
         this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_dispatch (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL,
