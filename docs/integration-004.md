@@ -99,6 +99,12 @@ names; manifest **admins** get `scope_all` (they see every entry, including ones
 later), manifest **parents** keep their explicit `personIds`. Existing one-child manifests
 keep working unchanged: same manifest digest, same target digest, same dispatch script.
 
+**Back up before upgrading.** Migration `008` is one-way: after it runs, an older binary
+refuses the database (`unsupported_database_version`) and there is no down-migration.
+Before deploying this version, stop the service and privately copy the whole `dataDir`
+database — `integration.sqlite` together with `integration.sqlite-wal` and
+`integration.sqlite-shm` — so a rollback restores that copy with the older binary.
+
 - **Entries.** Each entry is a `child` or a `device_group` (a named set of shared devices
   such as a living-room TV, paused and scheduled exactly like a child; the UI labels it
   "Device group", never as a child). Router-side both are just a policy person id
@@ -149,9 +155,25 @@ pre-write codes) as `failed` instead of `unknown`, so it does not wedge; the adm
 lists the devices the refused change needed (labels only, in scope; others counted) and
 parents see a generic message. The transition refusal also leaves the router's
 `runtime/error`, so status stays unhealthy (`router_runtime_unconfirmed`) until the router
-reconfirms. Recovery: bring the device back so it has an address and let the router
-reconfirm, or have the router operator act on the router itself. A device that is gone for
-good cannot be removed through the service until then. Rehearse this live before relying on it.
+reconfirms.
+
+In plain terms (a product limitation to accept before enrolling more devices): **while any
+one enrolled device is offline, the router refuses every policy change for every entry** —
+including "pause now" for a different child, resume, allowance changes and device add or
+remove. Nothing already on the router is lost: existing pauses and schedules keep being
+enforced exactly as last accepted; only new changes are refused (`failed`, never applied).
+
+Operator procedure when a change fails this way:
+
+1. Open the admin panel and read the refusal banner; it names the devices (child and
+   device label) the refused change needed.
+2. Bring each named device online (powered on, joined to the network, holding a DHCP lease)
+   and wait for the router to reconfirm (status healthy again), then retry the change.
+3. If a device is gone for good, it cannot be removed through the service while it is
+   offline (it is still in the router's current policy); have the router operator remove
+   it on the router itself, then remove the row locally ("not on the router").
+
+Rehearse this live before relying on it.
 
 ### Rebinding to a later manifest
 
@@ -165,7 +187,12 @@ npm run integration:rebind -- "<OLD_MANIFEST>" "<NEW_MANIFEST>" "<OLD_SHA256>" "
 Stop the service first. The digests are `sha256sum` of each manifest file. It refuses
 unless dispatch is stopped (no automatic owner), no operation is pending/unknown, no RPC
 claim or dispatch step is live or uncertain, and no time request owes a restore. It refuses
-a changed origin (the passkey RP ID), person id or `dataDir`. It keeps accounts, passkeys,
+a changed origin (the passkey RP ID), person id or `dataDir`. It also refuses a new manifest whose
+`protectedMacs` contain a stored device (`rebind_device_protected`) or whose router scope
+(`routerScope`, or the seed device alone when absent) leaves one out
+(`rebind_device_outside_scope`): such a device would make every observation invalid and
+block every change, including its own removal. Remove the device first, or list it in the
+new `routerScope`. It keeps accounts, passkeys,
 children/devices and request links (devices the new installation does not hold show "not on
 the router" and can be removed locally), resets the router observation and desired policy from the new
 enrollment, bumps the dispatch epoch and audits both digests. A process still running on

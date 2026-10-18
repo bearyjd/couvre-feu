@@ -72,7 +72,7 @@ export class TestRouter implements AsyncRouter {
             const refused = observation(this.config, this.policy, this.now(), null);
             refused.currentOperationId = current?.operationId ?? null; refused.errors = [code];
             refused.status = {...refused.status, ok: false, errors: [code]};
-            return refused;
+            return this.transform ? this.transform(refused) : refused;
         }
         if (i.kind === 'apply') {
             const e = normalizeEnvelope(JSON.parse(i.stdin));

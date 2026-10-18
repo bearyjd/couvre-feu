@@ -193,3 +193,33 @@ test('an empty installed policy can be observed but cannot falsely enable the co
         const people = f.policy.people(actor); assert.equal(people.people[0].status, 'unknown'); assert.equal(people.revisionToken, null); assert.ok(people.errors.includes('pilot_device_not_enrolled'));
     } finally { f.cleanup(); }
 });
+// Only the router's own pre-write refusal of this attempt (one of the four codes, base unchanged, no receipt, not named
+// current) fails a change; anything else stays unknown because the outcome cannot be proven.
+const PRE_WRITE = ['incomplete_address_coverage', 'incomplete_transition_address_coverage', 'rpc_scope_overlap', 'protected_mac_overlap'];
+async function refusedApply(reject: string, transform: ((o: any, id: string) => any) | null, before?: (f: ReturnType<typeof integrationFixture>) => void) {
+    const f = integrationFixture();
+    try {
+        await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id);
+        before?.(f);
+        f.router.reject = reject; f.router.transform = transform && (o => transform(o, id));
+        await f.worker.execute(plan, plan.scriptSha256);
+        return {op: f.policy.operation(actor, id), active: f.store.integrationState().active_operation_id, id};
+    } finally { f.cleanup(); }
+}
+test('each pre-write router refusal of this attempt fails the change and clears the active operation', async () => {
+    for (const code of PRE_WRITE) {
+        const r = await refusedApply(code, null);
+        assert.equal(r.op.state, 'failed', code); assert.equal(r.op.error, code); assert.equal(r.active, null, code);
+    }
+});
+test('a refusal that is not provably pre-write stays unknown, never failed', async () => {
+    const unknown = (r: Awaited<ReturnType<typeof refusedApply>>, label: string) => {
+        assert.equal(r.op.state, 'unknown', label); assert.equal(r.op.error, 'receipt_missing_remote_outcome_unknown', label); assert.equal(r.active, r.id, label);
+    };
+    unknown(await refusedApply('apply_failed', null), 'other code');
+    unknown(await refusedApply('rpc_scope_overlap', null, f => { f.router.policy = {...f.router.policy, doh: {ipv4: ['1.1.1.1'], ipv6: []}}; }), 'base changed');
+    unknown(await refusedApply('rpc_scope_overlap', o => ({...o, errors: ['incomplete_address_coverage', 'apply_failed']})), 'mixed codes');
+    unknown(await refusedApply('rpc_scope_overlap', (o, id) => ({...o, currentOperationId: id})), 'router names it current');
+    unknown(await refusedApply('rpc_scope_overlap', o => ({...o, receipt: {operationId: 'op_other', requestDigest: 'a'.repeat(64), baseRevision: 0, baseDigest: 'b'.repeat(64), acceptedRevision: 1, acceptedDigest: 'c'.repeat(64), outcome: 'accepted', current: false}})), 'receipt present');
+    unknown(await refusedApply('rpc_scope_overlap', o => ({...o, errors: []})), 'no errors');
+});

@@ -183,8 +183,9 @@ export class IntegrationWorker {
                 }
                 const rpc = this.store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active)!;
                 if (invocation.kind === 'apply' && invocation.operationId === active && this.refusedBeforeWrite(o!, e)) {
-                    // The router's own reply to this single attempt: refused under its lock before any write, base unchanged and
-                    // no receipt. Nothing can apply later (attempt_count is capped at 1), so the change failed; it is not unknown.
+                    // The router's own reply to this single attempt: refused under its lock before any policy write (a refused
+                    // transition still records runtime/error), base unchanged and no receipt. Nothing can apply later
+                    // (attempt_count is capped at 1), so the change failed; it is not unknown.
                     this.updateOperation(active, 'failed', o!.errors[0]);
                     this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
                     this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
