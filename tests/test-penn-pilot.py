@@ -1071,15 +1071,14 @@ class PilotFixtureTests(PilotBase):
         path.chmod(0o700)
 
     def status_double(self, rewrite, count):
-        """`sh` double (the fixture's CFR_SH is `sh` from PATH): logs every `cfctl rpc-sync` and pipes the first
-        `count` `cfctl status --json` replies after the first rpc-sync through sed `rewrite`. Every call still
-        runs the real cfctl exactly once."""
-        if os.environ.get('CF_TEST_SHELL', 'sh') != 'sh':
-            self.skipTest('the status double wraps CFR_SH=sh')
+        """Double of the fixture's CFR_SH program from PATH (`sh`, or `busybox` for `busybox ash`): logs every
+        `cfctl rpc-sync` and pipes the first `count` `cfctl status --json` replies after the first rpc-sync
+        through sed `rewrite`. Every call still runs the real cfctl exactly once."""
+        program = shlex.split(self.spec['shell'])[0]
         q = shlex.quote
-        real, cfctl = q(shutil.which('sh')), str(self.root / 'usr/sbin/cfctl')
+        real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
         self.rpc_log, count_file = self.work / 'rpc-sync.log', self.work / 'status-rewrites'
-        self.router_double('sh', (
+        self.router_double(program, (
             f'case " $* " in\n'
             f'  *{q(" " + cfctl + " rpc-sync ")}*) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
             f'  *{q(" " + cfctl + " status --json ")}*)\n'
