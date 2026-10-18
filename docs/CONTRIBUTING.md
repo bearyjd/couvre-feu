@@ -11,7 +11,7 @@ Couvre-feu is a router enforcement layer (POSIX ash under `router/`), a TypeScri
 | npm | `11.19.0` (pinned) | `npm ci` from the lockfile |
 | Python 3 | any recent 3.x | Router fixtures under `tests/`, `tools/freeze-router-release.py`, `tools/live/*` |
 | BusyBox | with `ash`, `awk`, `timeout` applets | Router fixtures. CI runs them under BusyBox, not the host `sh` |
-| ShellCheck | 0.9 or newer | Static gate in `tests/run.sh` (it fails without it) |
+| ShellCheck | any (CI installs the Ubuntu package) | Static gate in `tests/run.sh` (it fails without it) |
 | Chromium | via `npx playwright install chromium` | `npm run test:web` |
 <!-- /AUTO-GENERATED -->
 

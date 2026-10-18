@@ -27,9 +27,9 @@ Both tools run only as `python3 -I`, first `plan` (local, disclosed), then `exec
 | `cfctl status --json` | Desired and confirmed revision, effective pauses, observed sets, drift, capabilities, errors |
 | `cfctl rpc-status --json [operation_id]` | Accepted policy, installation generation, receipt and runtime witness |
 
-A healthy fresh install reports ok, no drift, no errors, revision 0, no kids and no pauses. `cfctl expire` runs from minute cron; confirm crond is running (`/etc/init.d/cron` must be a procd script) and that exactly one crond serves `/etc/crontabs`.
+A healthy fresh install reports ok, no drift, no errors, revision 0, no kids and no pauses. `cfctl expire` runs from minute cron; confirm crond is running. Install checks (`cron_preflight`, `cron_running`) that `/etc/init.d/cron` is a `USE_PROCD=1` script, enabled at boot, and that procd reports a running cron instance. A separate firmware crond on `/tmp/gl_crontabs` (GL firmware) is normal.
 
-Service side: `npm run integration:start -- "<PRIVATE_MANIFEST>"` refuses an edited manifest (its digest is bound in the database); `dispatch -- stop` revokes the automatic dispatch epoch.
+Service side: `npm run integration:start -- "<PRIVATE_MANIFEST>"` refuses an edited manifest (its digest is bound in the database); `dispatch -- stop` revokes dispatch locally only; it does not prove remote drain or authorize router rollback.
 <!-- /AUTO-GENERATED -->
 
 ## Common failures
