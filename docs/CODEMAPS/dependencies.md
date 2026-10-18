@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-17 | Files scanned: 198 | Token estimate: ~214 -->
+<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~214 -->
 # Dependencies
 Runtime: `@simplewebauthn/server` 13.3.3 only (service). Node 26.8.1, npm 11.19.0 (engines, exact pins).
 Dev: typescript 7.0.2, @playwright/test 1.61.0, @types/node 26.6.5, @levischuck/tiny-cbor 0.2.11. `tsc --noEmit`, no build step (node runs .ts).

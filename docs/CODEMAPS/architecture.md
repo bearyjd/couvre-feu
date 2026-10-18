@@ -1,6 +1,6 @@
-<!-- Generated: 2026-10-17 | Files scanned: 198 | Token estimate: ~299 -->
+<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~299 -->
 # Architecture
-Monorepo: router (OpenWrt ash/awk) + service (Node 26.8.1 TS, no build) + static PWA. Base: origin/main cad61d5.
+Monorepo: router (OpenWrt ash/awk) + service (Node 26.8.1 TS, no build) + static PWA.
 
 ```
 parent browser (PWA, passkey)

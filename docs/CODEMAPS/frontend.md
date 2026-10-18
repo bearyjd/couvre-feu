@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-17 | Files scanned: 198 | Token estimate: ~218 -->
+<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~218 -->
 # Frontend (web/public, static PWA, no bundler)
 | File | Role |
 |---|---|

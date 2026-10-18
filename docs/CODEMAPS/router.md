@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-17 | Files scanned: 198 | Token estimate: ~379 -->
+<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~379 -->
 # Router (router/)
 | Path | Role |
 |---|---|

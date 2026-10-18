@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-17 | Files scanned: 198 | Token estimate: ~229 -->
+<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~229 -->
 # Data (SQLite, STRICT tables; db.ts `Store`, migrations in service/migrations)
 Main DB migrations 001..006; integration DB adds integration-001..002.
 

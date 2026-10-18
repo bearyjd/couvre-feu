@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-17 | Files scanned: 198 | Token estimate: ~198 -->
+<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~198 -->
 # Live tools (tools/live; python3 -I, stdlib only)
 - `first-rehearsal.py` + `.sh`: one SSH session; phases identity gate, prereq, snapshot, empty install, verify, exact uninstall, restore proof, connectivity. Subcommands plan/execute; config keeps real data outside repo (`config.example.json` uses 02:00:00:00:00:xx, 192.0.2.0/24).
 - `penn-pilot.py` + `.sh`: gate 3 of docs/integration-004.md; reuses rehearsal helpers (`cfr_*`).
