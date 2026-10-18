@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-session one-device (Penn) live pilot: plan locally, then execute once.
+"""Single-session Penn live pilot (one or two devices): plan locally, then execute once.
 
 `plan CONFIG` builds the exact payload and prints what the operator discloses.
 `execute CONFIG --expect-plan-sha256 HEX` rebuilds the plan, refuses on any
@@ -10,6 +10,11 @@ The configuration schema, source binding, SSH argv, deadline, agent and
 evidence checks are imported from first-rehearsal.py; the remote script is the
 filled rehearsal script followed by penn-pilot.sh. Standard library only; must
 run as `python3 -I`.
+
+Optional private-config extensions (absent: the single-device payload and plan
+are unchanged): `roles.penn_child_2` {ip, mac} enrolls a second device of the
+same person, and `scopeNegativeTest: true` adds the SCOPE phase (an out-of-scope
+rpc-sync after enrollment that must be cleanly rejected with no firewall change).
 
 Exit codes: 0 PASS, 1 REFUSED before any router mutation, 2 STOPPED/FAIL/UNKNOWN
 after mutation possibly began.
@@ -63,6 +68,11 @@ STOPPED_LINE = 'PENN_PILOT_STOPPED_RESTORED'
 STOPPED_NO_CONNECTIVITY_LINE = 'PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED'
 PERSON = 'penn'
 OPERATION_ID = 'penn-pilot-enroll-1'
+SECOND_ROLE = 'penn_child_2'
+# Synthetic, unicast, locally administered and never a household device.
+SCOPE_TEST_MAC = '02:00:00:00:00:99'
+SCOPE_OPERATION_ID = 'penn-pilot-scope-1'
+SCOPE_ERROR = 'rpc_scope_overlap'
 DNS_PROBE_NAME = 'example.com'
 # Predeclared, disclosed and digest-bound. Every pause is timed (--until).
 TIMING = {'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds': 20,
@@ -85,6 +95,8 @@ COUNTERS_WORST_SECONDS = 10 * READ_TIMEOUT_SECONDS
 # One adult-probe iteration before its poll sleep: nslookup (5 s), two pings
 # (8 s each) and one ipset read, rounded up.
 PROBE_ITERATION_SECONDS = 30
+# One firewall-state read for SCOPE: ipset save plus iptables/ip6tables -S.
+FIREWALL_STATE_WORST_SECONDS = 3 * READ_TIMEOUT_SECONDS
 # The tool cannot measure these; they are never reported otherwise.
 ALWAYS_UNMEASURED = {
     'service_key_confinement': 'not_exercised; no authorized_keys or service-key provisioning',
@@ -114,13 +126,13 @@ def iteration_worst_seconds(timing):
     return PROBE_ITERATION_SECONDS + max(timing['pollSeconds'], timing['expiryPollSeconds'])
 
 
-def phase_worst_seconds(timing):
+def phase_worst_seconds(timing, devices=1, scope=False):
     """Worst case of each post-install phase, as the remote script budgets it."""
     call = SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS
     snap, read, iteration = COUNTERS_WORST_SECONDS, READ_TIMEOUT_SECONDS, iteration_worst_seconds(timing)
-    return {
-        # rpc-status, rpc-sync, status; counters enrolled
-        'ENROLL': 3 * call + snap,
+    phases = {
+        # rpc-status, rpc-sync, status (two devices: rpc-activity); counters enrolled
+        'ENROLL': (3 + (devices > 1)) * call + snap,
         # counters prepause, pause, kernel read, counters pause0, observe, counters pause1
         'PAUSE': snap + call + read + snap + timing['pauseObserveSeconds'] + iteration + snap,
         # resume, kernel read, counters resume0, observe, counters resume1
@@ -131,34 +143,118 @@ def phase_worst_seconds(timing):
         # counters final
         'DNS': snap,
     }
+    if scope:
+        # one rpc-sync (expected rejection) between two firewall-state reads
+        phases['SCOPE'] = call + 2 * FIREWALL_STATE_WORST_SECONDS
+    return phases
 
 
-def worst_case_seconds(timing):
+def worst_case_seconds(timing, devices=1, scope=False):
     # The install waits for one safe band before running.
     return (timing['premutationBudgetSeconds'] + SAFE_BAND_WAIT_SECONDS + INSTALL_ALLOWANCE_SECONDS
-            + sum(phase_worst_seconds(timing).values()) + TEARDOWN_RESERVE_SECONDS)
+            + sum(phase_worst_seconds(timing, devices, scope).values()) + TEARDOWN_RESERVE_SECONDS)
+
+
+def penn_macs(config):
+    """Penn's device MACs, LC_ALL=C sorted (the router's canonical scope order)."""
+    return sorted(config['roles'][role]['mac'] for role in ('penn_child', SECOND_ROLE) if role in config['roles'])
+
+
+def scope_enabled(config):
+    return config.get('scopeNegativeTest') is True
+
+
+def pilot_phases(config):
+    if not scope_enabled(config):
+        return PHASES
+    index = PHASES.index('PAUSE')
+    return PHASES[:index] + ('SCOPE',) + PHASES[index:]
+
+
+def config_budget(config):
+    return {'devices': len(penn_macs(config)), 'scope': scope_enabled(config)}
+
+
+def _strict_document(path):
+    try:
+        with open(path, 'rb') as handle:
+            raw = handle.read(65537)
+    except OSError as error:
+        raise Refusal(f'config unreadable: {error.strerror}') from None
+    if len(raw) > 65536:
+        raise Refusal('config too large')
+    try:
+        return json.loads(raw.decode('utf-8'), object_pairs_hook=FR._unique_keys)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise Refusal(f'config is not strict JSON: {error}') from None
+
+
+def load_config(path):
+    """The rehearsal schema plus the pilot-only optional keys; refused before any SSH."""
+    document = _strict_document(path)
+    if not isinstance(document, dict):
+        return FR.validate_config(document)
+    base = {key: value for key, value in document.items() if key != 'scopeNegativeTest'}
+    roles = document.get('roles')
+    second = None
+    if isinstance(roles, dict) and SECOND_ROLE in roles:
+        second = roles[SECOND_ROLE]
+        base['roles'] = {role: entry for role, entry in roles.items() if role != SECOND_ROLE}
+    config = FR.validate_config(base)
+    scope = document.get('scopeNegativeTest', False)
+    if not isinstance(scope, bool):
+        raise Refusal('scopeNegativeTest must be true or false')
+    if second is not None:
+        if not isinstance(second, dict) or set(second) != {'ip', 'mac'}:
+            raise Refusal(f'roles.{SECOND_ROLE} must contain exactly ip and mac')
+        entry = {'ip': FR.canonical_ipv4(second['ip'], f'roles.{SECOND_ROLE}.ip'),
+                 'mac': FR.canonical_mac(second['mac'], f'roles.{SECOND_ROLE}.mac')}
+        macs = {role['mac'] for role in config['roles'].values()} | set(config['protectedHistoricalMacs'])
+        ips = {role['ip'] for role in config['roles'].values()} | {config['host']}
+        if entry['mac'] in macs | {SCOPE_TEST_MAC} or entry['ip'] in ips:
+            raise Refusal(f'roles.{SECOND_ROLE} must have a MAC and IP distinct from every role, the host, '
+                          'protected MACs and the scope test MAC')
+        config = dict(config, roles=dict(config['roles'], **{SECOND_ROLE: entry}))
+    if scope:
+        known = {role['mac'] for role in config['roles'].values()} | set(config['protectedHistoricalMacs'])
+        if SCOPE_TEST_MAC in known:
+            raise Refusal('the scope test MAC collides with a configured MAC')
+        config = dict(config, scopeNegativeTest=True)
+    return config
 
 
 def enrollment_policy(config):
-    return {'version': 1, 'revision': 1, 'people': [{'id': PERSON, 'macs': [config['roles']['penn_child']['mac']]}],
+    return {'version': 1, 'revision': 1, 'people': [{'id': PERSON, 'macs': penn_macs(config)}],
             'pauses': [], 'schedules': [], 'doh': {'ipv4': [], 'ipv6': []}}
 
 
 def assert_policy_only_penn(policy, config):
-    """The enrolled policy names Penn's MAC and nothing else, ever."""
+    """The enrolled policy names Penn's device MACs (sorted) and nothing else, ever."""
     roles = config['roles']
-    penn = roles['penn_child']['mac']
+    macs = penn_macs(config)
     protected = {roles['management']['mac'], roles['jd_adult']['mac'], *config['protectedHistoricalMacs']}
-    if penn in protected:
-        raise Refusal('penn_child MAC is protected')
+    if protected & set(macs) or len(set(macs)) != len(macs):
+        raise Refusal('a penn_child MAC is protected or duplicated')
     if not isinstance(policy, dict) or set(policy) != {'version', 'revision', 'people', 'pauses', 'schedules', 'doh'}:
         raise Refusal('enrollment policy has unexpected fields')
-    if policy['people'] != [{'id': PERSON, 'macs': [penn]}]:
-        raise Refusal('enrollment policy must contain exactly one person with only the penn_child MAC')
+    if policy['people'] != [{'id': PERSON, 'macs': macs}]:
+        raise Refusal('enrollment policy must contain exactly one person with only the penn_child MACs')
     if policy['pauses'] or policy['schedules'] or policy['doh'] != {'ipv4': [], 'ipv6': []}:
         raise Refusal('enrollment policy must not carry pauses, schedules or DoH addresses')
-    if MAC_TOKEN.findall(json.dumps(policy).lower()) != [penn]:
+    if MAC_TOKEN.findall(json.dumps(policy).lower()) != macs:
         raise Refusal('enrollment policy contains a MAC other than penn_child')
+    return policy
+
+
+def scope_policy(config):
+    """Revision 2 of the enrolled policy plus the synthetic out-of-scope MAC; the router must reject it."""
+    macs = penn_macs(config)
+    known = {role['mac'] for role in config['roles'].values()} | set(config['protectedHistoricalMacs'])
+    if SCOPE_TEST_MAC in known:
+        raise Refusal('the scope test MAC collides with a configured MAC')
+    policy = dict(enrollment_policy(config), revision=2, people=[{'id': PERSON, 'macs': sorted(macs + [SCOPE_TEST_MAC])}])
+    if MAC_TOKEN.findall(json.dumps(policy).lower()) != sorted(macs + [SCOPE_TEST_MAC]):
+        raise Refusal('scope test policy contains an unexpected MAC')
     return policy
 
 
@@ -184,7 +280,17 @@ def build_payload(config, commit, blobs, timing):
               'CFP_READ_TIMEOUT': READ_TIMEOUT_SECONDS, 'CFP_COUNTERS_WORST': COUNTERS_WORST_SECONDS,
               'CFP_ITERATION_WORST': iteration_worst_seconds(timing),
               'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS}
-    values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing).items()})
+    budget = config_budget(config)
+    values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing, **budget).items()})
+    # Single-device configurations emit no further parameters (the shell defaults apply).
+    if SECOND_ROLE in config['roles']:
+        macs = penn_macs(config)
+        values.update({'CFP_PENN2_IP': config['roles'][SECOND_ROLE]['ip'], 'CFP_PENN2_MAC': config['roles'][SECOND_ROLE]['mac'],
+                       'CFP_RPC_ALLOW': ' '.join(macs), 'CFP_KIDS_JSON': json.dumps(macs, separators=(',', ':'))})
+    if budget['scope']:
+        values.update({'CFP_SCOPE_TEST': 1, 'CFP_SCOPE_MAC': SCOPE_TEST_MAC, 'CFP_SCOPE_OPERATION_ID': SCOPE_OPERATION_ID,
+                       'CFP_SCOPE_ERROR': SCOPE_ERROR,
+                       'CFP_SCOPE_POLICY': json.dumps(scope_policy(config), separators=(',', ':'), sort_keys=False)})
     values = {key: str(value) for key, value in values.items()}
     for value in values.values():
         if not PARAM_VALUE.fullmatch(value):
@@ -200,14 +306,19 @@ PLAN_DIGEST_FIELDS = FR.PLAN_DIGEST_FIELDS + ('tool', 'phases', 'timing', 'hostP
                                               'operationId', 'policySha256')
 
 
+# Bound only when present, so single-device plans keep their field set.
+OPTIONAL_DIGEST_FIELDS = ('scopeNegativeTest', 'scopePolicySha256')
+
+
 def plan_digest(details):
     bound = {field: details[field] for field in PLAN_DIGEST_FIELDS}
+    bound.update({field: details[field] for field in OPTIONAL_DIGEST_FIELDS if field in details})
     return hashlib.sha256(json.dumps(bound, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 def plan(config, env):
     validate_timing(TIMING)
-    minimum = worst_case_seconds(TIMING)
+    minimum = worst_case_seconds(TIMING, **config_budget(config))
     if config['remoteTimeoutSeconds'] < minimum:
         raise Refusal(f'remoteTimeoutSeconds must be at least {minimum} for the pilot worst case')
     commit, blobs = FR.head_source()
@@ -223,11 +334,16 @@ def plan(config, env):
                'roles': config['roles'], 'protectedHistoricalMacs': config['protectedHistoricalMacs'],
                'knownHostsSha256': FR.regular_file_sha256(config['knownHostsPath'], 'knownHostsPath'),
                'adminPublicKeySha256': FR.regular_file_sha256(config['adminPublicKeyPath'], 'adminPublicKeyPath'),
-               'phases': list(PHASES), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS), 'hostProbe': dict(HOST_PROBE),
+               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS), 'hostProbe': dict(HOST_PROBE),
                'dnsProbeName': DNS_PROBE_NAME, 'person': PERSON, 'operationId': OPERATION_ID,
                'policyJson': policy_json, 'policySha256': hashlib.sha256(policy_json.encode()).hexdigest(),
                'pauseRulesKernelTimeBound': False,
                'serviceKeyConfinement': 'not exercised'}
+    if scope_enabled(config):
+        scope_json = json.dumps(scope_policy(config), separators=(',', ':'), sort_keys=False)
+        details.update({'scopeNegativeTest': True, 'scopeTestMac': SCOPE_TEST_MAC, 'scopeOperationId': SCOPE_OPERATION_ID,
+                        'scopeExpectedError': SCOPE_ERROR, 'scopePolicyJson': scope_json,
+                        'scopePolicySha256': hashlib.sha256(scope_json.encode()).hexdigest()})
     details['planSha256'] = plan_digest(details)
     return details, payload
 
@@ -347,17 +463,17 @@ def measurements(lines):
     return result
 
 
-def classify(stdout_text, remote_exit, timed_out):
+def classify(stdout_text, remote_exit, timed_out, expected=PHASES):
     lines = stdout_text.splitlines()
     phases = {}
     for line in lines:
         parts = line.split(' ', 3)
-        if len(parts) >= 3 and parts[0] == 'PHASE' and parts[1] in PHASES:
+        if len(parts) >= 3 and parts[0] == 'PHASE' and parts[1] in PHASES + ('SCOPE',):
             phases.setdefault(parts[1], []).append(parts[2] if len(parts) == 3 else parts[2] + ' ' + parts[3])
     stopped = any(line.startswith('STOP ') for line in lines)
     passed = (not timed_out and remote_exit == REMOTE_PASS and lines.count(PASS_LINE) == 1 and lines[-1] == PASS_LINE
               and 'MUTATION_BEGIN' in lines and not stopped
-              and all(phases.get(name) == ['OK'] for name in PHASES) and len(phases) == len(PHASES))
+              and all(phases.get(name) == ['OK'] for name in expected) and set(phases) == set(expected))
     if passed:
         return 'PASS', EXIT_PASS, phases
     refused = (not timed_out and remote_exit == REMOTE_REFUSED and 'MUTATION_BEGIN' not in lines
@@ -425,7 +541,7 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
             probes.stop()
         probes.collect('after')
         stdout_text = Path(directory, 'stdout.log').read_text(errors='replace')
-        outcome, code, phases = classify(stdout_text, remote_exit, timed_out)
+        outcome, code, phases = classify(stdout_text, remote_exit, timed_out, tuple(details['phases']))
         host = evaluate_host(probes.samples)
         reasons = []
         if outcome == 'PASS' and host['adultDisruption']:
@@ -462,14 +578,14 @@ def run(argv, *, env=None, now_fn=None, probe=None):
     usage = 'usage: penn-pilot.py plan CONFIG | execute CONFIG --expect-plan-sha256 HEX'
     try:
         if len(argv) == 2 and argv[0] == 'plan':
-            details, _ = plan(FR.load_config(argv[1]), env)
+            details, _ = plan(load_config(argv[1]), env)
             print(json.dumps(details, indent=2, sort_keys=True))
             print('PLAN ONLY: nothing was sent. Disclose this output, then run:')
             print('python3 -I tools/live/penn-pilot.py execute ' + shlex.quote(argv[1])
                   + ' --expect-plan-sha256 ' + details['planSha256'])
             return EXIT_PASS
         if len(argv) == 4 and argv[0] == 'execute' and argv[2] == '--expect-plan-sha256':
-            return execute(FR.load_config(argv[1]), argv[3], env, now_fn, probe or default_probe)
+            return execute(load_config(argv[1]), argv[3], env, now_fn, probe or default_probe)
         print(usage, file=sys.stderr)
         return EXIT_REFUSED
     except Refusal as refusal:
