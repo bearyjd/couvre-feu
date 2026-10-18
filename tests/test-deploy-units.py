@@ -143,6 +143,19 @@ class DeployFiles(unittest.TestCase):
         self.assertIn('/root/couvrefeu-key/service_key', doc)
         self.assertIn('install -d -o root -g root -m 0700 /root/couvrefeu-key', doc)
 
+    def test_ssh_add_commands_force_tty_prompt_and_root_can_connect(self):
+        doc = DOC_PATH.read_text()
+        loads = [l for l in doc.splitlines() if re.search(r'ssh-add .*couvrefeu-key/service_key', l)]
+        self.assertEqual(len(loads), 1)
+        self.assertIn('env SSH_ASKPASS_REQUIRE=never SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add', loads[0])
+        self.assertNotIn('only talks to its own uid', doc)
+        self.assertNotIn('sudo -u couvrefeu env SSH_AUTH_SOCK', doc)
+
+    def test_nft_file_documents_static_ip_ipv4_and_tailscale_limits(self):
+        header = '\n'.join(l for l in read('deploy', 'systemd', 'couvrefeu.nft').splitlines() if l.startswith('#'))
+        for phrase in ('REQUIRES A STATIC ADDRESS', 'udp 67/68', 'IPv4-only', 'tailscaled'):
+            self.assertIn(phrase, header)
+
     def test_doc_links_resolve_and_cover_required_topics(self):
         doc = DOC_PATH.read_text()
         for target in re.findall(r'\]\(([^)#]+)\)', doc):
@@ -150,7 +163,9 @@ class DeployFiles(unittest.TestCase):
                 self.assertTrue((DOC_PATH.parent / target).resolve().exists(), target)
         for phrase in ['network_mode: host', 'ss -tn sport = :4273', 'not reversible', 'manifest digest', 'RP ID', 'http-behind-proxy.md',
                        'docker exec', 'ssh-add -t <LIFETIME>', 'gpg --verify SHASUMS256.txt.sig SHASUMS256.txt', 'sha256sum -c --ignore-missing',
-                       'nft -c -f', 'systemd-run --on-active=5m nft delete table inet couvrefeu', 'PartOf=', 'does **not** show']:
+                       'nft -c -f', 'systemd-run --unit=couvrefeu-nft-rollback --on-active=5m nft delete table inet couvrefeu', 'systemctl stop couvrefeu-nft-rollback.timer',
+                       'NEW SSH session', 'Static address required', 'udp dport { 67, 68 } accept', 'IPv4 only', 'Tailscale is not combinable',
+                       'UDP 41641', 'tailscale0', 'Key lifetime', 'ssh-add -l', 'couvrefeu-agent-check', 'OnUnitActiveSec=1min', 'PartOf=', 'does **not** show']:
             self.assertIn(phrase, doc)
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze is not installed')

@@ -51,10 +51,18 @@ Units: [`deploy/systemd/couvrefeu-agent.service`](../../deploy/systemd/couvrefeu
 
 ```sh
 nft -c -f /etc/couvrefeu.nft                 # syntax check, changes nothing
-systemd-run --on-active=5m nft delete table inet couvrefeu   # rollback timer
-nft -f /etc/couvrefeu.nft                    # then confirm you can still SSH in and reach the app from the proxy
-systemctl list-timers 'run-*'; systemctl stop <RUN_TIMER_NAME>.timer   # only after confirming: cancels the rollback
+systemd-run --unit=couvrefeu-nft-rollback --on-active=5m nft delete table inet couvrefeu   # rollback timer
+nft -f /etc/couvrefeu.nft
+# Open a NEW SSH session (and test the proxy-to-app request) before continuing; the old session may survive on conntrack alone.
+systemctl stop couvrefeu-nft-rollback.timer   # only after the new session works: cancels the rollback
 ```
+
+Notes on the ruleset:
+
+- **Static address required.** The ruleset drops DHCP. Give the host a static address, or, if you must use DHCP, add `udp dport { 67, 68 } accept` to both chains (and allow the lease server) first; otherwise the host loses its address when the lease expires. The file carries these as commented lines.
+- **IPv4 only.** The allow rules (admin SSH, proxy, router, DNS, NTP) match IPv4. IPv6 is dropped except ICMPv6, which stays open so neighbor discovery works. The admin must connect over IPv4.
+- **Tailscale is not combinable as written.** `tailscaled` needs outbound UDP 41641 plus control-plane/DERP access (HTTPS), and an input rule for `tailscale0`; this ruleset blocks all of that. If you run Tailscale on the host (for example to encrypt the proxy hop), add rules such as `iifname "tailscale0" ip saddr <PROXY_TAILNET_IP> tcp dport 4273 accept`, `udp dport 41641 accept` in both directions and outbound `tcp dport 443 accept` for the control plane, then re-run the check and rollback procedure. Otherwise leave Tailscale off this host.
+- **Monitoring push.** If you add the agent-expiry check below, allow its outbound destination (`ip daddr <MONITOR_IP> tcp dport <MONITOR_PORT> accept`).
 
 Make it persistent only after it survived a test; load it from a small unit or `nftables.conf` `include`.
 
@@ -72,15 +80,37 @@ Do not start yet. After the approved key and manifest steps exist:
 
 ```sh
 systemctl enable --now couvrefeu-agent
-# Load the key as root through the agent socket. ssh-agent only talks to its own uid, so run ssh-add as the
-# service user but let ROOT open the key file (the shell redirect runs as root; the service never reads it):
-sudo -u couvrefeu env SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add -t <LIFETIME> - < /root/couvrefeu-key/service_key   # passphrase typed by a human
-sudo -u couvrefeu env SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add -l
+# Load the key as root. root may connect to the socket (the directory is 0700 owned by the service user, but
+# root bypasses it, and ssh-agent accepts root peers); the service user never reads the key file.
+# SSH_ASKPASS_REQUIRE=never forces the passphrase prompt onto your terminal even if an askpass helper is installed.
+env SSH_ASKPASS_REQUIRE=never SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add [-t <LIFETIME>] /root/couvrefeu-key/service_key   # passphrase typed by a human
+env SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add -l
 systemctl enable --now couvrefeu
 journalctl -u couvrefeu -n 20 --no-pager   # "private LAN proxy HTTP https://cf.example.invalid via 1 trusted proxies"
 ```
 
 Keep the encrypted key file root-only on the host and back it up offline.
+
+**Key lifetime.** Choose one policy and write it into your procedure:
+
+- *No expiry (omit `-t`)* suits an unattended service: the key stays loaded until the agent restarts or the host reboots. The key is constrained on the router (forced command, `from=` the app address), so this limits what a stolen socket can do but does not remove it.
+- *`-t <LIFETIME>`* bounds exposure but silently ends router access when it lapses, so a human must re-add the key before every expiry. Use it only with the alert below and a calendar reminder.
+
+Either way, alert when the agent is empty. A systemd timer runs a root-owned check every minute and pushes the result to a monitor you operate (placeholders; keep the push URL in a root-only file because it is a credential):
+
+```sh
+#!/bin/sh
+# /usr/local/sbin/couvrefeu-agent-check (0700 root)
+URL=$(cat /root/couvrefeu-key/<PUSH_URL_FILE>)      # <MONITOR_PUSH_URL>?status=...
+if env SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add -l >/dev/null 2>&1 && systemctl is-active --quiet couvrefeu; then
+    status=up; msg=agent-loaded
+else
+    status=down; msg=agent-empty-or-app-down
+fi
+curl -fsS -m 10 "$URL?status=$status&msg=$msg" >/dev/null
+```
+
+Run it from a `Type=oneshot` service triggered by a timer (`OnBootSec=2min`, `OnUnitActiveSec=1min`). Configure the monitor to alert on `status=down` and on missing heartbeats, which also covers a dead host. Do not add a check that sends router commands unless it is a reviewed, read-only status call.
 
 **Restart semantics.** The socket directory `/run/couvrefeu` is `0700` owned by the service user (root can still traverse it). Restarting or stopping `couvrefeu.service` leaves the agent and its loaded key untouched (the agent unit has no `PartOf=`). Restarting the agent drops the key, so it must be re-added, and because the app unit `Requires=` the agent, systemd restarts the app too. `RuntimeDirectoryPreserve=restart` keeps `/run/couvrefeu` across an agent restart so a Docker bind mount of it stays valid; stopping the agent unit removes the directory, so after a stop/start run `docker compose restart` to re-mount it.
 
