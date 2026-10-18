@@ -77,7 +77,9 @@ PrivateTmp=yes
 The NPM-to-service hop is **plaintext on the LAN**, and that LAN is shared with the children's devices.
 
 - **Session cookies.** Anyone who can observe that hop, for example by ARP spoofing on a flat LAN, can read the `cf_session` and `cf_browser` cookies and the CSRF token. They can then act as that parent until the session expires: **up to 1 hour, including pause and resume**. The source-address allowlist does not stop a sniffer. It only stops direct connections from other hosts, and it cannot stop a spoofed source address on the same L2 segment.
-- **Enrollment tokens.** A one-use enrollment token (valid 10 minutes) also crosses the hop when a parent registers a passkey. Until the planned step-up and pairing-code work lands, an attacker who sees it could race the real parent and bind their own passkey to that account. That would be a takeover, including of an admin account. **Enroll passkeys only over an encrypted path:** temporarily use mode (a) or (b) below, or enroll from the service host itself.
+- **First enrollment is still hijackable.** A one-use enrollment token (valid 10 minutes) crosses the hop when a passkey is registered. The *first* passkey of an account that has no active passkey yet, enrolled with an operator token (`integration:bootstrap`), is active at once. An attacker who sees that token can race the real parent and bind their own passkey to the account. For the first admin that is a full takeover. **Do every first enrollment over an encrypted path:** temporarily use mode (a) or (b) below, or enroll from the service host itself. Afterwards, check that the account lists exactly one passkey and that it is yours.
+- **Every later device needs approval.** Whether a token can enroll an active passkey is fixed when it is issued. Only an operator token issued while the account has no active passkey is marked as a first enrollment. Even such a token yields a pending passkey if the account has gained an active passkey by the time it is used. Admin-issued add-device tokens, and operator tokens issued for an enrolled account, always yield a *pending* passkey. Removing any passkey of an account also voids that account's outstanding tokens. A pending passkey cannot sign in until an admin compares its pairing code with the code shown on the new device, confirms with a fresh passkey step-up, and approves it. A sniffed token that was not issued as a first enrollment therefore yields only a pending device. A first-enrollment token is the exception described above. Never approve a pairing code you did not see on your own device. Issuing a new token for an account rejects that account's pending passkeys (audited as `passkey_pending_rejected`). A device whose token was already used is told so and asked to have the admin check the pending devices.
+- **Recovery.** If the only admin loses every device, the lost passkey stays active, so a new operator token yields only a pending passkey that nobody can approve. See [Recovering a lost passkey](#recovering-a-lost-passkey).
 - **What stays safe.** Passkey assertions cannot be replayed: the challenge is one-use, and the assertion is bound to the origin and `rpId`.
 
 Mitigations, best first:
@@ -88,3 +90,22 @@ Mitigations, best first:
 - **(d)** Accept the plaintext hop, restrict the port with the host firewall rule above, and keep sessions short. This mode ships for (d). Prefer (a) or (b).
 
 Keep one public origin. To reach the same app over Tailscale later, resolve the same `cf.example.invalid` to NPM over the tailnet, and add NPM's tailnet source address to `trustedProxies`. Never add a second origin.
+
+## Recovering a lost passkey
+
+On the service host, as the operator, remove every passkey of the affected account:
+
+```sh
+npm run integration:revoke-passkeys -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>"
+```
+
+The command removes all of the account's passkeys, both active and pending. It also ends all of the account's sessions and voids its outstanding enrollment tokens and step-ups. Each removal is written to the audit log (`passkey_operator_revoke`, and a summary row `account_passkeys_revoked`). The command uses the same private manifest and database checks as `integration:bootstrap`. It does not touch the router, so dispatch does not need to be stopped.
+
+The command refuses (`last_admin_required`) if it would leave no active admin with a passkey. If another admin still has a working passkey, let that admin remove the lost passkey in the app instead. For the **sole admin**, add `--allow-no-admin`:
+
+```sh
+npm run integration:revoke-passkeys -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>" --allow-no-admin
+npm run integration:bootstrap -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>"
+```
+
+The account then has no active passkey, so the bootstrap token enrolls an **active** first passkey. **That token is a first enrollment and can be hijacked on the cleartext hop.** Use it only over loopback or an encrypted path (modes (a) or (b) above, or from the service host itself). Then check that the account lists exactly one passkey and that it is yours.

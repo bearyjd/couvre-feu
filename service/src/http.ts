@@ -14,6 +14,8 @@ import { object, parseJSON } from '../../shared/src/json.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
 import { TimeRequestService } from './time-requests.ts';
 import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
+import { AccountAdmin } from './admin-accounts.ts';
+import { accountGet, accountPost } from './admin-accounts-http.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -23,7 +25,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -89,6 +91,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
     const drain = requests ? null : new TimeRequestService(auth.store, policy, clock);
     const provenance = auth.provenance;
+    const accounts = new AccountAdmin(auth);
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
@@ -164,7 +167,12 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                         return;
                     }
                     if (path === '/auth/register/verify' || path === '/auth/login/verify') {
-                        const result = path === '/auth/register/verify' ? await auth.registrationVerify(payload, browserToken, sessionToken) : await auth.loginVerify(payload, browserToken, sessionToken);
+                        const result = path === '/auth/register/verify' ? await auth.enroll(payload, browserToken, sessionToken) : await auth.loginVerify(payload, browserToken, sessionToken);
+                        if ('pending' in result) {
+                            // An add-device passkey cannot sign in until an admin approves it: no session cookie.
+                            send(response, 202, {...provenance, pending: true, pairingCode: result.pending.pairingCode});
+                            return;
+                        }
                         response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`]);
                         send(response, 200, result.dto);
                         return;
@@ -181,6 +189,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const session = auth.session(sessionToken, jar.cf_browser);
                 auth.csrf(session, request.headers['x-csrf-token']);
+                const account = await accountPost(accounts, session, path, payload);
+                if (account) {
+                    send(response, account.status, {...provenance, ...account.body as object});
+                    return;
+                }
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
                 if (match) {
                     const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
@@ -222,6 +235,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 send(response, 200, await policy.people(session.dto.actor));
+                return;
+            }
+            const accountRead = accountGet(accounts, session, path);
+            if (accountRead) {
+                send(response, accountRead.status, {...provenance, ...accountRead.body as object});
                 return;
             }
             const activityMatch = /^\/people\/([a-z][a-z0-9_]{0,31})\/activity$/.exec(path);

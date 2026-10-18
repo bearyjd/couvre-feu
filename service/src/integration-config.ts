@@ -10,6 +10,7 @@ import type { Role, Provenance } from '../../shared/src/contracts.ts';
 import { scheduleClockReader } from './schedule-clock.ts';
 import { loadTLS, privateIPv4, privateListenHost } from './tls.ts';
 import type { TLSFiles } from './tls.ts';
+import { ACCOUNT_LIMIT } from './account-limits.ts';
 
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
@@ -89,7 +90,8 @@ export function integrationConfig(path: string): IntegrationConfig {
     if (!Array.isArray(m.protectedMacs) || !m.protectedMacs.length || m.protectedMacs.length > 64) bad('protected_identities_required');
     const protectedMacs = (m.protectedMacs as unknown[]).map(mac);
     if (new Set(protectedMacs).size !== protectedMacs.length || protectedMacs.includes(person.device.mac)) bad('protected_mac_overlap');
-    if (!Array.isArray(m.accounts) || !m.accounts.length || m.accounts.length > 16) bad();
+    // Seeds a fresh database only; the database is authoritative afterwards. ACCOUNT_LIMIT is a defensive bound, not a product cap.
+    if (!Array.isArray(m.accounts) || !m.accounts.length || m.accounts.length > ACCOUNT_LIMIT) bad();
     const accounts = (m.accounts as unknown[]).map(v => {
         const a = object(v, ['id', 'displayName', 'role', 'personIds']);
         if (!['admin', 'parent'].includes(a.role as string) || !Array.isArray(a.personIds) || a.personIds.length !== 1 || a.personIds[0] !== person.id) bad('invalid_account_scope');

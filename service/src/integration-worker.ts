@@ -72,6 +72,7 @@ export class IntegrationWorker {
         const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now();
         const invocationDigest = owner ? sha256(plan.script + '\n' + batchId) : plan.scriptSha256;
         this.store.transaction(() => {
+            this.store.assertIdentity();
             this.validate(plan);
             const automatic = this.store.get<{enabled: number; epoch: number; owner_token: string}>('SELECT * FROM automatic_dispatch WHERE singleton=1');
             if (owner ? !this.store.config.dispatch?.enabled || !automatic?.enabled || automatic.epoch !== owner.epoch || owner.epoch !== epoch || automatic.owner_token !== owner.token : automatic?.enabled) throw new AppError(409, 'automatic_dispatch_authority_required');

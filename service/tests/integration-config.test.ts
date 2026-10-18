@@ -10,6 +10,7 @@ import { integrationConfig, privateHTTPSOrigin } from '../src/integration-config
 import { IntegrationStore } from '../src/integration-db.ts';
 import { Store } from '../src/db.ts';
 import { testConfig } from './fixtures/integration.ts';
+import { ACCOUNT_LIMIT } from '../src/account-limits.ts';
 
 test('private manifest validates explicit real bindings, pinned public keys and agent; rejects unsafe or fictional mode', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cf-private-config-test-')), sample = testConfig(dir), socket = createServer();
@@ -23,6 +24,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
     const save = (value: unknown) => writeFileSync(path, JSON.stringify(value), {mode: 0o600});
     try {
         save(manifest); const c = integrationConfig(path);
+        // No 16-account product cap: manifest accounts only seed a fresh database, bounded by the defensive ACCOUNT_LIMIT.
+        const seeded = Array.from({length: 40}, (_, i) => ({id: `parent_${i}`, displayName: `Parent ${i}`, role: 'parent', personIds: ['pilot']}));
+        save({...manifest, accounts: [...manifest.accounts, ...seeded]}); assert.equal(integrationConfig(path).accounts.length, 42);
+        save({...manifest, accounts: [...manifest.accounts, ...Array.from({length: ACCOUNT_LIMIT}, (_, i) => ({id: `p${i}`, displayName: 'P', role: 'parent', personIds: ['pilot']}))]}); assert.throws(() => integrationConfig(path), /invalid_integration_manifest|body_too_large/); // the 64 KiB manifest bound may bind first
         assert.equal(c.dispatch, undefined);
         assert.equal(c.timeRequests, undefined, 'time requests are off unless explicitly enabled');
         save({...manifest, timeRequests: {enabled: true}}); assert.equal(integrationConfig(path).timeRequests?.enabled, true);
@@ -42,7 +47,7 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         save(manifest);
         assert.equal(c.provenance.source, 'real-router-integration'); assert.equal(c.provenance.routerCompatibilityVerified, false);
         assert.deepEqual(c.accounts.map(a => a.id), ['operator', 'parent']); assert.equal(c.router.generation, manifest.router.generation);
-        for (const changed of [{...manifest, mode: 'demo'}, {...manifest, protectedMacs: [manifest.person.device.mac]}, {...manifest, router: {...manifest.router, generation: undefined}}, {...manifest, router: {...manifest.router, host: 'evil.example'}}, {...manifest, accounts: [{...manifest.accounts[0], personIds: ['other']}]}, {...manifest, enrollment: {...manifest.enrollment, people: [{id: 'pilot', macs: ['02:aa:bb:cc:dd:ee']}]}}]) { save(changed); assert.throws(() => integrationConfig(path)); }
+        for (const changed of [{...manifest, mode: 'demo'}, {...manifest, protectedMacs: [manifest.person.device.mac]}, {...manifest, router: {...manifest.router, generation: undefined}}, {...manifest, router: {...manifest.router, host: 'evil.example'}}, {...manifest, accounts: [{...manifest.accounts[0], personIds: ['other']}]}, {...manifest, accounts: [{...manifest.accounts[0], personIds: []}]}, {...manifest, enrollment: {...manifest.enrollment, people: [{id: 'pilot', macs: ['02:aa:bb:cc:dd:ee']}]}}]) { save(changed); assert.throws(() => integrationConfig(path)); }
         save(manifest); chmodSync(path, 0o644); assert.throws(() => integrationConfig(path), /unsafe_private_path/); chmodSync(path, 0o600);
         const link = join(dir, 'link.json'); symlinkSync(path, link); assert.throws(() => integrationConfig(link), /unsafe_private_path/);
         writeFileSync(sample.router.knownHosts, `192.168.1.1 ssh-ed25519 ${blob}\n192.168.1.2 ssh-ed25519 ${blob}\n`); assert.throws(() => integrationConfig(path), /invalid_pinned_host_key/);
