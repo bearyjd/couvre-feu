@@ -306,6 +306,86 @@ class CoreTests(unittest.TestCase):
                         self.assertTrue(any(direction in args and address in args for args in calls), calls)
             self.assertFalse(any("192.168.1.10" in args for args in calls))
 
+    def test_cached_ipv6_aliases_cover_schedule_pause_guards_and_conntrack(self):
+        neighbors = self.fixture.backend()["neighbors"]
+        for row in neighbors:
+            if row["ip"] in ("2001:db8::20", "2001:db8::21"):
+                row["state"] = "STALE" if row["ip"].endswith("20") else "DELAY"
+        neighbors.append({"ip": "2001:0db8:0:0:0:0:0:0022", "mac": KID, "state": "PROBE"})
+        self.fixture.update_backend(neighbors=neighbors)
+        document = policy()
+        document["schedules"] = [{"person": "alice", "id": "night", "weekdays": ["Mon"], "start": "22:00", "stop": "06:30"}]
+        self.sync(document)
+        aliases = ("2001:db8::20", "2001:db8::21", "2001:db8::22")
+        offset = 0
+        for action in ("schedule", "pause"):
+            if action == "pause":
+                offset = len(self.fixture.calls())
+                self.success(self.fixture.run("pause", "alice"))
+            state = self.fixture.backend()
+            calls = [row["argv"] for row in self.fixture.calls()[offset:] if row["command"] == "conntrack"]
+            guards = [row["argv"] for row in self.fixture.calls()[offset:]
+                      if row["command"] == "ip6tables" and "-A" in row["argv"]
+                      and any(arg.endswith("_g") for arg in row["argv"])]
+            for address in aliases:
+                with self.subTest(action=action, address=address):
+                    packet = {"in": "eth0", "out": "br-lan", "src": "2001:db8:ffff::1", "dst": address,
+                              "mac": "02:ff:ff:ff:ff:01", "protocol": "udp", "dport": "5000",
+                              "weekday": "Mon", "time": "12:00:00" if action == "pause" else "23:00:00",
+                              "ctstate": "ESTABLISHED"}
+                    decision = evaluate_fixture_chain(state["tables"]["ip6tables"]["filter"], "FORWARD", packet, state["sets"])
+                    self.assertIn(decision, ("DROP", "REJECT"))
+                    for direction in ("-s", "-d"):
+                        self.assertTrue(any(direction in args and address in args for args in calls), calls)
+                    self.assertTrue(any("-d" in row and address in row for row in guards))
+            self.assertFalse(any("2001:db8::10" in args for args in calls))
+
+    def test_ipv6_valid_state_changes_preserve_confirmation_and_noop_sync(self):
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        self.sync(document)
+        before = self.fixture.durable_snapshot()
+        mutations = len(self.fixture.mutation_calls())
+        for state in ("STALE", "DELAY", "PROBE", "PERMANENT", "REACHABLE"):
+            with self.subTest(state=state):
+                neighbors = [dict(row, state=state) if ":" in row["ip"] and row["mac"] == KID else row
+                             for row in self.fixture.backend()["neighbors"]]
+                self.fixture.update_backend(neighbors=neighbors)
+                self.success(self.fixture.run("status", "--json"))
+                self.assertEqual([call for call in self.fixture.mutation_calls()[mutations:]
+                                  if call["command"] != "conntrack"], [])
+                self.sync(document)
+                # Active unchanged policy intentionally drains conntrack; state
+                # aging must not rebuild sets/chains or reload the native rules.
+                self.assertEqual([call for call in self.fixture.mutation_calls()[mutations:]
+                                  if call["command"] != "conntrack"], [])
+                self.assertEqual(self.fixture.durable_snapshot(), before)
+
+    def test_stale_protected_ipv6_collision_refuses_without_mutation(self):
+        neighbors = self.fixture.backend()["neighbors"]
+        neighbors.append({"ip": "2001:0db8:0:0:0:0:0:20", "mac": PROTECTED, "state": "STALE"})
+        self.fixture.update_backend(neighbors=neighbors)
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        self.reject_without_mutation(document=document)
+
+    def test_preexisting_failed_or_missing_alias_remains_an_inventory_gap(self):
+        neighbors = [dict(row, state="FAILED") if row["ip"] == "2001:db8::20" else row
+                     for row in self.fixture.backend()["neighbors"]]
+        self.fixture.update_backend(neighbors=neighbors)
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        status = self.sync(document)
+        self.assertIs(status["capabilities"]["addressCoverageComplete"], True)
+        self.fixture.update_backend(neighbors=[row for row in neighbors if row["ip"] != "2001:db8::20"])
+        self.sync(document)
+        # Another usable alias supplies coverage; neither request covers the
+        # missing/FAILED one. This records the limit, not long-term completeness.
+        rows = self.fixture.backend()["tables"]["ip6tables"]["filter"][self.fixture.active_chain("f")]
+        self.assertFalse(any("2001:db8::20" in row for row in rows))
+        self.assertTrue(any("2001:db8::21" in row for row in rows))
+        self.assertFalse(any("2001:db8::20" in row["argv"] for row in self.fixture.calls() if row["command"] == "conntrack"))
+
     def test_expiry_is_local_and_same_revision_replay_cannot_resurrect(self):
         document = policy()
         expiry = int(self.fixture.env["CF_NOW"]) + 120
@@ -1203,7 +1283,7 @@ class CoreTests(unittest.TestCase):
                 with self.subTest(family=family, destination=destination):
                     self.assertEqual(decision in ("DROP", "REJECT"), should_block, decision)
 
-    def stopped_sync(self, checkpoint):
+    def stopped_sync(self, checkpoint, document=None):
         marker = self.fixture.root / "rpc-stopped"
         marker.unlink(missing_ok=True)
         process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "sync"],
@@ -1211,7 +1291,7 @@ class CoreTests(unittest.TestCase):
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         try:
-            process.stdin.write(json.dumps(policy()))
+            process.stdin.write(json.dumps(document or policy()))
             process.stdin.close()
             process.stdin = None
             deadline = time.monotonic() + 60
@@ -1225,6 +1305,70 @@ class CoreTests(unittest.TestCase):
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=10)
             raise
+
+    def assert_cached_ipv6_transition_change_refuses(self, change):
+        address = "2001:db8::20"
+        neighbors = [dict(row, state="STALE") if row["ip"] == address else row
+                     for row in self.fixture.backend()["neighbors"]]
+        self.fixture.update_backend(neighbors=neighbors)
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        process = self.stopped_sync("transition_native", document)
+        try:
+            intent = self.fixture.root / "etc/couvrefeu/runtime/firewall.intent"
+            frozen = [line for line in intent.read_text().splitlines() if line.startswith("ADDRESS ")]
+            self.assertIn(f"ADDRESS {address}\t{KID}", frozen)
+            neighbors = self.fixture.backend()["neighbors"]
+            if change == "absent":
+                neighbors = [row for row in neighbors if row["ip"] != address]
+            else:
+                for row in neighbors:
+                    if row["ip"] == address:
+                        if change == "remap":
+                            row["mac"] = OTHER_KID
+                        else:
+                            row["state"] = "FAILED"
+            self.fixture.update_backend(neighbors=neighbors)
+            process.send_signal(signal.SIGCONT)
+            stdout, stderr = process.communicate(timeout=90)
+            self.assertNotEqual(process.returncode, 0, stdout + stderr)
+            self.assertIn("transition_address_changed", json.loads(stdout)["errors"])
+            self.assertEqual([line for line in intent.read_text().splitlines() if line.startswith("ADDRESS ")], frozen)
+            self.assertFalse((self.fixture.root / "etc/couvrefeu/runtime/confirmed").exists())
+            self.assertTrue(any("_g" in " ".join(row) for row in self.fixture.backend()["tables"]["ip6tables"]["filter"]["cf_fwd"]))
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=10)
+
+    def test_cached_ipv6_disappearance_during_active_transition_refuses(self):
+        self.assert_cached_ipv6_transition_change_refuses("absent")
+
+    def test_cached_ipv6_failure_during_active_transition_refuses(self):
+        self.assert_cached_ipv6_transition_change_refuses("failed")
+
+    def test_cached_ipv6_remap_during_active_transition_refuses(self):
+        self.assert_cached_ipv6_transition_change_refuses("remap")
+
+    def test_cached_ipv6_state_only_change_during_active_transition_succeeds(self):
+        neighbors = [dict(row, state="STALE") if row["ip"] == "2001:db8::20" else row
+                     for row in self.fixture.backend()["neighbors"]]
+        self.fixture.update_backend(neighbors=neighbors)
+        document = policy()
+        document["pauses"] = [{"person": "alice", "until": 0}]
+        process = self.stopped_sync("transition_native", document)
+        try:
+            neighbors = [dict(row, state="DELAY") if row["ip"] == "2001:db8::20" else row
+                         for row in self.fixture.backend()["neighbors"]]
+            self.fixture.update_backend(neighbors=neighbors)
+            process.send_signal(signal.SIGCONT)
+            stdout, stderr = process.communicate(timeout=90)
+            self.success(subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr))
+            self.assertFalse((self.fixture.root / "etc/couvrefeu/runtime/firewall.intent").exists())
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=10)
 
     def test_wholly_absent_interrupted_initial_staging_recovers_old_policy(self):
         state = (self.fixture.root / "etc/couvrefeu/state").read_bytes()
@@ -1359,6 +1503,89 @@ cf_transition_inventory_check
                 process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
+
+
+class AddressBindingTests(unittest.TestCase):
+    """Binding trust is independent of recent IPv6 reachability, not future ownership."""
+    def setUp(self):
+        self.fixture = RouterFixture()
+
+    def tearDown(self):
+        self.fixture.close()
+
+    def addresses(self):
+        script = '''CF_BASE=$CF_ROOT CF_LOCAL_TEST=1
+. "$1"
+. "$2"
+CF_POLICY=$(printf 'P\\talice\\t%s\\nP\\talice\\t%s\\n' "$3" "$4")
+cf_clock && cf_addresses
+'''
+        result = subprocess.run(self.fixture.shell + ["-c", script, "bindings", str(REPO / "router/lib/core.sh"),
+                                                     str(REPO / "router/lib/firewall.sh"), KID, OTHER_KID],
+                                env=self.fixture.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.mutation_calls(), [])
+        return result.stdout.splitlines()
+
+    def test_all_valid_ipv6_states_have_identical_canonical_unique_bindings(self):
+        reference = self.addresses()
+        original = self.fixture.backend()["neighbors"]
+        for state in ("REACHABLE", "PERMANENT", "STALE", "DELAY", "PROBE"):
+            with self.subTest(state=state):
+                neighbors = [dict(row, ip="2001:0DB8:0000:0:0:0:0:0020", state=state)
+                             if row["ip"] == "2001:db8::20"
+                             else dict(row, state=state) if ":" in row["ip"] else row for row in original]
+                neighbors.append({"ip": "2001:db8::20", "mac": KID, "state": state})
+                self.fixture.update_backend(neighbors=neighbors)
+                self.assertEqual(self.addresses(), reference)
+
+    def test_invalid_ipv6_states_do_not_qualify_and_expose_existing_inventory_gap(self):
+        # Missing/FAILED aliases before a request are not a completeness proof:
+        # the other usable child address can still satisfy current admission.
+        original = self.fixture.backend()["neighbors"]
+        for state in ("FAILED", "INCOMPLETE", "NOARP", "NONE", None):
+            with self.subTest(state=state):
+                neighbors = [dict(row, state=state) if row["ip"] == "2001:db8::20" else row for row in original
+                             if state is not None or row["ip"] != "2001:db8::20"]
+                self.fixture.update_backend(neighbors=neighbors)
+                records = self.addresses()
+                self.assertFalse(any("2001:db8::20" in line for line in records))
+                self.assertIn(f"2001:db8::21\t{KID}", records)
+
+    def test_stale_protected_collision_duplicate_owner_and_router_alias_remain_uncertain(self):
+        original = self.fixture.backend()["neighbors"]
+        for collision in (PROTECTED, OTHER_KID, "router"):
+            with self.subTest(collision=collision):
+                neighbors = original + [{"ip": "2001:0db8:0:0:0:0:0:20", "mac": KID, "state": "STALE"}]
+                if collision == "router":
+                    addresses6 = ["2: br-lan inet6 2001:db8::20/64 scope global"]
+                else:
+                    neighbors += [{"ip": "2001:db8::20", "mac": collision, "state": "STALE"}]
+                    addresses6 = []
+                self.fixture.update_backend(neighbors=neighbors, addresses6=addresses6)
+                records = self.addresses()
+                self.assertNotIn(f"2001:db8::20\t{KID}", records)
+                self.assertIn(f"UNCERTAIN\t2001:db8::20\t{KID}", records)
+                if collision == PROTECTED:
+                    self.assertIn(f"PROTECTED\t2001:db8::20\t{PROTECTED}", records)
+
+    def test_ipv4_cached_states_still_require_current_lease(self):
+        original = self.fixture.backend()["neighbors"]
+        leases = self.fixture.root / "tmp/dhcp.leases"
+        for state in ("STALE", "DELAY", "PROBE"):
+            for expiry in (0, int(self.fixture.env["CF_NOW"]) + 1, int(self.fixture.env["CF_NOW"]) - 1, None):
+                with self.subTest(state=state, expiry=expiry):
+                    self.fixture.update_backend(neighbors=[dict(row, state=state) if row["ip"] == "192.168.1.20" else row
+                                                           for row in original])
+                    leases.write_text("" if expiry is None else f"{expiry} {KID} 192.168.1.20 fixture *\n")
+                    records = self.addresses()
+                    valid = expiry is not None and (expiry == 0 or expiry > int(self.fixture.env["CF_NOW"]))
+                    self.assertEqual(f"192.168.1.20\t{KID}" in records, valid)
+                    self.assertEqual(f"UNCERTAIN\t192.168.1.20\t{KID}" in records, not valid)
+        # A current child lease still cannot override a conflicting protected mapping.
+        leases.write_text(f"0 {KID} 192.168.1.20 fixture *\n")
+        self.fixture.update_backend(neighbors=original + [{"ip": "192.168.1.20", "mac": PROTECTED, "state": "STALE"}])
+        self.assertNotIn(f"192.168.1.20\t{KID}", self.addresses())
 
 
 class FixtureProcessTests(unittest.TestCase):
