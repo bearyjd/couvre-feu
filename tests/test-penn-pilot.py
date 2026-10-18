@@ -695,6 +695,73 @@ class PilotPlanTests(PilotBase):
         commit, blobs = tool.FR.head_source()
         self.assertIn("CFP_CFCTL_ALLOWANCE='45'\n", tool.build_payload(config, commit, blobs, timing)[0].decode())
 
+    def coverage_shell(self, extra=''):
+        leases = self.work / 'diag.leases'
+        leases.write_text(f'1900000000 {PENN["mac"]} {PENN["ip"]} PRIVATE_CHILD *\n'
+                          '1900000000 02:00:00:00:00:99 192.0.2.99 PRIVATE_OTHER *\n')
+        body = (f'CFP_DIR={shlex.quote(str(self.work))}\nCFR_LEASES={shlex.quote(str(leases))}\n'
+                f'CFP_RPC_ALLOW={PENN["mac"]}\nCFR_PENN_IP={PENN["ip"]}\n'
+                'CFP_READ_TIMEOUT=8\nCFR_START=0\nCFP_REMOTE_TIMEOUT=2000\nCFP_TEARDOWN_RESERVE=300\n'
+                'cfp_now() { echo 1000; }\ncfr_info() { echo "INFO $1"; }\n'
+                'ip() { case "$*" in\n'
+                f' *neigh*) printf "%s\\n" "2001:db8::30 lladdr {PENN["mac"]} STALE" '
+                f'"{PENN["ip"]} lladdr 02:00:00:00:00:88 REACHABLE" '
+                '"192.0.2.99 lladdr 02:00:00:00:00:99 REACHABLE";;\n'
+                ' *addr*) echo "2: br-lan inet6 2001:db8::1/64 scope global";; esac; }\n'
+                'timeout() { shift 3; "$@"; }\n' + extra + '\ncfp_coverage_diag\necho TEARDOWN\n')
+        return self.pilot_shell(body)
+
+    def test_coverage_diag_scopes_neighbor_and_lease_fields(self):
+        code, out = self.coverage_shell()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f'neighbor 2001:db8::30 mac={PENN["mac"]} state=STALE', out)
+        self.assertIn(f'neighbor {PENN["ip"]} mac=02:00:00:00:00:88', out)
+        self.assertIn(f'lease expiry=1900000000 mac={PENN["mac"]} ip={PENN["ip"]}', out)
+        self.assertIn('lan inet6 2001:db8::1/64', out)
+        self.assertNotIn('192.0.2.99', out)
+        self.assertNotIn('PRIVATE_', out)
+
+    def test_coverage_diag_budget_skip_and_read_timeout_continue_teardown(self):
+        code, out = self.coverage_shell('CFP_REMOTE_TIMEOUT=1350\ntimeout() { echo SHOULD_NOT_READ; return 1; }')
+        self.assertEqual(code, 0, out)
+        self.assertIn('coverage_diag skipped teardown_reserve', out)
+        self.assertNotIn('SHOULD_NOT_READ', out)
+        self.assertTrue(out.endswith('TEARDOWN\n'))
+        code, out = self.coverage_shell('timeout() { return 137; }')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count('unavailable read_timeout_or_failed'), 6)
+        self.assertTrue(out.endswith('TEARDOWN\n'))
+        # Recheck the actual remaining reserve before each subsequent read.
+        code, out = self.coverage_shell('cfp_now() { echo 1000; }\n'
+                                       'timeout() { CFP_REMOTE_TIMEOUT=1300; shift 3; "$@"; }')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count('skipped teardown_reserve'), 5)
+
+    def test_coverage_diag_limits_rows(self):
+        code, out = self.coverage_shell(f'ip() {{ i=0; while [ "$i" -lt 40 ]; do '
+                                       f'echo "2001:db8::$i lladdr {PENN["mac"]} STALE"; i=$((i+1)); done; }}')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count('INFO coverage_diag neighbor 2001:'), 32)
+        self.assertEqual(out.count('INFO coverage_diag neighbor truncated'), 2)
+
+    def test_coverage_diag_only_exact_enroll_failure_token(self):
+        for error, expected in [('incomplete_transition_address_coverage', True),
+                                ('incomplete_transition_address_coverage_extra', False),
+                                ('different_error', False)]:
+            with self.subTest(error=error):
+                status = json.dumps({'rpc_version': 1, 'generation': 'a' * 64, 'policyDigest': 'b' * 64,
+                                     'acceptedPolicy': {'version': 1, 'revision': 0, 'people': [], 'pauses': []}}, separators=(',', ':'))
+                body = (f'CFP_DIR={shlex.quote(str(self.work))}\nCFP_POLICY=policy\n'
+                        f'cfp_cfctl() {{ echo {shlex.quote(status)}; }}\n'
+                        f"cfp_cfctl_input() {{ echo '[\"{error}\"]'; return 1; }}\n"
+                        'cfp_policy_only_penn() { return 0; }\n'
+                        'cfp_coverage_diag() { echo DIAGNOSTIC; }\n'
+                        'cfp_stop() { echo "STOP $1 $2"; exit 20; }\ncfp_enroll\n')
+                code, out = self.pilot_shell(body)
+                self.assertEqual(code, 20, out)
+                self.assertEqual('DIAGNOSTIC' in out, expected, out)
+                self.assertIn('STOP ENROLL rpc_sync_failed', out)
+
     def test_latency_guard_treats_empty_clock_as_zero(self):
         code, out = self.pilot_shell('cfp_now() { :; }\ncfp_lat_note 1000\necho "$cfp_lat $CFP_LAT_MAX"\n')
         self.assertEqual((code, out), (0, '0 0\n'))
@@ -1000,6 +1067,40 @@ class PilotFixtureTests(PilotBase):
         self.assertFalse(summary['pauseRulesKernelTimeBound'])
         argv = [json.loads(line) for line in self.ssh_log.read_text().splitlines()]
         self.assertEqual(len(argv), 1)
+
+    def test_enroll_coverage_failure_captures_scoped_snapshot_once_and_restores(self):
+        ipv6 = dict(ip='2001:db8::30', mac=PENN['mac'], state='STALE')
+        self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
+                                               dict(PENN, state='DELAY'), ipv6,
+                                               dict(ip='2001:db8::99', mac='02:00:00:00:00:99', state='STALE')])
+        shell = shlex.split(self.spec['shell'])
+        program = shell[0]
+        q = shlex.quote
+        real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
+        real_shell = ' '.join([real, *map(q, shell[1:])])
+        rpc_log, accepted = self.work / 'rpc-count', self.work / 'accepted.json'
+        reply = q('{"ok":false,"errors":["incomplete_transition_address_coverage"],"receipt":null}')
+        self.router_double(program, (
+            f'case " $* " in *{q(" " + cfctl + " rpc-sync ")}*)\n'
+            f'  cat >/dev/null; echo rpc-sync >> {q(str(rpc_log))}\n'
+            f'  {real_shell} {q(cfctl)} rpc-status --json > {q(str(accepted))}\n'
+            f'  echo {reply}\n'
+            '  exit 1;; esac\n'
+            f'exec {real} "$@"\n'))
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        stdout = (self.evidence() / 'stdout.log').read_text()
+        self.assertEqual(code, 2, out + err + stdout[-4000:])
+        self.assertIn('coverage_diag neighbor 2001:db8::30', stdout)
+        self.assertIn('state=STALE', stdout)
+        self.assertNotIn('2001:db8::99', stdout)
+        self.assertLess(stdout.index('coverage_diag non_atomic'), stdout.index('STOP ENROLL rpc_sync_failed'))
+        self.assertEqual(rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertEqual(json.loads(accepted.read_text())['acceptedPolicy']['revision'], 0)
+        self.assertEqual(stdout.count('PHASE UNINSTALL OK'), 1)
+        self.assertIn('PHASE RESTORE OK', stdout)
+        self.assertIn('PENN_PILOT_STOPPED_RESTORED', stdout)
+        self.assertEqual(self.router_snapshot(), before)
 
     def test_adult_disruption_stops_and_always_tears_down(self):
         self.spec['touch_on']['INFO pause_observe_begin'] = str(self.dns_fail)

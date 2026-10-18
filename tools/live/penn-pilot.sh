@@ -68,7 +68,7 @@ CFP_MUTATED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
 CFP_FRESH_STATES='REACHABLE DELAY'
-CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh settle.neigh settle.tokens settle.map counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final activity.json scope-request.json scope-sync.json fw.before fw.after fw.ipset fw.rules'
+CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh settle.neigh settle.tokens settle.map counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final activity.json scope-request.json scope-sync.json coverage.clock coverage.neigh4 coverage.neigh6 coverage.leases coverage.addr4 coverage.addr6 fw.before fw.after fw.ipset fw.rules'
 
 cfp_cleanup() {
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ] && [ "$CFR_STDOUT_LOST" != 1 ]; then
@@ -636,6 +636,59 @@ cfp_teardown() {
 # $1 phase, $2 its worst-case seconds: start it only if it can finish before the reserve.
 cfp_budget() { cfp_elapsed_ok "$2" || cfp_stop "$1" remote_budget_reserved_for_teardown; }
 
+# Failure evidence only: no refresh, retry or policy change. Every read reserves
+# its full timeout plus output overhead before touching the teardown reserve.
+cfp_coverage_read() {
+    cfp_cd_kind=$1; shift
+    if ! cfp_elapsed_ok "$((CFP_READ_TIMEOUT + 2))"; then
+        cfr_info "coverage_diag $cfp_cd_kind skipped teardown_reserve"
+        return 1
+    fi
+    if ! timeout -s KILL "$CFP_READ_TIMEOUT" "$@" > "$CFP_DIR/coverage.$cfp_cd_kind" 2>/dev/null </dev/null; then
+        cfr_info "coverage_diag $cfp_cd_kind unavailable read_timeout_or_failed"
+        return 1
+    fi
+}
+cfp_coverage_diag() {
+    # Six reads plus bounded formatting; failure diagnostics never reduce the
+    # disclosed reserve, and add nothing to successful-run timing/minimums.
+    if ! cfp_elapsed_ok "$((6 * (CFP_READ_TIMEOUT + 2)))"; then
+        cfr_info 'coverage_diag skipped teardown_reserve'
+        return 0
+    fi
+    cfr_info 'coverage_diag non_atomic_failure_snapshot row_limit=16 expected_revision=0 no_retry'
+    if cfp_coverage_read clock date -u '+%Y-%m-%dT%H:%M:%SZ epoch=%s'; then
+        cfr_info "coverage_diag clock $(cat "$CFP_DIR/coverage.clock")"
+    fi
+    for cfp_cd_family in 4 6; do
+        if cfp_coverage_read "neigh$cfp_cd_family" ip "-$cfp_cd_family" neigh show dev br-lan; then
+            awk -v macs=" $CFP_RPC_ALLOW " -v ips=" $CFR_PENN_IP ${CFP_PENN2_IP:-} " '
+                {mac="-";state="-";for(i=2;i<=NF;i++){
+                    if($i=="lladdr"&&i<NF)mac=tolower($(i+1))
+                    if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE|UNCERTAIN)$/)state=$i}
+                if(index(macs," " mac " ")||index(ips," " $1 " ")){
+                    if(++n<=16)print "INFO coverage_diag neighbor",$1,"mac=" mac,"state=" state
+                    else {print "INFO coverage_diag neighbor truncated";exit}}}
+            ' "$CFP_DIR/coverage.neigh$cfp_cd_family" | while IFS= read -r cfp_cd_line; do cfr_out "$cfp_cd_line"; done
+        fi
+    done
+    if cfp_coverage_read leases cat "$CFR_LEASES"; then
+        awk -v macs=" $CFP_RPC_ALLOW " -v ips=" $CFR_PENN_IP ${CFP_PENN2_IP:-} " '
+            index(macs," " tolower($2) " ")||index(ips," " $3 " "){
+                if(++n<=16)print "INFO coverage_diag lease expiry=" $1,"mac=" tolower($2),"ip=" $3
+                else {print "INFO coverage_diag lease truncated";exit}}
+        ' "$CFP_DIR/coverage.leases" | while IFS= read -r cfp_cd_line; do cfr_out "$cfp_cd_line"; done
+    fi
+    for cfp_cd_family in 4 6; do
+        if cfp_coverage_read "addr$cfp_cd_family" ip "-$cfp_cd_family" addr show dev br-lan; then
+            awk '{for(i=1;i<NF;i++)if($i=="inet"||$i=="inet6"){
+                if(++n<=16)print "INFO coverage_diag lan",$i,$(i+1)
+                else {print "INFO coverage_diag lan truncated";exit}}}' "$CFP_DIR/coverage.addr$cfp_cd_family" |
+                while IFS= read -r cfp_cd_line; do cfr_out "$cfp_cd_line"; done
+        fi
+    done
+}
+
 cfp_enroll() {
     cfp_cfctl rpc-status --json > "$CFP_DIR/rpc-status.json" || cfp_stop ENROLL rpc_status_failed
     cfp_gen=$(sed -n 's/^{"rpc_version":1,"generation":"\([0-9a-f]\{64\}\)",.*/\1/p' "$CFP_DIR/rpc-status.json")
@@ -650,6 +703,9 @@ cfp_enroll() {
     cfp_cfctl_input "$CFP_DIR/request.json" rpc-sync > "$CFP_DIR/rpc-sync.json" || {
         cfp_rc=$?
         cfr_info "rpc-sync exit=$cfp_rc $(tr '\n' ' ' < "$CFP_DIR/rpc-sync.json")"
+        if grep -Fq '"incomplete_transition_address_coverage"' "$CFP_DIR/rpc-sync.json"; then
+            cfp_coverage_diag
+        fi
         cfp_stop ENROLL rpc_sync_failed
     }
     cfr_info "rpc-sync $(cat "$CFP_DIR/rpc-sync.json")"
