@@ -233,6 +233,12 @@ cfp_identity() {
         awk -v mac="$CFP_PENN2_MAC" -v ip="$CFR_PENN_IP" '$1==ip{for(i=2;i<NF;i++)if($i=="lladdr"&&tolower($(i+1))==mac)bad=1}END{exit bad}' "$CFP_DIR/identity.neigh" ||
             cfr_refuse IDENTITY penn_child_2_mac_on_penn_ip
     fi
+    # The synthetic SCOPE MAC must not belong to any live device.
+    if [ -n "$CFP_SCOPE_TEST" ]; then
+        awk -v mac="$CFP_SCOPE_MAC" '{for(i=1;i<NF;i++)if($i=="lladdr"&&tolower($(i+1))==mac)bad=1}END{exit bad}' "$CFP_DIR/identity.neigh" ||
+            cfr_refuse IDENTITY scope_mac_present
+        awk -v mac="$CFP_SCOPE_MAC" 'tolower($2)==mac{bad=1}END{exit bad}' "$CFR_LEASES" || cfr_refuse IDENTITY scope_mac_present
+    fi
     cfp_policy_only_penn "$CFP_POLICY" || cfr_refuse IDENTITY policy_not_penn_only
     cfr_info "identity penn_child fresh unique; policy admits only penn_child devices=$CFP_RPC_ALLOW"
 }
@@ -245,6 +251,21 @@ cfp_policy_macs() {
         END{for(m in want)if(!(m in seen))bad=1;exit bad||n<1}'
 }
 cfp_policy_only_penn() { cfp_policy_macs "$1" "$CFP_RPC_ALLOW"; }
+# Two devices: CFP_RPC_ALLOW and CFP_KIDS_JSON must equal the C-sorted pair of
+# the two MACs IDENTITY checks (CFR_PENN_MAC, CFP_PENN2_MAC); never trusted alone.
+cfp_device_set() {
+    for cfp_m in "$CFR_PENN_MAC" "$CFP_PENN2_MAC"; do
+        case $cfp_m in
+            [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+            *) return 1;;
+        esac
+    done
+    [ "$CFR_PENN_MAC" != "$CFP_PENN2_MAC" ] || return 1
+    cfp_ds=$(printf '%s\n%s\n' "$CFR_PENN_MAC" "$CFP_PENN2_MAC" | LC_ALL=C sort | tr '\n' ' ') || return 1
+    cfp_ds=${cfp_ds% }
+    [ "$CFP_RPC_ALLOW" = "$cfp_ds" ] || return 1
+    [ "$CFP_KIDS_JSON" = "[\"${cfp_ds% *}\",\"${cfp_ds#* }\"]" ]
+}
 
 # --- cfctl calls: avoid the cron minute and any in-flight core operation -----
 cfp_safe_band() {
@@ -274,9 +295,12 @@ cfp_cfctl() {
     cfp_lat_note "$cfp_c_t0"
     return "$cfp_c_rc"
 }
+# cfp_c_ran=1 only once cfctl was invoked (0: the safe band never opened).
 cfp_cfctl_input() {
     cfp_input=$1; shift
+    cfp_c_ran=0
     cfp_safe_band || return 1
+    cfp_c_ran=1
     cfp_c_t0=$(cfp_now)
     # shellcheck disable=SC2086
     $CFR_SH "$CFR_CFCTL" "$@" <"$cfp_input" 2>>"$CFR_STAGE/child.log"
@@ -534,8 +558,9 @@ cfp_rpc_activity() {
     grep -q ',"errors":\[\]}$' "$CFP_DIR/activity.json" || cfp_errs=' errors_reported'
     cfr_out "MEASURE rpc_activity_devices measured listed=$cfp_listed person=$CFP_PERSON$cfp_errs"
 }
-# Lock-free firewall fingerprint for SCOPE: slot instance, Couvre-feu ipset
-# lines and Couvre-feu filter rules of both families. $1 output file.
+# Lock-free firewall fingerprint for SCOPE: firewall.owned slot instance, cf*
+# ipset create/add lines and filter-table rules naming cf* (iptables and
+# ip6tables). nat and mangle are not compared. $1 output file.
 cfp_fw_state() {
     {
         cfp_slot_id || return 1
@@ -566,7 +591,8 @@ cfp_scope_clean() {
 }
 # Optional negative test: one rpc-sync naming a synthetic out-of-scope MAC,
 # sent once after enrollment. Anything but a clean rejection with an unchanged
-# firewall stops the pilot (teardown follows).
+# fingerprint stops the pilot (teardown follows); if the safe band never opens
+# the call is not made and the stop reason is safe_band_unavailable.
 cfp_scope_phase() {
     cfp_digest=$(sed -n 's/.*,"policyDigest":"\([0-9a-f]\{64\}\)",.*/\1/p' "$CFP_DIR/rpc-sync.json")
     [ "${#cfp_digest}" = 64 ] || cfp_stop SCOPE enrolled_digest_unparsed
@@ -577,11 +603,12 @@ cfp_scope_phase() {
     cfr_info "scope rpc-sync operation=$CFP_SCOPE_OPERATION_ID expect=$CFP_SCOPE_ERROR"
     cfp_cfctl_input "$CFP_DIR/scope-request.json" rpc-sync > "$CFP_DIR/scope-sync.json"
     cfp_rc=$?
+    [ "$cfp_c_ran" = 1 ] || cfp_stop SCOPE safe_band_unavailable
     cfr_info "scope rpc-sync exit=$cfp_rc $(tr '\n' ' ' < "$CFP_DIR/scope-sync.json")"
     cfp_fw_state "$CFP_DIR/fw.after" || cfp_stop SCOPE firewall_read_failed
     cfp_scope_clean "$CFP_DIR/scope-sync.json" "$cfp_rc" "$cfp_gen" "$cfp_digest" || cfp_stop SCOPE scope_not_cleanly_rejected
     cmp -s "$CFP_DIR/fw.before" "$CFP_DIR/fw.after" || cfp_stop SCOPE firewall_changed
-    cfr_out "MEASURE scope_negative measured out_of_scope_rpc_sync_rejected error=$CFP_SCOPE_ERROR receipt=null firewall_unchanged"
+    cfr_out "MEASURE scope_negative measured out_of_scope_rpc_sync_rejected error=$CFP_SCOPE_ERROR receipt=null filter_ipset_slot_unchanged"
     cfr_ok SCOPE
 }
 cfp_pause_phase() {
@@ -688,6 +715,7 @@ cfp_main() {
         for cfr_value in "$CFP_PENN2_IP" "$CFP_PENN2_MAC" "$CFP_RPC_ALLOW" "$CFP_KIDS_JSON"; do
             [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
         done
+        cfp_device_set || cfr_refuse PAYLOAD device_set_mismatch
     else
         # Single device: the set is Penn's one MAC.
         CFP_RPC_ALLOW=$CFR_PENN_MAC

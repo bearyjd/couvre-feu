@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
@@ -679,6 +680,36 @@ class PilotPlanTests(PilotBase):
             with self.subTest(name=name):
                 self.assertEqual(self.scope_clean(text, rc=rc), '1')
 
+    def test_device_set_is_derived_from_identity_macs(self):
+        macs = sorted([PENN['mac'], PENN2['mac']])
+        good = (' '.join(macs), json.dumps(macs, separators=(',', ':')))
+        cases = ((PENN['mac'], PENN2['mac'], *good, '0'), (PENN2['mac'], PENN['mac'], *good, '0'),
+                 (PENN['mac'], PENN2['mac'], ' '.join(reversed(macs)), good[1], '1'),
+                 (PENN['mac'], PENN2['mac'], f'{macs[0]} 02:00:00:00:00:77', good[1], '1'),
+                 (PENN['mac'], PENN2['mac'], good[0], json.dumps(macs[::-1], separators=(',', ':')), '1'),
+                 (PENN['mac'], PENN2['mac'], good[0], json.dumps(macs[:1], separators=(',', ':')), '1'),
+                 (PENN['mac'], PENN['mac'], f'{PENN["mac"]} {PENN["mac"]}', json.dumps([PENN['mac']] * 2), '1'),
+                 (PENN['mac'], PENN2['mac'].upper(), *good, '1'))
+        for first, second, allow, kids, want in cases:
+            body = (f'CFR_PENN_MAC={shlex.quote(first)}\nCFP_PENN2_MAC={shlex.quote(second)}\n'
+                    f'CFP_RPC_ALLOW={shlex.quote(allow)}\nCFP_KIDS_JSON={shlex.quote(kids)}\ncfp_device_set; echo $?\n')
+            self.assertEqual(self.pilot_shell(body), (0, want + '\n'), (first, second, allow, kids))
+
+    def scope_phase_shell(self, band_open):
+        (self.work / 'rpc-sync.json').write_text(f'{{"x":1,"policyDigest":"{"d" * 64}","y":2}}\n')
+        policy = json.dumps({'people': [{'id': 'penn', 'macs': [PENN['mac'], '02:00:00:00:00:99']}]}, separators=(',', ':'))
+        body = (f'CFP_DIR={shlex.quote(str(self.work))}\nCFR_STAGE={shlex.quote(str(self.work))}\n'
+                f'CFP_RPC_ALLOW={PENN["mac"]}\nCFP_SCOPE_MAC=02:00:00:00:00:99\nCFP_SCOPE_POLICY={shlex.quote(policy)}\n'
+                f'CFP_SCOPE_OPERATION_ID=penn-pilot-scope-1\nCFP_SCOPE_ERROR=rpc_scope_overlap\ncfp_gen={"a" * 64}\n'
+                'cfp_fw_state() { : > "$1"; }\ncfp_now() { echo 1000; }\n'
+                f'cfp_safe_band() {{ return {0 if band_open else 1}; }}\n'
+                'CFR_SH=cfctl_called\ncfctl_called() { echo CFCTL_CALLED; return 1; }\ncfp_scope_phase\n')
+        return self.pilot_shell(body)
+
+    def test_scope_safe_band_unavailable_is_a_distinct_stop(self):
+        self.assertEqual(self.scope_phase_shell(band_open=False), (20, 'STOP SCOPE safe_band_unavailable\n'))
+        self.assertEqual(self.scope_phase_shell(band_open=True), (20, 'STOP SCOPE scope_not_cleanly_rejected\n'))
+
     def test_rpc_activity_lists_both_devices_if_exposed(self):
         macs = sorted([PENN['mac'], PENN2['mac']])
         def device(mac):
@@ -790,11 +821,115 @@ class PilotFixtureTests(PilotBase):
         self.assertEqual(summary['outcome'], 'PASS')
         measured = summary['measurements']
         self.assertEqual(measured['scope_negative']['label'], 'measured')
-        self.assertIn('firewall_unchanged', measured['scope_negative']['detail'])
+        self.assertIn('filter_ipset_slot_unchanged', measured['scope_negative']['detail'])
         self.assertEqual(measured['packet_blocking']['label'], 'measured')
         self.assertRegex(measured['packet_blocking']['detail'], r'reject_delta=14 .*devices=2 aggregate')
         self.assertIn(measured['rpc_activity_devices']['label'], ('measured', 'unmeasured'))
         self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
+
+    def test_tampered_device_set_parameter_refused_before_mutation(self):
+        changes = self.two_devices()
+        macs = sorted([PENN['mac'], PENN2['mac']])
+        real_allow = f"CFP_RPC_ALLOW='{' '.join(macs)}'\n"
+        real_kids = f"CFP_KIDS_JSON='{json.dumps(macs, separators=(',', ':'))}'\n"
+        tampers = ((real_allow, f"CFP_RPC_ALLOW='{macs[0]} 02:00:00:00:00:77'\n"),
+                   (real_kids, f"CFP_KIDS_JSON='{json.dumps([macs[0], '02:00:00:00:00:77'], separators=(',', ':'))}'\n"))
+        original = self.tool.build_payload
+        before = self.router_snapshot()
+        for old, new in tampers:
+            def tampered(*args, **kwargs):
+                payload, *rest = original(*args, **kwargs)
+                text = payload.decode()
+                self.assertEqual(text.count(old), 1)
+                return (text.replace(old, new).encode(), *rest)
+            with self.subTest(param=new.split('=')[0]), mock.patch.object(self.tool, 'build_payload', tampered):
+                code, out, err = self.execute(**changes)
+                stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+                self.assertEqual(code, 1, out + err)
+                self.assertIn('PHASE PAYLOAD FAIL device_set_mismatch', stdout)
+                self.assertIn('REFUSED_BEFORE_MUTATION PAYLOAD', stdout)
+                self.assertNotIn('MUTATION_BEGIN', stdout)
+                self.assertFalse(any(line.startswith('INFO run install.sh') for line in stdout))
+                self.assertEqual(self.router_snapshot(), before)
+                shutil.rmtree(self.evidence())
+
+    def test_scope_mac_on_live_router_refused_at_identity(self):
+        scope = {'ip': '192.0.2.40', 'mac': '02:00:00:00:00:99'}
+        leases = self.root / 'tmp/dhcp.leases'
+        original = leases.read_text()
+        before = self.router_snapshot()
+        for where in ('neighbor', 'lease'):
+            with self.subTest(where=where):
+                if where == 'neighbor':
+                    self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
+                                                           dict(PENN, state='DELAY'), dict(scope, state='STALE')])
+                else:
+                    self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
+                                                           dict(PENN, state='DELAY')])
+                    leases.write_text(original + f'1800000000 {scope["mac"]} {scope["ip"]} ghost *\n')
+                    before = self.router_snapshot()
+                code, out, err = self.execute(scopeNegativeTest=True)
+                stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+                self.assertEqual(code, 1, out + err + '\n'.join(stdout[-20:]))
+                self.assertIn('PHASE IDENTITY FAIL scope_mac_present', stdout)
+                self.assertNotIn('MUTATION_BEGIN', stdout)
+                self.assertEqual(self.router_snapshot(), before)
+                shutil.rmtree(self.evidence())
+
+    def scope_doubles(self, mode):
+        """Router-side doubles keyed on the SCOPE fingerprint's ipset read (stdout is <stage>/pilot/fw.ipset).
+
+        firewall: the second fingerprint read reports one extra cf* ipset line (the router itself is untouched).
+        band: from the first fingerprint read, the next 71 `date +%S` reads fall outside the safe band
+        (and `sleep` returns at once), so the SCOPE rpc-sync is never sent; later reads are real."""
+        seen, count = self.work / 'fw-seen', self.work / 'band-count'
+        q = shlex.quote
+        if mode == 'firewall':
+            on_first, on_second = ':', f'{q(str(self.fixture.bin / "ipset"))} "$@" || exit $?; echo "add cf2_x_fake 192.0.2.250"; exit 0'
+        else:
+            on_first, on_second = f'echo 0 > {q(str(count))}', ':'
+        doubles = {
+            'ipset': (f'case $(readlink /proc/$$/fd/1 2>/dev/null) in */pilot/fw.ipset)\n'
+                      f'  if [ -e {q(str(seen))} ]; then {on_second}; else : > {q(str(seen))}; {on_first}; fi;;\nesac\n'
+                      f'exec {q(str(self.fixture.bin / "ipset"))} "$@"\n'),
+            'date': (f'if [ "$1" = +%S ] && [ -e {q(str(count))} ]; then n=$(cat {q(str(count))})\n'
+                     f'  if [ "$n" -lt 71 ]; then echo $((n + 1)) > {q(str(count))}; echo 60; exit 0; fi\nfi\n'
+                     f'exec {q(shutil.which("date"))} "$@"\n'),
+            'sleep': (f'if [ -e {q(str(count))} ] && [ "$(cat {q(str(count))})" -lt 71 ]; then exit 0; fi\n'
+                      f'exec {q(shutil.which("sleep"))} "$@"\n')}
+        for name, body in doubles.items():
+            path = self.rbin / name
+            path.write_text('#!/bin/sh\n' + body)
+            path.chmod(0o700)
+
+    def assert_scope_stop_torn_down_once(self, reason, before):
+        code, out, err = self.execute(scopeNegativeTest=True)
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
+        self.assertIn(f'STOP SCOPE {reason}', stdout)
+        self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
+        self.assertEqual(stdout.count('PHASE UNINSTALL OK'), 1)
+        self.assertIn('PHASE RESTORE OK', stdout)
+        self.assertNotIn('PHASE PAUSE OK', stdout)
+        self.assertNotIn('PENN_PILOT_PASS', stdout)
+        self.assertEqual(stdout[-1], 'PENN_PILOT_STOPPED_RESTORED')
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertEqual(json.loads((self.evidence() / 'summary.json').read_text())['outcome'], 'STOPPED')
+        return stdout
+
+    def test_scope_firewall_change_stops_and_tears_down_once(self):
+        self.scope_doubles('firewall')
+        before = self.router_snapshot()
+        stdout = self.assert_scope_stop_torn_down_once('firewall_changed', before)
+        self.assertEqual(sum(line.startswith('INFO scope rpc-sync exit=') for line in stdout), 1)
+
+    def test_scope_safe_band_never_opening_stops_and_tears_down_once(self):
+        self.scope_doubles('band')
+        before = self.router_snapshot()
+        stdout = self.assert_scope_stop_torn_down_once('safe_band_unavailable', before)
+        self.assertIn('PHASE SCOPE FAIL safe_band_unavailable', stdout)
+        self.assertFalse(any(line.startswith('INFO scope rpc-sync exit=') for line in stdout))
+        self.assertNotIn('STOP SCOPE scope_not_cleanly_rejected', stdout)
 
     def test_second_device_stale_refused_before_mutation(self):
         changes = self.two_devices()
