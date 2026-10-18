@@ -1,0 +1,55 @@
+# Dedicated ssh-agent for the Couvre-feu policy service. It holds ONLY the service's
+# constrained router key; the service never reads private-key bytes. Install to
+# /etc/systemd/system/. See docs/runbooks/deploy.md.
+[Unit]
+Description=Couvre-feu dedicated ssh-agent
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+
+[Service]
+Type=simple
+User=couvrefeu
+Group=couvrefeu
+# /run/couvrefeu (0700, owned by couvrefeu) is kept across agent restarts so a Docker bind mount of it stays valid;
+# it is removed when the unit is stopped. This unit has no PartOf=: restarting the app never wipes the loaded key.
+RuntimeDirectory=couvrefeu
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+UMask=0077
+# A crashed agent can leave its socket behind; remove it so the restart can bind.
+ExecStartPre=-/usr/bin/rm -f /run/couvrefeu/agent.sock
+# -D: stay in the foreground. The socket is created 0600 inside the private directory.
+ExecStart=/usr/bin/ssh-agent -D -a /run/couvrefeu/agent.sock
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the agent needs no network, no filesystem writes and no privileges.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+LimitCORE=0
+TasksMax=16
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
