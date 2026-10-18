@@ -161,11 +161,13 @@ export class ChildAdmin {
     }
     /**
      * The router refuses any sync while a managed device has no lease/neighbour entry, without naming it. Show the devices
-     * the refused change needed (both policies), never device identifiers, and only labels inside this admin's scope.
+     * the refused change needed (both policies), never device identifiers, and only labels inside this admin's scope; devices
+     * outside it are only counted, because an offline device there blocks this admin's changes too.
      */
     private rejection(actor: Actor): RejectionDTO | null {
-        const op = this.store.get<IntegrationOperation>('SELECT * FROM operations ORDER BY created_at DESC,rowid DESC LIMIT 1');
-        if (!op || op.state !== 'failed' || !op.error || !ADDRESS_COVERAGE_REJECTIONS.has(op.error)) return null;
+        // The newest change on an entry in this admin's scope, for a day: other scopes' refusals stay invisible.
+        const op = this.store.all<IntegrationOperation>('SELECT * FROM operations ORDER BY created_at DESC,rowid DESC LIMIT 64').find(row => actor.personIds.includes(row.person_id));
+        if (!op || op.state !== 'failed' || !op.error || !ADDRESS_COVERAGE_REJECTIONS.has(op.error) || this.policy.now() - op.updated_at > 86400) return null;
         const macs = [...new Set([op.base_json, op.payload_json].flatMap(json => (JSON.parse(json) as {people: {id: string; macs: string[]}[]}).people.flatMap(p => p.macs.map(m => `${p.id}\n${m}`))))].sort();
         const request = JSON.parse(op.request_json) as {mac?: string; label?: string; target?: string};
         const names = new Map(this.store.all<ChildRow>('SELECT * FROM people').map(c => [c.id, c.name]));

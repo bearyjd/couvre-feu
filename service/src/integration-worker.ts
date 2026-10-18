@@ -214,11 +214,24 @@ export class IntegrationWorker {
         this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, error, confirmedAt, this.now(), id);
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, id, op.action, op.revision, this.now(), state);
     }
-    /** Device rows staged by an enroll/unenroll operation settle with it; an unknown outcome leaves them pending. */
+    /**
+     * Device rows staged by an enroll/unenroll operation settle with it; an unknown outcome leaves them pending. A conflict
+     * may follow an accepted receipt that was later superseded, so it settles from the stored router observation instead.
+     */
     private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): void {
         if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return;
-        const done = state === 'confirmed';
-        if (op.action === 'enroll') this.store.run(done ? "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state='enrolling'" : "DELETE FROM devices WHERE operation_id=? AND state='enrolling'", op.id);
-        else this.store.run(done ? "DELETE FROM devices WHERE operation_id=? AND state='removing'" : "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state='removing'", op.id);
+        const pending = op.action === 'enroll' ? 'enrolling' : 'removing';
+        let held: boolean;
+        if (state === 'conflict') {
+            const o = this.store.observation().value;
+            if (!o) return;
+            for (const row of this.store.all<{id: string; identifier: string}>('SELECT id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
+                held = o.acceptedPolicy.people.some(p => p.id === op.person_id && p.macs.includes(row.identifier));
+                this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE id=?" : 'DELETE FROM devices WHERE id=?', row.id);
+            }
+            return;
+        }
+        held = (state === 'confirmed') === (op.action === 'enroll');
+        this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state=?" : 'DELETE FROM devices WHERE operation_id=? AND state=?', op.id, pending);
     }
 }

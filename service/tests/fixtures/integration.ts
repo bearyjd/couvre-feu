@@ -49,6 +49,8 @@ export class TestRouter implements AsyncRouter {
     reject: string | null = null;
     /** Like cf_error_record: a refused transition leaves runtime/error, so status stays not-ok until a later confirmation. */
     runtimeError: string | null = null;
+    /** Runs right after an accepted apply, e.g. to simulate a later out-of-band router change. */
+    afterApply: (() => void) | null = null;
     constructor(store: IntegrationStore, now: () => number) { this.store = store; this.config = store.config; this.ssh = new SSHRouter(this.config); this.now = now; this.policy = store.config.enrollment; }
     invocation(kind: DispatchKind, envelope?: RPCEnvelope, operationId?: string): FrozenInvocation { return this.ssh.invocation(kind, envelope, operationId); }
     async invokeActivity(i: FrozenInvocation): Promise<RouterActivity> {
@@ -77,6 +79,7 @@ export class TestRouter implements AsyncRouter {
             if (e.expected_revision !== this.policy.revision || e.expected_digest !== policyDigest(this.policy)) throw new RouterTransportError('test_rpc_conflict');
             this.policy = e.policy; this.runtimeError = null;
             this.receipts.set(e.operation_id, {operationId: e.operation_id, requestDigest: requestDigest(e), baseRevision: e.expected_revision, baseDigest: e.expected_digest, acceptedRevision: e.policy.revision, acceptedDigest: policyDigest(e.policy), outcome: 'accepted', current: true});
+            this.afterApply?.();
             if (this.afterApplyFailure) throw this.afterApplyFailure;
         }
         const current = [...this.receipts.values()].find(r => r.acceptedDigest === policyDigest(this.policy));

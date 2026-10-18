@@ -331,3 +331,33 @@ test('HTTP: child admin routes are admin-only, CSRF/Origin-checked, and step-up 
         assert.equal((await call(op, '/step-up/options', {action: 'token_issue', target: 'parent', params: {label: ''}})).status, 200);
     } finally { server.close(); server.closeAllConnections(); f.cleanup(); }
 });
+
+test('a superseded enrollment that the router accepted settles from the router policy, never into a foreign state', async () => {
+    const f = fixture();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const id = (await f.act(op, 'device_add', 'pilot', {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id;
+        // The router accepts, then something else moves its revision before the service sees the receipt as current.
+        f.router.afterApply = () => { f.router.policy = normalizePolicy({...f.router.policy, revision: f.router.policy.revision + 1}); };
+        await f.dispatch(id);
+        assert.equal(f.policy.operation(actor, id).state, 'conflict');
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM devices WHERE identifier=?', TABLET)!.state, 'active');
+        f.advance(1); await f.observe();
+        assert.equal(f.store.integrationState().observation_error, null);
+    } finally { f.cleanup(); }
+});
+
+test('the refusal banner is scoped: a restricted admin never sees another scope’s refused change', async () => {
+    const f = fixture();
+    try {
+        const op = await f.signIn('operator'), restricted = await f.signIn('parent'); await f.observe();
+        const other = (await f.act(op, 'child_create', '', {name: 'Second child'})).body.child.id as string;
+        f.router.reject = 'incomplete_transition_address_coverage';
+        await f.dispatch((await f.act(op, 'device_add', other, {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id);
+        f.store.run("UPDATE accounts SET role='admin' WHERE id='parent'");
+        assert.equal(f.admin.list(fresh(restricted)).lastRejection, null);
+        assert.equal(f.admin.list(fresh(op)).lastRejection?.code, 'incomplete_transition_address_coverage');
+        f.store.run('UPDATE operations SET updated_at=updated_at-86401');
+        assert.equal(f.admin.list(fresh(op)).lastRejection, null);
+    } finally { f.cleanup(); }
+});
