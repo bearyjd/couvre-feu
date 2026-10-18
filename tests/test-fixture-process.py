@@ -318,7 +318,7 @@ finally:
             with self.subTest(workers=workers, fail=fail), tempfile.TemporaryDirectory(prefix="couvre-feu-runner-", dir="/tmp") as directory:
                 root = Path(directory)
                 (root / "tests").mkdir()
-                for filename in ("test-transition.py", "test-rpc.py", "test-core.py", "test-fixture-process.py"):
+                for filename in runner.SUITES:
                     body = "import unittest\nfrom pathlib import Path\nclass Cases(unittest.TestCase):\n"
                     for index in range(4):
                         body += f"    def test_{index}(self):\n        with Path({str(root / 'executed')!r}).open('a') as stream: stream.write({(filename + ':' + str(index) + chr(10))!r})\n"
@@ -340,10 +340,10 @@ finally:
                     return real_pool(**kwargs)
                 with patch.object(runner, 'source_revision', return_value='f'*40), patch.dict(os.environ, CF_TEST_WORKERS=str(workers)), patch.object(runner, "ThreadPoolExecutor", pool), patch.object(runner, "REPO", root), patch.object(runner.tempfile, "mkdtemp", make_logs), contextlib.redirect_stdout(output):
                     self.assertEqual(runner.main(), 1 if fail else 0)
-                self.assertEqual(len((root / "executed").read_text().splitlines()), 16)
-                self.assertEqual(len(set((root / "executed").read_text().splitlines())), 16)
+                self.assertEqual(len((root / "executed").read_text().splitlines()), 4 * len(runner.SUITES))
+                self.assertEqual(len(set((root / "executed").read_text().splitlines())), 4 * len(runner.SUITES))
                 self.assertEqual(logs.exists(), fail)
-                for filename in ("test-transition.py", "test-rpc.py", "test-core.py", "test-fixture-process.py"):
+                for filename in runner.SUITES:
                     for index in range(1, 5):
                         self.assertIn(f'{filename} lane {index}, 1 cases', output.getvalue())
                 if fail:
@@ -370,14 +370,14 @@ finally:
             with patch.object(runner, 'source_revision', return_value='f'*40), patch.object(runner, 'REPO', root), patch.dict(os.environ, CF_TEST_WORKERS='1'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(runner.main(['--write-plan', str(plan_path)]), 0)
                 plan = json.loads(plan_path.read_text())
-                self.assertEqual(len(plan['shards']), 16)
+                self.assertEqual(len(plan['shards']), 4 * len(runner.SUITES))
                 for shard in plan['shards']:
                     receipt = receipts / f"{shard['suite']}.{shard['partition']}.json"
                     self.assertEqual(runner.main(['--shard', shard['suite'], '--partition', str(shard['partition']),
                                                   '--plan', str(plan_path), '--receipt', str(receipt)]), 0)
                 executed = (root / 'executed').read_text().splitlines()
-                self.assertEqual(len(executed), 16)
-                self.assertEqual(len(set(executed)), 16)
+                self.assertEqual(len(executed), 4 * len(runner.SUITES))
+                self.assertEqual(len(set(executed)), 4 * len(runner.SUITES))
                 verify = ['--verify-receipts', str(receipts), '--plan', str(plan_path)]
                 self.assertEqual(runner.main(verify), 0)
                 entries = sorted(receipts.iterdir())
