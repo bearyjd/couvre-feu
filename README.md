@@ -1,3 +1,22 @@
+<!-- glowup:hero start -->
+<div align="center">
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg">
+    <img src="docs/assets/banner-light.svg" alt="Couvre-feu" width="880">
+  </picture>
+</h1>
+
+[![Build](https://img.shields.io/github/actions/workflow/status/bearyjd/couvre-feu/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=build)](https://github.com/bearyjd/couvre-feu/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/bearyjd/couvre-feu?style=for-the-badge)](LICENSE)
+![OpenWrt](https://img.shields.io/badge/OpenWrt-00B5E2?style=for-the-badge&logo=openwrt&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-5FA04E?style=for-the-badge&logo=nodedotjs&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+
+</div>
+<!-- glowup:hero end -->
+
 # Couvre-feu
 
 Router-local internet pause and schedules, an authenticated fictional parent demo, and a separate operator-dispatched one-device integration path. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. Integration source implements exact policy CAS, durable receipts and asynchronous SSH; it is not installed or accepted on the target router. Real packet behavior and household production remain pending; companions and bonus grants are later work. A service-side estimate of per-child network activity from router byte counters (not app use, websites or screen time) is described in [activity service](docs/activity-service.md); live collection needs the router counters command and an approved invocation.
