@@ -43,16 +43,16 @@ MGMT, JD, PENN, HISTORICAL, HOST = TLR.MGMT, TLR.JD, TLR.PENN, TLR.HISTORICAL, T
 # Second device of the same child; sorts before PENN so set ordering is exercised.
 PENN2 = {'ip': '192.0.2.32', 'mac': '02:00:00:00:00:2a'}
 SHIPPED_TIMING = {'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds': 20, 'expirySeconds': 120,
-                  'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5}
+                  'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5, 'statusSettleSeconds': 45}
 SINGLE_PARAMETER_KEYS = [
     'CFP_ROUTER_IP', 'CFP_PERSON', 'CFP_OPERATION_ID', 'CFP_POLICY', 'CFP_DNS_NAME', 'CFP_PAUSE_SECONDS',
     'CFP_PAUSE_OBSERVE', 'CFP_RESUME_OBSERVE', 'CFP_EXPIRY_SECONDS', 'CFP_EXPIRY_TOLERANCE', 'CFP_POLL',
-    'CFP_EXPIRY_POLL', 'CFP_SAFE_BAND', 'CFP_DNS_MARGIN_CS', 'CFP_RTT_MARGIN_MS', 'CFP_PREMUTATION_BUDGET',
+    'CFP_EXPIRY_POLL', 'CFP_STATUS_SETTLE', 'CFP_SAFE_BAND', 'CFP_DNS_MARGIN_CS', 'CFP_RTT_MARGIN_MS', 'CFP_PREMUTATION_BUDGET',
     'CFP_REMOTE_TIMEOUT', 'CFP_TEARDOWN_RESERVE', 'CFP_READ_TIMEOUT', 'CFP_COUNTERS_WORST', 'CFP_ITERATION_WORST',
     'CFP_CFCTL_ALLOWANCE', 'CFP_WORST_ENROLL', 'CFP_WORST_PAUSE', 'CFP_WORST_RESUME', 'CFP_WORST_EXPIRY',
     'CFP_WORST_DNS']
 FAST_TIMING = {'pauseSeconds': 90, 'pauseObserveSeconds': 2, 'resumeObserveSeconds': 1, 'expirySeconds': 45,
-               'expiryToleranceSeconds': 120, 'pollSeconds': 1, 'expiryPollSeconds': 1, 'safeBandStart': 0,
+               'expiryToleranceSeconds': 120, 'pollSeconds': 1, 'expiryPollSeconds': 1, 'statusSettleSeconds': 3, 'safeBandStart': 0,
                'safeBandEnd': 59, 'dnsMarginCs': 150, 'rttMarginMs': 500, 'premutationBudgetSeconds': 360}
 FAKE_SSH = r'''
 import json, os, re, shlex, signal, subprocess, sys, threading, time
@@ -443,16 +443,150 @@ class PilotPlanTests(PilotBase):
         self.assertEqual(self.pause_lead(100), 45 + 45)  # margin capped at the disclosed cfctl allowance
         self.assertEqual(self.pause_lead(3, pause_s=120), 123)
 
+    @staticmethod
+    def status_line(drift=False, errors='[]', kids=None, effective='[]'):
+        kids = kids if kids is not None else [PENN['mac']]
+        return ('{"ok":%s,"desiredRevision":1,"confirmedRevision":1,"desiredPauses":[],"effectivePauses":%s,'
+                '"desiredAllowances":[],"effectiveAllowances":[],"observed":{"kids":%s,"paused":[]},"drift":%s,'
+                '"capabilities":{"ipv6":true},"errors":%s}') % (
+                    'false' if drift or errors != '[]' else 'true', effective, json.dumps(kids, separators=(',', ':')),
+                    'true' if drift else 'false', errors)
+
+    def settle(self, replies, settle=45, call_s=5, extra=''):
+        """cfp_status_settle (ENROLL gate) against scripted `cfctl status` replies on a fake clock.
+
+        Returns (exit code, stdout, the read-only call log)."""
+        work = self.work
+        for index, reply in enumerate(replies, 1):
+            (work / f'reply.{index}').write_text(reply + '\n' if reply else '')
+        q = shlex.quote
+        body = (f'W={q(str(work))}\necho 1000 > "$W/clock"\necho 0 > "$W/n"\n: > "$W/calls"\n'
+                'cfp_now() { cat "$W/clock"; }\n'
+                'sleep() { echo $(($(cat "$W/clock") + $1)) > "$W/clock"; }\n'
+                'cfr_info() { printf "INFO %s\\n" "$*"; }\n'
+                'cfp_adult_probe() { echo probe >> "$W/calls"; }\n'
+                'timeout() { shift 3; "$@"; }\n'
+                'ip() { echo "ip $*" >> "$W/calls"; printf "%s\\n" '
+                f'"{PENN["ip"]} lladdr {PENN["mac"]} STALE" "fe80::77 lladdr 02:00:00:00:00:77 REACHABLE" '
+                f'"{MGMT["ip"]} lladdr {MGMT["mac"]} REACHABLE" "192.0.2.99 FAILED"; }}\n'
+                'cfp_cfctl() { echo "cfctl $*" >> "$W/calls"; n=$(($(cat "$W/n") + 1)); echo "$n" > "$W/n"; '
+                f'echo $(($(cat "$W/clock") + {call_s})) > "$W/clock"; cat "$W/reply.$n"; }}\n'
+                f'CFP_DIR="$W"\nCFP_POLL=10\nCFP_STATUS_SETTLE={settle}\nCFP_ITERATION_WORST=40\nCFP_READ_TIMEOUT=8\n'
+                'CFP_CFCTL_ALLOWANCE=45\nCFR_START=1000\nCFP_REMOTE_TIMEOUT=100000\nCFP_TEARDOWN_RESERVE=300\n'
+                f'CFR_MGMT_MAC={MGMT["mac"]}\nCFR_JD_MAC={JD["mac"]}\nCFR_PENN_MAC={PENN["mac"]}\n'
+                f'CFR_HISTORICAL_MACS={q(" ".join(HISTORICAL))}\nCFP_KIDS_JSON={q(json.dumps([PENN["mac"]]))}\n'
+                + extra +
+                'cfp_status_settle ENROLL penn_not_observed "\\"observed\\":{\\"kids\\":$CFP_KIDS_JSON,\\"paused\\":[]}" '
+                '\'"effectivePauses":[]\'\necho settled\n')
+        code, out = self.pilot_shell(body)
+        return code, out, (work / 'calls').read_text().splitlines()
+
+    def test_status_settle_waits_out_transient_drift_with_read_only_calls(self):
+        # Live root cause: status read after a successful rpc-sync showed drift:true, errors:[] because a LAN
+        # neighbour changed after the confirm; cron `cfctl expire` re-confirms within a minute.
+        code, out, calls = self.settle([self.status_line(drift=True), self.status_line()])
+        self.assertEqual(code, 0, out)
+        self.assertIn('INFO status_settle ENROLL attempts=2 waited_s=15', out)
+        self.assertEqual(out.splitlines()[-1], 'settled')
+        self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'] * 2)
+        self.assertEqual(calls.count('probe'), 1)
+        self.assertEqual(calls.count('ip neigh show dev br-lan'), 2)
+        # Neighbour evidence on every attempt: role MACs named, other MACs and IPv6 addresses hashed.
+        neigh = [line for line in out.splitlines() if line.startswith('INFO status_settle_neigh ENROLL ')]
+        self.assertEqual(len(neigh), 2, out)
+        self.assertIn(f'{PENN["ip"]}=penn_child/STALE', neigh[0])
+        self.assertIn(f'{MGMT["ip"]}=management/REACHABLE', neigh[0])
+        self.assertRegex(neigh[0], r' ip6-[0-9a-f]{12}=mac-[0-9a-f]{12}/REACHABLE')
+        self.assertIn('192.0.2.99=-/FAILED', neigh[0])
+        for secret in ('02:00:00:00:00:77', 'fe80::77', PENN['mac'], MGMT['mac']):
+            self.assertNotIn(secret, '\n'.join(neigh))
+
+    def test_status_settle_gives_up_after_budget_and_stops_with_gate_reason(self):
+        code, out, calls = self.settle([self.status_line(drift=True)] * 20)
+        self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL penn_not_observed'), out)
+        # Reads at +0 (t0 1005), 15, 30, 45: the window closes at 45 s, never another read after it.
+        self.assertIn('INFO status_settle ENROLL attempts=4 waited_s=45 gave_up', out)
+        self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'] * 4)
+        # A zero window means one read only.
+        code, out, calls = self.settle([self.status_line(drift=True)] * 20, settle=0)
+        self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL penn_not_observed'), out)
+        self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'])
+
+    def test_status_settle_stops_on_first_read_unless_drift_only(self):
+        other = '02:00:00:00:00:55'
+        cases = {'errors': self.status_line(drift=True, errors='["x"]'),
+                 'errors_no_drift': self.status_line(errors='["x"]'),
+                 'kids_mismatch': self.status_line(drift=True, kids=[PENN['mac'], other]),
+                 'kids_missing': self.status_line(drift=True, kids=[]),
+                 'pause_mismatch': self.status_line(drift=True, effective='[{"person":"penn","until":5}]'),
+                 'not_ok_no_drift': self.status_line().replace('"ok":true', '"ok":false'),
+                 'empty': '',
+                 'two_lines': self.status_line(drift=True) + '\n' + self.status_line(drift=True)}
+        for name, reply in cases.items():
+            with self.subTest(name=name):
+                code, out, calls = self.settle([reply, self.status_line()])
+                self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL penn_not_observed'), out)
+                self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'])
+                self.assertNotIn('probe', calls)
+                self.assertIn('INFO status_settle ENROLL attempts=1 waited_s=0 not_transient', out)
+
+    def test_status_settle_keeps_budget_and_adult_probe_gates(self):
+        drift = [self.status_line(drift=True), self.status_line()]
+        code, out, calls = self.settle(drift, extra='CFP_REMOTE_TIMEOUT=450\n')
+        self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL remote_budget_reserved_for_teardown'), out)
+        self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'])
+        code, out, calls = self.settle(drift, extra='cfp_adult_probe() { CFP_ADULT_REASON=router_dns_failed; return 1; }\n')
+        self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL adult_disruption router_dns_failed'), out)
+        self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'])
+
+    def test_status_settle_is_used_only_at_read_only_status_gates(self):
+        script = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        self.assertEqual(script.count('cfp_status_settle ENROLL penn_not_observed '), 1)
+        self.assertEqual(script.count('cfp_status_settle EXPIRY status_not_clean_after_expiry '), 1)
+        self.assertEqual(len(re.findall(r'(?m)^\s+cfp_status_settle ', script)), 2)
+        # PAUSE, RESUME and the expiry pause gate the mutating call's own reply line, unchanged.
+        self.assertIn('cfp_status_has "$CFP_DIR/status.json" "\\"effectivePauses\\":[{', script)
+        self.assertIn('|| cfp_stop RESUME resume_not_clean', script)
+        self.assertIn('|| cfp_stop EXPIRY pause_not_effective', script)
+        settle = script[script.index('cfp_status_settle() {'):]
+        settle = settle[:settle.index('\n}\n')]
+        self.assertNotIn('rpc-sync', settle)
+        self.assertEqual(re.findall(r'cfp_cfctl [a-z-]+', settle), ['cfp_cfctl status'] * 2)
+
+    def test_status_settle_is_budgeted_and_disclosed(self):
+        tool, timing = self.tool, dict(self.tool.TIMING, **SHIPPED_TIMING)
+        call = tool.SAFE_BAND_WAIT_SECONDS + tool.CFCTL_ALLOWANCE_SECONDS
+        # First attempt's neighbour read, the window, then one admitted attempt (neighbour read + call).
+        self.assertEqual(tool.status_settle_worst_seconds(timing), 8 + 45 + 8 + call)
+        phases = tool.phase_worst_seconds(timing)
+        self.assertEqual(phases['ENROLL'], 3 * call + tool.COUNTERS_WORST_SECONDS + 178)
+        self.assertEqual({name: tool.worst_case_seconds(timing, devices, scope)
+                          for name, devices, scope in (('one', 1, False), ('two', 2, False),
+                                                       ('one_scope', 1, True), ('two_scope', 2, True))},
+                         {'one': 3318, 'two': 3435, 'one_scope': 3483, 'two_scope': 3600})
+        self.assertLessEqual(tool.worst_case_seconds(timing, 2, True), 3600)
+        self.assertEqual(SHIPPED_TIMING['statusSettleSeconds'], 45)
+        details = self.plan_details(self.write_config())
+        self.assertEqual(details['timing']['statusSettleSeconds'], tool.TIMING['statusSettleSeconds'])
+        params, _ = self.parameters(self.write_config())
+        self.assertEqual(params['CFP_STATUS_SETTLE'], str(tool.TIMING['statusSettleSeconds']))
+        with mock.patch.dict(tool.TIMING, statusSettleSeconds=tool.TIMING['statusSettleSeconds'] + 1):
+            self.assertNotEqual(self.plan_details(self.write_config())['planSha256'], details['planSha256'])
+        with mock.patch.dict(tool.TIMING, statusSettleSeconds=-1):
+            self.refused_before_ssh(self.write_config(), 'timing statusSettleSeconds')
+        # The plan refuses below the minimum.
+        self.refused_before_ssh(self.write_config(remoteTimeoutSeconds=tool.worst_case_seconds(tool.TIMING) - 1),
+                                f'at least {tool.worst_case_seconds(tool.TIMING)}')
+
     def test_expiry_worst_case_includes_pause_extension_and_is_disclosed(self):
         timing, tool = self.tool.TIMING, self.tool
         call = tool.SAFE_BAND_WAIT_SECONDS + tool.CFCTL_ALLOWANCE_SECONDS
         expected = (call + timing['expirySeconds'] + tool.CFCTL_ALLOWANCE_SECONDS + timing['expiryToleranceSeconds']
-                    + tool.iteration_worst_seconds(timing) + tool.COUNTERS_WORST_SECONDS + call)
+                    + tool.iteration_worst_seconds(timing) + tool.COUNTERS_WORST_SECONDS + call
+                    + tool.status_settle_worst_seconds(timing))
         self.assertEqual(tool.phase_worst_seconds(timing)['EXPIRY'], expected)
-        # The shipped timing: 2917 before the pause extension, 2962 with it.
-        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **{
-            'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds': 20, 'expirySeconds': 120,
-            'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5})), 2962)
+        # The shipped timing: 2962 with the pause extension, 3318 with the ENROLL and post-expiry status settles.
+        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3318)
         details = self.plan_details(self.write_config())
         self.assertEqual(details['timing']['cfctlAllowanceSeconds'], 45)
         config = tool.FR.load_config(self.write_config())
@@ -501,8 +635,8 @@ class PilotPlanTests(PilotBase):
         for key in ('scopeNegativeTest', 'scopePolicyJson', 'scopePolicySha256', 'scopeTestMac'):
             self.assertNotIn(key, details)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 2962)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 2962)
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3318)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3318)
         self.assertIn('CFP_RPC_ALLOW', payload)  # the template default, not a generated parameter
         self.assertEqual(self.tool.load_config(self.write_config()), self.tool.FR.load_config(self.write_config()))
 
@@ -547,8 +681,8 @@ class PilotPlanTests(PilotBase):
         self.assertNotIn('CFP_SCOPE_TEST', params)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_ALLOWANCE_SECONDS
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 2962 + call)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3079)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3318 + call)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3435)
         self.assertEqual(int(params['CFP_WORST_ENROLL']),
                          self.tool.phase_worst_seconds(self.tool.TIMING)['ENROLL'] + call)
         config = self.tool.load_config(config_path)
@@ -564,9 +698,9 @@ class PilotPlanTests(PilotBase):
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_ALLOWANCE_SECONDS
         scope_worst = call + 2 * self.tool.FIREWALL_STATE_WORST_SECONDS
         self.assertEqual(self.tool.FIREWALL_STATE_WORST_SECONDS, 3 * self.tool.READ_TIMEOUT_SECONDS)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 2962 + scope_worst)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3127)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3244)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3318 + scope_worst)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3483)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3600)
         self.assertLessEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3600)
         disabled = self.plan_details(self.write_config(**self.two_devices(scopeNegativeTest=False)))
         self.assertEqual(disabled['phases'], list(self.tool.PHASES))
@@ -930,6 +1064,114 @@ class PilotFixtureTests(PilotBase):
         self.assertIn('PHASE SCOPE FAIL safe_band_unavailable', stdout)
         self.assertFalse(any(line.startswith('INFO scope rpc-sync exit=') for line in stdout))
         self.assertNotIn('STOP SCOPE scope_not_cleanly_rejected', stdout)
+
+    def router_double(self, name, body):
+        path = self.rbin / name
+        path.write_text('#!/bin/sh\n' + body)
+        path.chmod(0o700)
+
+    def status_double(self, rewrite, count):
+        """`sh` double (the fixture's CFR_SH is `sh` from PATH): logs every `cfctl rpc-sync` and pipes the first
+        `count` `cfctl status --json` replies after the first rpc-sync through sed `rewrite`. Every call still
+        runs the real cfctl exactly once."""
+        if os.environ.get('CF_TEST_SHELL', 'sh') != 'sh':
+            self.skipTest('the status double wraps CFR_SH=sh')
+        q = shlex.quote
+        real, cfctl = q(shutil.which('sh')), str(self.root / 'usr/sbin/cfctl')
+        self.rpc_log, count_file = self.work / 'rpc-sync.log', self.work / 'status-rewrites'
+        self.router_double('sh', (
+            f'case " $* " in\n'
+            f'  *{q(" " + cfctl + " rpc-sync ")}*) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
+            f'  *{q(" " + cfctl + " status --json ")}*)\n'
+            f'    n=$(cat {q(str(count_file))} 2>/dev/null || echo 0)\n'
+            f'    if [ -s {q(str(self.rpc_log))} ] && [ "$n" -lt {count} ]; then\n'
+            f'      echo $((n + 1)) > {q(str(count_file))}\n'
+            f'      out=$({real} "$@"); rc=$?\n'
+            f'      printf "%s\\n" "$out" | sed {q(rewrite)}\n'
+            f'      exit $rc\n'
+            f'    fi;;\n'
+            f'esac\n'
+            f'exec {real} "$@"\n'))
+
+    DRIFT = 's/"ok":true,/"ok":false,/;s/"drift":false,/"drift":true,/'
+
+    def assert_enroll_stop_torn_down_once(self, before):
+        code, out, err = self.execute()
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
+        self.assertIn('STOP ENROLL penn_not_observed', stdout)
+        self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
+        self.assertEqual(stdout.count('PHASE UNINSTALL OK'), 1)
+        self.assertIn('PHASE RESTORE OK', stdout)
+        self.assertNotIn('PHASE ENROLL OK', stdout)
+        self.assertEqual(stdout[-1], 'PENN_PILOT_STOPPED_RESTORED')
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertEqual(json.loads((self.evidence() / 'summary.json').read_text())['outcome'], 'STOPPED')
+        return stdout
+
+    def test_transient_drift_after_rpc_sync_settles_with_one_rpc_sync(self):
+        # (a) drift:true, errors:[] on the first status read after rpc-sync, then clean: ENROLL passes, and the
+        # stale-on-arrival device is refreshed by the IDENTITY probe (d).
+        self.stale_penn_refreshed_by_probe(refreshes=True)
+        self.status_double(self.DRIFT, 1)
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        self.assertEqual(code, 0, out + err + '\n'.join(stdout[-40:]))
+        self.assertEqual(stdout[-1], 'PENN_PILOT_PASS')
+        self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertTrue(any('"drift":true,' in line and line.startswith('INFO status ') for line in stdout))
+        self.assertTrue(any(re.fullmatch(r'INFO status_settle ENROLL attempts=2 waited_s=[0-9]+', line) for line in stdout))
+        self.assertTrue(any(line.startswith('INFO status_settle_neigh ENROLL attempt=2 ') for line in stdout))
+        self.assertTrue(any(re.fullmatch(r'INFO status_settle EXPIRY attempts=1 waited_s=[0-9]+', line) for line in stdout))
+        self.assertIn('INFO identity refresh_probe penn_child ping_count=2 network_probe_only', stdout)
+        self.assertIn(PENN['ip'], self.ping_log.read_text())
+        self.assertEqual(self.router_snapshot(), before)
+
+    def test_persistent_drift_stops_enroll_after_settle_and_restores(self):
+        # (b) drift past the settle window: STOP penn_not_observed, one teardown, exact restore, one rpc-sync.
+        self.status_double(self.DRIFT, 1000)
+        stdout = self.assert_enroll_stop_torn_down_once(self.router_snapshot())
+        self.assertTrue(any(re.fullmatch(r'INFO status_settle ENROLL attempts=[2-9][0-9]* waited_s=[0-9]+ gave_up', line)
+                            for line in stdout), '\n'.join(stdout[-40:]))
+
+    def test_status_errors_stop_enroll_on_first_read(self):
+        # (c) errors:["x"] is never waited out.
+        self.status_double(self.DRIFT + r';s/"errors":\[\]}$/"errors":["x"]}/', 1000)
+        stdout = self.assert_enroll_stop_torn_down_once(self.router_snapshot())
+        self.assertTrue(any(re.fullmatch(r'INFO status_settle ENROLL attempts=1 waited_s=[0-9]+ not_transient', line)
+                            for line in stdout))
+        self.assertFalse(any(line.startswith('INFO status_settle_neigh ENROLL attempt=2') for line in stdout))
+
+    def stale_penn_refreshed_by_probe(self, refreshes):
+        """Penn arrives STALE; the `ping` double logs its targets and, if `refreshes`, the `ip` double then
+        reports Penn's row REACHABLE (as the kernel does once the device answers ARP)."""
+        self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
+                                               dict(PENN, state='STALE')])
+        q = shlex.quote
+        self.ping_log, flag = self.work / 'ping.log', self.work / 'penn-refreshed'
+        ping = (self.rbin / 'ping').read_text().split('\n', 1)[1]
+        self.router_double('ping', f'echo "$*" >> {q(str(self.ping_log))}\n'
+                           + (f'case " $* " in *" {PENN["ip"]} "*) : > {q(str(flag))};; esac\n' if refreshes else '')
+                           + ping)
+        self.router_double('ip', f'out=$({q(str(self.fixture.bin / "ip"))} "$@") || exit $?\n'
+                           f'if [ -e {q(str(flag))} ]; then printf "%s\\n" "$out" | '
+                           f'sed {q("s/^" + PENN["ip"].replace(".", "[.]") + " \\(.*\\) STALE$/" + PENN["ip"] + " \\1 REACHABLE/")}\n'
+                           'else printf "%s\\n" "$out"; fi\n')
+
+    def test_stale_penn_not_refreshed_by_probe_refused_before_mutation(self):
+        # (d) the probe ran, Penn stayed stale: the existing refusal, before any mutation.
+        self.stale_penn_refreshed_by_probe(refreshes=False)
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('PHASE IDENTITY FAIL penn_child_not_fresh', stdout)
+        self.assertIn('INFO identity refresh_probe penn_child ping_count=2 network_probe_only', stdout)
+        self.assertEqual(self.ping_log.read_text().splitlines(), [f'-c 2 -W 1 -q {PENN["ip"]}'])
+        self.assertNotIn('MUTATION_BEGIN', stdout)
+        self.assertEqual(self.router_snapshot(), before)
 
     def test_second_device_stale_refused_before_mutation(self):
         changes = self.two_devices()

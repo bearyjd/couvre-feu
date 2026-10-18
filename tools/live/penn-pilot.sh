@@ -29,6 +29,7 @@ CFP_EXPIRY_SECONDS=
 CFP_EXPIRY_TOLERANCE=
 CFP_POLL=
 CFP_EXPIRY_POLL=
+CFP_STATUS_SETTLE=
 CFP_SAFE_BAND=
 CFP_DNS_MARGIN_CS=
 CFP_RTT_MARGIN_MS=
@@ -63,7 +64,7 @@ CFP_MUTATED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
 CFP_FRESH_STATES='REACHABLE DELAY'
-CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final activity.json scope-request.json scope-sync.json fw.before fw.after fw.ipset fw.rules'
+CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh settle.neigh settle.tokens settle.map counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final activity.json scope-request.json scope-sync.json fw.before fw.after fw.ipset fw.rules'
 
 cfp_cleanup() {
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ] && [ "$CFR_STDOUT_LOST" != 1 ]; then
@@ -219,7 +220,21 @@ cfp_identity_device() {
             cfr_refuse IDENTITY "$cfp_ipreason"
     done
 }
+# Bounded refresh probe of one child device before its freshness check: two
+# ICMP echoes from the router (the BusyBox ping flags cfp_ping already uses)
+# make the kernel re-resolve the neighbor, turning an idle Wi-Fi device's STALE
+# entry REACHABLE when it answers ARP. A network probe only: no router state is
+# written, and a device that stays stale is still refused.
+cfp_refresh_probe() {
+    cfr_info "identity refresh_probe $1 ping_count=2 network_probe_only"
+    timeout -s KILL 5 ping -c 2 -W 1 -q "$2" >/dev/null 2>&1 </dev/null || :
+}
 cfp_identity() {
+    for cfp_tool in ping timeout; do
+        command -v "$cfp_tool" >/dev/null 2>&1 || cfr_refuse IDENTITY "missing_tool $cfp_tool"
+    done
+    cfp_refresh_probe penn_child "$CFR_PENN_IP"
+    [ -z "$CFP_PENN2_MAC" ] || cfp_refresh_probe penn_child_2 "$CFP_PENN2_IP"
     ip -4 neigh show dev br-lan > "$CFP_DIR/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
     if [ ! -f "$CFR_LEASES" ] || [ -L "$CFR_LEASES" ]; then cfr_refuse IDENTITY leases_unavailable; fi
     # shellcheck disable=SC2086
@@ -339,9 +354,81 @@ cfp_status_has() {
         awk -v w="$cfp_want" 'index($0,w){f=1}END{exit !f}' "$cfp_file" || return 1
     done
 }
-cfp_status() {
+# $1 file, then the caller's wanted substrings: true only for the transient
+# drift a LAN neighbor change after the last confirm causes (cf_effective_digest
+# covers every fresh neighbor): one line, drift true, errors empty and every
+# wanted kids/pauses substring present. Anything else is a real failure.
+cfp_status_transient() {
+    cfp_tr_file=$1; shift
+    awk 'END{exit NR!=1}' "$cfp_tr_file" || return 1
+    for cfp_tr_want in '"drift":true,' '"errors":[]}' "$@"; do
+        awk -v w="$cfp_tr_want" 'index($0,w){f=1}END{exit !f}' "$cfp_tr_file" || return 1
+    done
+}
+# Read-only neighbor evidence for one settle attempt ($1 tag), so a run can name
+# the neighbor that changed: role MACs by role, other MACs and every IPv6
+# address (EUI-64 embeds the MAC) as a 12-hex sha256 prefix; IPv4 kept.
+cfp_neigh_evidence() {
+    if ! timeout -s KILL "$CFP_READ_TIMEOUT" ip neigh show dev br-lan > "$CFP_DIR/settle.neigh" 2>/dev/null </dev/null; then
+        cfr_info "status_settle_neigh $1 unreadable"; return 0
+    fi
+    awk '{if(index($1,":"))print "ip6 " tolower($1);for(i=2;i<NF;i++)if($i=="lladdr")print "mac " tolower($(i+1))}' \
+        "$CFP_DIR/settle.neigh" | sort -u > "$CFP_DIR/settle.tokens"
+    : > "$CFP_DIR/settle.map"
+    while read -r cfp_ne_kind cfp_ne_tok; do
+        cfp_ne_label=
+        if [ "$cfp_ne_kind" = mac ]; then
+            case $cfp_ne_tok in
+                "$CFR_MGMT_MAC") cfp_ne_label=management;;
+                "$CFR_JD_MAC") cfp_ne_label=jd_adult;;
+                "$CFR_PENN_MAC") cfp_ne_label=penn_child;;
+                "$CFP_PENN2_MAC") cfp_ne_label=penn_child_2;;
+            esac
+            for cfp_ne_old in $CFR_HISTORICAL_MACS; do [ "$cfp_ne_tok" != "$cfp_ne_old" ] || cfp_ne_label=protected; done
+        fi
+        if [ -z "$cfp_ne_label" ]; then
+            cfp_ne_sum=$(printf '%s' "$cfp_ne_tok" | sha256sum | awk '{print substr($1,1,12)}')
+            cfp_ne_label=$cfp_ne_kind-$cfp_ne_sum
+        fi
+        printf '%s %s\n' "$cfp_ne_tok" "$cfp_ne_label" >> "$CFP_DIR/settle.map"
+    done < "$CFP_DIR/settle.tokens"
+    cfr_info "status_settle_neigh $1 $(awk 'NR==FNR{m[$1]=$2;next}
+        {a=tolower($1);if(a in m)a=m[a];mac="-";for(i=2;i<NF;i++)if($i=="lladdr")mac=m[tolower($(i+1))]
+         printf "%s=%s/%s ",a,mac,$NF}' "$CFP_DIR/settle.map" "$CFP_DIR/settle.neigh")"
+}
+# Read-only status gate: $1 phase, $2 its stop reason, then wanted substrings.
+# A drift-only read (cfp_status_transient) is re-read every CFP_POLL seconds,
+# with the budget and adult-probe checks, until it passes or CFP_STATUS_SETTLE
+# seconds after the first read; cron `cfctl expire` re-confirms every minute.
+# Only `cfctl status` runs here: no rpc-sync or other mutating call is retried.
+# Worst case after the first read: the window plus one admitted attempt
+# (neighbor read + safe-band wait of at most 71 one-second steps + cfctl call).
+cfp_status_settle() {
+    cfp_ss_phase=$1 cfp_ss_reason=$2; shift 2
+    cfp_ss_n=1
+    cfp_neigh_evidence "$cfp_ss_phase attempt=1"
     cfp_cfctl status --json > "$CFP_DIR/status.json" || :
-    cfp_status_has "$CFP_DIR/status.json" "$@"
+    cfp_ss_t0=$(cfp_now)
+    [ -n "$cfp_ss_t0" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
+    while :; do
+        cfp_ss_now=$(cfp_now)
+        [ -n "$cfp_ss_now" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
+        cfp_ss_log="status_settle $cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
+        if cfp_status_has "$CFP_DIR/status.json" "$@"; then cfr_info "$cfp_ss_log"; return 0; fi
+        cfp_status_transient "$CFP_DIR/status.json" "$@" || { cfr_info "$cfp_ss_log not_transient"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$CFP_STATUS_SETTLE" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        cfp_elapsed_ok "$((CFP_ITERATION_WORST + CFP_READ_TIMEOUT + 72 + CFP_CFCTL_ALLOWANCE))" ||
+            cfp_stop "$cfp_ss_phase" remote_budget_reserved_for_teardown
+        cfp_adult_probe "$cfp_ss_phase" || cfp_stop "$cfp_ss_phase" "adult_disruption $CFP_ADULT_REASON"
+        sleep "$CFP_POLL"
+        cfp_ss_now=$(cfp_now)
+        [ -n "$cfp_ss_now" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
+        cfp_ss_log="status_settle $cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
+        [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$CFP_STATUS_SETTLE" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        cfp_ss_n=$((cfp_ss_n + 1))
+        cfp_neigh_evidence "$cfp_ss_phase attempt=$cfp_ss_n"
+        cfp_cfctl status --json > "$CFP_DIR/status.json" || :
+    done
 }
 
 # --- Kernel reads (lock-free, never -Z) --------------------------------------
@@ -534,7 +621,7 @@ cfp_enroll() {
     }
     cfr_info "rpc-sync $(cat "$CFP_DIR/rpc-sync.json")"
     grep -q "\"receipt\":{\"operationId\":\"$CFP_OPERATION_ID\"" "$CFP_DIR/rpc-sync.json" || cfp_stop ENROLL receipt_missing
-    cfp_status "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]' || cfp_stop ENROLL penn_not_observed
+    cfp_status_settle ENROLL penn_not_observed "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
     cfr_out 'MEASURE service_key_confinement unmeasured not_exercised'
     [ -z "$CFP_PENN2_MAC" ] || cfp_rpc_activity
     cfp_counters enrolled || cfr_info 'counters enrolled unavailable'
@@ -671,7 +758,7 @@ cfp_expiry_phase() {
     cfr_info "expiry_observed latency_s=$((cfp_t - CFP_UNTIL))"
     cfp_counters expired || cfr_info 'counters expired unavailable'
     cfr_out "MEASURE timed_expiry measured latency_s=$((cfp_t - CFP_UNTIL)) tolerance_s=$CFP_EXPIRY_TOLERANCE poll_s=$CFP_EXPIRY_POLL"
-    cfp_status '"effectivePauses":[]' '"paused":[]' || cfp_stop EXPIRY status_not_clean_after_expiry
+    cfp_status_settle EXPIRY status_not_clean_after_expiry '"effectivePauses":[]' '"paused":[]'
     cfp_dup=
     [ "${CFP_CROND_INSTALL:-0}" -le 1 ] && [ "${CFP_CROND_EXPIRY:-0}" -le 1 ] || cfp_dup=' duplicate_etc_crond'
     cfr_out "MEASURE crond_processes measured baseline=etc$CFP_CROND_BASELINE,other$CFP_CROND_OTHER_BASELINE after_install=etc$CFP_CROND_INSTALL,other$CFP_CROND_OTHER_INSTALL during_expiry=etc$CFP_CROND_EXPIRY,other$CFP_CROND_OTHER_EXPIRY$cfp_dup"
@@ -706,7 +793,7 @@ cfp_main() {
     CFR_PREMUTATION_BUDGET=$CFP_PREMUTATION_BUDGET
     printf 'BEGIN penn-pilot commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS" \
-        "$CFP_ROUTER_IP" "$CFP_PERSON" "$CFP_OPERATION_ID" "$CFP_POLICY" "$CFP_DNS_NAME" "$CFP_SAFE_BAND" "$CFP_REMOTE_TIMEOUT" \
+        "$CFP_ROUTER_IP" "$CFP_PERSON" "$CFP_OPERATION_ID" "$CFP_POLICY" "$CFP_DNS_NAME" "$CFP_SAFE_BAND" "$CFP_STATUS_SETTLE" "$CFP_REMOTE_TIMEOUT" \
         "$CFP_TEARDOWN_RESERVE" "$CFP_READ_TIMEOUT" "$CFP_COUNTERS_WORST" "$CFP_ITERATION_WORST" "$CFP_CFCTL_ALLOWANCE" "$CFP_WORST_ENROLL" "$CFP_WORST_PAUSE" \
         "$CFP_WORST_RESUME" "$CFP_WORST_EXPIRY" "$CFP_WORST_DNS"; do
         [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
