@@ -151,6 +151,24 @@ class DeployFiles(unittest.TestCase):
         self.assertNotIn('only talks to its own uid', doc)
         self.assertNotIn('sudo -u couvrefeu env SSH_AUTH_SOCK', doc)
 
+    def test_push_url_credential_never_in_curl_argv(self):
+        doc = DOC_PATH.read_text()
+        curls = [l for l in doc.splitlines() if re.search(r'(?:^|\| )curl\b', l.strip())]
+        self.assertTrue(curls)
+        for line in curls:
+            self.assertNotRegex(line[line.index('curl'):], r'\$\{?(?:URL|PUSH)', line)
+            self.assertNotIn('<MONITOR_PUSH_URL>', line)
+        pushes = [l for l in curls if '-K -' in l]
+        self.assertEqual(len(pushes), 1)
+        self.assertRegex(pushes[0], r"^printf 'url = \"%s\?status=%s&msg=%s\"\\n' \"\$URL\" \"\$status\" \"\$msg\" \| curl -fsS -m 10 -K - >/dev/null$")
+        self.assertNotIn('?status=...', doc)
+        self.assertIn('bare monitor push URL', doc)
+
+    def test_tailscale_note_lists_all_required_rules(self):
+        doc = DOC_PATH.read_text()
+        for phrase in ('oif "tailscale0" accept', 'udp dport 3478', 'udp dport 41641', 'Tailscale is not combinable as written'):
+            self.assertIn(phrase, doc)
+
     def test_nft_file_documents_static_ip_ipv4_and_tailscale_limits(self):
         header = '\n'.join(l for l in read('deploy', 'systemd', 'couvrefeu.nft').splitlines() if l.startswith('#'))
         for phrase in ('REQUIRES A STATIC ADDRESS', 'udp 67/68', 'IPv4-only', 'tailscaled'):

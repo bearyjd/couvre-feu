@@ -61,7 +61,7 @@ Notes on the ruleset:
 
 - **Static address required.** The ruleset drops DHCP. Give the host a static address, or, if you must use DHCP, add `udp dport { 67, 68 } accept` to both chains (and allow the lease server) first; otherwise the host loses its address when the lease expires. The file carries these as commented lines.
 - **IPv4 only.** The allow rules (admin SSH, proxy, router, DNS, NTP) match IPv4. IPv6 is dropped except ICMPv6, which stays open so neighbor discovery works. The admin must connect over IPv4.
-- **Tailscale is not combinable as written.** `tailscaled` needs outbound UDP 41641 plus control-plane/DERP access (HTTPS), and an input rule for `tailscale0`; this ruleset blocks all of that. If you run Tailscale on the host (for example to encrypt the proxy hop), add rules such as `iifname "tailscale0" ip saddr <PROXY_TAILNET_IP> tcp dport 4273 accept`, `udp dport 41641 accept` in both directions and outbound `tcp dport 443 accept` for the control plane, then re-run the check and rollback procedure. Otherwise leave Tailscale off this host.
+- **Tailscale is not combinable as written.** `tailscaled` needs outbound UDP 41641 plus control-plane/DERP access (HTTPS), and an input rule for `tailscale0`; this ruleset blocks all of that. If you run Tailscale on the host (for example to encrypt the proxy hop), add rules such as `iifname "tailscale0" ip saddr <PROXY_TAILNET_IP> tcp dport 4273 accept`, `oif "tailscale0" accept`, `udp dport 41641 accept` in both directions, outbound STUN `udp dport 3478 accept` and `tcp dport 443 accept` for the control plane and DERP relays, then re-run the check and rollback procedure. Otherwise leave Tailscale off this host.
 - **Monitoring push.** If you add the agent-expiry check below, allow its outbound destination (`ip daddr <MONITOR_IP> tcp dport <MONITOR_PORT> accept`).
 
 Make it persistent only after it survived a test; load it from a small unit or `nftables.conf` `include`.
@@ -101,13 +101,16 @@ Either way, alert when the agent is empty. A systemd timer runs a root-owned che
 ```sh
 #!/bin/sh
 # /usr/local/sbin/couvrefeu-agent-check (0700 root)
-URL=$(cat /root/couvrefeu-key/<PUSH_URL_FILE>)      # <MONITOR_PUSH_URL>?status=...
+# <PUSH_URL_FILE> holds ONLY the bare monitor push URL (no query string); the script adds the query itself.
+URL=$(cat /root/couvrefeu-key/<PUSH_URL_FILE>)
 if env SSH_AUTH_SOCK=/run/couvrefeu/agent.sock ssh-add -l >/dev/null 2>&1 && systemctl is-active --quiet couvrefeu; then
     status=up; msg=agent-loaded
 else
     status=down; msg=agent-empty-or-app-down
 fi
-curl -fsS -m 10 "$URL?status=$status&msg=$msg" >/dev/null
+# status and msg are fixed [A-Za-z0-9_.-] strings, so nothing can break out of the curl config line.
+# The URL is a credential: it goes to curl on stdin (-K -), never in argv where ps and /proc/<pid>/cmdline show it.
+printf 'url = "%s?status=%s&msg=%s"\n' "$URL" "$status" "$msg" | curl -fsS -m 10 -K - >/dev/null
 ```
 
 Run it from a `Type=oneshot` service triggered by a timer (`OnBootSec=2min`, `OnUnitActiveSec=1min`). Configure the monitor to alert on `status=down` and on missing heartbeats, which also covers a dead host. Do not add a check that sends router commands unless it is a reviewed, read-only status call.
