@@ -79,8 +79,9 @@ TIMING = {'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds'
           'expirySeconds': 120, 'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5,
           # Read-only status re-reads at ENROLL and after expiry wait out the transient drift a LAN
           # neighbor change after the last confirm causes (cron `cfctl expire` re-confirms every minute).
-          # 45 s outlasts one probe iteration (40 s), so one re-read always waits through the next
-          # cron minute, and keeps two devices with SCOPE at the 3600 s remoteTimeoutSeconds cap.
+          # 45 s (re-reads admitted until 44 s, leaving 1 s for date granularity and hashing forks)
+          # outlasts one probe iteration (40 s), so one re-read always waits through the next cron
+          # minute, and keeps two devices with SCOPE at the 3600 s remoteTimeoutSeconds cap.
           'statusSettleSeconds': 45,
           'safeBandStart': 15, 'safeBandEnd': 45, 'dnsMarginCs': 150, 'rttMarginMs': 500,
           'premutationBudgetSeconds': 360}
@@ -134,8 +135,9 @@ def iteration_worst_seconds(timing):
 def status_settle_worst_seconds(timing):
     """Extra worst case of one settled status gate beyond its first `cfctl status` call.
 
-    The first attempt's neighbor read, the settle window, then one attempt admitted just before the
-    window closes: its neighbor read and a full cfctl call (safe-band wait + allowance)."""
+    The first attempt's neighbor read, the settle window, then one attempt admitted at least one second
+    before the window closes (that second absorbs 1 s clock granularity and the neighbor-hash forks): a
+    full cfctl call (safe-band wait + allowance) and its neighbor read."""
     return (READ_TIMEOUT_SECONDS + timing['statusSettleSeconds'] + READ_TIMEOUT_SECONDS
             + SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS)
 

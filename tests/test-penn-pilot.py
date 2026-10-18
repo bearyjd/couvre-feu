@@ -10,6 +10,7 @@ restoration.
 import contextlib
 import copy
 import datetime
+import hashlib
 import importlib.util
 import io
 import json
@@ -52,7 +53,7 @@ SINGLE_PARAMETER_KEYS = [
     'CFP_CFCTL_ALLOWANCE', 'CFP_WORST_ENROLL', 'CFP_WORST_PAUSE', 'CFP_WORST_RESUME', 'CFP_WORST_EXPIRY',
     'CFP_WORST_DNS']
 FAST_TIMING = {'pauseSeconds': 90, 'pauseObserveSeconds': 2, 'resumeObserveSeconds': 1, 'expirySeconds': 45,
-               'expiryToleranceSeconds': 120, 'pollSeconds': 1, 'expiryPollSeconds': 1, 'statusSettleSeconds': 3, 'safeBandStart': 0,
+               'expiryToleranceSeconds': 120, 'pollSeconds': 1, 'expiryPollSeconds': 1, 'statusSettleSeconds': 12, 'safeBandStart': 0,
                'safeBandEnd': 59, 'dnsMarginCs': 150, 'rttMarginMs': 500, 'premutationBudgetSeconds': 360}
 FAKE_SSH = r'''
 import json, os, re, shlex, signal, subprocess, sys, threading, time
@@ -444,13 +445,13 @@ class PilotPlanTests(PilotBase):
         self.assertEqual(self.pause_lead(3, pause_s=120), 123)
 
     @staticmethod
-    def status_line(drift=False, errors='[]', kids=None, effective='[]'):
+    def status_line(drift=False, errors='[]', kids=None, effective='[]', desired=1, confirmed=1):
         kids = kids if kids is not None else [PENN['mac']]
-        return ('{"ok":%s,"desiredRevision":1,"confirmedRevision":1,"desiredPauses":[],"effectivePauses":%s,'
+        return ('{"ok":%s,"desiredRevision":%s,"confirmedRevision":%s,"desiredPauses":[],"effectivePauses":%s,'
                 '"desiredAllowances":[],"effectiveAllowances":[],"observed":{"kids":%s,"paused":[]},"drift":%s,'
                 '"capabilities":{"ipv6":true},"errors":%s}') % (
-                    'false' if drift or errors != '[]' else 'true', effective, json.dumps(kids, separators=(',', ':')),
-                    'true' if drift else 'false', errors)
+                    'false' if drift or errors != '[]' else 'true', desired, confirmed, effective,
+                    json.dumps(kids, separators=(',', ':')), 'true' if drift else 'false', errors)
 
     def settle(self, replies, settle=45, call_s=5, extra=''):
         """cfp_status_settle (ENROLL gate) against scripted `cfctl status` replies on a fake clock.
@@ -466,6 +467,7 @@ class PilotPlanTests(PilotBase):
                 'cfr_info() { printf "INFO %s\\n" "$*"; }\n'
                 'cfp_adult_probe() { echo probe >> "$W/calls"; }\n'
                 'timeout() { shift 3; "$@"; }\n'
+                'dd() { echo dd >> "$W/calls"; printf "fixed-test-entropy"; }\n'
                 'ip() { echo "ip $*" >> "$W/calls"; printf "%s\\n" '
                 f'"{PENN["ip"]} lladdr {PENN["mac"]} STALE" "fe80::77 lladdr 02:00:00:00:00:77 REACHABLE" '
                 f'"{MGMT["ip"]} lladdr {MGMT["mac"]} REACHABLE" "192.0.2.99 FAILED"; }}\n'
@@ -476,7 +478,7 @@ class PilotPlanTests(PilotBase):
                 f'CFR_MGMT_MAC={MGMT["mac"]}\nCFR_JD_MAC={JD["mac"]}\nCFR_PENN_MAC={PENN["mac"]}\n'
                 f'CFR_HISTORICAL_MACS={q(" ".join(HISTORICAL))}\nCFP_KIDS_JSON={q(json.dumps([PENN["mac"]]))}\n'
                 + extra +
-                'cfp_status_settle ENROLL penn_not_observed "\\"observed\\":{\\"kids\\":$CFP_KIDS_JSON,\\"paused\\":[]}" '
+                'cfp_status_settle ENROLL penn_not_observed 1 "\\"observed\\":{\\"kids\\":$CFP_KIDS_JSON,\\"paused\\":[]}" '
                 '\'"effectivePauses":[]\'\necho settled\n')
         code, out = self.pilot_shell(body)
         return code, out, (work / 'calls').read_text().splitlines()
@@ -487,10 +489,11 @@ class PilotPlanTests(PilotBase):
         code, out, calls = self.settle([self.status_line(drift=True), self.status_line()])
         self.assertEqual(code, 0, out)
         self.assertIn('INFO status_settle ENROLL attempts=2 waited_s=15', out)
+        self.assertIn('MEASURE status_settle measured settled_after_drift phase=ENROLL attempts=2 waited_s=15', out)
         self.assertEqual(out.splitlines()[-1], 'settled')
-        self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'] * 2)
-        self.assertEqual(calls.count('probe'), 1)
-        self.assertEqual(calls.count('ip neigh show dev br-lan'), 2)
+        # The neighbour snapshot follows each status read; one salt read for the whole run.
+        self.assertEqual(calls, ['cfctl status --json', 'dd', 'ip neigh show dev br-lan', 'probe',
+                                 'cfctl status --json', 'ip neigh show dev br-lan'])
         # Neighbour evidence on every attempt: role MACs named, other MACs and IPv6 addresses hashed.
         neigh = [line for line in out.splitlines() if line.startswith('INFO status_settle_neigh ENROLL ')]
         self.assertEqual(len(neigh), 2, out)
@@ -500,6 +503,31 @@ class PilotPlanTests(PilotBase):
         self.assertIn('192.0.2.99=-/FAILED', neigh[0])
         for secret in ('02:00:00:00:00:77', 'fe80::77', PENN['mac'], MGMT['mac']):
             self.assertNotIn(secret, '\n'.join(neigh))
+        # Hashes are salted per run (sha256 of the salt hex + token), the salt is never logged, and one
+        # token keeps one label across attempts.
+        salt = hashlib.sha256(b'fixed-test-entropy').hexdigest()
+        salted = hashlib.sha256((salt + '02:00:00:00:00:77').encode()).hexdigest()[:12]
+        unsalted = hashlib.sha256(b'02:00:00:00:00:77').hexdigest()[:12]
+        self.assertNotEqual(salted, unsalted)
+        self.assertIn(f'=mac-{salted}/REACHABLE', neigh[0])
+        self.assertIn(f'=mac-{salted}/REACHABLE', neigh[1])
+        self.assertNotIn(unsalted, out)
+        self.assertNotIn(salt, out)
+        self.assertNotIn(salt, ''.join(f.read_text() for f in self.work.iterdir() if f.is_file() and f.name != 'calls'))
+
+    def test_status_settle_without_salt_logs_no_hashes(self):
+        code, out, calls = self.settle([self.status_line(drift=True), self.status_line()],
+                                       extra='dd() { echo dd >> "$W/calls"; return 1; }\n')
+        self.assertEqual(code, 0, out)
+        neigh = [line for line in out.splitlines() if line.startswith('INFO status_settle_neigh ENROLL ')]
+        self.assertEqual(neigh, ['INFO status_settle_neigh ENROLL attempt=1 salt_unavailable',
+                                 'INFO status_settle_neigh ENROLL attempt=2 salt_unavailable'], out)
+
+    def test_status_settle_first_read_pass_emits_no_measure(self):
+        code, out, calls = self.settle([self.status_line()])
+        self.assertEqual(code, 0, out)
+        self.assertIn('INFO status_settle ENROLL attempts=1 waited_s=0', out)
+        self.assertNotIn('MEASURE status_settle', out)
 
     def test_status_settle_gives_up_after_budget_and_stops_with_gate_reason(self):
         code, out, calls = self.settle([self.status_line(drift=True)] * 20)
@@ -507,6 +535,11 @@ class PilotPlanTests(PilotBase):
         # Reads at +0 (t0 1005), 15, 30, 45: the window closes at 45 s, never another read after it.
         self.assertIn('INFO status_settle ENROLL attempts=4 waited_s=45 gave_up', out)
         self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'] * 4)
+        # Admission leaves one second for clock granularity: a 41 s window re-reads at 15 and 30 only.
+        code, out, calls = self.settle([self.status_line(drift=True)] * 20, settle=41)
+        self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL penn_not_observed'), out)
+        self.assertIn('INFO status_settle ENROLL attempts=3 waited_s=40 gave_up', out)
+        self.assertNotIn('MEASURE status_settle', out)
         # A zero window means one read only.
         code, out, calls = self.settle([self.status_line(drift=True)] * 20, settle=0)
         self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL penn_not_observed'), out)
@@ -520,6 +553,13 @@ class PilotPlanTests(PilotBase):
                  'kids_missing': self.status_line(drift=True, kids=[]),
                  'pause_mismatch': self.status_line(drift=True, effective='[{"person":"penn","until":5}]'),
                  'not_ok_no_drift': self.status_line().replace('"ok":true', '"ok":false'),
+                 # A never-confirmed or stale apply is not waited out (cron must not repair it into a PASS).
+                 'confirmed_null': self.status_line(drift=True, confirmed='null'),
+                 'confirmed_stale': self.status_line(drift=True, confirmed=0),
+                 'desired_stale': self.status_line(drift=True, desired=0, confirmed=0),
+                 'desired_ahead': self.status_line(drift=True, desired=2, confirmed=1),
+                 'revision_ahead': self.status_line(drift=True, desired=2, confirmed=2),
+                 'revision_prefix': self.status_line(drift=True, desired=10, confirmed=10),
                  'empty': '',
                  'two_lines': self.status_line(drift=True) + '\n' + self.status_line(drift=True)}
         for name, reply in cases.items():
@@ -566,6 +606,8 @@ class PilotPlanTests(PilotBase):
                          {'one': 3318, 'two': 3435, 'one_scope': 3483, 'two_scope': 3600})
         self.assertLessEqual(tool.worst_case_seconds(timing, 2, True), 3600)
         self.assertEqual(SHIPPED_TIMING['statusSettleSeconds'], 45)
+        script = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        self.assertEqual(script.count('-lt "$((CFP_STATUS_SETTLE - 1))"'), 2)
         details = self.plan_details(self.write_config())
         self.assertEqual(details['timing']['statusSettleSeconds'], tool.TIMING['statusSettleSeconds'])
         params, _ = self.parameters(self.write_config())
@@ -1070,10 +1112,10 @@ class PilotFixtureTests(PilotBase):
         path.write_text('#!/bin/sh\n' + body)
         path.chmod(0o700)
 
-    def status_double(self, rewrite, count):
+    def status_double(self, rewrite, count, skip=0):
         """Double of the fixture's CFR_SH program from PATH (`sh`, or `busybox` for `busybox ash`): logs every
-        `cfctl rpc-sync` and pipes the first `count` `cfctl status --json` replies after the first rpc-sync
-        through sed `rewrite`. Every call still runs the real cfctl exactly once."""
+        `cfctl rpc-sync` and pipes `count` `cfctl status --json` replies after the first rpc-sync, from the
+        one after the first `skip`, through sed `rewrite`. Every call still runs the real cfctl exactly once."""
         program = shlex.split(self.spec['shell'])[0]
         q = shlex.quote
         real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
@@ -1083,8 +1125,8 @@ class PilotFixtureTests(PilotBase):
             f'  *{q(" " + cfctl + " rpc-sync ")}*) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
             f'  *{q(" " + cfctl + " status --json ")}*)\n'
             f'    n=$(cat {q(str(count_file))} 2>/dev/null || echo 0)\n'
-            f'    if [ -s {q(str(self.rpc_log))} ] && [ "$n" -lt {count} ]; then\n'
-            f'      echo $((n + 1)) > {q(str(count_file))}\n'
+            f'    [ -s {q(str(self.rpc_log))} ] && echo $((n + 1)) > {q(str(count_file))}\n'
+            f'    if [ -s {q(str(self.rpc_log))} ] && [ "$n" -ge {skip} ] && [ "$n" -lt {skip + count} ]; then\n'
             f'      out=$({real} "$@"); rc=$?\n'
             f'      printf "%s\\n" "$out" | sed {q(rewrite)}\n'
             f'      exit $rc\n'
@@ -1127,6 +1169,19 @@ class PilotFixtureTests(PilotBase):
         self.assertIn('INFO identity refresh_probe penn_child ping_count=2 network_probe_only', stdout)
         self.assertIn(PENN['ip'], self.ping_log.read_text())
         self.assertEqual(self.router_snapshot(), before)
+
+    def test_transient_drift_after_expiry_settles_at_the_accounted_revision(self):
+        # Only the post-expiry status read drifts: its settle must expect revision 4 (enroll, pause, resume,
+        # expiry pause; cron expire keeps it) and pass.
+        self.status_double(self.DRIFT, 1, skip=1)
+        code, out, err = self.execute()
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        self.assertEqual(code, 0, out + err + '\n'.join(stdout[-40:]))
+        self.assertEqual(stdout[-1], 'PENN_PILOT_PASS')
+        self.assertTrue(any(re.fullmatch(r'INFO status_settle ENROLL attempts=1 waited_s=[0-9]+', line) for line in stdout))
+        self.assertTrue(any(re.fullmatch(r'INFO status_settle EXPIRY attempts=2 waited_s=[0-9]+', line) for line in stdout))
+        self.assertTrue(any(re.fullmatch(r'MEASURE status_settle measured settled_after_drift phase=EXPIRY attempts=2 '
+                                         r'waited_s=[0-9]+', line) for line in stdout), '\n'.join(stdout[-40:]))
 
     def test_persistent_drift_stops_enroll_after_settle_and_restores(self):
         # (b) drift past the settle window: STOP penn_not_observed, one teardown, exact restore, one rpc-sync.

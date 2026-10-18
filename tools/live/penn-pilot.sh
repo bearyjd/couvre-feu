@@ -60,6 +60,10 @@ CFP_WORST_SCOPE=
 
 CFP_DIR=
 CFP_LAT_MAX=0
+CFP_NE_SALT=
+# The policy revision the pilot's own successful calls set (rpc-sync from 0,
+# then +1 per pause or resume; cron `cfctl expire` keeps it).
+CFP_REV=0
 CFP_MUTATED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
@@ -354,21 +358,33 @@ cfp_status_has() {
         awk -v w="$cfp_want" 'index($0,w){f=1}END{exit !f}' "$cfp_file" || return 1
     done
 }
-# $1 file, then the caller's wanted substrings: true only for the transient
-# drift a LAN neighbor change after the last confirm causes (cf_effective_digest
-# covers every fresh neighbor): one line, drift true, errors empty and every
-# wanted kids/pauses substring present. Anything else is a real failure.
+# $1 file, $2 the revision the pilot's own calls set, then the caller's wanted
+# substrings: true only for the transient drift a LAN neighbor change after the
+# last confirm causes (cf_effective_digest covers every fresh neighbor): one
+# line, drift true, errors empty, desired and confirmed revision both $2 (a
+# null or stale confirm, which cron could later repair, is never waited out)
+# and every wanted kids/pauses substring present. Anything else is a real failure.
 cfp_status_transient() {
-    cfp_tr_file=$1; shift
+    cfp_tr_file=$1 cfp_tr_rev=$2; shift 2
     awk 'END{exit NR!=1}' "$cfp_tr_file" || return 1
-    for cfp_tr_want in '"drift":true,' '"errors":[]}' "$@"; do
+    for cfp_tr_want in '"drift":true,' '"errors":[]}' "\"desiredRevision\":$cfp_tr_rev," \
+        "\"confirmedRevision\":$cfp_tr_rev," "$@"; do
         awk -v w="$cfp_tr_want" 'index($0,w){f=1}END{exit !f}' "$cfp_tr_file" || return 1
     done
 }
 # Read-only neighbor evidence for one settle attempt ($1 tag), so a run can name
 # the neighbor that changed: role MACs by role, other MACs and every IPv6
-# address (EUI-64 embeds the MAC) as a 12-hex sha256 prefix; IPv4 kept.
+# address (EUI-64 embeds the MAC) as a 12-hex prefix of sha256(salt+token),
+# with one per-run salt that is never logged or written; IPv4 kept. Without a
+# salt nothing is hashed or logged.
 cfp_neigh_evidence() {
+    if [ -z "$CFP_NE_SALT" ]; then
+        CFP_NE_SALT=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')
+        # A failed read hashes nothing: the empty-input digest is no salt.
+        case $CFP_NE_SALT in *[!0-9a-f]*|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) CFP_NE_SALT=;; esac
+        [ "${#CFP_NE_SALT}" = 64 ] || CFP_NE_SALT=
+    fi
+    [ -n "$CFP_NE_SALT" ] || { cfr_info "status_settle_neigh $1 salt_unavailable"; return 0; }
     if ! timeout -s KILL "$CFP_READ_TIMEOUT" ip neigh show dev br-lan > "$CFP_DIR/settle.neigh" 2>/dev/null </dev/null; then
         cfr_info "status_settle_neigh $1 unreadable"; return 0
     fi
@@ -387,7 +403,7 @@ cfp_neigh_evidence() {
             for cfp_ne_old in $CFR_HISTORICAL_MACS; do [ "$cfp_ne_tok" != "$cfp_ne_old" ] || cfp_ne_label=protected; done
         fi
         if [ -z "$cfp_ne_label" ]; then
-            cfp_ne_sum=$(printf '%s' "$cfp_ne_tok" | sha256sum | awk '{print substr($1,1,12)}')
+            cfp_ne_sum=$(printf '%s%s' "$CFP_NE_SALT" "$cfp_ne_tok" | sha256sum | awk '{print substr($1,1,12)}')
             cfp_ne_label=$cfp_ne_kind-$cfp_ne_sum
         fi
         printf '%s %s\n' "$cfp_ne_tok" "$cfp_ne_label" >> "$CFP_DIR/settle.map"
@@ -396,27 +412,34 @@ cfp_neigh_evidence() {
         {a=tolower($1);if(a in m)a=m[a];mac="-";for(i=2;i<NF;i++)if($i=="lladdr")mac=m[tolower($(i+1))]
          printf "%s=%s/%s ",a,mac,$NF}' "$CFP_DIR/settle.map" "$CFP_DIR/settle.neigh")"
 }
-# Read-only status gate: $1 phase, $2 its stop reason, then wanted substrings.
-# A drift-only read (cfp_status_transient) is re-read every CFP_POLL seconds,
-# with the budget and adult-probe checks, until it passes or CFP_STATUS_SETTLE
-# seconds after the first read; cron `cfctl expire` re-confirms every minute.
-# Only `cfctl status` runs here: no rpc-sync or other mutating call is retried.
-# Worst case after the first read: the window plus one admitted attempt
-# (neighbor read + safe-band wait of at most 71 one-second steps + cfctl call).
+# Read-only status gate: $1 phase, $2 its stop reason, $3 expected revision,
+# then wanted substrings. A drift-only read (cfp_status_transient) is re-read
+# every CFP_POLL seconds, with the budget and adult-probe checks, until it
+# passes or CFP_STATUS_SETTLE seconds after the first read; cron `cfctl expire`
+# re-confirms every minute. Only `cfctl status` runs here: no rpc-sync or other
+# mutating call is retried. Each neighbor snapshot follows its status read.
+# Worst case after the first read: its neighbor read, the window, plus one
+# attempt admitted a second before it closes (1 s date granularity and the
+# hashing forks) (cfctl call with a safe-band wait of at most 71 one-second
+# steps + neighbor read).
 cfp_status_settle() {
-    cfp_ss_phase=$1 cfp_ss_reason=$2; shift 2
+    cfp_ss_phase=$1 cfp_ss_reason=$2 cfp_ss_rev=$3; shift 3
     cfp_ss_n=1
-    cfp_neigh_evidence "$cfp_ss_phase attempt=1"
     cfp_cfctl status --json > "$CFP_DIR/status.json" || :
+    cfp_neigh_evidence "$cfp_ss_phase attempt=1"
     cfp_ss_t0=$(cfp_now)
     [ -n "$cfp_ss_t0" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
     while :; do
         cfp_ss_now=$(cfp_now)
         [ -n "$cfp_ss_now" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
         cfp_ss_log="status_settle $cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
-        if cfp_status_has "$CFP_DIR/status.json" "$@"; then cfr_info "$cfp_ss_log"; return 0; fi
-        cfp_status_transient "$CFP_DIR/status.json" "$@" || { cfr_info "$cfp_ss_log not_transient"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
-        [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$CFP_STATUS_SETTLE" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        if cfp_status_has "$CFP_DIR/status.json" "$@"; then
+            cfr_info "$cfp_ss_log"
+            [ "$cfp_ss_n" = 1 ] || cfr_out "MEASURE status_settle measured settled_after_drift phase=$cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
+            return 0
+        fi
+        cfp_status_transient "$CFP_DIR/status.json" "$cfp_ss_rev" "$@" || { cfr_info "$cfp_ss_log not_transient"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$((CFP_STATUS_SETTLE - 1))" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
         cfp_elapsed_ok "$((CFP_ITERATION_WORST + CFP_READ_TIMEOUT + 72 + CFP_CFCTL_ALLOWANCE))" ||
             cfp_stop "$cfp_ss_phase" remote_budget_reserved_for_teardown
         cfp_adult_probe "$cfp_ss_phase" || cfp_stop "$cfp_ss_phase" "adult_disruption $CFP_ADULT_REASON"
@@ -424,10 +447,10 @@ cfp_status_settle() {
         cfp_ss_now=$(cfp_now)
         [ -n "$cfp_ss_now" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
         cfp_ss_log="status_settle $cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
-        [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$CFP_STATUS_SETTLE" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$((CFP_STATUS_SETTLE - 1))" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
         cfp_ss_n=$((cfp_ss_n + 1))
-        cfp_neigh_evidence "$cfp_ss_phase attempt=$cfp_ss_n"
         cfp_cfctl status --json > "$CFP_DIR/status.json" || :
+        cfp_neigh_evidence "$cfp_ss_phase attempt=$cfp_ss_n"
     done
 }
 
@@ -621,7 +644,8 @@ cfp_enroll() {
     }
     cfr_info "rpc-sync $(cat "$CFP_DIR/rpc-sync.json")"
     grep -q "\"receipt\":{\"operationId\":\"$CFP_OPERATION_ID\"" "$CFP_DIR/rpc-sync.json" || cfp_stop ENROLL receipt_missing
-    cfp_status_settle ENROLL penn_not_observed "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
+    CFP_REV=1
+    cfp_status_settle ENROLL penn_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
     cfr_out 'MEASURE service_key_confinement unmeasured not_exercised'
     [ -z "$CFP_PENN2_MAC" ] || cfp_rpc_activity
     cfp_counters enrolled || cfr_info 'counters enrolled unavailable'
@@ -702,6 +726,7 @@ cfp_pause_phase() {
     cfp_pause "$CFP_PAUSE_SECONDS" prepause || cfp_stop PAUSE pause_failed
     cfp_status_has "$CFP_DIR/status.json" "\"effectivePauses\":[{\"person\":\"$CFP_PERSON\",\"until\":$CFP_UNTIL}]" \
         "\"paused\":$CFP_KIDS_JSON" || cfp_stop PAUSE pause_not_effective
+    CFP_REV=$((CFP_REV + 1))
     [ "$(cfp_penn_state)" = paused ] || cfp_stop PAUSE penn_not_in_kernel_set
     cfp_counters pause0 || cfr_info 'counters pause0 unavailable'
     cfr_info pause_observe_begin
@@ -718,6 +743,7 @@ cfp_pause_phase() {
 cfp_resume_phase() {
     cfp_cfctl resume "$CFP_PERSON" > "$CFP_DIR/status.json" || :
     cfp_status_has "$CFP_DIR/status.json" '"effectivePauses":[]' '"paused":[]' || cfp_stop RESUME resume_not_clean
+    CFP_REV=$((CFP_REV + 1))
     [ "$(cfp_penn_state)" = clear ] || cfp_stop RESUME penn_kernel_state_not_clear
     cfp_counters resume0 || cfr_info 'counters resume0 unavailable'
     cfp_observe "$CFP_RESUME_OBSERVE" clear RESUME
@@ -735,6 +761,7 @@ cfp_resume_phase() {
 cfp_expiry_phase() {
     cfp_pause "$CFP_EXPIRY_SECONDS" || cfp_stop EXPIRY pause_failed
     cfp_status_has "$CFP_DIR/status.json" "\"paused\":$CFP_KIDS_JSON" || cfp_stop EXPIRY pause_not_effective
+    CFP_REV=$((CFP_REV + 1))
     cfr_info "expiry_wait_begin until=$CFP_UNTIL tolerance=$CFP_EXPIRY_TOLERANCE"
     cfp_crond_count during_expiry
     cfp_last=0
@@ -758,7 +785,7 @@ cfp_expiry_phase() {
     cfr_info "expiry_observed latency_s=$((cfp_t - CFP_UNTIL))"
     cfp_counters expired || cfr_info 'counters expired unavailable'
     cfr_out "MEASURE timed_expiry measured latency_s=$((cfp_t - CFP_UNTIL)) tolerance_s=$CFP_EXPIRY_TOLERANCE poll_s=$CFP_EXPIRY_POLL"
-    cfp_status_settle EXPIRY status_not_clean_after_expiry '"effectivePauses":[]' '"paused":[]'
+    cfp_status_settle EXPIRY status_not_clean_after_expiry "$CFP_REV" '"effectivePauses":[]' '"paused":[]'
     cfp_dup=
     [ "${CFP_CROND_INSTALL:-0}" -le 1 ] && [ "${CFP_CROND_EXPIRY:-0}" -le 1 ] || cfp_dup=' duplicate_etc_crond'
     cfr_out "MEASURE crond_processes measured baseline=etc$CFP_CROND_BASELINE,other$CFP_CROND_OTHER_BASELINE after_install=etc$CFP_CROND_INSTALL,other$CFP_CROND_OTHER_INSTALL during_expiry=etc$CFP_CROND_EXPIRY,other$CFP_CROND_OTHER_EXPIRY$cfp_dup"
