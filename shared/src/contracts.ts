@@ -20,7 +20,7 @@ export interface SessionDTO extends Provenance {
     csrfToken: string;
     expiresAt: number;
 }
-export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete';
+export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll';
 export interface ScheduleWindowDTO {
     id: string;
     weekdays: string[];
@@ -54,6 +54,8 @@ export interface DeviceEvidenceDTO {
 export interface AssignedDeviceDTO {
     id: string;
     label: string;
+    /** A queued router change for this device (integration only); absent once the router confirmed it. */
+    change?: 'adding' | 'removing';
     /** Policy enrollment evidence only, never network presence or activity. */
     evidence?: DeviceEvidenceDTO;
 }
@@ -76,7 +78,10 @@ export interface OperationalAlertEvidenceDTO {
     expiryVerifiedThrough: number | null;
     conditions: OperationalAlertSignalDTO[];
 }
+export type EntryKind = 'child' | 'device_group';
 export interface PersonDTO {
+    /** Integration only: a child, or a named group of shared devices (e.g. a TV) paused/scheduled the same way. */
+    kind?: EntryKind;
     id: string;
     name: string;
     devices: AssignedDeviceDTO[];

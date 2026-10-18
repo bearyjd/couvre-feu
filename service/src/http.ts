@@ -1,3 +1,5 @@
+import { ChildAdmin, childrenGet, childrenPost } from './admin-children.ts';
+import { IntegrationPolicy } from './integration-policy.ts';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -25,7 +27,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -92,6 +94,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const drain = requests ? null : new TimeRequestService(auth.store, policy, clock);
     const provenance = auth.provenance;
     const accounts = new AccountAdmin(auth);
+    // Children/device groups and their devices are database-managed only against a real router integration.
+    const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
@@ -189,6 +193,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const session = auth.session(sessionToken, jar.cf_browser);
                 auth.csrf(session, request.headers['x-csrf-token']);
+                const child = await childrenPost(children, session, path, payload);
+                if (child) {
+                    send(response, child.status, {...provenance, ...child.body as object});
+                    return;
+                }
                 const account = await accountPost(accounts, session, path, payload);
                 if (account) {
                     send(response, account.status, {...provenance, ...account.body as object});
@@ -235,6 +244,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 send(response, 200, await policy.people(session.dto.actor));
+                return;
+            }
+            const childRead = childrenGet(children, session, path);
+            if (childRead) {
+                send(response, childRead.status, {...provenance, ...childRead.body as object});
                 return;
             }
             const accountRead = accountGet(accounts, session, path);

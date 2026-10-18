@@ -12,10 +12,10 @@ const ACTIONS: readonly AdminAction[] = ['account_create', 'token_issue', 'accou
 const ACCOUNT_ID = /^[a-z][a-z0-9_]{0,31}$/;
 export const CREDENTIAL_ID = /^[A-Za-z0-9_-]{1,1400}$/;
 const TOKEN_SECONDS = 600;
-interface AccountRow {id: string; display_name: string; role: Role; person_ids: string; active: number}
+interface AccountRow {id: string; display_name: string; role: Role; person_ids: string; active: number; scope_all: number}
 interface CredentialRow {id: string; account_id: string; label: string; state: 'active' | 'pending'; created_at: number; last_used_at: number | null}
 export interface PasskeyDTO {id: string; label: string; state: 'active' | 'pending'; createdAt: number; lastUsedAt: number | null; pairingCode: string}
-export interface AccountDTO {id: string; displayName: string; role: Role; personIds: string[]; active: boolean; passkeys: PasskeyDTO[]; token: {expiresAt: number; label: string} | null}
+export interface AccountDTO {id: string; displayName: string; role: Role; personIds: string[]; scopeAll: boolean; active: boolean; passkeys: PasskeyDTO[]; token: {expiresAt: number; label: string} | null}
 
 function text(value: unknown, code: string, min: number): string {
     if (typeof value !== 'string') throw new AppError(400, code);
@@ -36,12 +36,13 @@ function normalize(kind: AdminAction, target: unknown, params: unknown, actor: A
     if (typeof target !== 'string') throw new AppError(400, 'invalid_target');
     if (kind === 'account_create') {
         if (target !== '') throw new AppError(400, 'invalid_target');
-        const body = object(params, ['displayName', 'role', 'personIds']);
+        const body = object(params, ['displayName', 'role', 'personIds'], ['scopeAll']);
+        if (body.scopeAll !== undefined && typeof body.scopeAll !== 'boolean') throw new AppError(400, 'invalid_person_scope');
         const people = body.personIds;
         if (!Array.isArray(people) || people.length < 1 || people.length > 64 || new Set(people).size !== people.length) throw new AppError(400, 'invalid_person_scope');
         // An admin can grant only people inside the admin's own scope.
         if (people.some(person => typeof person !== 'string' || !ACCOUNT_ID.test(person) || !actor.personIds.includes(person))) throw new AppError(403, 'invalid_person_scope');
-        return {target, params: {displayName: text(body.displayName, 'invalid_display_name', 1), role: role(body.role), personIds: [...people as string[]].sort()}};
+        return {target, params: {displayName: text(body.displayName, 'invalid_display_name', 1), role: role(body.role), personIds: [...people as string[]].sort(), ...(body.scopeAll ? {scopeAll: true} : {})}};
     }
     if (kind === 'passkey_approve' || kind === 'passkey_revoke' || kind === 'own_passkey_revoke') {
         if (!CREDENTIAL_ID.test(target)) throw new AppError(404, 'passkey_not_found');
@@ -70,7 +71,7 @@ export class AccountAdmin {
     }
     private dto(row: AccountRow): AccountDTO {
         const token = this.store.get<{expires_at: number; label: string}>("SELECT expires_at,label FROM bootstrap_tokens WHERE account_id=? AND consumed=0 AND expires_at>? ORDER BY expires_at DESC LIMIT 1", row.id, this.auth.now());
-        return {id: row.id, displayName: row.display_name, role: row.role, personIds: JSON.parse(row.person_ids), active: row.active === 1, passkeys: this.passkeys(row.id), token: token ? {expiresAt: token.expires_at, label: token.label} : null};
+        return {id: row.id, displayName: row.display_name, role: row.role, personIds: JSON.parse(row.person_ids), scopeAll: row.scope_all === 1, active: row.active === 1, passkeys: this.passkeys(row.id), token: token ? {expiresAt: token.expires_at, label: token.label} : null};
     }
     list(actor: Actor): {accounts: AccountDTO[]} {
         this.allowed(actor, 'account_create');
@@ -132,8 +133,10 @@ export class AccountAdmin {
         switch (kind) {
         case 'account_create': {
             if (this.store.get<{n: number}>('SELECT count(*) n FROM accounts')!.n >= ACCOUNT_LIMIT) throw new AppError(409, 'account_limit_reached', `The defensive limit of ${ACCOUNT_LIMIT} accounts is reached.`);
+            // scope_all (every child, including later ones) can only be granted by an admin who holds it.
+            if (params.scopeAll && this.store.get<{scope_all: number}>('SELECT scope_all FROM accounts WHERE id=?', actor.id)?.scope_all !== 1) throw new AppError(403, 'scope_all_required');
             const id = `parent_${randomBytes(6).toString('hex')}`;
-            this.store.run('INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES(?,?,?,?,?)', id, params.displayName as string, params.role as string, JSON.stringify(params.personIds), randomBytes(32).toString('base64url'));
+            this.store.run('INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id,scope_all) VALUES(?,?,?,?,?,?)', id, params.displayName as string, params.role as string, JSON.stringify(params.personIds), randomBytes(32).toString('base64url'), params.scopeAll ? 1 : 0);
             return {body: {account: this.dto(this.account(id))}, audit: id};
         }
         case 'token_issue': {

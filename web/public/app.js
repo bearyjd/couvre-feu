@@ -5,6 +5,7 @@ import { createParentAlerts } from './parent-alerts.js';
 import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
 import { createAccounts } from './accounts.js';
+import { createChildren } from './children.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -20,6 +21,7 @@ const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.s
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
+const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
@@ -295,12 +297,13 @@ async function mutate(personId, action, presetSeconds) {
   }
 }
 
+const COVERAGE_REFUSALS = ['incomplete_address_coverage', 'incomplete_transition_address_coverage'];
 function operationText(operation) {
   const verb = actionVerb(operation.action);
   if (isReal()) return ({
     pending: operation.dispatch === 'awaiting_automatic_dispatch' ? `${verb} pending. Waiting for automatic router confirmation.` : operation.dispatch === 'consumed' ? `${verb} pending. Waiting for the router receipt.` : `${verb} pending. Waiting for an exact operator-approved router invocation.`,
     confirmed: `${verb} confirmed by a fresh router receipt and current runtime observation. Packet behavior remains unmeasured.`,
-    failed: `${verb} was not delivered. Review the operation details before another deliberate action.`,
+    failed: COVERAGE_REFUSALS.includes(operation.error) ? `${verb} refused by the router: a managed device had no network address (it may be off or away). Nothing changed. An admin can see which devices to check.` : `${verb} was not delivered. Review the operation details before another deliberate action.`,
     unknown: `${verb} outcome unknown. A historical receipt or local timeout cannot establish current enforcement. No retry is authorized.`,
     conflict: `${verb} conflict. The accepted router policy changed; review a separately approved fresh observation.`,
   })[operation.state] ?? 'Operation status unavailable.';
@@ -382,9 +385,9 @@ function renderPeople() {
     const choices = [['0', 'Until I resume'], ['60', isReal() ? '1 minute' : '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
     const timedPause = effectiveManual && effectiveManual.until > 0;
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
-      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
+      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${person.kind === 'device_group' ? 'Device group' : isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
       <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
-      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
+      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}${device.change ? ` · ${device.change === 'adding' ? 'being added' : 'being removed'}` : ''}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="quick-pauses" role="group" aria-label="Quick pause for ${label}">${[[900, '15'], [1800, '30'], [3600, '60']].map(([seconds, minutes]) => `<button class="button primary" type="button" data-quick-pause="${seconds}" data-person-id="${id}" data-focus-key="quick-${seconds}-${id}" aria-label="Pause ${label} for ${minutes} minutes">Pause ${minutes} min</button>`).join('')}</div>
       ${timedPause ? `<p class="remaining" role="timer" aria-label="Time remaining on ${label} timed pause">Time left: <strong data-remaining="${effectiveManual.until}"></strong></p>` : ''}
       <p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: the router policy has no allowance concept yet, so a schedule block cannot be lifted temporarily. Pausing and ending a pause work as shown.</span></p>
@@ -460,6 +463,7 @@ function render() {
   parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
   timeRequests.update();
   accounts.update();
+  children.update();
 }
 
 function tick() {

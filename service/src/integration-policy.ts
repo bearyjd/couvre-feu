@@ -5,16 +5,18 @@ import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
 import { integer, normalizePolicy, policyJSON, healthyConfirmation } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
+import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { exactHealthy, normalizeEnvelope, policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
-import { validatePilotPolicy } from './integration-config.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
+import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
+import type { ChildRow } from './integration-children.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
 }
@@ -27,8 +29,11 @@ export class IntegrationPolicy {
         const o = this.store.observation(), time = this.now();
         return !this.store.integrationState().observation_error && o.value !== null && o.observedAt !== null && o.observedAt <= time + 1 && time - o.observedAt <= OBSERVATION_FRESH_SECONDS && o.value.routerTime <= time + 1 && time - o.value.routerTime <= OBSERVATION_FRESH_SECONDS;
     }
-    private authorized(actor: Actor, person: string): void {
-        if (person !== this.store.config.person.id || !actor.personIds.includes(person)) throw new AppError(404, 'person_not_found');
+    /** Only an active database child inside the actor's scope; anything else is indistinguishable from a missing one. */
+    authorized(actor: Actor, person: string): ChildRow {
+        const child = actor.personIds.includes(person) ? this.store.get<ChildRow>('SELECT * FROM people WHERE id=? AND active=1', person) : undefined;
+        if (!child) throw new AppError(404, 'person_not_found');
+        return child;
     }
     private row(id: string): IntegrationOperation | undefined { return this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id); }
     envelope(id: string): RPCEnvelope {
@@ -57,7 +62,7 @@ export class IntegrationPolicy {
         const o = this.store.observation().value;
         return this.fresh() && o ? `"s${this.state().highwater}-r${o.acceptedPolicy.revision}-${o.policyDigest}"` : null;
     }
-    private result(op: IntegrationOperation): {status: number; result: OperationResult} {
+    result(op: IntegrationOperation): {status: number; result: OperationResult} {
         const dto = this.dto(op);
         return {status: dto.currentHealthy && op.state === 'confirmed' ? 200 : op.state === 'conflict' ? 409 : op.state === 'failed' ? 502 : 202,
             result: {...this.store.config.provenance, operation: dto, operationUrl: `/operations/${op.id}`}};
@@ -73,55 +78,81 @@ export class IntegrationPolicy {
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
             if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
             if (until !== null && until !== 0 && until <= this.now()) throw new AppError(400, 'pause_expiry_must_be_future');
-            if (!this.fresh()) throw new AppError(503, 'approved_router_observation_required');
-            const o = this.store.observation().value!;
-            if (precondition !== this.token()) throw new AppError(409, 'revision_conflict');
-            if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
-            if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
-            validatePilotPolicy(o.acceptedPolicy, this.store.config, false);
-            const policy = normalizePolicy({...o.acceptedPolicy, revision: o.acceptedPolicy.revision + 1,
-                pauses: [...o.acceptedPolicy.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: until!}] : [])]}, this.store.config.protectedMacs);
-            validatePilotPolicy(policy, this.store.config, false);
-            const id = randomUUID(), now = this.now();
-            const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
-            this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
-            this.store.run("INSERT INTO operation_rpc(operation_id,generation,base_digest,request_digest,envelope_json,phase) VALUES(?,?,?,?,?,'queued')", id, o.generation, o.policyDigest, requestDigest(envelope), JSON.stringify(envelope));
-            this.store.run('UPDATE integration_state SET active_operation_id=? WHERE singleton=1', id);
-            this.store.run('UPDATE service_state SET desired_json=?,highwater=highwater+1 WHERE singleton=1', policyJSON(policy));
-            this.store.run("INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,'pending')", actor.id, id, action, policy.revision, now);
-            return this.row(id)!;
+            return this.queue(actor, person, action, request, key, precondition, base => {
+                if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
+                return normalizePolicy({...base, revision: base.revision + 1,
+                    pauses: [...base.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: until!}] : [])]}, this.store.config.protectedMacs);
+            });
         });
         return this.result(op);
     }
+    /**
+     * The one CAS path for every router change, inside the caller's transaction: a fresh healthy observation, the caller's
+     * revision token, no other change in flight. `build` derives the next policy from the router's accepted policy; `stage`
+     * records local intent (e.g. a device row) under the new operation id before the result is validated.
+     */
+    queue(actor: Actor, person: string, action: IntegrationOperation['action'], request: string, key: string, precondition: string | null,
+        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void): IntegrationOperation {
+        if (!this.store.db.isTransaction) throw new Error('queue_requires_transaction');
+        if (!this.fresh()) throw new AppError(503, 'approved_router_observation_required');
+        const o = this.store.observation().value!;
+        if (precondition === null || precondition !== this.token()) throw new AppError(409, 'revision_conflict');
+        if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
+        if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
+        validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
+        const policy = build(o.acceptedPolicy), id = randomUUID(), now = this.now();
+        stage?.(id);
+        validateManagedPolicy(policy, this.store.config, this.store, false);
+        const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
+        this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
+        this.store.run("INSERT INTO operation_rpc(operation_id,generation,base_digest,request_digest,envelope_json,phase) VALUES(?,?,?,?,?,'queued')", id, o.generation, o.policyDigest, requestDigest(envelope), JSON.stringify(envelope));
+        this.store.run('UPDATE integration_state SET active_operation_id=? WHERE singleton=1', id);
+        this.store.run('UPDATE service_state SET desired_json=?,highwater=highwater+1 WHERE singleton=1', policyJSON(policy));
+        this.store.run("INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,'pending')", actor.id, id, action, policy.revision, now);
+        return this.row(id)!;
+    }
+    /** The router holds exactly the child's configured MACs (none when it has no devices). */
+    private enrolled(o: RPCObservation | null, child: string): boolean {
+        if (o === null) return false;
+        const configured = configuredMacs(this.store, child), routed = o.acceptedPolicy.people.find(p => p.id === child)?.macs ?? [];
+        return configured.length === routed.length && configured.every(m => routed.includes(m));
+    }
     people(actor: Actor): PeopleDTO {
-        const state = this.state(), info = this.store.integrationState(), cached = this.store.observation(), o = cached.value;
-        const enrolled = o !== null && o.acceptedPolicy.people.length === 1 && o.acceptedPolicy.people[0].id === this.store.config.person.id && o.acceptedPolicy.people[0].macs.length === 1 && o.acceptedPolicy.people[0].macs[0] === this.store.config.person.device.mac;
-        const healthy = enrolled && this.fresh() && o !== null && o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime);
-        const p = this.store.config.person, latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE person_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', p.id);
-        const dto = latest ? this.dto(latest) : null;
+        const state = this.state(), info = this.store.integrationState(), cached = this.store.observation(), o = cached.value, config = this.store.config;
+        const routerHealthy = this.fresh() && o !== null && o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime);
+        const children = activeChildren(this.store).filter(child => actor.personIds.includes(child.id));
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
-        if (!enrolled) errors.push('pilot_device_not_enrolled');
-        if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
-        return {...this.store.config.provenance, packetAcceptance: 'unmeasured', people: actor.personIds.includes(p.id) ? [{id: p.id, name: p.name, devices: [{id: p.device.id, label: p.device.label, evidence: deviceEvidence({source: 'router-policy', now: this.now(),
-            sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: p.id, mac: p.device.mac, configuredMacs: [p.device.mac],
-            policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length),
-            generationMatches: o?.generation === this.store.config.router.generation})}],
-            manualPause: o?.acceptedPolicy.pauses.find(a => a.person === p.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === p.id) ?? null,
-            ...integrationScheduleState(enrolled ? o!.acceptedPolicy : this.store.config.enrollment, this.store.config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1),
-            observationHealth: info.observation_error ? 'unreachable' : healthy ? 'healthy' : 'unconfirmed', status: dto?.state ?? (healthy ? 'confirmed' : 'unknown'), latestOperation: dto,
-            operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
-                generationMatches: o?.generation === this.store.config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,
-                drift: o?.status.drift === true, pauseUntil: o?.acceptedPolicy.pauses.find(pause => pause.person === p.id)?.until ?? null,
-                expiredEffectivePause: Boolean(o?.status.effectivePauses.some(pause => pause.person === p.id && pause.until > 0 && pause.until <= (o?.routerTime ?? 0))),
-                operation: dto, operationHealthy: dto?.currentHealthy === true})}] : [],
+        let allEnrolled = true;
+        const people = children.map(child => {
+            const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id);
+            if (!enrolled) allEnrolled = false;
+            const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE person_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
+            const dto = latest ? this.dto(latest) : null;
+            if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
+            return {id: child.id, name: child.name, kind: child.kind, devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, ...(d.state === 'active' ? {} : {change: d.state === 'enrolling' ? 'adding' as const : 'removing' as const}),
+                evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
+                    policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
+                manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
+                ...integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, child.id),
+                observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
+                operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
+                    generationMatches: o?.generation === config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,
+                    drift: o?.status.drift === true, pauseUntil: o?.acceptedPolicy.pauses.find(pause => pause.person === child.id)?.until ?? null,
+                    expiredEffectivePause: Boolean(o?.status.effectivePauses.some(pause => pause.person === child.id && pause.until > 0 && pause.until <= (o?.routerTime ?? 0))),
+                    operation: dto, operationHealthy: dto?.currentHealthy === true})};
+        });
+        if (!allEnrolled) errors.push('pilot_device_not_enrolled');
+        const healthy = routerHealthy && allEnrolled;
+        return {...config.provenance, packetAcceptance: 'unmeasured', people,
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
     }
+    /** Admin-only, scoped: device identifiers never reach parents. */
     devices(actor: Actor) {
         if (actor.role !== 'admin') throw new AppError(403, 'admin_required');
-        const p = this.store.config.person;
-        return {...this.store.config.provenance, devices: [{...p.device, personId: p.id}]};
+        return {...this.store.config.provenance, devices: activeChildren(this.store).filter(child => actor.personIds.includes(child.id))
+            .flatMap(child => devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, mac: d.identifier, personId: child.id, state: d.state})))};
     }
     private automaticEnabled(): boolean {
         return !!this.store.config.dispatch?.enabled && this.store.get<{enabled: number}>('SELECT enabled FROM automatic_dispatch WHERE singleton=1')?.enabled === 1;

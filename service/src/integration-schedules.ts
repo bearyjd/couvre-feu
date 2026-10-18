@@ -4,8 +4,8 @@ import type { IntegrationManifest } from './integration-config.ts';
 import { scheduleClockReader } from './schedule-clock.ts';
 
 /** Clock evidence is an explicit owner assertion, not a new router/DST capability. */
-export function integrationScheduleState(policy: RouterPolicy, config: IntegrationManifest, routerTime: number | null, healthy: boolean, currentTime = routerTime, observationValidUntil = routerTime === null ? null : routerTime + 31) {
-    const schedules = policy.schedules.filter(s => s.person === config.person.id);
+export function integrationScheduleState(policy: RouterPolicy, config: IntegrationManifest, routerTime: number | null, healthy: boolean, currentTime = routerTime, observationValidUntil = routerTime === null ? null : routerTime + 31, personId = config.person.id) {
+    const schedules = policy.schedules.filter(s => s.person === personId);
     if (!schedules.length) return {scheduleBlocked: false, scheduleExplanation: 'No owner-configured schedule.', scheduleWitness: 'none' as const, scheduleValidUntil: null, scheduleCheckedAt: null};
     const clock = config.scheduleClock;
     const windows = schedules.map(s => `${s.id}: ${s.weekdays.join(', ')} ${s.start}–${s.stop}`).join('; ');
