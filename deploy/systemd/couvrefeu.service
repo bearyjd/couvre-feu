@@ -7,6 +7,8 @@ Description=Couvre-feu parent app
 Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
 After=network-online.target couvrefeu-agent.service
 Wants=network-online.target
+# Requires= points app -> agent only. Restarting the agent restarts the app (and the key must be re-added);
+# restarting the app leaves the agent and its loaded key untouched.
 Requires=couvrefeu-agent.service
 
 [Service]
@@ -31,7 +33,6 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible
-ProcSubset=pid
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

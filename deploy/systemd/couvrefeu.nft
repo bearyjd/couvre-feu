@@ -1,21 +1,29 @@
 #!/usr/sbin/nft -f
-# Example host firewall for the systemd option. Replace the placeholders; never commit real values.
-# Inbound: only the TLS proxy may reach the app port. Outbound: DNS and SSH to the router only.
-# Load apt/node downloads BEFORE enabling this, or temporarily allow outbound.
-flush ruleset
+# Example host firewall for the systemd option. Replace every <PLACEHOLDER>; never commit real values.
+# It owns only `table inet couvrefeu` and leaves every other table alone (Docker, libvirt, ...).
+# Inbound: only <PROXY_IP> reaches the app port; admin SSH; ICMP/ICMPv6 (needed for IPv6 neighbor discovery).
+# Outbound: router SSH, DNS and NTP only. Everything else, IPv4 and IPv6, is dropped.
+# Apply safely: see docs/runbooks/deploy.md (nft -c -f first, then a rollback timer).
+add table inet couvrefeu
+delete table inet couvrefeu
 table inet couvrefeu {
     chain input {
         type filter hook input priority 0; policy drop;
         iif lo accept
         ct state established,related accept
+        ct state invalid drop
+        meta l4proto { icmp, ipv6-icmp } accept
+        ip saddr <ADMIN_IP> tcp dport 22 accept
         ip saddr <PROXY_IP> tcp dport 4273 accept
     }
     chain output {
         type filter hook output priority 0; policy drop;
         oif lo accept
         ct state established,related accept
+        meta l4proto { icmp, ipv6-icmp } accept
         ip daddr <ROUTER_IP> tcp dport 22 accept
         ip daddr <DNS_IP> udp dport 53 accept
         ip daddr <DNS_IP> tcp dport 53 accept
+        ip daddr <NTP_IP> udp dport 123 accept
     }
 }
