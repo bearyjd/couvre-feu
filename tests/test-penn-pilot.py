@@ -1044,8 +1044,8 @@ class PilotFixtureTests(PilotBase):
         leases.write_text(''.join(f'1800000000 {role["mac"]} {role["ip"]} host *\n' for role in devices))
         # Observe installed protection, before teardown removes it.
         protection = self.work / 'installed-protection'
-        firewall = self.fixture.bin / 'firewall'
-        real = self.fixture.bin / 'firewall.real'
+        firewall = self.fixture.bin / 'fw3'
+        real = self.fixture.bin / 'fw3.real'
         firewall.rename(real)
         protected = self.root / 'etc/couvrefeu/protected'
         firewall.write_text(f'#!/bin/sh\nif [ -f {shlex.quote(str(protected))} ]; then '
