@@ -309,6 +309,21 @@ class PilotPlanTests(PilotBase):
             with self.assertRaises(self.tool.Refusal):
                 self.tool.assert_policy_only_penn(policy, config)
 
+    def test_exact_adult_alias_plan_keeps_child_and_scope_guards(self):
+        roles = dict(self.config['roles'], jd_adult=MGMT)
+        for second in (None, PENN2):
+            with self.subTest(second=second):
+                configured = dict(roles, **({'penn_child_2': second} if second else {}))
+                config = self.tool.load_config(self.write_config(roles=configured, scopeNegativeTest=True))
+                policy = self.tool.enrollment_policy(config)
+                self.assertEqual(policy['people'][0]['macs'], sorted([PENN['mac']] + ([PENN2['mac']] if second else [])))
+                self.assertNotIn(MGMT['mac'], policy['people'][0]['macs'])
+                self.plan_details(self.write_config(roles=configured, scopeNegativeTest=True))
+        for child in (MGMT, dict(PENN2, ip=MGMT['ip']), dict(PENN2, mac=MGMT['mac'])):
+            self.refused_before_ssh(self.write_config(roles=dict(roles, penn_child_2=child)), 'penn_child_2')
+        self.refused_before_ssh(self.write_config(roles=roles, scopeNegativeTest=True,
+                                                protectedHistoricalMacs=[self.tool.SCOPE_TEST_MAC]), 'scope test MAC')
+
     def test_protected_or_duplicate_penn_mac_refused_before_ssh(self):
         for penn in ({'ip': PENN['ip'], 'mac': HISTORICAL[0]}, {'ip': PENN['ip'], 'mac': JD['mac']}):
             code, _, err = self.invoke('plan', self.write_config(roles=dict(self.config['roles'], penn_child=penn)))
@@ -1017,6 +1032,42 @@ class PilotFixtureTests(PilotBase):
             self.assertEqual(self.router_snapshot(), before)
             shutil.rmtree(self.evidence())
 
+
+    def adult_alias_pass(self, second):
+        roles = dict(self.config['roles'], jd_adult=MGMT)
+        devices = [MGMT, PENN]
+        if second:
+            roles['penn_child_2'] = PENN2
+            devices.append(PENN2)
+        self.fixture.update_backend(neighbors=[dict(role, state='REACHABLE') for role in devices])
+        leases = self.root / 'tmp/dhcp.leases'
+        leases.write_text(''.join(f'1800000000 {role["mac"]} {role["ip"]} host *\n' for role in devices))
+        # Observe installed protection, before teardown removes it.
+        protection = self.work / 'installed-protection'
+        firewall = self.fixture.bin / 'firewall'
+        real = self.fixture.bin / 'firewall.real'
+        firewall.rename(real)
+        protected = self.root / 'etc/couvrefeu/protected'
+        firewall.write_text(f'#!/bin/sh\nif [ -f {shlex.quote(str(protected))} ]; then '
+                            f'cat {shlex.quote(str(protected))} > {shlex.quote(str(protection))}; fi\n'
+                            f'exec {shlex.quote(str(real))} "$@"\n')
+        firewall.chmod(0o700)
+        before = self.router_snapshot()
+        code, out, err = self.execute(roles=roles, scopeNegativeTest=True)
+        stdout = (self.evidence() / 'stdout.log').read_text()
+        self.assertEqual(code, 0, out + err + stdout[-5000:])
+        self.assertIn('PENN_PILOT_PASS', stdout)
+        self.assertIn('adult baseline management=jd_adult same_confirmed_device', stdout)
+        self.assertIn('PHASE SCOPE OK', stdout)
+        self.assertIn('"errors":["rpc_scope_overlap"]', stdout)
+        self.assertEqual(sorted(protection.read_text().splitlines()), sorted([MGMT['mac'], *HISTORICAL]))
+        self.assertEqual(self.router_snapshot(), before)
+
+    def test_single_child_exact_adult_alias_passes_and_preserves_protection(self):
+        self.adult_alias_pass(second=False)
+
+    def test_two_children_exact_adult_alias_passes_and_preserves_protection(self):
+        self.adult_alias_pass(second=True)
 
     def test_two_devices_with_scope_negative_test_pass_and_restore_exactly(self):
         changes = self.two_devices(scopeNegativeTest=True)

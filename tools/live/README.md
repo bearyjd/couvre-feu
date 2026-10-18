@@ -25,7 +25,7 @@ Keep the real configuration outside the repository, in a private directory. [`co
 | `roles.penn_child` | object | `{"ip", "mac"}`. The child device. It must be present, but it is **not** enrolled |
 | `protectedHistoricalMacs` | array | 1–32 MACs to protect (for example Bryn's) that need not be present. None may equal a live role MAC |
 
-MACs must be canonical lowercase `aa:bb:cc:dd:ee:ff`, unicast and non-zero. Live role MACs and IPs must be distinct from each other and from `host`.
+MACs must be canonical lowercase `aa:bb:cc:dd:ee:ff`, unicast and non-zero. Live role MACs and IPs must be distinct from each other and role IPs from `host`, with one exception: `management` and `jd_adult` may have exactly the same IP **and** MAC (for example, both `192.0.2.10` / `02:00:00:00:00:10`). Matching only one field is refused. Child roles must remain distinct, and historical MACs must remain unique and separate from every live role. Repeated adult `--protect` arguments are deduplicated by the installer. Evidence explicitly labels the adult and management probes as sharing one confirmed device; this does not establish connectivity for a second adult device.
 
 ## Penn pilot, one or two devices (`penn-pilot.py`)
 

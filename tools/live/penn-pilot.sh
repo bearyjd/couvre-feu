@@ -154,6 +154,9 @@ cfp_baseline() {
 cfp_adult_probe() {
     CFP_ADULT_REASON=
     cfp_tag=$1
+    if [ "$CFR_MGMT_IP" = "$CFR_JD_IP" ] && [ "$CFR_MGMT_MAC" = "$CFR_JD_MAC" ]; then
+        cfr_info "adult $cfp_tag management=jd_adult same_confirmed_device; probes share one device"
+    fi
     [ "$CFR_STDOUT_LOST" != 1 ] || { CFP_ADULT_REASON=management_session_lost; return 1; }
     ip -4 neigh show dev br-lan > "$CFR_STAGE/connectivity.neigh" 2>/dev/null </dev/null || { CFP_ADULT_REASON=neighbor_read_failed; return 1; }
     cfr_neighbor "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_PRESENT_STATES" "$CFR_STAGE/connectivity.neigh" || { CFP_ADULT_REASON=management_neighbor_lost; return 1; }

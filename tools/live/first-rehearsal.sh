@@ -168,8 +168,17 @@ cfr_identity() {
             [ "$cfr_live" != "$cfr_old" ] || cfr_refuse IDENTITY live_role_matches_protected_historical_mac
         done
     done
-    if [ "$CFR_MGMT_MAC" = "$CFR_JD_MAC" ] || [ "$CFR_MGMT_MAC" = "$CFR_PENN_MAC" ] || [ "$CFR_JD_MAC" = "$CFR_PENN_MAC" ]; then
+    if [ "$CFR_MGMT_MAC" = "$CFR_JD_MAC" ] && [ "$CFR_MGMT_IP" != "$CFR_JD_IP" ]; then
         cfr_refuse IDENTITY duplicate_live_mac
+    fi
+    if [ "$CFR_MGMT_MAC" = "$CFR_PENN_MAC" ] || [ "$CFR_JD_MAC" = "$CFR_PENN_MAC" ]; then
+        cfr_refuse IDENTITY duplicate_live_mac
+    fi
+    if [ "$CFR_MGMT_IP" = "$CFR_JD_IP" ] && [ "$CFR_MGMT_MAC" != "$CFR_JD_MAC" ]; then
+        cfr_refuse IDENTITY duplicate_live_ip
+    fi
+    if [ "$CFR_PENN_IP" = "$CFR_MGMT_IP" ] || [ "$CFR_PENN_IP" = "$CFR_JD_IP" ]; then
+        cfr_refuse IDENTITY duplicate_live_ip
     fi
     [ -n "${SSH_CONNECTION:-}" ] || cfr_refuse IDENTITY ssh_connection_missing
     set -f
@@ -190,6 +199,9 @@ cfr_identity() {
         set -- $cfr_role
         awk -v ip="$2" -v mac="$3" 'tolower($2)==mac&&$3==ip{n++}END{exit n!=1}' "$CFR_LEASES" || cfr_refuse IDENTITY "$1_lease_mismatch"
     done
+    if [ "$CFR_MGMT_IP" = "$CFR_JD_IP" ] && [ "$CFR_MGMT_MAC" = "$CFR_JD_MAC" ]; then
+        cfr_info "adult_identity management=jd_adult same_confirmed_device; adult and management probes share one device"
+    fi
     cfr_ok IDENTITY
 }
 

@@ -339,6 +339,54 @@ class LiveRehearsalTests(unittest.TestCase):
         missing = json.dumps({k: v for k, v in fields.items() if k != 'capabilities'}, separators=(',', ':'))
         self.assertEqual(verdicts(missing), (False, False))
 
+    def test_exact_adult_alias_parser_preserves_other_identity_guards(self):
+        roles = dict(self.config['roles'], jd_adult=MGMT)
+        config = dict(self.config, roles=roles)
+        self.assertEqual(self.tool.validate_config(config)['roles']['jd_adult'], MGMT)
+        for replacement in (dict(MGMT, mac=JD['mac']), dict(MGMT, ip=JD['ip'])):
+            with self.subTest(partial=replacement), self.assertRaises(self.tool.Refusal):
+                self.tool.validate_config(dict(config, roles=dict(roles, jd_adult=replacement)))
+        for child in (MGMT, dict(PENN, ip=MGMT['ip']), dict(PENN, mac=MGMT['mac'])):
+            with self.subTest(child=child), self.assertRaises(self.tool.Refusal):
+                self.tool.validate_config(dict(config, roles=dict(roles, penn_child=child)))
+        for changes in ({'host': MGMT['ip']}, {'host': PENN['ip']},
+                        {'protectedHistoricalMacs': HISTORICAL * 2},
+                        {'protectedHistoricalMacs': [MGMT['mac']]}):
+            with self.subTest(changes=changes), self.assertRaises(self.tool.Refusal):
+                self.tool.validate_config(dict(config, **changes))
+
+    def test_remote_partial_and_child_alias_payloads_refused(self):
+        config = self.tool.validate_config(self.config)
+        commit, blobs = self.tool.head_source()
+        self.tool_env()
+        cases = [(dict(config['roles'], jd_adult=dict(MGMT, mac=JD['mac'])), 'duplicate_live_ip'),
+                 (dict(config['roles'], jd_adult=dict(MGMT, ip=JD['ip'])), 'duplicate_live_mac'),
+                 (dict(config['roles'], jd_adult=MGMT, penn_child=MGMT), 'duplicate_live_mac'),
+                 (dict(config['roles'], jd_adult=MGMT, penn_child=dict(PENN, ip=MGMT['ip'])),
+                  'duplicate_live_ip')]
+        for roles, reason in cases:
+            # Bypass the parser: the router must make this decision independently.
+            with self.subTest(roles=roles):
+                payload, _ = self.tool.build_payload(dict(config, roles=roles), commit, blobs)
+                result = subprocess.run([str(self.bin / 'ssh'), 'fixture'], input=payload, capture_output=True,
+                                        env={'FAKE_SSH_SPEC': str(self.spec_path), 'PATH': os.environ['PATH']})
+                self.assertEqual(result.returncode, 10, result.stderr.decode())
+                self.assertIn(f'PHASE IDENTITY FAIL {reason}'.encode(), result.stdout)
+                self.assertNotIn(b'MUTATION_BEGIN', result.stdout)
+                self.assertFalse(self.installer_ran())
+
+    def test_exact_adult_alias_rehearsal_passes_with_one_neighbor_and_lease(self):
+        self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(PENN, state='DELAY')])
+        leases = self.root / 'tmp/dhcp.leases'
+        leases.write_text(''.join(f'1800000000 {role["mac"]} {role["ip"]} host *\n' for role in (MGMT, PENN)))
+        before = self.router_snapshot()
+        code, out, err = self.execute(roles=dict(self.config['roles'], jd_adult=MGMT))
+        self.assertEqual(code, 0, out + err)
+        stdout = (self.evidence() / 'stdout.log').read_text()
+        self.assertIn('management=jd_adult same_confirmed_device', stdout)
+        self.assertIn('FIRST_REHEARSAL_PASS', stdout)
+        self.assertEqual(self.router_snapshot(), before)
+
     def test_identity_mac_mismatch_refused_before_install(self):
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'),
                                                {'ip': JD['ip'], 'mac': '02:00:00:00:00:99', 'state': 'REACHABLE'},

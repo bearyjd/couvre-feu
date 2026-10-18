@@ -150,9 +150,14 @@ def validate_config(document):
         raise Refusal('protectedHistoricalMacs must list 1 to 32 MACs')
     config['protectedHistoricalMacs'] = [canonical_mac(mac, 'protectedHistoricalMacs') for mac in historical]
     live_macs = [config['roles'][role]['mac'] for role in ROLES]
-    live_ips = [config['roles'][role]['ip'] for role in ROLES] + [config['host']]
-    if len(set(live_macs)) != len(live_macs) or len(set(live_ips)) != len(live_ips):
-        raise Refusal('live roles and host must have distinct MACs and IPs')
+    # Only these two adult roles may describe one confirmed device.
+    distinct_roles = list(ROLES)
+    if config['roles']['management'] == config['roles']['jd_adult']:
+        distinct_roles.remove('jd_adult')
+    distinct_macs = [config['roles'][role]['mac'] for role in distinct_roles]
+    live_ips = [config['roles'][role]['ip'] for role in distinct_roles] + [config['host']]
+    if len(set(distinct_macs)) != len(distinct_macs) or len(set(live_ips)) != len(live_ips):
+        raise Refusal('live roles and host must have distinct MACs and IPs except an exact management/jd_adult pair')
     if len(set(config['protectedHistoricalMacs'])) != len(historical):
         raise Refusal('protectedHistoricalMacs contains duplicates')
     if set(live_macs) & set(config['protectedHistoricalMacs']):
