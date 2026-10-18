@@ -289,7 +289,9 @@ cf_reentrant_include() {
     printf '%s\n' '{"ok":false,"deferred":true,"errors":["outer_reload_in_progress"]}'
 }
 cf_addresses() {
-    # Only current, unique attribution can authorize address-based rules/eviction.
+    # Only usable, unique bindings authorize address-based rules/eviction.
+    # IPv6 cached NUD bindings need not prove recent reachability; IPv4 keeps
+    # its existing current-lease or REACHABLE/PERMANENT requirement.
     cf_network || return 1
     cf_neigh4=$(cf_backend ip -4 neigh show dev br-lan) || return 1
     cf_neigh6=$(cf_backend ip -6 neigh show dev br-lan) || return 1
@@ -325,10 +327,10 @@ cf_addresses() {
         ip=tolower($2);if(ip6(ip))ip=canon6(ip);else if(!ip4(ip)){if($1=="N")exit 2;next}
         if($1=="L"){
             if($4!~/^(0|[1-9][0-9]*)$/||length($4)>10||$4+0>2147483647||($4!=0&&$4<=now))next
-            fresh[ip SUBSEP $3]=1
+            usable[ip SUBSEP $3]=1
         }else if($1=="N"){
             if($4!~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE)$/)next
-            if($4~/^(REACHABLE|PERMANENT)$/)fresh[ip SUBSEP $3]=1
+            if(index(ip,":")||$4~/^(REACHABLE|PERMANENT)$/)usable[ip SUBSEP $3]=1
         }else next
         if(!owner[ip SUBSEP $3]++){count[ip]++;chosen[ip]=$3}
         if(adult[$3])protectedip[ip]=$3
@@ -337,8 +339,8 @@ cf_addresses() {
     END{
         for(ip in count){
             if(protectedip[ip])print "PROTECTED\t" ip "\t" protectedip[ip]
-            if(count[ip]==1&&!router[ip]&&fresh[ip SUBSEP chosen[ip]])print ip "\t" chosen[ip]
-            if(relevant[ip]&&(count[ip]!=1||router[ip]||protectedip[ip]||!fresh[ip SUBSEP chosen[ip]])){
+            if(count[ip]==1&&!router[ip]&&usable[ip SUBSEP chosen[ip]])print ip "\t" chosen[ip]
+            if(relevant[ip]&&(count[ip]!=1||router[ip]||protectedip[ip]||!usable[ip SUBSEP chosen[ip]])){
                 for(key in owner){split(key,b,SUBSEP);if(b[1]==ip&&kid[b[2]])print "UNCERTAIN\t" ip "\t" b[2]}
             }
         }
