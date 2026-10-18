@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 from harness import run_owned_process
 
-SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py')
+SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py', 'test-penn-pilot.py')
 # Fixed public source paths bind the plan to fixtures and the entire release.
 SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.py', 'tests/fixtures/harness.py', 'tests/fixtures/backend.py',
                 'router/release.sha256', 'router/install.sh', 'router/uninstall.sh',
@@ -146,8 +146,8 @@ def verify_receipts(plan, directory):
     if not directory.is_dir() or directory.is_symlink():
         raise ValueError('receipt directory missing or unsafe')
     entries = list(directory.iterdir())
-    if len(entries) != 16:
-        raise ValueError('all 16 shard receipts are required')
+    if len(entries) != len(plan['shards']):
+        raise ValueError(f"all {len(plan['shards'])} shard receipts are required")
     expected = {(shard['suite'], shard['partition']): receipt_for(plan, shard, 0)
                 for shard in plan['shards']}
     seen = set()
@@ -163,7 +163,7 @@ def verify_receipts(plan, directory):
         seen.add(key)
     if seen != set(expected):
         raise ValueError('missing coverage partition')
-    print('PASS: all 16 nonempty shards prove complete duplicate-free case coverage', flush=True)
+    print(f"PASS: all {len(plan['shards'])} nonempty shards prove complete duplicate-free case coverage", flush=True)
 
 
 def selection(argv):

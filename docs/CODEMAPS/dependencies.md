@@ -9,7 +9,7 @@ Dev/CI-only: python3 (fixture runners, tools/), busybox, shellcheck.
 
 CI (.github/workflows/ci.yml, "isolated-project-checks"):
 1. preflight: installer recovery/adapter/probe/static checks, publish fixture plan.
-2. matrix: 16 bounded fixture partitions (python tests/run-fixtures.py), shard receipts.
-3. gate: require preflight + all matrix; verify 16 unique partitions match source discovery.
+2. matrix: 20 bounded fixture partitions (python tests/run-fixtures.py), shard receipts.
+3. gate: require preflight + all matrix; verify 20 unique partitions match source discovery.
 4. node job: `npm ci`, `npm run typecheck && npm run test:service`, playwright chromium, `npm run test:web`.
 Tests: tests/test-*.py (router fixtures), service/tests + shared/tests (node --test), web/tests.

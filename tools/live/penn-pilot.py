@@ -77,6 +77,12 @@ DNS_PROBE_NAME = 'example.com'
 # Predeclared, disclosed and digest-bound. Every pause is timed (--until).
 TIMING = {'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds': 20,
           'expirySeconds': 120, 'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5,
+          # Read-only status re-reads at ENROLL and after expiry wait out the transient drift a LAN
+          # neighbor change after the last confirm causes (cron `cfctl expire` re-confirms every minute).
+          # 45 s (re-reads admitted until 44 s, leaving 1 s for date granularity and hashing forks)
+          # outlasts one probe iteration (40 s), so one re-read always waits through the next cron
+          # minute, and keeps two devices with SCOPE at the 3600 s remoteTimeoutSeconds cap.
+          'statusSettleSeconds': 45,
           'safeBandStart': 15, 'safeBandEnd': 45, 'dnsMarginCs': 150, 'rttMarginMs': 500,
           'premutationBudgetSeconds': 360}
 HOST_PROBE = {'intervalSeconds': 15, 'samples': 3, 'timeoutSeconds': 2, 'dnsMarginMs': 1500,
@@ -126,20 +132,32 @@ def iteration_worst_seconds(timing):
     return PROBE_ITERATION_SECONDS + max(timing['pollSeconds'], timing['expiryPollSeconds'])
 
 
+def status_settle_worst_seconds(timing):
+    """Extra worst case of one settled status gate beyond its first `cfctl status` call.
+
+    The first attempt's neighbor read, the settle window, then one attempt admitted at least one second
+    before the window closes (that second absorbs 1 s clock granularity and the neighbor-hash forks): a
+    full cfctl call (safe-band wait + allowance) and its neighbor read."""
+    return (READ_TIMEOUT_SECONDS + timing['statusSettleSeconds'] + READ_TIMEOUT_SECONDS
+            + SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS)
+
+
 def phase_worst_seconds(timing, devices=1, scope=False):
     """Worst case of each post-install phase, as the remote script budgets it."""
     call = SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS
     snap, read, iteration = COUNTERS_WORST_SECONDS, READ_TIMEOUT_SECONDS, iteration_worst_seconds(timing)
+    settle = status_settle_worst_seconds(timing)
     phases = {
-        # rpc-status, rpc-sync, status (two devices: rpc-activity); counters enrolled
-        'ENROLL': (3 + (devices > 1)) * call + snap,
+        # rpc-status, rpc-sync, status and its settle (two devices: rpc-activity); counters enrolled
+        'ENROLL': (3 + (devices > 1)) * call + settle + snap,
         # counters prepause, pause, kernel read, counters pause0, observe, counters pause1
         'PAUSE': snap + call + read + snap + timing['pauseObserveSeconds'] + iteration + snap,
         # resume, kernel read, counters resume0, observe, counters resume1
         'RESUME': call + read + snap + timing['resumeObserveSeconds'] + iteration + snap,
-        # pause (extended by up to one cfctl allowance), wait until expiry plus tolerance, counters expired, status
+        # pause (extended by up to one cfctl allowance), wait until expiry plus tolerance, counters expired,
+        # status and its settle
         'EXPIRY': (call + timing['expirySeconds'] + CFCTL_ALLOWANCE_SECONDS + timing['expiryToleranceSeconds']
-                   + iteration + snap + call),
+                   + iteration + snap + call + settle),
         # counters final
         'DNS': snap,
     }
@@ -272,7 +290,7 @@ def build_payload(config, commit, blobs, timing):
               'CFP_PAUSE_SECONDS': timing['pauseSeconds'], 'CFP_PAUSE_OBSERVE': timing['pauseObserveSeconds'],
               'CFP_RESUME_OBSERVE': timing['resumeObserveSeconds'], 'CFP_EXPIRY_SECONDS': timing['expirySeconds'],
               'CFP_EXPIRY_TOLERANCE': timing['expiryToleranceSeconds'], 'CFP_POLL': timing['pollSeconds'],
-              'CFP_EXPIRY_POLL': timing['expiryPollSeconds'],
+              'CFP_EXPIRY_POLL': timing['expiryPollSeconds'], 'CFP_STATUS_SETTLE': timing['statusSettleSeconds'],
               'CFP_SAFE_BAND': f"{timing['safeBandStart']} {timing['safeBandEnd']}",
               'CFP_DNS_MARGIN_CS': timing['dnsMarginCs'], 'CFP_RTT_MARGIN_MS': timing['rttMarginMs'],
               'CFP_PREMUTATION_BUDGET': timing['premutationBudgetSeconds'],

@@ -44,7 +44,7 @@ Host `sh -n` alone is not ash proof: `tests/run.sh` reports `PENDING` when BusyB
 
 **Service and web.** `npm ci && npm run typecheck && npm run test:service`, then `npx playwright install chromium && npm run test:web`. This is the CI `local-demo` job.
 
-**Router fixtures.** The four large suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`) are slow. CI splits each into 4 partitions (16 shards) and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
+**Router fixtures.** The five large suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`, `test-penn-pilot.py`) are slow. CI splits each into 4 partitions (20 shards) and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
 
 ```sh
 export CF_TEST_SHELL="busybox ash" CF_TEST_AWK="busybox awk" CF_TEST_TIMEOUT="busybox timeout" CF_TEST_WORKERS=1
@@ -55,7 +55,7 @@ python3 tests/run-fixtures.py --shard test-core.py --partition 0 --plan "$PRIVAT
 python3 tests/run-fixtures.py --verify-receipts "$PRIVATE_DIR/receipts" --plan "$PRIVATE_DIR/plan.json"
 ```
 
-`--shard` takes one of the four suites and `--partition` 0 to 3. A lane that skips a case is a failure. Smaller suites (`test-install.py`, `test-no-dev-stdin.py`, `test-platform-integration.py`, `test-os-trust.py`, `test-client-probe.py`, `test-live-rehearsal.py`, `test-penn-pilot.py`) run directly with `python3 tests/<name>.py`.
+`--shard` takes one of the five suites and `--partition` 0 to 3. A lane that skips a case is a failure. Smaller suites (`test-install.py`, `test-no-dev-stdin.py`, `test-platform-integration.py`, `test-os-trust.py`, `test-client-probe.py`, `test-live-rehearsal.py`) run directly with `python3 tests/<name>.py`.
 
 **TMPDIR.** Fixtures and the integration service require private roots. A path whose ancestors are symlinks or writable by other users (without the sticky bit, owned by root) is refused with `unsafe_private_ancestor`. Point `TMPDIR` at a directory under your home that only you can write, mode 0700, and keep evidence and manifests there, never in the repository.
 
