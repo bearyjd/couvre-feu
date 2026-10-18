@@ -34,6 +34,6 @@
   <text x="588" y="374" font-family="Cantarell, 'Segoe UI', 'Noto Sans', sans-serif" font-size="28" fill="#AEB9D6">Pause and schedule kids' internet at the router</text>
   <rect x="588" y="402" width="652" height="2" rx="1" fill="#1D99F3" opacity="0.40"/>
   <text x="588" y="446" font-family="'Fira Code', 'DejaVu Sans Mono', ui-monospace, monospace" font-size="25" fill="#6E7A9C">github.com/bearyjd/couvre-feu</text>
-  <text x="588" y="486" font-family="Cantarell, 'Segoe UI', 'Noto Sans', sans-serif" font-size="22" fill="#52607F">Router-enforced · Passkey parent app · Self-hosted AGPL</text>
+  <text x="588" y="486" font-family="Cantarell, 'Segoe UI', 'Noto Sans', sans-serif" font-size="22" fill="#52607F">Router-side · Passkey parent app · Pre-release · AGPL</text>
   </g>
 </svg>
