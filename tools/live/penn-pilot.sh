@@ -227,18 +227,23 @@ cfp_identity_device() {
 # Bounded refresh probe of one child device before its freshness check: two
 # ICMP echoes from the router (the BusyBox ping flags cfp_ping already uses)
 # make the kernel re-resolve the neighbor, turning an idle Wi-Fi device's STALE
-# entry REACHABLE when it answers ARP. A network probe only: no router state is
-# written, and a device that stays stale is still refused.
+# entry REACHABLE when it answers ARP. A failed probe may itself move STALE to
+# DELAY, so it cannot establish freshness: only an already-fresh device may
+# ignore probe failure. A network probe only: no router state is written.
 cfp_refresh_probe() {
+    cfp_rp_fresh=0
+    cfr_neighbor "$2" "$3" "$CFP_FRESH_STATES" "$CFP_DIR/identity.neigh" && cfp_rp_fresh=1
     cfr_info "identity refresh_probe $1 ping_count=2 network_probe_only"
-    timeout -s KILL 5 ping -c 2 -W 1 -q "$2" >/dev/null 2>&1 </dev/null || :
+    timeout -s KILL 5 ping -c 2 -W 1 -q "$2" >/dev/null 2>&1 </dev/null ||
+        [ "$cfp_rp_fresh" = 1 ] || cfr_refuse IDENTITY "${1}_not_fresh"
 }
 cfp_identity() {
     for cfp_tool in ping timeout; do
         command -v "$cfp_tool" >/dev/null 2>&1 || cfr_refuse IDENTITY "missing_tool $cfp_tool"
     done
-    cfp_refresh_probe penn_child "$CFR_PENN_IP"
-    [ -z "$CFP_PENN2_MAC" ] || cfp_refresh_probe penn_child_2 "$CFP_PENN2_IP"
+    ip -4 neigh show dev br-lan > "$CFP_DIR/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
+    cfp_refresh_probe penn_child "$CFR_PENN_IP" "$CFR_PENN_MAC"
+    [ -z "$CFP_PENN2_MAC" ] || cfp_refresh_probe penn_child_2 "$CFP_PENN2_IP" "$CFP_PENN2_MAC"
     ip -4 neigh show dev br-lan > "$CFP_DIR/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
     if [ ! -f "$CFR_LEASES" ] || [ -L "$CFR_LEASES" ]; then cfr_refuse IDENTITY leases_unavailable; fi
     # shellcheck disable=SC2086
@@ -415,7 +420,8 @@ cfp_neigh_evidence() {
 # Read-only status gate: $1 phase, $2 its stop reason, $3 expected revision,
 # then wanted substrings. A drift-only read (cfp_status_transient) is re-read
 # every CFP_POLL seconds, with the budget and adult-probe checks, until it
-# passes or CFP_STATUS_SETTLE seconds after the first read; cron `cfctl expire`
+# passes at the expected revision or CFP_STATUS_SETTLE seconds after the first
+# read; cron `cfctl expire`
 # re-confirms every minute. Only `cfctl status` runs here: no rpc-sync or other
 # mutating call is retried. Each neighbor snapshot follows its status read.
 # Worst case after the first read: its neighbor read, the window, plus one
@@ -433,7 +439,8 @@ cfp_status_settle() {
         cfp_ss_now=$(cfp_now)
         [ -n "$cfp_ss_now" ] || cfp_stop "$cfp_ss_phase" clock_unavailable
         cfp_ss_log="status_settle $cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
-        if cfp_status_has "$CFP_DIR/status.json" "$@"; then
+        if cfp_status_has "$CFP_DIR/status.json" "\"desiredRevision\":$cfp_ss_rev," \
+            "\"confirmedRevision\":$cfp_ss_rev," "$@"; then
             cfr_info "$cfp_ss_log"
             [ "$cfp_ss_n" = 1 ] || cfr_out "MEASURE status_settle measured settled_after_drift phase=$cfp_ss_phase attempts=$cfp_ss_n waited_s=$((cfp_ss_now - cfp_ss_t0))"
             return 0

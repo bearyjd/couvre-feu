@@ -523,11 +523,56 @@ class PilotPlanTests(PilotBase):
         self.assertEqual(neigh, ['INFO status_settle_neigh ENROLL attempt=1 salt_unavailable',
                                  'INFO status_settle_neigh ENROLL attempt=2 salt_unavailable'], out)
 
+    def test_refresh_probe_requires_reply_to_establish_new_freshness(self):
+        rehearsal = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        neighbor = rehearsal[rehearsal.index('cfr_neighbor() {'):].split('\n}\n', 1)[0] + '\n}\n'
+        for state in ('STALE', 'REACHABLE', 'DELAY'):
+            for probe_succeeds in (False, True):
+                with self.subTest(state=state, probe_succeeds=probe_succeeds):
+                    body = (neighbor + f'CFP_DIR={shlex.quote(str(self.work))}\n'
+                            f'printf "%s\\n" "{PENN["ip"]} lladdr {PENN["mac"]} {state}" > "$CFP_DIR/identity.neigh"\n'
+                            'cfr_refuse() { printf "REFUSE %s %s\\n" "$1" "$2"; exit 21; }\n'
+                            'timeout() { '
+                            f'printf "%s\\n" "{PENN["ip"]} lladdr {PENN["mac"]} DELAY" > "$CFP_DIR/identity.neigh"; '
+                            f'return {0 if probe_succeeds else 1}; }}\n'
+                            f'cfp_refresh_probe penn_child {PENN["ip"]} {PENN["mac"]}\necho admitted\n')
+                    code, out = self.pilot_shell(body)
+                    if state == 'STALE' and not probe_succeeds:
+                        self.assertEqual((code, out), (21, 'REFUSE IDENTITY penn_child_not_fresh\n'))
+                    else:
+                        self.assertEqual((code, out), (0, 'admitted\n'))
+
     def test_status_settle_first_read_pass_emits_no_measure(self):
         code, out, calls = self.settle([self.status_line()])
         self.assertEqual(code, 0, out)
         self.assertIn('INFO status_settle ENROLL attempts=1 waited_s=0', out)
         self.assertNotIn('MEASURE status_settle', out)
+
+    def test_status_settle_rejects_clean_status_at_other_revisions(self):
+        cases = {'confirmed_null': (1, 'null'),
+                 'desired_null': ('null', 1),
+                 'confirmed_stale': (1, 0),
+                 'desired_stale': (0, 1),
+                 'confirmed_ahead': (1, 2),
+                 'desired_ahead': (2, 1),
+                 'both_stale': (0, 0),
+                 'both_ahead': (2, 2),
+                 'both_null': ('null', 'null'),
+                 'revision_prefix': (10, 10)}
+        for name, (desired, confirmed) in cases.items():
+            for after_drift in (False, True):
+                with self.subTest(name=name, after_drift=after_drift):
+                    replies = [self.status_line(drift=True)] if after_drift else []
+                    replies += [self.status_line(desired=desired, confirmed=confirmed), self.status_line()]
+                    code, out, calls = self.settle(replies)
+                    attempts = 2 if after_drift else 1
+                    waited = 15 if after_drift else 0
+                    self.assertEqual((code, out.splitlines()[-1]), (20, 'STOP ENROLL penn_not_observed'), out)
+                    self.assertEqual([c for c in calls if c.startswith('cfctl')], ['cfctl status --json'] * attempts)
+                    self.assertEqual(calls.count('probe'), int(after_drift))
+                    self.assertIn(f'INFO status_settle ENROLL attempts={attempts} waited_s={waited} not_transient', out)
+                    self.assertNotIn('MEASURE status_settle', out)
+                    self.assertNotIn('settled', out.splitlines())
 
     def test_status_settle_gives_up_after_budget_and_stops_with_gate_reason(self):
         code, out, calls = self.settle([self.status_line(drift=True)] * 20)
@@ -1198,7 +1243,7 @@ class PilotFixtureTests(PilotBase):
                             for line in stdout))
         self.assertFalse(any(line.startswith('INFO status_settle_neigh ENROLL attempt=2') for line in stdout))
 
-    def stale_penn_refreshed_by_probe(self, refreshes):
+    def stale_penn_refreshed_by_probe(self, refreshes, probe_succeeds=True, refreshed_state='REACHABLE'):
         """Penn arrives STALE; the `ping` double logs its targets and, if `refreshes`, the `ip` double then
         reports Penn's row REACHABLE (as the kernel does once the device answers ARP)."""
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
@@ -1208,11 +1253,24 @@ class PilotFixtureTests(PilotBase):
         ping = (self.rbin / 'ping').read_text().split('\n', 1)[1]
         self.router_double('ping', f'echo "$*" >> {q(str(self.ping_log))}\n'
                            + (f'case " $* " in *" {PENN["ip"]} "*) : > {q(str(flag))};; esac\n' if refreshes else '')
+                           + (f'case " $* " in *" {PENN["ip"]} "*) exit 1;; esac\n' if not probe_succeeds else '')
                            + ping)
         self.router_double('ip', f'out=$({q(str(self.fixture.bin / "ip"))} "$@") || exit $?\n'
                            f'if [ -e {q(str(flag))} ]; then printf "%s\\n" "$out" | '
-                           f'sed {q("s/^" + PENN["ip"].replace(".", "[.]") + " \\(.*\\) STALE$/" + PENN["ip"] + " \\1 REACHABLE/")}\n'
+                           f'sed {q("s/^" + PENN["ip"].replace(".", "[.]") + " \\(.*\\) STALE$/" + PENN["ip"] + " \\1 " + refreshed_state + "/")}\n'
                            'else printf "%s\\n" "$out"; fi\n')
+
+    def test_failed_refresh_probe_moving_stale_to_delay_refused_before_mutation(self):
+        # Sending alone can move STALE to DELAY; no reply means no renewed freshness evidence.
+        self.stale_penn_refreshed_by_probe(refreshes=True, probe_succeeds=False, refreshed_state='DELAY')
+        before = self.router_snapshot()
+        code, out, err = self.execute()
+        stdout = (self.evidence() / 'stdout.log').read_text().splitlines()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('PHASE IDENTITY FAIL penn_child_not_fresh', stdout)
+        self.assertEqual(self.ping_log.read_text().splitlines(), [f'-c 2 -W 1 -q {PENN["ip"]}'])
+        self.assertNotIn('MUTATION_BEGIN', stdout)
+        self.assertEqual(self.router_snapshot(), before)
 
     def test_stale_penn_not_refreshed_by_probe_refused_before_mutation(self):
         # (d) the probe ran, Penn stayed stale: the existing refusal, before any mutation.
