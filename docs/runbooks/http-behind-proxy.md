@@ -1,5 +1,7 @@
 # Runbook: plain HTTP on the LAN behind a TLS-terminating proxy (Nginx Proxy Manager)
 
+For installing the service itself (systemd, Docker, LXC) see [deploy.md](deploy.md).
+
 Use this mode when the integration service runs on one LAN host and Nginx Proxy Manager (NPM), on a **different** host, terminates TLS for the parent app. The service listens with plain HTTP on one private address and accepts TCP connections only from the proxy address(es) you list. The fictional demo is unchanged.
 
 If NPM runs on the **same** host as the service, do not use this mode: use the loopback `origin` mode (`docs/integration-004.md`), so no cleartext crosses the wire. If the service should serve TLS itself, use `docs/runbooks/lan-https.md`.

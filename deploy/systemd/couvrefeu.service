@@ -1,0 +1,55 @@
+# Couvre-feu parent app (integration mode). Install to /etc/systemd/system/.
+# Paths below are the documented defaults; keep them in sync with the private manifest.
+# See docs/runbooks/deploy.md. Do not start before the manifest, pinned known_hosts and
+# public key exist: the service refuses unsafe or missing private files.
+[Unit]
+Description=Couvre-feu parent app
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+After=network-online.target couvrefeu-agent.service
+Wants=network-online.target
+Requires=couvrefeu-agent.service
+
+[Service]
+Type=simple
+User=couvrefeu
+Group=couvrefeu
+WorkingDirectory=/opt/couvrefeu
+ExecStart=/usr/local/bin/node /opt/couvrefeu/service/src/integration-main.ts /etc/couvrefeu/manifest.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# Node closes the listener and the database on SIGTERM.
+TimeoutStopSec=30
+
+# Hardening. The source tree is read-only; the only writable path is the private data directory.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/couvrefeu
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute is intentionally absent: V8 needs writable+executable pages.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+LimitCORE=0
+TasksMax=64
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

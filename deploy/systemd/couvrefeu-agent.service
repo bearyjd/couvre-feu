@@ -1,0 +1,53 @@
+# Dedicated ssh-agent for the Couvre-feu policy service. It holds ONLY the service's
+# constrained router key; the service never reads private-key bytes. Install to
+# /etc/systemd/system/. See docs/runbooks/deploy.md.
+[Unit]
+Description=Couvre-feu dedicated ssh-agent
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+PartOf=couvrefeu.service
+
+[Service]
+Type=simple
+User=couvrefeu
+Group=couvrefeu
+# Creates /run/couvrefeu (0700, owned by couvrefeu) and removes it, with any stale socket, on stop.
+RuntimeDirectory=couvrefeu
+RuntimeDirectoryMode=0700
+UMask=0077
+# -D: stay in the foreground. The socket is created 0600 inside the private directory.
+ExecStart=/usr/bin/ssh-agent -D -a /run/couvrefeu/agent.sock
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the agent needs no network, no filesystem writes and no privileges.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+LimitCORE=0
+TasksMax=16
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

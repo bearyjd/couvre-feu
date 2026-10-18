@@ -1,0 +1,29 @@
+# Example only. Build context is the repository root.
+#   docker compose -f deploy/docker/compose.yaml up -d --build
+# Host paths are owned by uid/gid 10001 with mode 0700 (see docs/runbooks/deploy.md).
+# network_mode: host is REQUIRED for proxy mode. With bridge networking and a published port,
+# Docker's userland proxy/NAT can make every client appear as the bridge gateway, which defeats
+# `trustedProxies`. Never publish the port with `ports:` and never list a Docker gateway as a proxy.
+# Alternative: a macvlan/ipvlan network giving the container its own LAN address (<APP_IP>).
+services:
+  couvrefeu:
+    image: couvrefeu:local
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    network_mode: host
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    restart: unless-stopped
+    volumes:
+      # Private data directory (SQLite, WAL, SHM): the only writable path.
+      - /var/lib/couvrefeu:/var/lib/couvrefeu
+      # Manifest, pinned known_hosts and the service public key: read-only.
+      - /etc/couvrefeu:/etc/couvrefeu:ro
+      # Directory holding the dedicated ssh-agent socket (agent runs on the host: couvrefeu-agent.service).
+      - /run/couvrefeu:/run/couvrefeu:ro

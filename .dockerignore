@@ -1,0 +1,10 @@
+# Whitelist: the image carries only the runtime tree. There is no build step.
+*
+!package.json
+!package-lock.json
+!LICENSE
+!shared/src
+!service/src
+!service/migrations
+!web/public
+!deploy/docker/healthcheck.mjs

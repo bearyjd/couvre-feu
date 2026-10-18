@@ -1,0 +1,21 @@
+#!/usr/sbin/nft -f
+# Example host firewall for the systemd option. Replace the placeholders; never commit real values.
+# Inbound: only the TLS proxy may reach the app port. Outbound: DNS and SSH to the router only.
+# Load apt/node downloads BEFORE enabling this, or temporarily allow outbound.
+flush ruleset
+table inet couvrefeu {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ip saddr <PROXY_IP> tcp dport 4273 accept
+    }
+    chain output {
+        type filter hook output priority 0; policy drop;
+        oif lo accept
+        ct state established,related accept
+        ip daddr <ROUTER_IP> tcp dport 22 accept
+        ip daddr <DNS_IP> udp dport 53 accept
+        ip daddr <DNS_IP> tcp dport 53 accept
+    }
+}
