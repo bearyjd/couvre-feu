@@ -1528,13 +1528,14 @@ cf_clock && cf_addresses
         return result.stdout.splitlines()
 
     def test_mac_validity_checks_multicast_bit_and_accepts_locally_administered_unicast(self):
-        """Pins cf_mac_valid: it rejects multicast, so it is NOT a locally-administered test."""
+        """Pins cf_mac_valid: it rejects multicast, the all-zero MAC and uppercase hex, so it is NOT a locally-administered test."""
         script = '''CF_BASE=$CF_ROOT CF_LOCAL_TEST=1
 . "$1"
 cf_mac_valid "$2"
 '''
         for mac, valid in (("02:00:00:00:00:01", True), ("01:00:00:00:00:01", False),
-                           ("03:00:00:00:00:01", False)):
+                           ("03:00:00:00:00:01", False), ("00:00:5e:00:53:01", True),
+                           ("00:00:00:00:00:00", False), ("02:AA:BB:CC:DD:EE", False)):
             with self.subTest(mac=mac):
                 result = subprocess.run(self.fixture.shell + ["-c", script, "mac", str(REPO / "router/lib/core.sh"), mac],
                                         env=self.fixture.env, capture_output=True, text=True, timeout=20)

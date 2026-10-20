@@ -2,109 +2,211 @@
 
 Status: DRAFT, nothing here is implemented. It lets router (R) and service (S) work proceed in parallel. Router-side
 validation and service-side parsing must both reject anything outside these bounds. All MACs below are fictional.
+Line references are to this branch (`chore/m0-contracts`). A claim marked UNVERIFIED was not confirmed against code.
+
+Deploy order: service first, then router. The service parser accepts both old and new replies before any router changes.
 
 ## 1. rpc-status: optional scope fields
 
 `rpc-status` (`router/lib/rpc.sh`) gains two optional top-level fields, added in one change on both sides
-(`shared/src/router-rpc.ts` `normalizeObservation` uses a strict `object()`, so an unknown key is rejected today).
+(`shared/src/router-rpc.ts:78` `normalizeObservation` uses a strict `object()`, so an unknown key is rejected today).
 
 | field | type | rule |
 |---|---|---|
 | `scope` | string[] | canonical lowercase colon MACs, unique, strictly ascending (`LC_ALL=C`), 1..256 entries |
-| `scopeSha` | string | 64 lowercase hex, SHA-256 of the exact snapshot bytes the router validated |
+| `scopeSha` | string | 64 lowercase hex |
 
 Rules for the service parser:
-- Absent `scope` means the manifest floor, never "unbounded".
+- `scope` and `scopeSha` appear together or not at all. `scope:null` is invalid (distinct from absent).
+- The service recomputes `sha256(scope.join('\n') + '\n')` and requires it to equal `scopeSha`.
 - `scope` must contain the floor, be disjoint from `protectedMacs`, and contain every MAC in `acceptedPolicy`.
-- `scope` and `scopeSha` appear together or not at all.
-- The snapshot is taken once per call from `rpc-allowed` (private runtime dir); status and the strict validation read the
-  same bytes, so `scopeSha` describes what was checked.
+- Absent, busy or failed replies mean scope is `unknown` for alerting and audit, and only "the floor" for authorization.
+  A busy reply must never look like scope shrinkage (see `scope_changes` below).
+- `rpc-allowed` lives in `/etc/couvrefeu` (`router/lib/rpc.sh:31` reads `$CF_DIR/rpc-allowed`; `router/install.sh:200`
+  writes it). Only a per-call snapshot may live in the private runtime dir. The snapshot is UNVERIFIED: no such snapshot
+  exists in `rpc.sh` today, so the "status and validation read the same bytes" property is a router requirement, not current
+  behaviour.
 
-## 2. rpc-inventory v1 (read-only)
+## 2. rpc-inventory v1 (read-only, LOCKED format)
 
-Output of `cfctl-ssh rpc-inventory`, one JSON object, strict keys, no unknown fields:
+Exact argv: `cfctl rpc-inventory --json`. One JSON object, strict keys, no unknown fields:
 
 ```
-{"inventory_version":1,"generation":"<router generation>","routerTime":<int>,
- "devices":[{"mac":"02:00:00:00:00:01","addresses":["192.0.2.10"],"hostname":"host-a"|null,
-             "source":"lease"|"neigh"|"both","leaseExpires":<int>|null}],
- "protectedCount":<int>,"truncated":<bool>}
+{"inventory_version":1,"generation":"<64 hex>","routerTime":<int>,
+ "devices":[{"mac":"02:00:00:00:00:01","ipv4":["192.0.2.10"],"hostname":"host-a"|null,
+             "source":"lease"|"neigh"|"both"}],
+ "truncated":<bool>,"errors":["<code>"]}
 ```
 
 | field | bound |
 |---|---|
-| `devices` | <= 256 entries, canonical unicast MACs, unique, ascending |
-| `addresses` | <= 8 per device, valid IPv4/IPv6 text |
-| `hostname` | <= 63 chars, `[A-Za-z0-9._-]`, or `null` |
-| `source` | one of `lease`, `neigh`, `both` |
-| whole reply | < 131072 bytes (the existing stdout cap); over-limit sets `truncated:true` rather than growing |
+| `inventory_version` | integer 1. The service checks it BEFORE the strict key check, so a future version is "unknown version", not "bad keys" |
+| `generation` | 64 lowercase hex and equal to the configured generation |
+| `routerTime` | integer; an invalid clock gives `0` plus error `invalid_clock` |
+| `devices` | <= 256 entries, canonical unicast MACs (`cf_mac_valid`), unique, ascending |
+| `ipv4` | <= 4 per device, canonical dotted quad, sorted, unique. No IPv6, no lease expiry, no protected count |
+| `hostname` | see section 2.1 |
+| `source` | `lease`, `neigh` or `both` |
+| `truncated` | bool |
+| `errors` | <= 16 codes, each matching `^[a-z][a-z0-9_]{0,63}$` |
 
-Protected management MACs are never listed; only their count is exposed (`protectedCount`). The reader is new: the lease
-parse in `core.sh` drops the hostname field and `cf_addresses` filters to kids and protected devices.
+Size bound holds by construction: 256 devices x 4 addresses is about 51 KB, under the 131072 byte stdout cap
+(`service/src/ssh-router.ts:82`). There is no "set truncated when over the size limit" rule.
 
-### Old routers
+Scope of the listing: br-lan only. Sources are br-lan neighbours (`ip -4 neigh show dev br-lan`,
+`router/lib/core.sh:296`) and leases whose IPv4 lies in the br-lan subnet. `/tmp/dhcp.leases` covers every dnsmasq pool
+including guest (`core.sh:313-315`), so the subnet filter is required. `neigh` means state REACHABLE, PERMANENT, STALE,
+DELAY or PROBE (the set `cf_addresses` already treats as live, `core.sh:305-340`).
 
-A router without the command answers either `{"errors":["invalid_command"]}` with exit 2 (new `cfctl-ssh`, old `cfctl`),
-or empty output with exit 2 (old `cfctl-ssh` that rejects the argv). Both map to the service state
-`inventory_unavailable`. Neither is a transport failure, neither triggers dispatch backoff, and neither affects policy
-observation or operations.
+Truncation: whole devices only. Neighbour-present devices are kept before lease-only ones, and kid MACs first. The service
+must not infer "gone" or "New" from a truncated reply.
+
+Refusal body: the same keys with `devices` empty, mirroring `cf_activity_refuse` (`router/lib/activity.sh:248-251`),
+which carries the error code in `errors`. An invalid clock yields `routerTime:0` and `invalid_clock`.
+
+Protected management MACs are never listed. The reader is new: the lease parse in `core.sh:315` is
+`awk 'NF>=3{print "L\t" $3 "\t" tolower($2) "\t" $1}'`, which drops field 4 (hostname) (VERIFIED), and `cf_addresses`
+emits only kid and protected bindings (VERIFIED, `core.sh:341-345`).
+
+### 2.1 Hostnames
+
+- The router maps dnsmasq `*` or empty to `null`. Any character outside `[A-Za-z0-9._-]`, length > 63, or a first
+  character that is not alphanumeric gives `null`. REJECT, never strip.
+- The service validates again with `parseJSON(text, true, ...)` and rejects the WHOLE reply on any violation.
+- One shared sanitiser is used for both inventory hostnames and scope-preview terminal output.
+- The UI renders with `textContent` only, labelled "name reported by device". Hostnames are never identity, never in
+  alerts, audit rows or logs. Any alert text defangs dots.
+
+### 2.2 Old routers and errors
+
+Anything other than a valid v1 reply gives `inventory_unavailable:<code>`, stored ONLY in `inventory_state`, NEVER in
+`integration_state.observation_error`, and never thrown out of the dispatch cycle. Accepted old-router outcomes:
+
+| case | observable | verified at |
+|---|---|---|
+| new `cfctl-ssh`, old `cfctl` | exactly `{"ok":false,"errors":["invalid_command"]}`, exit 2 | `router/lib/core.sh:572,574` |
+| old `cfctl-ssh` | empty stdout, exit 2 (silent `exit 2`) | `router/cfctl-ssh:35` (`--rpc-only`), `:58` (default arm) |
+| transport error, empty output, unknown version, parse failure | any | service side |
+
+Exit code problem: `boundedChild` (`service/src/ssh-router.ts:60`, close handler `:91`) drops the exit code. A nonzero exit
+with empty output becomes `ssh_exit_failed`, indistinguishable from ssh's own 255 (host-key mismatch, auth failure). The
+change must surface the exit code (e.g. on `RouterTransportError`) so exit 2 maps to "old router" and 255 is NOT hidden as
+"unavailable". With `allowNonzeroOutput=true` (`ssh-router.ts:55`) the invalid_command body reaches the parser today, and the
+parser must map it to `inventory_unavailable:invalid_command`.
+
+Execution model:
+- Inventory runs inside the existing single dispatch loop, at the start of `cycle()`, only when no operation is active.
+- Own 8 s deadline, modelled on `runActivity` (`service/src/integration-worker.ts:134-152`).
+- New automatic permit kind: `executeAutomatic` refuses `'activity'` today (`integration-worker.ts:71`). Note `runActivity`
+  sets `dispatch_stopped=1` after a poll (`:150`); inventory is automatic and must not.
+- Admin refresh only sets `refresh_requested_at` (1 per 10 s across admins; 409 when dispatch is off). It never opens SSH.
+- Inventory failure never triggers dispatch backoff and never affects policy observation or operations.
+
+### 2.3 cfctl-ssh and cfctl grammar edits
+
+- `router/cfctl-ssh:35`: append `|rpc-inventory` to the `--rpc-only` allowlist.
+- `router/cfctl-ssh:46`: add `rpc-inventory` to the `status|activity|rpc-activity` arm (`[ "$#" = 2 ] && [ "$2" = --json ]`).
+- `router/lib/core.sh:565`: add `rpc-inventory` to the `activity|rpc-activity` arm.
 
 ## 3. Receipt semantics the service relies on
 
 A `null` receipt for the service's own attempted operation is "unknown" (`receipt_missing_remote_outcome_unknown`), not
-success and not failed, unless the router's own pre-write refusal is proven (`service/src/integration-worker.ts`
-`refusedBeforeWrite`). The router will evict the oldest receipt beyond 128, so absence can no longer imply "never applied".
+success and not failed, unless the router's own pre-write refusal is proven (`integration-worker.ts:207`
+`refusedBeforeWrite`). Today the router REFUSES new changes at 128 receipts (`router/lib/rpc.sh:109`
+`receipt_capacity`). Labelling eviction is a ROUTER-SIDE CHANGE: evict the oldest, never the current receipt, in the same
+metadata write. After it, absence can no longer imply "never applied". Tests: `service/tests/integration-worker.test.ts`.
 
 ## 4. integration-004 DDL (DRAFT)
 
-One forward-only migration owns all Tier-1 schema (plan D1), applied by `IntegrationStore` after integration-003 using the
-same detect-by-`sqlite_master` pattern and `PRAGMA foreign_keys=OFF` + `foreign_key_check` for the `operations` rebuild.
-Conventions followed: `STRICT` tables, `CHECK` enums, integer epoch seconds, text ids.
+Placement: integration migrations (`service/migrations/integration-NNN.sql`, applied by `IntegrationStore`,
+`service/src/integration-db.ts:50-62`) are a separate chain from the main chain (`001`..`008`). 004 needs main migration
+008 (`people`) to have run first, because `scope_requests.person_id` references `people(id)`.
+
+Detection: one marker for 004. Run it unless `operations` sql contains `'pause_all'` AND `dispatch_steps` sql contains
+`'inventory'` (both from `sqlite_master`; 003 detects `"'enroll'"`, `integration-db.ts:57`). Rebuilds: `operations` follows
+003's `_next` pattern; `dispatch_steps` follows integration-002's RENAME-to-`_v1` pattern. Set `PRAGMA foreign_keys=OFF`
+OUTSIDE the transaction (a no-op inside), then `PRAGMA foreign_key_check` before commit. Never rename a parent table away
+first: SQLite >= 3.26 rewrites child FK references to the renamed name. Always create `X_next`, copy, drop `X`, rename.
+`INSERT ... SELECT` uses explicit column lists. Conventions: `STRICT`, `CHECK` enums, integer epoch seconds, text ids.
 
 ```sql
--- 1. operations.action: add pause_all, resume_all, move (rebuild like integration-003; columns unchanged).
-CREATE TABLE operations_next (
- id TEXT PRIMARY KEY, actor_id TEXT NOT NULL REFERENCES accounts(id), person_id TEXT NOT NULL,
- action TEXT NOT NULL CHECK(action IN ('pause','resume','enroll','unenroll','pause_all','resume_all','move')),
- revision INTEGER NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('pending','confirmed','unknown','failed','conflict')),
- payload_json TEXT NOT NULL, base_json TEXT NOT NULL, request_json TEXT NOT NULL, idempotency_key TEXT NOT NULL,
- created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, error TEXT, confirmed_at INTEGER,
- UNIQUE(actor_id,idempotency_key)
-) STRICT;
-INSERT INTO operations_next SELECT * FROM operations;
-DROP TABLE operations;
-ALTER TABLE operations_next RENAME TO operations;
+-- 1. operations: add pause_all, resume_all, move (columns unchanged; explicit lists).
+CREATE TABLE operations_next ( ...same as integration-003..., action TEXT NOT NULL CHECK(action IN
+ ('pause','resume','enroll','unenroll','pause_all','resume_all','move')), ... ) STRICT;
+INSERT INTO operations_next(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,
+ idempotency_key,created_at,updated_at,error,confirmed_at)
+ SELECT id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,
+ idempotency_key,created_at,updated_at,error,confirmed_at FROM operations;
+DROP TABLE operations; ALTER TABLE operations_next RENAME TO operations;
 
--- 2. Multi-person operations (pause_all/resume_all/move): person_id above holds a representative or '*'.
+-- 2. operation_people is the AUTHORITY for multi-child operations (operations.person_id is a representative only).
 CREATE TABLE operation_people (
- operation_id TEXT NOT NULL REFERENCES operations(id), person_id TEXT NOT NULL,
- PRIMARY KEY(operation_id,person_id)
-) STRICT;
+ operation_id TEXT NOT NULL REFERENCES operations(id), person_id TEXT NOT NULL REFERENCES people(id),
+ PRIMARY KEY(operation_id,person_id)) STRICT;
+-- Every pause_all/resume_all/move operation has >= 1 row.
 
--- 3. dispatch_steps.kind: add 'inventory' (rebuild like integration-002, copy rows, recreate dispatch_live_claims).
---    kind CHECK becomes IN ('observe','apply','receipt','activity','inventory').
+-- 3. dispatch_steps: kind IN ('observe','apply','receipt','activity','inventory') via the 002 RENAME-to-_v1 pattern;
+--    recreate dispatch_live_claims.
+-- 4. automatic_read_summary: kind CHECK IN ('observe','receipt') is created by CREATE TABLE IF NOT EXISTS
+--    (integration-db.ts:78), so existing DBs keep the narrow CHECK. 004 rebuilds it (_next, copy, drop, rename) with
+--    kind IN ('observe','receipt','inventory').
 
--- 4. Pending router-scope requests raised when a device is outside the router scope.
+-- 5. Scope requests (kept after resolution for audit).
 CREATE TABLE scope_requests (
  id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES people(id),
- mac TEXT NOT NULL, requested_by TEXT NOT NULL REFERENCES accounts(id),
+ mac TEXT NOT NULL CHECK(length(mac)=17 AND mac GLOB '[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]'),
+ requested_by TEXT NOT NULL REFERENCES accounts(id),
  state TEXT NOT NULL CHECK(state IN ('pending','observed','expired','cancelled')),
- scope_sha_before TEXT CHECK(scope_sha_before IS NULL OR length(scope_sha_before)=64),
- scope_sha_after TEXT CHECK(scope_sha_after IS NULL OR length(scope_sha_after)=64),
- created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL CHECK(expires_at>created_at),
- UNIQUE(person_id,mac)
-) STRICT;
+ scope_sha_before TEXT CHECK(scope_sha_before IS NULL OR (length(scope_sha_before)=64 AND scope_sha_before NOT GLOB '*[^0-9a-f]*')),
+ scope_sha_after  TEXT CHECK(scope_sha_after  IS NULL OR (length(scope_sha_after)=64  AND scope_sha_after  NOT GLOB '*[^0-9a-f]*')),
+ generation TEXT NOT NULL, created_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL CHECK(expires_at>created_at AND expires_at<=created_at+604800),
+ resolved_at INTEGER, resolved_by TEXT REFERENCES accounts(id)) STRICT;
+CREATE UNIQUE INDEX scope_requests_pending ON scope_requests(mac) WHERE state='pending';
 CREATE INDEX scope_requests_person ON scope_requests(person_id,state);
--- Application rules: at most 4 pending per child; expiry 7 days; MAC canonical unicast.
+-- Application rule: at most 4 pending per child. No UNIQUE(person_id,mac): resolved rows stay.
 
--- 5. Last inventory snapshot (silent baseline on first successful poll).
+-- 6. Router scope observation, so growth/removal and growth while the service was down are recorded and alertable.
+CREATE TABLE router_scope_observed (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ scope_sha TEXT NOT NULL, observed_at INTEGER NOT NULL) STRICT;
+CREATE TABLE scope_changes (id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, sha_before TEXT, sha_after TEXT NOT NULL,
+ added_json TEXT NOT NULL, removed_json TEXT NOT NULL, matched_request_id TEXT REFERENCES scope_requests(id)) STRICT;
+-- matched_request_id NULL means unmatched growth/removal: alertable.
+
+-- 7. Inventory snapshot, scoped by generation.
 CREATE TABLE inventory_devices (
- mac TEXT PRIMARY KEY, addresses_json TEXT NOT NULL, hostname TEXT,
- source TEXT NOT NULL CHECK(source IN ('lease','neigh','both')), lease_expires INTEGER,
- first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged IN (0,1))
-) STRICT;
+ generation TEXT NOT NULL, mac TEXT NOT NULL CHECK(length(mac)=17 AND mac GLOB '[0-9a-f][0-9a-f]:*'),
+ ipv4_json TEXT NOT NULL CHECK(json_valid(ipv4_json) AND json_array_length(ipv4_json)<=4),
+ hostname TEXT CHECK(hostname IS NULL OR (length(hostname)<=63 AND hostname NOT GLOB '*[^A-Za-z0-9._-]*')),
+ source TEXT NOT NULL CHECK(source IN ('lease','neigh','both')),
+ first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+ acknowledged_at INTEGER, acknowledged_by TEXT REFERENCES accounts(id),
+ PRIMARY KEY(generation,mac)) STRICT;
+-- Row cap 1024 per generation. Retention 30 days default, configurable up to 90 (cf. activity-store.ts:11-12, which
+-- uses DEFAULT_RETENTION_DAYS=30 and MAX_RETENTION_DAYS=365). last_seen advances only for source neigh or both.
+
+-- 8. Inventory state singleton.
+CREATE TABLE inventory_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ baseline_at INTEGER, last_ok_at INTEGER, last_error TEXT, refresh_requested_at INTEGER,
+ alert_day_start INTEGER, alert_day_count INTEGER NOT NULL DEFAULT 0, last_alert_at INTEGER) STRICT;
 ```
 
-Open points: the exact `person_id` value for multi-person operations, and whether `acknowledged` belongs in
-`inventory_devices` or an audit-only record, are decided in M2a/M2c.
+Required code changes for `operation_people` (not in M0): `integration-worker.ts:95` currently checks only
+`actor.person_ids.includes(op.person_id)`, so the actor must instead be authorized for EVERY `operation_people` row at
+dispatch; visibility (`service/src/integration-policy.ts:57`, `:129`) becomes "any row".
+
+## 5. Flags and alerts
+
+- Baseline and alerts come only from a COMPLETE poll (no `errors`, not `truncated`).
+- Re-baseline silently when the store is empty or `last_ok_at` is older than retention.
+- "New" = unacknowledged and first seen after the baseline.
+- Alerts are coalesced: 1 per poll, <= 1 per hour per admin, <= 12 per day.
+- "Private address" = locally-administered bit (second hex digit of the first octet in `2367abef`). A hint only, never a
+  gate. Pinned by `tests/test-core.py` (`cf_mac_valid` itself does NOT test this bit; it checks unicast, `core.sh:56-59`).
+- MAC rotation is never merged, transferred or used to suppress an alert.
+- Tap-to-assign warns: "confirm in the device's Wi-Fi settings".
+
+## 6. Open points
+
+Exact `operations.person_id` representative value for multi-child operations, and the alert settings UI, are decided in
+M2a/M2c.

@@ -224,13 +224,24 @@ test('a refusal that is not provably pre-write stays unknown, never failed', asy
     unknown(await refusedApply('rpc_scope_overlap', o => ({...o, errors: []})), 'no errors');
 });
 // M0 pin (tier1 plan, receipt eviction): a null receipt for the service's own attempted operation is never success and never
-// provably failed. Receipts may later be evicted by the router, so absence must settle as unknown and keep the operation active.
-test('null receipt for our own attempted operation is unknown, never confirmed or failed', async () => {
-    for (const [label, transform] of [
-        ['clean reply, no errors', (o: any) => ({...o, errors: [], receipt: null})],
-    ] as const) {
-        const r = await refusedApply('rpc_scope_overlap', transform);
-        assert.equal(r.op.state, 'unknown', label); assert.equal(r.op.error, 'receipt_missing_remote_outcome_unknown', label);
-        assert.equal(r.op.accepted, false, label); assert.equal(r.active, r.id, label);
-    }
+// provably failed. The router will evict receipts, so absence must settle as unknown and keep the operation active.
+test('apply reply with a null receipt and a non-pre-write error is unknown, never confirmed', async () => {
+    const r = await refusedApply('apply_failed', o => ({...o, errors: ['apply_failed'], receipt: null}));
+    assert.equal(r.op.state, 'unknown'); assert.equal(r.op.error, 'receipt_missing_remote_outcome_unknown');
+    assert.equal(r.op.accepted, false); assert.equal(r.op.confirmedAt, null); assert.equal(r.active, r.id);
+});
+test('receipt poll returning null after eviction while policy moved on is unknown, not success', async () => {
+    const f = integrationFixture();
+    try {
+        await f.observe(); const id = f.pause(f.now() + 60).result.operation.id, plan = f.worker.prepare('apply', id);
+        f.router.afterApplyFailure = new RouterTransportError('test_lost_response');
+        await f.worker.execute(plan, plan.scriptSha256);
+        assert.equal(f.policy.operation(actor, id).state, 'unknown');
+        f.router.afterApplyFailure = null; f.router.policy = {...f.router.policy, revision: 2, pauses: []};
+        f.router.transform = o => ({...o, receipt: null}); f.advance(70);
+        const receipt = f.worker.prepare('receipt', id); await f.worker.execute(receipt, receipt.scriptSha256);
+        const op = f.policy.operation(actor, id);
+        assert.equal(op.state, 'unknown'); assert.equal(op.accepted, false); assert.equal(op.confirmedAt, null);
+        assert.equal(f.store.integrationState().active_operation_id, id);
+    } finally { f.cleanup(); }
 });
