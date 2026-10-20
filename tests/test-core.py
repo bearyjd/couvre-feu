@@ -1527,6 +1527,19 @@ cf_clock && cf_addresses
         self.assertEqual(self.fixture.mutation_calls(), [])
         return result.stdout.splitlines()
 
+    def test_mac_validity_checks_multicast_bit_and_accepts_locally_administered_unicast(self):
+        """Pins cf_mac_valid: it rejects multicast, so it is NOT a locally-administered test."""
+        script = '''CF_BASE=$CF_ROOT CF_LOCAL_TEST=1
+. "$1"
+cf_mac_valid "$2"
+'''
+        for mac, valid in (("02:00:00:00:00:01", True), ("01:00:00:00:00:01", False),
+                           ("03:00:00:00:00:01", False)):
+            with self.subTest(mac=mac):
+                result = subprocess.run(self.fixture.shell + ["-c", script, "mac", str(REPO / "router/lib/core.sh"), mac],
+                                        env=self.fixture.env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode == 0, valid, result.stdout + result.stderr)
+
     def test_all_valid_ipv6_states_have_identical_canonical_unique_bindings(self):
         reference = self.addresses()
         original = self.fixture.backend()["neighbors"]

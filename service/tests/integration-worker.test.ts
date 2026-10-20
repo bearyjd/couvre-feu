@@ -223,3 +223,14 @@ test('a refusal that is not provably pre-write stays unknown, never failed', asy
     unknown(await refusedApply('rpc_scope_overlap', o => ({...o, receipt: {operationId: 'op_other', requestDigest: 'a'.repeat(64), baseRevision: 0, baseDigest: 'b'.repeat(64), acceptedRevision: 1, acceptedDigest: 'c'.repeat(64), outcome: 'accepted', current: false}})), 'receipt present');
     unknown(await refusedApply('rpc_scope_overlap', o => ({...o, errors: []})), 'no errors');
 });
+// M0 pin (tier1 plan, receipt eviction): a null receipt for the service's own attempted operation is never success and never
+// provably failed. Receipts may later be evicted by the router, so absence must settle as unknown and keep the operation active.
+test('null receipt for our own attempted operation is unknown, never confirmed or failed', async () => {
+    for (const [label, transform] of [
+        ['clean reply, no errors', (o: any) => ({...o, errors: [], receipt: null})],
+    ] as const) {
+        const r = await refusedApply('rpc_scope_overlap', transform);
+        assert.equal(r.op.state, 'unknown', label); assert.equal(r.op.error, 'receipt_missing_remote_outcome_unknown', label);
+        assert.equal(r.op.accepted, false, label); assert.equal(r.active, r.id, label);
+    }
+});
