@@ -125,10 +125,10 @@ database — `integration.sqlite` together with `integration.sqlite-wal` and
   rebind), never already managed by any entry (`device_already_enrolled`, without naming
   the owner).
 - **Router scope.** The router's `--rpc-allow` set is fixed at install time and is **not**
-  reported over RPC (the `rpc-status` reply has no scope field). The manifest therefore
+  reported over RPC by routers before the scope release (newer routers add `scope`/`scopeSha`, see `docs/contracts/tier1-rpc.md` section 7; the manifest list stays the floor). The manifest therefore
   carries an optional `routerScope` list that the operator must keep identical to the
   installed `--rpc-allow` set; a device outside it is refused with
-  `device_outside_router_scope` before anything is queued. Absent, the scope is the seed
+  `device_pending_router_scope` (a recorded request, not an error) before anything is queued. Absent, the scope is the seed
   device alone (a single-MAC installation). Adding `routerScope` changes the manifest and
   target digest: use `integration:rebind`. The dispatch script header then reads
   `# Allowed MACs: …` instead of `# Allowed MAC: …`.

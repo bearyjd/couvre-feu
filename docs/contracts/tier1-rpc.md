@@ -210,3 +210,27 @@ dispatch; visibility (`service/src/integration-policy.ts:57`, `:129`) becomes "a
 
 Exact `operations.person_id` representative value for multi-child operations, and the alert settings UI, are decided in
 M2a/M2c.
+
+## 7. M2a decisions (resolved from the open points above)
+
+- Parser context: `normalizeObservation(value, {protectedMacs, floor})` and `parseObservation(text, context)`. The shared parser checks format,
+  order, digest and the accepted-policy superset on its own; the disjoint-from-protected and floor-superset rules need the manifest, so the
+  worker always passes it. `ssh-router.ts` parses without context first (format only); the worker's second pass enforces the manifest rules.
+  Any violation rejects the whole observation (fail closed, `router_observation_invalid`).
+- A reply with `errors` is treated like a reply without scope: scope stays unknown and the remembered scope is not replaced.
+- integration-004 holds only what M2a needs: the `operations.action` widening (pause_all, resume_all, move), `operation_people`,
+  `scope_requests`, `router_scope_observed`, `scope_changes` and `parent_alerts` (the integration chain skips main 004.sql, so ParentAlerts had
+  no table; new kind `router_scope_change`). One detection marker: `operations` sql contains `'pause_all'`. The `dispatch_steps` /
+  `automatic_read_summary` rebuilds and `inventory_*` tables are NOT in 004; M2c adds them (integration-005), so 004 is not amended after M2a ships.
+- `router_scope_observed` gains `generation` and `scope_json` (the contract table had only the digest, which cannot yield added/removed MACs).
+- Baseline: with no remembered scope the comparison base is the manifest floor, so growth that happened while the service was away alerts.
+  A rebind deletes `router_scope_observed` (new generation, new baseline).
+- A change is "matched" only when it is pure growth and every added MAC has a pending request of the same generation; mixed changes alert
+  but still resolve the requests whose MAC appeared. Removal is always unmatched (warning). Alert details carry counts and the change id, never MACs.
+- `scope_requests` caps: 4 pending per child (`scope_request_limit`), one pending per MAC (a second child asking gets `scope_request_conflict`),
+  7-day expiry (also enforced by CHECK). Resolved rows older than 90 days go unless a scope change references them.
+- `device_add` for a MAC outside the floor and outside a fresh observed scope answers 409 `device_pending_router_scope` (committed, not thrown, so
+  the request and audit row persist). The body carries `mac` and `requestId` as fields and only the placeholder text
+  `cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>`.
+- Protected cap is 128 in the service (`PROTECTED_MAC_LIMIT`), pinned to `router/lib/install-common.sh` `valid_protection` by a drift test.
+- Observed scope is not part of `targetDigest`; rebind validates stored devices against the NEW manifest floor only.

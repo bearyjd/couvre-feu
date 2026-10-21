@@ -64,7 +64,7 @@ export class ParentAlerts {
         this.store.transaction(() => {
             for (const candidate of candidates) this.upsert(candidate, now);
             for (const row of this.store.all<Row>("SELECT * FROM parent_alerts WHERE state IN ('open','acknowledged')")) {
-                if (active.has(key(row.kind, row.person_id))) continue;
+                if (active.has(key(row.kind, row.person_id)) || row.kind === 'router_scope_change') continue; // scope changes are events: only an admin acknowledges them
                 const clear = STATE_KINDS.includes(row.kind) ? Boolean(input.people)
                     : ACTIVITY_KINDS.includes(row.kind) ? Boolean(input.activity) && (decided.has(row.person_id ?? '') && now - row.last_seen >= ACTIVITY_CLEAR_SECONDS || now - row.last_seen >= ACTIVITY_QUIET_SECONDS)
                     : Boolean(input.timeRequests);
@@ -72,6 +72,26 @@ export class ParentAlerts {
             }
             this.store.run("DELETE FROM parent_alerts WHERE state='resolved' AND resolved_at < ?", now - RETENTION_SECONDS);
         });
+    }
+
+    /**
+     * Record one new event. Unlike reconcile, which tracks a standing condition, this re-opens an acknowledged alert and counts
+     * the occurrence: a second unexplained router change must not hide behind an earlier acknowledgement. Joins a caller's transaction.
+     */
+    raise(candidate: AlertCandidate): void {
+        const now = this.now(), details = JSON.stringify(candidate.details);
+        if (details.length > 1024) throw new Error('alert_details_too_large');
+        const write = () => {
+            const open = this.store.get<Row>("SELECT * FROM parent_alerts WHERE kind=? AND COALESCE(person_id,'')=? AND state IN ('open','acknowledged')", candidate.kind, candidate.personId ?? '');
+            if (open) {
+                const severity = RANK[candidate.severity] >= RANK[open.severity] ? candidate.severity : open.severity;
+                this.store.run("UPDATE parent_alerts SET last_seen=MAX(last_seen,?),count=count+1,severity=?,details=?,state='open',acknowledged_at=NULL,acknowledged_by=NULL WHERE id=?", now, severity, details, open.id);
+            } else {
+                this.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES(?,?,?,?,?,?,1,'open',?)",
+                    candidate.personId, candidate.kind, candidate.severity, now, now, now, details);
+            }
+        };
+        if (this.store.db.isTransaction) write(); else this.store.transaction(write);
     }
 
     private upsert(candidate: AlertCandidate, now: number) {

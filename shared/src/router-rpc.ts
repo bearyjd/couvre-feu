@@ -50,6 +50,29 @@ export interface RPCObservation {
     rpc_version: 1; generation: string; acceptedPolicy: RouterPolicy; policyDigest: string;
     currentOperationId: string | null; routerTime: number; receipt: RPCReceipt | null;
     status: RouterStatus; errors: string[];
+    /** Live router scope (rpc-allowed) and its digest. Absent from old routers, and then only the manifest floor is known. */
+    scope?: string[]; scopeSha?: string;
+}
+export const MAX_SCOPE = 256;
+/** Matches the router's snapshot digest: the LC_ALL=C ascending list, one MAC per line, one trailing LF. */
+export const scopeDigest = (scope: readonly string[]) => sha256(scope.join('\n') + '\n');
+/** What only the service's manifest knows: the protected MACs and the install-time scope floor. */
+export interface ScopeContext { protectedMacs?: readonly string[]; floor?: readonly string[] }
+function scopeFields(o: Record<string, unknown>, policy: RouterPolicy, context: ScopeContext): {scope: string[]; scopeSha: string} | null {
+    const hasScope = o.scope !== undefined, hasSha = o.scopeSha !== undefined;
+    if (hasScope !== hasSha) invalid();
+    if (!hasScope) return null;
+    if (!Array.isArray(o.scope) || o.scope.length < 1 || o.scope.length > MAX_SCOPE) invalid();
+    const scope = (o.scope as unknown[]).map(entry => { try { return mac(entry); } catch { return invalid(); } });
+    // Strictly ascending in byte order means canonical, sorted and unique at once.
+    if (scope.some((entry, i) => i > 0 && !(scope[i - 1] < entry))) invalid();
+    const scopeSha = hexDigest(o.scopeSha);
+    if (scopeSha !== scopeDigest(scope)) invalid();
+    const members = new Set(scope);
+    if ((context.protectedMacs ?? []).some(entry => members.has(entry))) invalid();
+    if ((context.floor ?? []).some(entry => !members.has(entry))) invalid();
+    if (policy.people.some(person => person.macs.some(entry => !members.has(entry)))) invalid();
+    return {scope, scopeSha};
 }
 function bool(value: unknown): boolean { if (typeof value !== 'boolean') invalid(); return value as boolean; }
 function strings(value: unknown, max = 256): string[] {
@@ -74,8 +97,8 @@ function effectiveAllowanceList(value: unknown): EffectiveAllowance[] {
     if (new Set(result.map(a => a.person)).size !== result.length || result.some(a => a.until < 1 || a.remaining < 1 || a.remaining > MAX_ALLOWANCE_SECONDS)) invalid();
     return result;
 }
-export function normalizeObservation(value: unknown): RPCObservation {
-    const o = object(value, ['rpc_version', 'generation', 'acceptedPolicy', 'policyDigest', 'currentOperationId', 'routerTime', 'receipt', 'status', 'errors']);
+export function normalizeObservation(value: unknown, context: ScopeContext = {}): RPCObservation {
+    const o = object(value, ['rpc_version', 'generation', 'acceptedPolicy', 'policyDigest', 'currentOperationId', 'routerTime', 'receipt', 'status', 'errors'], ['scope', 'scopeSha']);
     if (o.rpc_version !== 1) invalid();
     const policy = normalizePolicy(o.acceptedPolicy), digest = hexDigest(o.policyDigest), time = integer(o.routerTime);
     if (digest !== policyDigest(policy)) invalid();
@@ -99,10 +122,11 @@ export function normalizeObservation(value: unknown): RPCObservation {
     if ((status.effectiveAllowances ?? []).some(a => !(policy.allowances ?? []).some(d => d.person === a.person && d.until === a.until))) invalid();
     // A failed clock/status read may report no effective pauses; it cannot grant health.
     if (status.ok && JSON.stringify(status.effectivePauses) !== JSON.stringify(effectivePauses(policy, time))) invalid();
-    return {rpc_version: 1, generation: hexDigest(o.generation), acceptedPolicy: policy, policyDigest: digest, currentOperationId: current, routerTime: time, receipt, status, errors: strings(o.errors, 64)};
+    const scope = scopeFields(o, policy, context);
+    return {rpc_version: 1, generation: hexDigest(o.generation), acceptedPolicy: policy, policyDigest: digest, currentOperationId: current, routerTime: time, receipt, status, errors: strings(o.errors, 64), ...(scope ?? {})};
 }
-export function parseObservation(text: string): RPCObservation {
-    return normalizeObservation(parseJSON(text, false, 131072));
+export function parseObservation(text: string, context: ScopeContext = {}): RPCObservation {
+    return normalizeObservation(parseJSON(text, false, 131072), context);
 }
 export function exactReceipt(o: RPCObservation, e: RPCEnvelope): boolean {
     const r = o.receipt;
