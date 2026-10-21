@@ -97,13 +97,13 @@ Reviewed releases include [PR #3](https://github.com/bearyjd/couvre-feu/pull/3) 
 
 Installation records original contents, permissions and absent paths before mutation. The journal and expected checksums protect against overwriting unrelated later changes. `router/uninstall.sh` restores originals only after drift checks; it refuses destructive restoration on drift. After exact restoration it removes the external recovery release `/etc/.couvrefeu-release-<id>` only when that installation created it and its contents still match the reviewed manifest. It waits up to 20 seconds for an in-flight core operation's runtime lock before refusing. Preserve the journal and changed files for explicit resolution. Durable cleanup intent and uninstall phase markers block ordinary mutations through interrupted recovery; safe retries validate remaining owned objects and exact originals. Only validated durable zero-owned-mutation proof skips recovery firewall reload; partial-owned cleanup still reloads. Read the recovery runbook before activation. Do not delete the journal or replace refusal with blanket firewall restoration.
 
-The installer does not install an SSH key. A future approved manual dedicated-key setup uses this authorized-key prefix:
+The installer does not install an SSH key. A future approved manual dedicated-key setup uses this authorized-key line; substitute only the service PUBLIC key blob (`from=` pins the application host address, which is deployment-specific):
 
 ```text
-command="/usr/sbin/cfctl-ssh --rpc-only",no-port-forwarding,no-agent-forwarding,no-pty ssh-ed25519 <dedicated-public-key> <key-label>
+command="/usr/sbin/cfctl-ssh --rpc-only",restrict,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,from="192.0.2.17" ssh-ed25519 <PUBLIC_KEY_BLOB> couvrefeu-service
 ```
 
-Dropbear runtime restriction remains untested. Keep a separately protected recovery session and original authorized-key bytes/mode before any approved edit; do not reuse an unrestricted administrator key for the service.
+`restrict` is paired with the explicit `no-*` options so older Dropbear builds that ignore `restrict` still restrict; `restrict` support in the actual Dropbear version is unverified. Dropbear runtime restriction remains untested, and Dropbear may silently ignore authorized_keys options it does not know (fail-open), so only the live confinement probes prove enforcement. Keep a separately protected recovery session and original authorized-key bytes/mode before any approved edit; do not reuse an unrestricted administrator key for the service.
 
 ## Router interface
 
