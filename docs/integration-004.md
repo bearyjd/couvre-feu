@@ -131,7 +131,7 @@ database — `integration.sqlite` together with `integration.sqlite-wal` and
   `device_pending_router_scope` (a recorded request, not an error) before anything is queued. Absent, the scope is the seed
   device alone (a single-MAC installation). Adding `routerScope` changes the manifest and
   target digest: use `integration:rebind`. The dispatch script header then reads
-  `# Allowed MACs: …` instead of `# Allowed MAC: …`.
+  `# Allowed MACs: …` instead of `# Allowed MAC: …`. Upgrade the service before the router.
 - **Same router path.** A device add/remove is an `enroll`/`unenroll` operation through the
   existing CAS rpc-sync pipeline (revision token, one change at a time, receipts, audit,
   automatic or operator dispatch; automatic dispatch re-checks that the actor is still an

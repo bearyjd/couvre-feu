@@ -113,7 +113,8 @@ export class ChildAdmin {
     /** The install-time floor, or a MAC the router itself reported in scope on a fresh observation. Old routers report none, so only the floor counts. */
     private inRouterScope(mac: string): boolean {
         if (routerScopeOf(this.store.config).includes(mac)) return true;
-        return this.policy.fresh() && (this.store.observation().value?.scope ?? []).includes(mac);
+        // The remembered scope is generation-checked and only ever written from a clean reply; a reply carrying errors cannot vouch for a MAC.
+        return this.policy.fresh() && this.scope.observedScope().includes(mac);
     }
     private apply(actor: Actor, kind: ChildAction, target: string, params: Record<string, unknown>): {status?: number; body?: unknown; op?: IntegrationOperation; audit: string} {
         const now = this.policy.now(), config = this.store.config;
@@ -145,14 +146,15 @@ export class ChildAdmin {
             if (config.protectedMacs.includes(mac)) throw new AppError(409, 'device_mac_protected', 'This device is protected and can never be paused.');
             // Never says whose device it is: the owner may be outside this admin's scope.
             if (this.store.get("SELECT id FROM devices WHERE identifier_kind='mac' AND identifier=?", mac)) throw new AppError(409, 'device_already_enrolled', 'This device is already managed.');
-            if (!this.inRouterScope(mac)) {
-                // Not thrown: the request row and the audit entry must commit. The canonical MAC is a field for the admin UI only.
-                const request = this.scope.request(actor, target, mac);
-                return {status: 409, body: {error: {code: 'device_pending_router_scope', message: PENDING_SCOPE_TEXT, mac, requestId: request.id}}, audit: `scope_request:${request.id}`};
-            }
+            // Preconditions first: a refused change must not leave a scope request behind.
             if (devicesOf(this.store, target).length >= DEVICES_PER_CHILD) throw new AppError(409, 'child_device_limit_reached', `The router holds at most ${DEVICES_PER_CHILD} devices per entry.`);
             if (this.store.get<{n: number}>('SELECT count(*) n FROM devices')!.n >= DEVICE_LIMIT) throw new AppError(409, 'device_limit_reached', `The router holds at most ${DEVICE_LIMIT} devices.`);
             if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
+            if (!this.inRouterScope(mac)) {
+                // Not thrown: the request row and the audit entry must commit. The canonical MAC is a field for the admin UI only.
+                const request = this.scope.request(actor, target, mac);
+                return {status: 409, body: {error: {code: 'device_pending_router_scope', message: PENDING_SCOPE_TEXT, mac, requestId: request.id}}, audit: `scope_request:${request.id}:${mac}:${actor.id}`};
+            }
             const device = id('d');
             const op = this.policy.queue(actor, target, 'enroll', request({label: params.label, mac}), id('enroll'), params.precondition as string,
                 base => withDevice(base, config, target, mac),

@@ -62,7 +62,7 @@ export class ParentAlerts {
         const active = new Set(candidates.map(candidate => key(candidate.kind, candidate.personId)));
         const decided = input.activity ? evaluatedPeople(input.activity, now) : new Set<string>();
         this.store.transaction(() => {
-            for (const candidate of candidates) this.upsert(candidate, now);
+            for (const candidate of candidates) this.write(candidate, now, false);
             for (const row of this.store.all<Row>("SELECT * FROM parent_alerts WHERE state IN ('open','acknowledged')")) {
                 if (active.has(key(row.kind, row.person_id)) || row.kind === 'router_scope_change') continue; // scope changes are events: only an admin acknowledges them
                 const clear = STATE_KINDS.includes(row.kind) ? Boolean(input.people)
@@ -79,33 +79,27 @@ export class ParentAlerts {
      * the occurrence: a second unexplained router change must not hide behind an earlier acknowledgement. Joins a caller's transaction.
      */
     raise(candidate: AlertCandidate): void {
-        const now = this.now(), details = JSON.stringify(candidate.details);
-        if (details.length > 1024) throw new Error('alert_details_too_large');
-        const write = () => {
-            const open = this.store.get<Row>("SELECT * FROM parent_alerts WHERE kind=? AND COALESCE(person_id,'')=? AND state IN ('open','acknowledged')", candidate.kind, candidate.personId ?? '');
-            if (open) {
-                const severity = RANK[candidate.severity] >= RANK[open.severity] ? candidate.severity : open.severity;
-                this.store.run("UPDATE parent_alerts SET last_seen=MAX(last_seen,?),count=count+1,severity=?,details=?,state='open',acknowledged_at=NULL,acknowledged_by=NULL WHERE id=?", now, severity, details, open.id);
-            } else {
-                this.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES(?,?,?,?,?,?,1,'open',?)",
-                    candidate.personId, candidate.kind, candidate.severity, now, now, now, details);
-            }
-        };
+        const now = this.now(), write = () => this.write(candidate, now, true);
         if (this.store.db.isTransaction) write(); else this.store.transaction(write);
     }
 
-    private upsert(candidate: AlertCandidate, now: number) {
+    /**
+     * One row per unresolved (kind, person). An event re-opens an acknowledged alert, counts the occurrence and never lowers severity;
+     * a standing condition only re-opens on escalation, keeps its count (a held condition is not a new occurrence) and follows the candidate's severity.
+     */
+    private write(candidate: AlertCandidate, now: number, event: boolean): void {
         const details = JSON.stringify(candidate.details);
         if (details.length > 1024) throw new Error('alert_details_too_large');
         const open = this.store.get<Row>("SELECT * FROM parent_alerts WHERE kind=? AND COALESCE(person_id,'')=? AND state IN ('open','acknowledged')", candidate.kind, candidate.personId ?? '');
-        if (open) {
-            // count is the number of times the condition newly occurred; a held condition does not change it. Escalation re-opens an acknowledged alert.
-            const escalated = RANK[candidate.severity] > RANK[open.severity];
-            this.store.run(`UPDATE parent_alerts SET last_seen=MAX(last_seen,?),severity=?,details=?${escalated ? ",state='open',acknowledged_at=NULL,acknowledged_by=NULL" : ''} WHERE id=?`, now, candidate.severity, details, open.id);
-        } else {
+        if (!open) {
             this.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES(?,?,?,?,?,?,1,'open',?)",
                 candidate.personId, candidate.kind, candidate.severity, now, now, now, details);
+            return;
         }
+        const escalated = RANK[candidate.severity] > RANK[open.severity];
+        const severity = event && !escalated && RANK[candidate.severity] < RANK[open.severity] ? open.severity : candidate.severity;
+        this.store.run(`UPDATE parent_alerts SET last_seen=MAX(last_seen,?),count=count+?,severity=?,details=?${event || escalated ? ",state='open',acknowledged_at=NULL,acknowledged_by=NULL" : ''} WHERE id=?`,
+            now, event ? 1 : 0, severity, details, open.id);
     }
 
     /** Assigned people always; system (null person) alerts only for admins. */

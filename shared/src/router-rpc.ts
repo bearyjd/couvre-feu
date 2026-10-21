@@ -58,6 +58,8 @@ export const MAX_SCOPE = 256;
 export const scopeDigest = (scope: readonly string[]) => sha256(scope.join('\n') + '\n');
 /** What only the service's manifest knows: the protected MACs and the install-time scope floor. */
 export interface ScopeContext { protectedMacs?: readonly string[]; floor?: readonly string[] }
+/** Explicitly no manifest: the router's format is checked but the protected-disjoint and floor-superset rules are not. Only for a first pass that a manifest-aware second pass follows. */
+export const FORMAT_ONLY: ScopeContext = Object.freeze({});
 function scopeFields(o: Record<string, unknown>, policy: RouterPolicy, context: ScopeContext): {scope: string[]; scopeSha: string} | null {
     const hasScope = o.scope !== undefined, hasSha = o.scopeSha !== undefined;
     if (hasScope !== hasSha) invalid();
@@ -97,7 +99,7 @@ function effectiveAllowanceList(value: unknown): EffectiveAllowance[] {
     if (new Set(result.map(a => a.person)).size !== result.length || result.some(a => a.until < 1 || a.remaining < 1 || a.remaining > MAX_ALLOWANCE_SECONDS)) invalid();
     return result;
 }
-export function normalizeObservation(value: unknown, context: ScopeContext = {}): RPCObservation {
+export function normalizeObservation(value: unknown, context: ScopeContext): RPCObservation {
     const o = object(value, ['rpc_version', 'generation', 'acceptedPolicy', 'policyDigest', 'currentOperationId', 'routerTime', 'receipt', 'status', 'errors'], ['scope', 'scopeSha']);
     if (o.rpc_version !== 1) invalid();
     const policy = normalizePolicy(o.acceptedPolicy), digest = hexDigest(o.policyDigest), time = integer(o.routerTime);
@@ -125,7 +127,7 @@ export function normalizeObservation(value: unknown, context: ScopeContext = {})
     const scope = scopeFields(o, policy, context);
     return {rpc_version: 1, generation: hexDigest(o.generation), acceptedPolicy: policy, policyDigest: digest, currentOperationId: current, routerTime: time, receipt, status, errors: strings(o.errors, 64), ...(scope ?? {})};
 }
-export function parseObservation(text: string, context: ScopeContext = {}): RPCObservation {
+export function parseObservation(text: string, context: ScopeContext): RPCObservation {
     return normalizeObservation(parseJSON(text, false, 131072), context);
 }
 export function exactReceipt(o: RPCObservation, e: RPCEnvelope): boolean {

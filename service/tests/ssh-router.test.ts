@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { boundedChild, SSHRouter } from '../src/ssh-router.ts';
 import { testConfig, observation } from './fixtures/integration.ts';
-import { parseObservation, policyDigest } from '../../shared/src/router-rpc.ts';
+import { parseObservation, policyDigest, FORMAT_ONLY } from '../../shared/src/router-rpc.ts';
 
 test('SSH invocation uses fixed public-key-only pinned argv, no forwarding, shell interpolation or environment fallback', async () => {
     const c = testConfig('/tmp/cf-no-agent-test'), router = new SSHRouter(c), i = router.invocation('observe');
@@ -20,7 +20,7 @@ test('bounded real child distinguishes spawn failure from possibly delivered exi
     await assert.rejects(boundedChild('/definitely/missing/cf-test-child', [], '', 1000, {}), e => e instanceof Error && e.message === 'ssh_spawn_failed' && 'delivery' in e && e.delivery === 'not_delivered');
     await assert.rejects(boundedChild(process.execPath, ['service/tests/fixtures/transport-child.ts', 'exit'], '', 1000, {}), /ssh_exit_failed/);
     const text = await boundedChild(process.execPath, ['service/tests/fixtures/transport-child.ts', 'truncated'], '', 1000, {});
-    assert.throws(() => parseObservation(text));
+    assert.throws(() => parseObservation(text, FORMAT_ONLY));
 });
 test('real children enforce output, diagnostic and deadline bounds without returning diagnostics', async () => {
     for (const [mode, expected] of [['oversize', 'ssh_output_limit'], ['diagnostics', 'ssh_diagnostic_limit'], ['delay', 'ssh_timeout']] as const) {
@@ -31,7 +31,7 @@ test('real children enforce output, diagnostic and deadline bounds without retur
 test('child stdin is literal and nonzero accepted output remains subject to full RPC validation', async () => {
     const c = testConfig('/tmp/unused'), o = observation(c, c.enrollment, 1791691200), input = JSON.stringify(o);
     const text = await boundedChild(process.execPath, ['service/tests/fixtures/transport-child.ts', 'echo-nonzero'], input, 1000, {}, true);
-    assert.deepEqual(parseObservation(text), o);
+    assert.deepEqual(parseObservation(text, FORMAT_ONLY), o);
     const literal = '$(echo PRIVATE_COMMAND); `id`\n';
     assert.equal(await boundedChild(process.execPath, ['service/tests/fixtures/transport-child.ts', 'echo'], literal, 1000, {}), literal);
     assert.equal(await boundedChild(process.execPath, ['service/tests/fixtures/transport-child.ts', 'environment'], '', 1000, {CF_TEST_PUBLIC: 'explicit'}), 'explicit:absent');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeObservation, parseObservation, policyDigest, sha256 } from '../src/router-rpc.ts';
+import { normalizeObservation, parseObservation, policyDigest, sha256, FORMAT_ONLY } from '../src/router-rpc.ts';
 import { normalizePolicy } from '../src/router-schema.ts';
 import { testConfig, observation } from '../../service/tests/fixtures/integration.ts';
 
@@ -62,7 +62,7 @@ test('scopeSha must be 64 lowercase hex and equal sha256(scope.join LF + LF)', (
 test('scope overlapping a protected MAC is rejected', () => {
     assert.throws(() => normalizeObservation(withScope([SEED, PROTECTED]), context), /invalid_router_rpc/);
     // The protected set comes from the manifest, so without that context the parser cannot know; the worker always passes it.
-    assert.deepEqual(normalizeObservation(withScope([SEED, PROTECTED])).scope, [SEED, PROTECTED]);
+    assert.deepEqual(normalizeObservation(withScope([SEED, PROTECTED]), FORMAT_ONLY).scope, [SEED, PROTECTED]);
 });
 
 test('scope that does not contain the manifest floor is rejected', () => {
@@ -73,7 +73,7 @@ test('scope that does not contain the manifest floor is rejected', () => {
     assert.throws(() => normalizeObservation(make([TABLET, LAPTOP]), {...context, floor: [SEED, TABLET]}), /invalid_router_rpc/);
     assert.equal(normalizeObservation(make([SEED, TABLET, LAPTOP]), {...context, floor: [SEED, TABLET]}).scope!.length, 3);
     // No floor in the context (a context-free parse) cannot judge it.
-    assert.deepEqual(normalizeObservation(make([TABLET])).scope, [TABLET]);
+    assert.deepEqual(normalizeObservation(make([TABLET]), FORMAT_ONLY).scope, [TABLET]);
 });
 
 test('scope that omits a MAC of the accepted policy is rejected', () => {

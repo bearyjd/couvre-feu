@@ -39,3 +39,19 @@ test('an admin also sees alerts for every child, and a resolved alert leaves the
   await expect(page.locator('#alert-badge')).toBeHidden();
   await expect(page.locator('#parent-alert-feed [data-alert-state="resolved"]')).toHaveCount(1);
 });
+
+test('an admin sees a router_scope_change alert with counts only and its matched/unmatched wording', async ({ page, demo }) => {
+  const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message));
+  const alert = (id: number, matched: boolean, severity: string) => ({ id, personId: null, kind: 'router_scope_change', severity, createdAt: nowSeconds(), firstSeen: nowSeconds(), lastSeen: nowSeconds(), count: 1,
+    state: 'open', acknowledgedAt: null, resolvedAt: null, details: { added: 2, removed: 1, matched, changeId: id } });
+  // The demo database has no router_scope_change kind, so the server response is fixed here; the real server path is covered in service tests.
+  await page.route('**/alerts', (route) => route.fulfill({ json: { alerts: [alert(2, false, 'critical'), alert(1, true, 'info')], nextBefore: null, openCount: 2 } }));
+  await enroll(page, demo, 'jd');
+  const feed = page.locator('#parent-alert-feed');
+  await expect(feed.locator('.parent-alert')).toHaveCount(2);
+  await expect(feed).toContainText('Router device list changed');
+  await expect(feed).toContainText('2 devices added and 1 removed from the router\'s allowed list. No matching request');
+  await expect(feed).toContainText('A request exists.');
+  expect(await feed.innerText()).not.toMatch(/[0-9a-f]{2}(:[0-9a-f]{2}){5}/);
+  expect(errors).toEqual([]);
+});

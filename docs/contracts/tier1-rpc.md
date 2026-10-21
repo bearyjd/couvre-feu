@@ -215,7 +215,8 @@ M2a/M2c.
 
 - Parser context: `normalizeObservation(value, {protectedMacs, floor})` and `parseObservation(text, context)`. The shared parser checks format,
   order, digest and the accepted-policy superset on its own; the disjoint-from-protected and floor-superset rules need the manifest, so the
-  worker always passes it. `ssh-router.ts` parses without context first (format only); the worker's second pass enforces the manifest rules.
+  worker always passes it. The context argument is required: `ssh-router.ts` parses with the named `FORMAT_ONLY` marker first (format only);
+  the worker's second pass enforces the manifest rules.
   Any violation rejects the whole observation (fail closed, `router_observation_invalid`).
 - A reply with `errors` is treated like a reply without scope: scope stays unknown and the remembered scope is not replaced.
 - integration-004 holds only what M2a needs: the `operations.action` widening (pause_all, resume_all, move), `operation_people`,
@@ -226,7 +227,15 @@ M2a/M2c.
 - Baseline: with no remembered scope the comparison base is the manifest floor, so growth that happened while the service was away alerts.
   A rebind deletes `router_scope_observed` (new generation, new baseline).
 - A change is "matched" only when it is pure growth and every added MAC has a pending request of the same generation; mixed changes alert
-  but still resolve the requests whose MAC appeared. Removal is always unmatched (warning). Alert details carry counts and the change id, never MACs.
+  but still resolve the requests whose MAC appeared. Removal is always unmatched (warning). Every change raises one `router_scope_change` alert
+  (admins only): `info` when matched, `critical` for unmatched growth, `warning` for pure removal. Alert details carry counts, `matched` and the change
+  id, never MACs; the `audit` row (never pruned) carries the MACs, requesters, request ids and digests as JSON.
+- A rebind cancels every pending scope request (`cancelled`); pending rows are also keyed by generation (dedupe, per-child cap, matching).
+- The first observation after a rebind onto a router whose live scope is larger than the new manifest floor raises exactly one `critical` unmatched
+  alert, because the baseline is the floor. That is intended: the admin acknowledges it after checking the router.
+- `device_add` checks the device limits and the revision precondition before it may create a scope request, and reads the router scope only from the
+  generation-checked `router_scope_observed` row. `scope_request_conflict` (another child already has a pending request for that MAC) is an accepted
+  information leak of the same kind as `device_already_enrolled`.
 - `scope_requests` caps: 4 pending per child (`scope_request_limit`), one pending per MAC (a second child asking gets `scope_request_conflict`),
   7-day expiry (also enforced by CHECK). Resolved rows older than 90 days go unless a scope change references them.
 - `device_add` for a MAC outside the floor and outside a fresh observed scope answers 409 `device_pending_router_scope` (committed, not thrown, so

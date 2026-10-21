@@ -33,7 +33,7 @@ CREATE TABLE scope_requests (
  expires_at INTEGER NOT NULL CHECK(expires_at>created_at AND expires_at<=created_at+604800),
  resolved_at INTEGER, resolved_by TEXT REFERENCES accounts(id)
 ) STRICT;
-CREATE UNIQUE INDEX scope_requests_pending ON scope_requests(mac) WHERE state='pending';
+CREATE UNIQUE INDEX scope_requests_pending ON scope_requests(mac,generation) WHERE state='pending';
 CREATE INDEX scope_requests_person ON scope_requests(person_id,state);
 
 -- Last router scope seen (with its list, to compute growth and removal), so a change made while the service was down is still recorded.

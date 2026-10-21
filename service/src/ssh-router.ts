@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { validateTransportFiles } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
-import { normalizeEnvelope, parseObservation, requestDigest, rpcId, sha256 } from '../../shared/src/router-rpc.ts';
+import { FORMAT_ONLY, normalizeEnvelope, parseObservation, requestDigest, rpcId, sha256 } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope, RPCObservation } from '../../shared/src/router-rpc.ts';
 import { parseRouterActivity } from '../../shared/src/router-activity.ts';
 import type { RouterActivity } from '../../shared/src/router-activity.ts';
@@ -39,7 +39,7 @@ export class SSHRouter implements AsyncRouter {
     async invoke(invocation: FrozenInvocation): Promise<RPCObservation> {
         if (invocation.kind === 'activity') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
         const text = await this.run(invocation);
-        try { return parseObservation(text); } catch { throw new RouterTransportError('invalid_router_response'); }
+        try { return parseObservation(text, FORMAT_ONLY); } catch { throw new RouterTransportError('invalid_router_response'); }
     }
     async invokeActivity(invocation: FrozenInvocation): Promise<RouterActivity> {
         if (invocation.kind !== 'activity') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
