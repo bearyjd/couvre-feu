@@ -1836,11 +1836,14 @@ class ReleaseRetirementTests(unittest.TestCase):
         release = self.release()
         (release / 'lib').mkdir(parents=True, mode=0o700)
         release.chmod(0o700)
-        for line in (REPO / 'router/release.sha256').read_text().splitlines():
+        emitted = self.root / 'emitted-release'
+        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+                       check=True, capture_output=True)
+        for line in (emitted / 'release.sha256').read_text().splitlines():
             name = line.split()[1]
-            shutil.copyfile(REPO / 'router' / name, release / name)
+            shutil.copyfile(emitted / name, release / name)
             (release / name).chmod(0o644 if name.startswith('lib/') else 0o755)
-        shutil.copyfile(REPO / 'router/release.sha256', release / 'release.sha256')
+        shutil.copyfile(emitted / 'release.sha256', release / 'release.sha256')
         (release / 'release.sha256').chmod(0o600)
         before = self.snapshot()
         self.assertEqual(self.install('--activate').returncode, 0)

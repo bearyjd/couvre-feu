@@ -38,6 +38,7 @@ Host `sh -n` alone is not ash proof: `tests/run.sh` reports `PENDING` when BusyB
 | `sh tests/acceptance.sh --preflight` | Read-only local prerequisite report |
 | `python3 tools/freeze-router-release.py` | Refreeze router release pins |
 | `python3 tools/freeze-router-release.py --check` | Read-only check that pins are current |
+| `python3 tools/freeze-router-release.py --emit DIR` | Write the shippable router tree (wrappers stripped of CF_TEST_MODE); release.sha256 covers the emitted bytes |
 <!-- /AUTO-GENERATED -->
 
 ## Running the test suites

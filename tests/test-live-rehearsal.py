@@ -82,6 +82,7 @@ class SourceCopy:
         shutil.copytree(REPO / 'router', self.root / 'router')
         shutil.copytree(REPO / 'tools/live', self.root / 'tools/live',
                         ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copyfile(REPO / 'tools/strip-test-mode.py', self.root / 'tools/strip-test-mode.py')
         quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'check': True}
         git = ['git', '-C', str(self.root), '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid']
         subprocess.run(git + ['init', '-q'], **quiet)

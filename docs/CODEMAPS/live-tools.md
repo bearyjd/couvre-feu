@@ -6,5 +6,5 @@
   Usage: `plan CONFIG` then `execute CONFIG --expect-plan-sha256 HEX`. After MUTATION_BEGIN every outcome ends in the single teardown.
   Result lines: PENN_PILOT_PASS / PENN_PILOT_STOPPED_RESTORED[_CONNECTIVITY_FAILED]; PENN_KERNEL_STATE paused|clear|unknown.
 - Config: host, admin key fingerprint pinned, knownHosts, evidenceDir (not tmpfs), authorizationPath, deadlineUtc, platformProfile, roles{management,jd_adult,penn_child}, protectedHistoricalMacs.
-- `tools/freeze-router-release.py`: module pins + router/release.sha256.
+- `tools/freeze-router-release.py`: module pins + router/release.sha256; `--emit DIR` writes the shippable tree with cfctl-ssh/cfctl-scope stripped via strip-test-mode.py.
 - Tests: tests/test-live-rehearsal.py, tests/test-penn-pilot.py. Runbook: docs/runbooks/live-first-rehearsal.md.

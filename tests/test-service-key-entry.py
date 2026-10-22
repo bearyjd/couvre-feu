@@ -6,11 +6,13 @@ that a real Dropbear enforces any option. The README line is parsed as-is; the s
 service/tests/ssh-router.test.ts.
 """
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -265,6 +267,63 @@ class StrippedProductionCopyTests(unittest.TestCase):
         self.assertEqual(self.fixture.env.get('CF_TEST_MODE'), '1')
         self.run_stripped('cfctl rpc-sync')
         self.assertFalse(self.log.exists())
+
+
+class EmittedReleaseTreeTests(unittest.TestCase):
+    """freeze-router-release.py --emit writes the shippable tree: wrappers stripped, manifest over emitted bytes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.out = Path(cls.tmp.name) / 'tree'
+        cls.result = subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(cls.out)],
+                                    text=True, capture_output=True, timeout=30)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_emit_succeeds(self):
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+
+    def test_wrappers_equal_strip_of_repo_without_test_mode(self):
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+        spec = importlib.util.spec_from_file_location('strip_test_mode', REPO / 'tools/strip-test-mode.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for name in ('cfctl-ssh', 'cfctl-scope'):
+            with self.subTest(name=name):
+                emitted = (self.out / name).read_text()
+                self.assertEqual(emitted, module.strip((REPO / 'router' / name).read_text(), module.BLOCK_LINES[name]))
+                self.assertNotIn('CF_TEST_MODE', emitted)
+                self.assertIn('CF_TEST_MODE', (REPO / 'router' / name).read_text())
+
+    def test_manifest_hashes_emitted_bytes(self):
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+        lines = (self.out / 'release.sha256').read_text().splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            digest, name = line.split('  ')
+            self.assertEqual(digest, hashlib.sha256((self.out / name).read_bytes()).hexdigest(), name)
+        self.assertEqual((self.out / 'release.sha256').read_bytes(), (REPO / 'router/release.sha256').read_bytes())
+
+    def test_release_id_covers_boundary_files(self):
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+        text = (self.out / 'lib/platform-bootstrap.sh').read_text()
+        release_id = re.search(r'^CF_RELEASE_ID=(\w+)$', text, re.M).group(1)
+        modules = re.search(r"^CF_RELEASE_MODULES='(.*)'$", text, re.M).group(1).split()
+        self.assertTrue(all(pair.split(':')[0].endswith(('.sh', '.awk')) for pair in modules), modules)
+        self.assertEqual(self.result.stdout.strip(), release_id)
+        base = sorted(set(re.findall(r'\S+:[0-9a-f]{64}', ' '.join(modules))))
+        self.assertEqual(len(base), 9)
+        # Identity must change when a stripped wrapper changes: recompute with a one-byte-different cfctl-scope.
+        entries = list(modules)
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope'):
+            data = (self.out / name).read_bytes()
+            if name == 'cfctl':
+                data = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data, flags=re.M)
+            entries.append(name + ':' + hashlib.sha256(data).hexdigest())
+        self.assertEqual(hashlib.sha256(('\n'.join(entries) + '\n').encode()).hexdigest(), release_id)
 
 
 if __name__ == '__main__':

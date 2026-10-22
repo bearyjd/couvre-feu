@@ -225,7 +225,27 @@ def head_source():
         if blob_id(data) != sha:
             raise Refusal(f'{path}: blob integrity check failed')
         blobs[path] = data
-    return commit, blobs
+    return commit, ship_stripped_wrappers(blobs)
+
+
+def ship_stripped_wrappers(blobs):
+    """The live tools ship the emitted tree: wrappers without CF_TEST_MODE, checked against release.sha256."""
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('strip_test_mode', REPO / 'tools/strip-test-mode.py')
+    stripper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stripper)
+    shipped = dict(blobs)
+    for name, lines in stripper.BLOCK_LINES.items():
+        try:
+            shipped['router/' + name] = stripper.strip(blobs['router/' + name].decode('utf-8'), lines).encode('utf-8')
+        except ValueError as error:
+            raise Refusal(f'router/{name}: {error}')
+    for line in blobs['router/release.sha256'].decode('utf-8').splitlines():
+        digest, rel = line.split()
+        if hashlib.sha256(shipped['router/' + rel]).hexdigest() != digest:
+            raise Refusal(f'router/{rel}: shipped bytes do not match release.sha256')
+    return shipped
 
 
 def release_id(blobs):
