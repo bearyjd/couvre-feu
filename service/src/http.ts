@@ -19,6 +19,8 @@ import { TimeRequestService } from './time-requests.ts';
 import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
 import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
+import { inventoryGet, inventoryPost } from './inventory-http.ts';
+import type { InventoryStore } from './inventory-store.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -88,7 +90,7 @@ export function remoteIPv4(address: string | undefined): string | undefined {
 /** The Idempotency-Key header, dropped when it uses the `tr-` prefix reserved for the time-request service (the route then reports the key as missing). */
 const clientKey = (value: string | string[] | undefined): string | undefined => typeof value === 'string' && !value.startsWith('tr-') ? value : undefined;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService) {
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore) {
     // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
     const timeRequestsEnabled = timeRequests !== undefined || auth.provenance.source !== 'real-router-integration' || (config as {timeRequests?: {enabled?: boolean}}).timeRequests?.enabled === true;
     const clock = (policy as {now?: () => number}).now ?? auth.now;
@@ -207,6 +209,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, bulkRoute.status, {...provenance, ...bulkRoute.body as object});
                     return;
                 }
+                const inventoryWrite = inventoryPost(inventory ?? null, session, path, payload);
+                if (inventoryWrite) {
+                    send(response, inventoryWrite.status, {...provenance, ...inventoryWrite.body as object});
+                    return;
+                }
                 const account = await accountPost(accounts, session, path, payload);
                 if (account) {
                     send(response, account.status, {...provenance, ...account.body as object});
@@ -258,6 +265,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const childRead = childrenGet(children, session, path);
             if (childRead) {
                 send(response, childRead.status, {...provenance, ...childRead.body as object});
+                return;
+            }
+            const inventoryRead = inventoryGet(inventory ?? null, session, path);
+            if (inventoryRead) {
+                send(response, inventoryRead.status, {...provenance, ...inventoryRead.body as object});
                 return;
             }
             const accountRead = accountGet(accounts, session, path);

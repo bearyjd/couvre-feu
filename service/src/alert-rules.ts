@@ -1,6 +1,6 @@
 import type { OperationDTO, PeopleDTO } from '../../shared/src/contracts.ts';
 
-export type AlertKind = 'enforcement_unhealthy' | 'sync_failed' | 'apply_pending_too_long' | 'possible_bypass' | 'repeated_blocked_attempts' | 'time_request_pending' | 'router_scope_change';
+export type AlertKind = 'enforcement_unhealthy' | 'sync_failed' | 'apply_pending_too_long' | 'possible_bypass' | 'repeated_blocked_attempts' | 'time_request_pending' | 'router_scope_change' | 'new_device' | 'inventory_stalled';
 export type AlertSeverity = 'info' | 'warning' | 'critical';
 export type DetailValue = number | string | boolean;
 /** Bounded summary only: counts, windows and operation ids. Never MACs, addresses, domains or router diagnostics. */

@@ -64,7 +64,7 @@ export class ParentAlerts {
         this.store.transaction(() => {
             for (const candidate of candidates) this.write(candidate, now, false);
             for (const row of this.store.all<Row>("SELECT * FROM parent_alerts WHERE state IN ('open','acknowledged')")) {
-                if (active.has(key(row.kind, row.person_id)) || row.kind === 'router_scope_change') continue; // scope changes are events: only an admin acknowledges them
+                if (active.has(key(row.kind, row.person_id)) || row.kind === 'router_scope_change' || row.kind === 'new_device' || row.kind === 'inventory_stalled') continue; // events (scope changes, new devices): only an admin acknowledges them
                 const clear = STATE_KINDS.includes(row.kind) ? Boolean(input.people)
                     : ACTIVITY_KINDS.includes(row.kind) ? Boolean(input.activity) && (decided.has(row.person_id ?? '') && now - row.last_seen >= ACTIVITY_CLEAR_SECONDS || now - row.last_seen >= ACTIVITY_QUIET_SECONDS)
                     : Boolean(input.timeRequests);

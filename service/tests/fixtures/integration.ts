@@ -5,10 +5,11 @@ import type { IntegrationConfig } from '../../src/integration-config.ts';
 import { IntegrationStore } from '../../src/integration-db.ts';
 import { IntegrationPolicy } from '../../src/integration-policy.ts';
 import { IntegrationWorker } from '../../src/integration-worker.ts';
-import { SSHRouter } from '../../src/ssh-router.ts';
+import { SSHRouter, inventoryFromReply } from '../../src/ssh-router.ts';
 import { RouterTransportError } from '../../src/router-transport.ts';
 import { normalizeRouterActivity } from '../../../shared/src/router-activity.ts';
 import type { RouterActivity } from '../../../shared/src/router-activity.ts';
+import type { RouterInventory } from '../../../shared/src/router-inventory.ts';
 import type { AsyncRouter, FrozenInvocation, DispatchKind } from '../../src/router-transport.ts';
 import { normalizeEnvelope, policyDigest, requestDigest } from '../../../shared/src/router-rpc.ts';
 import type { RPCObservation, RPCEnvelope, RPCReceipt } from '../../../shared/src/router-rpc.ts';
@@ -46,6 +47,14 @@ export class TestRouter implements AsyncRouter {
     transform: ((o: RPCObservation) => RPCObservation) | null = null;
     defer: Promise<void> | null = null;
     activity: unknown = null;
+    /** Raw stdout of `cfctl rpc-inventory --json`, parsed by the real classifier; null behaves like an old router (exit 2, no output). */
+    inventoryText: string | null = null;
+    inventoryFailure: RouterTransportError | null = null;
+    inventoryDefer: Promise<void> | null = null;
+    /** Simulated wall time a call takes: the clock moves AFTER the reply is built (router time = call start, as on a real router), then onReturn runs. */
+    spend: Partial<Record<DispatchKind, number>> = {};
+    elapse: ((seconds: number) => void) | null = null;
+    onReturn: ((kind: DispatchKind) => void) | null = null;
     /** Like rpc.sh: an rpc-sync refused under the lock before any write (e.g. a managed device without an address). */
     reject: string | null = null;
     /** Like cf_error_record: a refused transition leaves runtime/error, so status stays not-ok until a later confirmation. */
@@ -61,7 +70,26 @@ export class TestRouter implements AsyncRouter {
         if (this.failure) throw this.failure;
         return normalizeRouterActivity(this.activity);
     }
+    async invokeInventory(i: FrozenInvocation): Promise<RouterInventory> {
+        if (this.store.db.isTransaction) throw new Error('test_network_transaction');
+        this.calls.push(i);
+        if (this.inventoryDefer) await this.inventoryDefer;
+        if (this.inventoryFailure) throw this.inventoryFailure;
+        if (this.inventoryText === null) throw new RouterTransportError('inventory_unavailable:old_router');
+        const reply = inventoryFromReply(this.inventoryText, this.config);
+        this.spent('inventory');
+        return reply;
+    }
+    private spent(kind: DispatchKind): void {
+        if (this.spend[kind]) this.elapse?.(this.spend[kind]!);
+        this.onReturn?.(kind);
+    }
     async invoke(i: FrozenInvocation): Promise<RPCObservation> {
+        const result = await this.invokeNow(i);
+        this.spent(i.kind);
+        return result;
+    }
+    private async invokeNow(i: FrozenInvocation): Promise<RPCObservation> {
         if (this.store.db.isTransaction) throw new Error('test_network_transaction');
         this.calls.push(i);
         if (this.defer) await this.defer;
@@ -96,6 +124,7 @@ export function integrationFixture() {
     const dir = mkdtempSync(join(tmpdir(), 'cf-integration-test-')), config = testConfig(dir), store = new IntegrationStore(config);
     let clock = 1791691200;
     const now = () => clock, policy = new IntegrationPolicy(store, now), router = new TestRouter(store, now), worker = new IntegrationWorker(store, router, now);
+    router.elapse = seconds => { clock += seconds; };
     return {dir, config, store, now, policy, router, worker, advance: (seconds: number) => {clock += seconds;}, cleanup: () => {store.close(); rmSync(dir, {recursive: true, force: true});},
         observe: async () => { const plan = worker.prepare('observe'); await worker.execute(plan, plan.scriptSha256); },
         pause: (until = 0, key = 'test_key_123456789') => policy.mutate(actor, 'pilot', 'pause', {until}, policy.people(actor).revisionToken!, key)};

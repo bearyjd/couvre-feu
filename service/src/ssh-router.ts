@@ -6,9 +6,29 @@ import { FORMAT_ONLY, normalizeEnvelope, parseObservation, requestDigest, rpcId,
 import type { RPCEnvelope, RPCObservation } from '../../shared/src/router-rpc.ts';
 import { parseRouterActivity } from '../../shared/src/router-activity.ts';
 import type { RouterActivity } from '../../shared/src/router-activity.ts';
+import { classifyInventoryReply } from '../../shared/src/router-inventory.ts';
+import type { RouterInventory } from '../../shared/src/router-inventory.ts';
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 
+/** Inventory is polled on its own short budget; the claim lease and the dispatch_steps CHECK (1000..30000 ms) both accept it. */
+export const INVENTORY_DEADLINE_MS = 8000;
+/**
+ * Transport failure -> the error the inventory poller records. An old cfctl-ssh exits 2 silently (D7); ssh's own failures (255: host-key
+ * mismatch, auth) are returned as the distinct code `ssh_exit_255` so they are never hidden as "inventory unavailable".
+ */
+export function inventoryFailure(error: unknown): RouterTransportError {
+    if (!(error instanceof RouterTransportError)) return new RouterTransportError('inventory_unavailable:invalid_router_inventory', 'not_delivered');
+    if (error.code === 'ssh_exit_failed' && error.exitCode === 2) return new RouterTransportError('inventory_unavailable:old_router', error.delivery, 2);
+    if (error.code === 'ssh_exit_failed' && error.exitCode === 255) return new RouterTransportError('ssh_exit_255', error.delivery, 255);
+    return error;
+}
+/** Anything other than a valid v1 reply is `inventory_unavailable:<code>` (both old-router shapes, unknown version, parse failure). */
+export function inventoryFromReply(text: string, config: IntegrationConfig): RouterInventory {
+    const result = classifyInventoryReply(text, {generation: config.router.generation, protectedMacs: config.protectedMacs});
+    if (!result.ok) throw new RouterTransportError(`inventory_unavailable:${result.code}`, 'not_delivered');
+    return result.inventory;
+}
 export class SSHRouter implements AsyncRouter {
     readonly config: IntegrationConfig;
     constructor(config: IntegrationConfig) { this.config = config; }
@@ -30,14 +50,14 @@ export class SSHRouter implements AsyncRouter {
             stdin = JSON.stringify(e) + '\n'; op = e.operation_id; digest = requestDigest(e); argv.push('cfctl rpc-sync');
         } else {
             if (kind === 'receipt') op = rpcId(operationId);
-            else if ((kind !== 'observe' && kind !== 'activity') || envelope !== undefined || operationId !== undefined) throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
-            argv.push(kind === 'activity' ? 'cfctl rpc-activity --json' : `cfctl rpc-status --json${op ? ' ' + op : ''}`);
+            else if ((kind !== 'observe' && kind !== 'activity' && kind !== 'inventory') || envelope !== undefined || operationId !== undefined) throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
+            argv.push(kind === 'activity' ? 'cfctl rpc-activity --json' : kind === 'inventory' ? 'cfctl rpc-inventory --json' : `cfctl rpc-status --json${op ? ' ' + op : ''}`);
             digest = sha256(`${kind}\n${r.generation}\n${op ?? ''}\n`);
         }
-        return {executable: '/usr/bin/ssh', argv, stdin, deadlineMs: 15000, kind, operationId: op, requestDigest: digest};
+        return {executable: '/usr/bin/ssh', argv, stdin, deadlineMs: kind === 'inventory' ? INVENTORY_DEADLINE_MS : 15000, kind, operationId: op, requestDigest: digest};
     }
     async invoke(invocation: FrozenInvocation): Promise<RPCObservation> {
-        if (invocation.kind === 'activity') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
+        if (invocation.kind === 'activity' || invocation.kind === 'inventory') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
         const text = await this.run(invocation);
         try { return parseObservation(text, FORMAT_ONLY); } catch { throw new RouterTransportError('invalid_router_response'); }
     }
@@ -45,6 +65,12 @@ export class SSHRouter implements AsyncRouter {
         if (invocation.kind !== 'activity') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
         const text = await this.run(invocation);
         try { return parseRouterActivity(text); } catch { throw new RouterTransportError('invalid_router_response'); }
+    }
+    async invokeInventory(invocation: FrozenInvocation): Promise<RouterInventory> {
+        if (invocation.kind !== 'inventory') throw new RouterTransportError('invalid_dispatch_kind', 'not_delivered');
+        let text: string;
+        try { text = await this.run(invocation); } catch (error) { throw inventoryFailure(error); }
+        return inventoryFromReply(text, this.config);
     }
     private async run(invocation: FrozenInvocation): Promise<string> {
         const expected = invocation.kind === 'apply'
@@ -88,7 +114,7 @@ export async function boundedChild(executable: string, argv: readonly string[], 
             done = true;
             // An accepted RPC may exit nonzero because firewall application failed. Its validated receipt
             // remains useful; neither a zero nor a nonzero process exit substitutes for that witness.
-            if (signal || (code !== 0 && (!allowNonzeroOutput || size === 0))) { reject(new RouterTransportError('ssh_exit_failed', spawned ? 'possible' : 'not_delivered')); return; }
+            if (signal || (code !== 0 && (!allowNonzeroOutput || size === 0))) { reject(new RouterTransportError('ssh_exit_failed', spawned ? 'possible' : 'not_delivered', signal ? null : code)); return; }
             const result = Buffer.concat(output).toString('utf8');
             if (result.includes('\uFFFD')) reject(new RouterTransportError('ssh_invalid_utf8'));
             else resolve(result);
