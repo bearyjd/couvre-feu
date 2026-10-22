@@ -91,7 +91,7 @@ test('touch targets: the move select and buttons are at least 44px tall', async 
   await signIn(page, f, 'operator');
   const row = page.locator('#children-panel [data-entry="kid2"] [data-device="d_kid2"]');
   for (const control of [row.getByLabel('Move Device kid2 to'), row.getByRole('button', { name: 'Move device Device kid2', exact: true }), row.getByRole('button', { name: /^Remove device/ })]) {
-    await control.scrollIntoViewIfNeeded();
-    expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    // Re-resolved on every poll: a periodic redraw can detach the element between separate steps.
+    await expect.poll(() => control.evaluate((el: HTMLElement) => el.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
   }
 });
