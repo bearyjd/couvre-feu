@@ -8,8 +8,11 @@ service/tests/ssh-router.test.ts.
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -314,9 +317,7 @@ class EmittedReleaseTreeTests(unittest.TestCase):
         modules = re.search(r"^CF_RELEASE_MODULES='(.*)'$", text, re.M).group(1).split()
         self.assertTrue(all(pair.split(':')[0].endswith(('.sh', '.awk')) for pair in modules), modules)
         self.assertEqual(self.result.stdout.strip(), release_id)
-        base = sorted(set(re.findall(r'\S+:[0-9a-f]{64}', ' '.join(modules))))
-        self.assertEqual(len(base), 9)
-        # Identity must change when a stripped wrapper changes: recompute with a one-byte-different cfctl-scope.
+        # The id is the digest of the module pins plus cfctl (pin line blanked), cfctl-ssh and cfctl-scope as emitted.
         entries = list(modules)
         for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope'):
             data = (self.out / name).read_bytes()
@@ -324,6 +325,133 @@ class EmittedReleaseTreeTests(unittest.TestCase):
                 data = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data, flags=re.M)
             entries.append(name + ':' + hashlib.sha256(data).hexdigest())
         self.assertEqual(hashlib.sha256(('\n'.join(entries) + '\n').encode()).hexdigest(), release_id)
+
+    def test_release_id_changes_when_a_wrapper_changes(self):
+        with ScratchRepo() as scratch:
+            base = scratch.run().stdout.strip()
+            self.assertEqual(base, self.result.stdout.strip())
+            for name in ('cfctl-scope', 'cfctl-ssh', 'cfctl'):
+                with self.subTest(name=name):
+                    scratch.append(f'router/{name}', '# perturbation\n')
+                    changed = scratch.run()
+                    self.assertEqual(changed.returncode, 0, changed.stderr)
+                    self.assertNotEqual(changed.stdout.strip(), base)
+                    scratch.restore(f'router/{name}')
+
+    def test_emitted_modes_match_what_install_expects(self):
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+        mode = lambda path: stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode(self.out), 0o700)
+        self.assertEqual(mode(self.out / 'lib'), 0o700)
+        for name in ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'):
+            self.assertEqual(mode(self.out / name), 0o755, name)
+        for path in sorted((self.out / 'lib').iterdir()):
+            self.assertEqual(mode(path), 0o644, path.name)
+        self.assertEqual(mode(self.out / 'release.sha256'), 0o600)
+
+
+class ScratchRepo:
+    """A throwaway copy of the files freeze-router-release.py reads, so drift can be injected safely."""
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / 'repo'
+        shutil.copytree(REPO / 'router', self.root / 'router')
+        (self.root / 'tools').mkdir()
+        for name in ('freeze-router-release.py', 'strip-test-mode.py'):
+            shutil.copyfile(REPO / 'tools' / name, self.root / 'tools' / name)
+        self.originals = {}
+        return self
+
+    def __exit__(self, *exc):
+        self.tmp.cleanup()
+
+    def append(self, rel, text):
+        path = self.root / rel
+        self.originals.setdefault(rel, path.read_bytes())
+        path.write_bytes(path.read_bytes() + text.encode())
+
+    def replace(self, rel, old, new):
+        path = self.root / rel
+        self.originals.setdefault(rel, path.read_bytes())
+        data = path.read_bytes()
+        assert old in data
+        path.write_bytes(data.replace(old, new, 1))
+
+    def restore(self, rel):
+        (self.root / rel).write_bytes(self.originals.pop(rel))
+
+    def run(self, *args):
+        return subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), *args],
+                              text=True, capture_output=True, timeout=30)
+
+    def siblings(self):
+        return sorted(p.name for p in self.tmp_path().iterdir())
+
+    def tmp_path(self):
+        return Path(self.tmp.name)
+
+
+class FreezeScriptRefusalTests(unittest.TestCase):
+    def assert_refused(self, result, needle, out):
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('refused: ', result.stderr)
+        self.assertIn(needle, result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertFalse(out.exists())
+
+    def test_emit_refuses_when_router_not_frozen(self):
+        with ScratchRepo() as scratch:
+            scratch.append('router/lib/core.sh', '# drift\n')
+            out = scratch.tmp_path() / 'tree'
+            self.assert_refused(scratch.run('--emit', str(out)), 'router not frozen', out)
+            self.assertEqual(scratch.siblings(), ['repo'])
+            self.assertEqual(scratch.run('--check').returncode, 1)
+
+    def test_emit_refuses_when_a_wrapper_drifts_from_the_manifest(self):
+        with ScratchRepo() as scratch:
+            scratch.append('router/cfctl-scope', '# drift\n')
+            out = scratch.tmp_path() / 'tree'
+            self.assert_refused(scratch.run('--emit', str(out)), 'router not frozen', out)
+
+    def test_emit_to_existing_directory_is_refused_cleanly(self):
+        with ScratchRepo() as scratch:
+            out = scratch.tmp_path() / 'tree'
+            out.mkdir()
+            result = scratch.run('--emit', str(out))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('refused: ', result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+            self.assertEqual(list(out.iterdir()), [])
+
+    def test_emit_with_missing_parent_is_refused_cleanly(self):
+        with ScratchRepo() as scratch:
+            out = scratch.tmp_path() / 'no-such-parent' / 'tree'
+            self.assert_refused(scratch.run('--emit', str(out)), '', out)
+
+    def test_emit_and_check_cannot_be_combined(self):
+        with ScratchRepo() as scratch:
+            for args in (('--emit', str(scratch.tmp_path() / 't'), '--check'), ('--check', '--emit', str(scratch.tmp_path() / 't'))):
+                with self.subTest(args=args):
+                    result = scratch.run(*args)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('usage', result.stderr)
+                    self.assertFalse((scratch.tmp_path() / 't').exists())
+
+    def test_stripped_wrapper_must_pass_sh_n(self):
+        with ScratchRepo() as scratch:
+            scratch.append('router/cfctl-ssh', 'fi )\n')
+            out = scratch.tmp_path() / 'tree'
+            self.assert_refused(scratch.run('--emit', str(out)), 'sh -n', out)
+
+    def test_cfctl_needs_exactly_one_bootstrap_pin_line(self):
+        for label, edit in (('duplicate', lambda s: s.append('router/cfctl', 'CF_BOOTSTRAP_PIN=' + '0' * 64 + '\n')),
+                            ('malformed', lambda s: s.replace('router/cfctl', b'CF_BOOTSTRAP_PIN=c', b'CF_BOOTSTRAP_PIN=Z')),
+                            ('missing', lambda s: s.replace('router/cfctl', b'\nCF_BOOTSTRAP_PIN=', b'\nCF_BOOTSTRAP_PINX='))):
+            with self.subTest(label), ScratchRepo() as scratch:
+                edit(scratch)
+                out = scratch.tmp_path() / 'tree'
+                self.assert_refused(scratch.run('--emit', str(out)), 'CF_BOOTSTRAP_PIN', out)
 
 
 if __name__ == '__main__':

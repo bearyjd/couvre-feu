@@ -618,6 +618,74 @@ class LiveRehearsalTests(unittest.TestCase):
                 self.assertIn('REFUSED', err)
         self.assertEqual(self.invoke('plan', self.write_config())[0], 0)
 
+    def committed_copy(self, **edits):
+        """A fresh committed source copy whose HEAD carries the given path -> bytes edits (None deletes)."""
+        copy = SourceCopy()
+        self.addCleanup(copy.tmp.cleanup)
+        for rel, data in edits.items():
+            if data is None:
+                (copy.root / rel).unlink()
+            else:
+                (copy.root / rel).write_bytes(data)
+        git = ['git', '-C', str(copy.root), '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid']
+        subprocess.run(git + ['add', '-A'], check=True, capture_output=True)
+        subprocess.run(git + ['commit', '-q', '-m', 'edit'], check=True, capture_output=True)
+        return copy
+
+    def assert_head_source_refused(self, copy, needle):
+        with self.assertRaises(copy.tool.Refusal) as caught:
+            copy.tool.head_source()
+        self.assertIn(needle, str(caught.exception))
+
+    def test_stripper_is_bound_to_head_and_never_run_from_disk(self):
+        copy = SourceCopy()
+        self.addCleanup(copy.tmp.cleanup)
+        stripper = copy.root / 'tools/strip-test-mode.py'
+        original = stripper.read_bytes()
+        marker = copy.root.parent / (copy.root.name + '-ran')
+        git = ['git', '-C', str(copy.root)]
+        cases = {
+            'modified on disk': (lambda: stripper.write_bytes(original + b'\nopen(%r, "w").write("x")\n' % str(marker)),
+                                 lambda: stripper.write_bytes(original), 'differs from HEAD'),
+            'removed from index': (lambda: subprocess.run(git + ['rm', '--cached', '-q', 'tools/strip-test-mode.py'], check=True),
+                                   lambda: subprocess.run(git + ['add', 'tools/strip-test-mode.py'], check=True), 'index differs'),
+        }
+        for label, (apply, revert, needle) in cases.items():
+            with self.subTest(label):
+                apply()
+                try:
+                    self.assert_head_source_refused(copy, needle)
+                finally:
+                    revert()
+                self.assertFalse(marker.exists(), 'stripper executed from disk')
+        self.assertEqual(copy.tool.head_source()[0], copy.tool.git('rev-parse', 'HEAD').strip())
+
+    def test_stripper_missing_from_head_refused(self):
+        self.assert_head_source_refused(self.committed_copy(**{'tools/strip-test-mode.py': None}), 'strip-test-mode.py')
+
+    def test_committed_stripper_is_the_one_executed_and_its_blob_is_recorded(self):
+        original = (REPO / 'tools/strip-test-mode.py').read_bytes()
+        copy = self.committed_copy(**{'tools/strip-test-mode.py': original + b'\nBLOCK_LINES = {"cfctl-ssh": 1, "cfctl-scope": 1}\n'})
+        self.assert_head_source_refused(copy, 'router/cfctl-ssh')
+        self.assertEqual(self.plan_details(self.write_config())['stripperBlobSha1'], self.tool.blob_id(original))
+
+    def test_tampered_wrapper_blob_refused(self):
+        rel = 'router/cfctl-scope'
+        copy = self.committed_copy(**{rel: (SOURCE.root / rel).read_bytes() + b'# tampered\n'})
+        self.assert_head_source_refused(copy, 'do not match release.sha256')
+
+    def test_wrapper_without_test_mode_marker_refused(self):
+        rel = 'router/cfctl-ssh'
+        text = (SOURCE.root / rel).read_text().replace('# The grammar fixture may invoke only a marked private-root executable.\n', '')
+        self.assert_head_source_refused(self.committed_copy(**{rel: text.encode()}), 'marker')
+
+    def test_unknown_or_malformed_manifest_entry_refused_not_keyerror(self):
+        manifest = (SOURCE.root / 'router/release.sha256').read_bytes()
+        for label, line in (('unknown', b'0' * 64 + b'  no-such-file\n'), ('malformed', b'justonefield\n')):
+            with self.subTest(label):
+                copy = self.committed_copy(**{'router/release.sha256': manifest + line})
+                self.assert_head_source_refused(copy, 'release.sha256')
+
     def test_evidence_directory_collision_refused(self):
         (self.evidence_root / 'evidence/20261012T180000Z-first-rehearsal').mkdir(mode=0o700)
         config = self.write_config()
