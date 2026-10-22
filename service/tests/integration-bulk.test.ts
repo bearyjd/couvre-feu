@@ -8,7 +8,7 @@ import { integrationFixture, actor } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { ChildAdmin } from '../src/admin-children.ts';
 import type { ChildAction } from '../src/admin-children.ts';
-import { BulkOps, bulkPolicy, movePolicy } from '../src/integration-bulk.ts';
+import { BulkOps, bulkPolicy } from '../src/integration-bulk.ts';
 import type { BulkAction } from '../src/integration-bulk.ts';
 import { AutomaticDispatch } from '../src/integration-automatic.ts';
 import { IntegrationStore } from '../src/integration-db.ts';
@@ -17,7 +17,7 @@ import { appServer } from '../src/http.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
-import { PRE_WRITE_REJECTIONS } from '../src/integration-children.ts';
+import { PRE_WRITE_REJECTIONS, movePolicy } from '../src/integration-children.ts';
 import { TimeRequestService } from '../src/time-requests.ts';
 
 // Placeholder, locally administered unicast MACs only.
@@ -430,5 +430,149 @@ test('a confirmed bulk operation that names a child supersedes that child\'s owe
         await new TimeRequestService(f.store, policy as never, f.now).advance();
         assert.equal(f.store.get<{repause_state: string}>("SELECT repause_state FROM time_requests WHERE id='req-1'")!.repause_state, 'superseded');
         assert.deepEqual(mutate, []);
+    } finally { f.cleanup(); }
+});
+
+/** A child owed a re-pause after an approved allowance (pilot, originally paused indefinitely), with the service's own resume already recorded. */
+function oweRepause(f: ReturnType<typeof world>) {
+    const now = f.now();
+    f.store.run("INSERT INTO request_links(id,person_id,token_hash,created_by,created_at,revoked_at,revoked_by) VALUES('l1','pilot',?,'operator',?,?,'operator')", 'h'.repeat(64), now - 2000, now - 100);
+    f.store.run("INSERT INTO time_requests(id,link_id,person_id,minutes,reason,state,created_at,expires_at,decided_by,decided_at,granted_minutes,allowance_until,original_pause_until,repause_state) VALUES('req-1','l1','pilot',15,'','approved',?,?,'operator',?,15,?,0,'waiting')", now - 1500, now - 600, now - 1000, now + 5);
+    const calls: string[] = [];
+    const policy = {people: () => { calls.push('people'); return {people: [{id: 'pilot', manualPause: null}], revisionToken: 'x'}; },
+        mutate: () => { calls.push('mutate'); return {status: 202, result: {operation: {id: 'x', state: 'pending'}}}; }, now: f.now, devices: () => ({}), operation: () => ({}), reconcile: () => undefined};
+    /** The service's own earlier resume (revision 0); recorded after any queued change so that change is the LATER one. */
+    const resumed = () => f.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at) VALUES('own','operator','pilot','resume',0,'confirmed','{}','{}','{}','tr-req-1-r1',?,?)", now - 900, now - 900);
+    return {calls, resumed, advance: () => new TimeRequestService(f.store, policy as never, f.now).advance(),
+        state: () => f.store.get<{repause_state: string}>("SELECT repause_state FROM time_requests WHERE id='req-1'")!.repause_state};
+}
+
+test('H1: a pending move naming a child does NOT supersede its owed re-pause', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const owed = oweRepause(f);
+        assert.equal((await f.move(op, 'd_kid2', 'pilot')).status, 202);
+        owed.resumed(); f.advance(10);
+        await owed.advance();
+        assert.notEqual(owed.state(), 'superseded');
+        assert.ok(owed.calls.includes('mutate'), 'the re-pause is still attempted (the mutate itself gets operation_in_progress and the backoff retries)');
+    } finally { f.cleanup(); }
+});
+
+test('H1: a pending pause_all that is later refused leaves the re-pause owed, never superseded', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const owed = oweRepause(f);
+        const r = await f.block(op, 'pause_all', {until: 0});
+        owed.resumed(); f.advance(10);
+        await owed.advance();
+        assert.notEqual(owed.state(), 'superseded');
+        f.router.reject = 'incomplete_address_coverage';
+        await f.dispatch(r.body.operation.id);
+        assert.equal(f.policy.operation(f.wide, r.body.operation.id).state, 'failed');
+        await owed.advance();
+        assert.notEqual(owed.state(), 'superseded');
+    } finally { f.cleanup(); }
+});
+
+test('H1: a CONFIRMED move does not supersede the re-pause either; only a confirmed pause/resume family op does', async () => {
+    const f = world();
+    try {
+        const owed = oweRepause(f); owed.resumed(); f.advance(10);
+        const insert = (id: string, action: string, revision: number, key: string) => f.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at) VALUES(?,'operator','pilot',?,?,'confirmed','{}','{}','{}',?,?,?)", id, action, revision, key, f.now() - 800, f.now() - 800);
+        insert('mv', 'move', 4, 'move_key_1234567890'); insert('en', 'enroll', 5, 'enroll_key_123456789');
+        await owed.advance();
+        assert.notEqual(owed.state(), 'superseded');
+        insert('ps', 'pause_all', 6, 'pause_key_123456789');
+        f.store.run("UPDATE time_requests SET repause_state='waiting',next_attempt_at=NULL WHERE id='req-1'");
+        await owed.advance();
+        assert.equal(owed.state(), 'superseded');
+    } finally { f.cleanup(); }
+});
+
+test('H2: removing a child that is the TARGET of a moving device is refused (409 device_change_in_progress)', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        f.store.run("INSERT INTO people(id,name,kind,active,created_at) VALUES('kid4','Kid 4','child',1,?)", f.now());
+        f.setScope('operator', [...ALL, 'kid4']);
+        const r = await f.move(op, 'd_kid2', 'kid4');
+        const opts = await f.admin.stepUpOptions(op.session(), {action: 'child_remove', target: 'kid4', params: {}});
+        await assert.rejects(f.admin.perform(op.session(), 'child_remove' as ChildAction, 'kid4', {stepUp: {challengeId: opts.challengeId, response: op.key.login(opts.options, origin)}}), code('device_change_in_progress'));
+        assert.equal(f.store.get<{active: number}>("SELECT active FROM people WHERE id='kid4'")!.active, 1);
+        await f.dispatch(r.body.operation.id);
+        assert.equal(f.store.get<{person_id: string}>("SELECT person_id FROM devices WHERE id='d_kid2'")!.person_id, 'kid4');
+    } finally { f.cleanup(); }
+});
+
+test('H2: at settle time a target child that became inactive gets no device; it reverts to the source with a drift error', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        f.store.run("INSERT INTO people(id,name,kind,active,created_at) VALUES('kid4','Kid 4','child',1,?)", f.now());
+        f.setScope('operator', [...ALL, 'kid4']);
+        const r = await f.move(op, 'd_kid2', 'kid4');
+        // The target is removed while the apply is in flight (after the dispatch-time authorization), so only the settle step can catch it.
+        f.router.afterApply = () => f.store.run("UPDATE people SET active=0 WHERE id='kid4'");
+        await f.dispatch(r.body.operation.id);
+        assert.deepEqual({...f.store.get("SELECT person_id,state,move_to FROM devices WHERE id='d_kid2'")!}, {person_id: 'kid2', state: 'active', move_to: null});
+        assert.equal(f.store.get<{error: string}>('SELECT error FROM operations WHERE id=?', r.body.operation.id)!.error, 'device_move_drift');
+    } finally { f.cleanup(); }
+});
+
+test('C-M2: a moved device the observation shows under NEITHER child stays active under the source with a drift error (conflict)', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const before = f.router.policy;
+        f.router.afterApply = () => { f.router.policy = normalizePolicy({...before, revision: before.revision + 5, people: before.people.filter(p => p.id !== 'kid2')}, f.config.protectedMacs); };
+        const r = await f.move(op, 'd_kid2', 'kid3'); await f.dispatch(r.body.operation.id);
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM operations WHERE id=?', r.body.operation.id)!.state, 'conflict');
+        assert.deepEqual({...f.store.get("SELECT person_id,state,move_to,label FROM devices WHERE id='d_kid2'")!}, {person_id: 'kid2', state: 'active', move_to: null, label: 'Device kid2'});
+        assert.equal(f.store.get<{error: string}>('SELECT error FROM operations WHERE id=?', r.body.operation.id)!.error, 'device_move_drift');
+    } finally { f.cleanup(); }
+});
+
+test('M1: pause_all never shortens an existing pause: indefinite stays indefinite, a later expiry stays later', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator');
+        const later = f.now() + 5000, sooner = f.now() + 100;
+        f.router.policy = f.policyOf(1, {pauses: [{person: 'kid2', until: 0}, {person: 'kid3', until: later}]});
+        await f.observe();
+        const r = await f.block(op, 'pause_all', {until: sooner});
+        await f.dispatch(r.body.operation.id);
+        const pauses = Object.fromEntries(f.router.policy.pauses.map(p => [p.person, p.until]));
+        assert.deepEqual(pauses, {kid2: 0, kid3: later, pilot: sooner});
+        // And the other way: an indefinite pause_all extends a finite one.
+        f.advance(1); await f.observe();
+        const again = await f.block(op, 'pause_all', {until: 0});
+        await f.dispatch(again.body.operation.id);
+        assert.deepEqual(Object.fromEntries(f.router.policy.pauses.map(p => [p.person, p.until])), {kid2: 0, kid3: 0, pilot: 0});
+    } finally { f.cleanup(); }
+});
+
+test('L1: the operator dispatch path also re-checks every operation_people row; a narrowed scope refuses the dispatch', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const r = await f.block(op, 'pause_all', {until: 0});
+        f.setScope('operator', ['pilot', 'kid2']);
+        await f.dispatch(r.body.operation.id);
+        assert.equal(f.applies().length, 0);
+        const dto = f.policy.operation(f.wide, r.body.operation.id);
+        assert.equal(dto.state, 'failed'); assert.equal(dto.error, 'actor_permission_changed_before_dispatch');
+    } finally { f.cleanup(); }
+});
+
+test('L3: the tr- idempotency-key prefix is reserved for the time-request service; client keys cannot use it', async () => {
+    const f = world();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        await assert.rejects(f.block(op, 'pause_all', {until: 0}, 'tr-req-1-r1-abcdefgh'), code('idempotency_key_required'));
+        assert.equal(f.ops().length, 0);
+        assert.equal((await f.block(op, 'pause_all', {until: 0}, 'trx-req-1-r1-abcdefgh')).status, 202);
     } finally { f.cleanup(); }
 });

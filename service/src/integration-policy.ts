@@ -146,7 +146,7 @@ export class IntegrationPolicy {
         const people = children.map(child => {
             const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id);
             if (!enrolled) allEnrolled = false;
-            const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE person_id=? OR id IN (SELECT operation_id FROM operation_people WHERE person_id=?) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id, child.id);
+            const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
             if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
             return {id: child.id, name: child.name, kind: child.kind, devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, ...(d.state === 'active' ? {} : {change: d.state === 'enrolling' ? 'adding' as const : d.state === 'moving' ? 'moving' as const : 'removing' as const}),

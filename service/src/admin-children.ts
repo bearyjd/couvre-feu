@@ -9,8 +9,7 @@ import { routerScopeOf } from './integration-config.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import type { IntegrationPolicy, IntegrationOperation } from './integration-policy.ts';
-import { movePolicy } from './integration-bulk.ts';
-import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, activeChildren, devicesOf, withDevice, withoutDevice } from './integration-children.ts';
+import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, TOKEN, activeChildren, devicesOf, movePolicy, withDevice, withoutDevice } from './integration-children.ts';
 import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
 
@@ -18,7 +17,6 @@ import type { Routed } from './time-requests-http.ts';
 export type ChildAction = 'child_create' | 'child_remove' | 'device_add' | 'device_remove' | 'device_move';
 export const CHILD_ACTIONS: readonly ChildAction[] = ['child_create', 'child_remove', 'device_add', 'device_remove', 'device_move'];
 const ID = /^[a-z][a-z0-9_]{0,31}$/;
-const TOKEN = /^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/;
 const KINDS: readonly EntryKind[] = ['child', 'device_group'];
 export interface ChildAdminDTO {
     id: string; name: string; kind: EntryKind;
@@ -140,6 +138,8 @@ export class ChildAdmin {
         if (kind === 'child_remove') {
             this.policy.authorized(actor, target);
             if (devicesOf(this.store, target).length) throw new AppError(409, 'child_has_devices', 'Remove every device first.');
+            // A queued move names this child as its destination: removing it now would settle the device onto a hidden child.
+            if (this.store.get("SELECT 1 FROM devices WHERE move_to=? AND state='moving'", target)) throw new AppError(409, 'device_change_in_progress', 'A device is being moved to this entry.');
             if (this.obligations(target)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
             this.store.run('UPDATE people SET active=0 WHERE id=?', target);
             this.store.run('UPDATE request_links SET revoked_at=?,revoked_by=? WHERE person_id=? AND revoked_at IS NULL', now, actor.id, target);

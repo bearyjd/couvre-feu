@@ -85,6 +85,8 @@ type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
 export function remoteIPv4(address: string | undefined): string | undefined {
     return address?.startsWith('::ffff:') ? address.slice(7) : address;
 }
+/** The Idempotency-Key header, dropped when it uses the `tr-` prefix reserved for the time-request service (the route then reports the key as missing). */
+const clientKey = (value: string | string[] | undefined): string | undefined => typeof value === 'string' && !value.startsWith('tr-') ? value : undefined;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService) {
     // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
@@ -200,7 +202,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, child.status, {...provenance, ...child.body as object});
                     return;
                 }
-                const bulkRoute = await bulkPost(bulk, session, path, payload, typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
+                const bulkRoute = await bulkPost(bulk, session, path, payload, clientKey(request.headers['idempotency-key']));
                 if (bulkRoute) {
                     send(response, bulkRoute.status, {...provenance, ...bulkRoute.body as object});
                     return;
@@ -212,7 +214,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
                 if (match) {
-                    const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
+                    const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;
@@ -223,7 +225,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                         throw new AppError(403, 'schedule_editing_unavailable', 'Schedules are owner-configured in this installation.');
                     }
                     const action = !schedule[2] ? 'schedule_create' : schedule[3] ? 'schedule_delete' : 'schedule_update';
-                    const result = await policy.scheduleMutate(session.dto.actor, schedule[1], action, payload, schedule[2], request.headers['if-match'], typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
+                    const result = await policy.scheduleMutate(session.dto.actor, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;

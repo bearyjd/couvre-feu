@@ -303,11 +303,14 @@ export class TimeRequestService {
      * pause is restored or provably unnecessary; while it is overdue the parent UI shows an alert.
      */
     private async repause(row: RequestRow): Promise<void> {
-        // A later confirmed or pending policy change for this child outranks the stale allowance. Our own operations are excluded by key.
+        // Only a later CONFIRMED pause/resume-type change outranks the stale allowance. A pending one may still fail, and a move or enrollment
+        // never settles whether the child is blocked, so those leave the re-pause owed (a pending change makes the mutate retry via backoff).
+        // Our own operations are excluded by key. A bulk operation names the child through operation_people (integration databases only).
         const own = this.store.get<{revision: number}>("SELECT revision FROM operations WHERE person_id=? AND idempotency_key LIKE ? ORDER BY revision LIMIT 1", row.person_id, `tr-${row.id}-r%`);
-        // A bulk operation names this child through operation_people (integration databases only), not necessarily as its representative person_id.
-        const people = this.store.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_people'") ? ' OR id IN (SELECT operation_id FROM operation_people WHERE person_id=?)' : '';
-        const later = own && this.store.get(`SELECT id FROM operations WHERE (person_id=?${people}) AND revision>? AND state IN ('pending','confirmed') AND idempotency_key NOT LIKE ? LIMIT 1`, ...(people ? [row.person_id, row.person_id] : [row.person_id]), own.revision, `tr-${row.id}-%`);
+        const named = this.store.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_people'")
+            ? 'o.person_id=?1 OR EXISTS(SELECT 1 FROM operation_people n WHERE n.operation_id=o.id AND n.person_id=?1)' : 'o.person_id=?1';
+        const later = own && this.store.get(`SELECT o.id FROM operations o WHERE (${named}) AND o.revision>?2 AND o.state='confirmed'
+            AND o.action IN ('pause','resume','pause_all','resume_all') AND o.idempotency_key NOT LIKE ?3 LIMIT 1`, row.person_id, own.revision, `tr-${row.id}-%`);
         if (later) return this.setRepause(row, 'superseded', null);
         // The original timed pause would already have ended by itself: nothing to restore.
         if (row.original_pause_until !== 0 && row.original_pause_until! <= this.now()) return this.setRepause(row, 'not_needed', null);

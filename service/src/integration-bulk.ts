@@ -5,7 +5,7 @@ import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
-import { activeChildren, withDevice, withoutDevice } from './integration-children.ts';
+import { CLIENT_KEY, TOKEN, activeChildren } from './integration-children.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { IntegrationOperation, IntegrationPolicy } from './integration-policy.ts';
 import type { Routed } from './time-requests-http.ts';
@@ -14,8 +14,6 @@ import type { Routed } from './time-requests-http.ts';
 export type BulkAction = 'pause_all' | 'resume_all';
 export const BULK_ACTIONS: readonly BulkAction[] = ['pause_all', 'resume_all'];
 type PolicyConfig = Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>;
-const TOKEN = /^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/;
-const KEY = /^[A-Za-z0-9_-]{16,128}$/;
 
 /**
  * The next policy for a bulk change, built from the router's accepted policy for EXACTLY the bound child ids. It never looks at
@@ -26,18 +24,14 @@ export function bulkPolicy(base: RouterPolicy, config: PolicyConfig, action: Bul
     if (ids.length === 0) throw new AppError(409, 'no_enrolled_children');
     if (ids.some(id => !base.people.some(p => p.id === id))) throw new AppError(409, 'bulk_children_changed');
     const bound = new Set(ids), rest = base.pauses.filter(p => !bound.has(p.person));
-    const pauses = action === 'pause_all' ? [...rest, ...ids.map(person => ({person, until: until!}))] : rest;
-    const allowances = action === 'pause_all' && base.allowances ? {allowances: base.allowances.filter(a => !bound.has(a.person))} : {};
-    return normalizePolicy({...base, revision: base.revision + 1, pauses, ...allowances}, config.protectedMacs);
+    const next = (pauses: RouterPolicy['pauses'], extra: Partial<RouterPolicy> = {}) => normalizePolicy({...base, revision: base.revision + 1, pauses, ...extra}, config.protectedMacs);
+    if (action === 'resume_all') return next(rest);
+    if (until === null) throw new AppError(400, 'pause_expiry_required');
+    // "Block all" never SHORTENS a pause a child already has: indefinite (0) wins, otherwise the later expiry.
+    const strongest = (existing: number | undefined) => existing === undefined ? until : existing === 0 || until === 0 ? 0 : Math.max(existing, until);
+    const pauses = [...rest, ...ids.map(person => ({person, until: strongest(base.pauses.find(p => p.person === person)?.until)}))];
+    return next(pauses, base.allowances ? {allowances: base.allowances.filter(a => !bound.has(a.person))} : {});
 }
-/** withoutDevice(A) then withDevice(B), as ONE revision: the router sees a single step, so there is never a state with the device nowhere. */
-export function movePolicy(base: RouterPolicy, config: PolicyConfig, from: string, to: string, mac: string): RouterPolicy {
-    if (from === to) throw new AppError(409, 'device_move_same_child');
-    if (!base.people.some(p => p.id === from && p.macs.includes(mac))) throw new AppError(409, 'device_not_on_router');
-    const next = withDevice(withoutDevice(base, config, from, mac), config, to, mac);
-    return normalizePolicy({...next, revision: base.revision + 1}, config.protectedMacs);
-}
-
 export class BulkOps {
     readonly auth: Auth;
     readonly policy: IntegrationPolicy;
@@ -56,12 +50,12 @@ export class BulkOps {
         if (ids.length === 0) throw new AppError(409, 'no_enrolled_children');
         return ids;
     }
-    private fields(action: BulkAction, params: unknown): {until: number | null; precondition: string} {
+    private fields(action: BulkAction, params: unknown): {action: 'pause_all'; until: number; precondition: string} | {action: 'resume_all'; until: null; precondition: string} {
         const body = object(params, action === 'pause_all' ? ['until', 'precondition'] : ['precondition']);
         const until = action === 'pause_all' ? integer(body.until) : null;
         if (typeof body.precondition !== 'string' || !TOKEN.test(body.precondition)) throw new AppError(428, 'revision_precondition_required');
         if (until !== null && until !== 0 && until <= this.policy.now()) throw new AppError(400, 'pause_expiry_must_be_future');
-        return {until, precondition: body.precondition};
+        return until === null ? {action: 'resume_all', until, precondition: body.precondition} : {action: 'pause_all', until, precondition: body.precondition};
     }
     private binding(action: BulkAction, ids: readonly string[], until: number | null, precondition: string): string {
         return digest(JSON.stringify(['bulk', action, ids, until, precondition]));
@@ -74,7 +68,7 @@ export class BulkOps {
     }
     /** Verifies the step-up for the exact child list, then re-derives that list inside the write transaction and refuses any difference. */
     async perform(session: AuthSession, action: BulkAction, key: string | undefined, input: unknown): Promise<Routed> {
-        if (!key || !KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
+        if (!key || !CLIENT_KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!input || typeof input !== 'object' || Array.isArray(input)) throw new AppError(400, 'invalid_object');
         const {stepUp, ...rest} = input as Record<string, unknown>;
         const {until, precondition} = this.fields(action, rest);
