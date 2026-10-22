@@ -739,7 +739,8 @@ class RpcTests(RpcCommon, unittest.TestCase):
                                     ('cfctl rpc-sync\n', False), ('cfctl rpc-status --json --rpc-only', False),
                                     ('cfctl rpc-activity --json', True), ('cfctl rpc-activity', False),
                                     ('cfctl rpc-activity --json op-1', False), ('cfctl activity --json', False),
-                                    ('cfctl rpc-activity --json; id', False)):
+                                    ('cfctl rpc-activity --json; id', False), ('cfctl rpc-inventory --json', True),
+                                    ('cfctl rpc-inventory', False), ('cfctl rpc-inventory --json x', False)):
             with self.subTest(original=original):
                 result = self.script('cfctl-ssh', '--rpc-only', env=dict(self.f.env, SSH_ORIGINAL_COMMAND=original))
                 self.assertEqual(result.returncode == 0, permitted, result.stdout + result.stderr)

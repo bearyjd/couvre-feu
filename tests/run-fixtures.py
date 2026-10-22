@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 from harness import run_owned_process
 
-SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py', 'test-penn-pilot.py', 'test-scope-admin.py')
+SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py', 'test-penn-pilot.py', 'test-scope-admin.py', 'test-inventory.py')
 # Fixed public source paths bind the plan to fixtures and the entire release.
 SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.py', 'tests/fixtures/harness.py', 'tests/fixtures/backend.py',
                 'router/release.sha256', 'router/install.sh', 'router/uninstall.sh',

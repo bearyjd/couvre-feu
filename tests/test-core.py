@@ -1715,6 +1715,7 @@ class RestrictedCommandTests(unittest.TestCase):
                                   ("cfctl expire", ["expire"]),
                                   ("cfctl activity --json", ["activity", "--json"]),
                                   ("cfctl rpc-activity --json", ["rpc-activity", "--json"]),
+                                  ("cfctl rpc-inventory --json", ["rpc-inventory", "--json"]),
                                   ("cfctl apply-fw", ["apply-fw"])):
             with self.subTest(command=command):
                 result = self.run_wrapper(command)
@@ -1731,7 +1732,8 @@ class RestrictedCommandTests(unittest.TestCase):
                         "cfctl pause alice --until 2147483648", "cfctl sync extra",
                         "cfctl remove-fw", "cfctl check", "cfctl bonus alice 60",
                         "cfctl status --json --root /tmp", "cfctl resume ../../root",
-                        "cfctl activity", "cfctl activity --json extra", "cfctl rpc-activity --json op-1"):
+                        "cfctl activity", "cfctl activity --json extra", "cfctl rpc-activity --json op-1",
+                        "cfctl rpc-inventory", "cfctl rpc-inventory --json extra"):
             with self.subTest(command=command):
                 self.assertNotEqual(self.run_wrapper(command).returncode, 0)
                 self.assertFalse(self.wrapper_log.exists())
