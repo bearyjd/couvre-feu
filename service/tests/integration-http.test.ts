@@ -76,9 +76,9 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
             while (f.policy.operation(verified.body.actor, result.body.operation.id).state !== 'confirmed' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
         }
         for (let i = 0; i < 3; i++) { const operation = await request('/operations/' + result.body.operation.id); assert.equal(operation.body.state, enabled ? 'confirmed' : 'pending'); assert.equal(operation.body.source, 'real-router-integration'); assert.equal((await request('/people')).status, 200); }
-        assert.equal(f.router.calls.length, enabled ? 3 : 1);
+        assert.equal(f.router.calls.filter(c => c.kind !== 'inventory').length, enabled ? 3 : 1, 'policy dispatches (the separate inventory poll is not one of them)');
         assert.equal((await request('/operations/00000000-0000-0000-0000-000000000000')).status, 404);
         f.store.run("UPDATE accounts SET permission_version=permission_version+1 WHERE id='parent'"); assert.equal((await request('/people')).status, 401);
-        assert.equal(f.router.calls.length, enabled ? 3 : 1);
+        assert.equal(f.router.calls.filter(c => c.kind !== 'inventory').length, enabled ? 3 : 1);
     } finally { await automatic?.stop(); server.close(); await once(server, 'close'); f.cleanup(); }
 });

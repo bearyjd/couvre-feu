@@ -1,5 +1,5 @@
 import { object } from './json.ts';
-import { hexDigest, parseObservation, policyDigest } from './router-rpc.ts';
+import { FORMAT_ONLY, hexDigest, parseObservation, policyDigest } from './router-rpc.ts';
 import { healthyConfirmation, integer, normalizePolicy } from './router-schema.ts';
 
 export interface EmptyWitnessContext {
@@ -37,7 +37,7 @@ export function emptyRuntimeWitness(raw: string, context: unknown): EmptyWitness
     if (Buffer.byteLength(raw) > 131072) return unavailableEmptyWitness('input_limit');
     if (!/^[\x09\x0a\x0d\x20-\x7e]*$/.test(raw)) return unavailableEmptyWitness('input_not_ascii');
     let o;
-    try { o = parseObservation(raw); } catch { return result('FAIL', 'invalid_rpc'); }
+    try { o = parseObservation(raw, FORMAT_ONLY); } catch { return result('FAIL', 'invalid_rpc'); }
     if (o.generation !== expectedGeneration) return result('FAIL', 'generation_mismatch');
     const empty = normalizePolicy({version: 1, revision: 0, people: [], pauses: [], schedules: [], doh: {ipv4: [], ipv6: []}});
     if (JSON.stringify(normalizePolicy(o.acceptedPolicy)) !== JSON.stringify(empty) || o.policyDigest !== policyDigest(empty)) return result('FAIL', 'policy_not_empty');

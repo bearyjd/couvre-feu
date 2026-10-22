@@ -37,6 +37,8 @@ export interface IntegrationManifest {
 export interface IntegrationConfig extends IntegrationManifest {
     origin: string; host: string; manifestDigest: string; targetDigest: string; provenance: Provenance;
 }
+/** Matches the router's valid_protection cap (router/lib/install-common.sh); a drift test reads that file. */
+export const PROTECTED_MAC_LIMIT = 128;
 const bad = (code = 'invalid_integration_manifest'): never => { throw new Error(code); };
 function text(value: unknown): string {
     if (typeof value !== 'string' || value.length < 1 || value.length > 128 || /[\x00-\x1f\x7f]/.test(value)) bad();
@@ -93,7 +95,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const router: IntegrationManifest['router'] = {...routerTarget(r), knownHosts: safePath(r.knownHosts), hostFingerprint: expectedFingerprint(r.hostFingerprint), agentSocket: safePath(r.agentSocket), publicIdentity: safePath(r.publicIdentity), publicKeyFingerprint: expectedFingerprint(r.publicKeyFingerprint), generation: hexDigest(r.generation)};
     const p = object(m.person, ['id', 'name', 'device']), d = object(p.device, ['id', 'label', 'mac']);
     const person = {id: id(p.id), name: text(p.name), device: {id: id(d.id), label: text(d.label), mac: mac(d.mac)}};
-    if (!Array.isArray(m.protectedMacs) || !m.protectedMacs.length || m.protectedMacs.length > 64) bad('protected_identities_required');
+    if (!Array.isArray(m.protectedMacs) || !m.protectedMacs.length || m.protectedMacs.length > PROTECTED_MAC_LIMIT) bad('protected_identities_required');
     const protectedMacs = (m.protectedMacs as unknown[]).map(mac);
     if (new Set(protectedMacs).size !== protectedMacs.length || protectedMacs.includes(person.device.mac)) bad('protected_mac_overlap');
     // Seeds a fresh database only; the database is authoritative afterwards. ACCOUNT_LIMIT is a defensive bound, not a product cap.
