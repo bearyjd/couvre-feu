@@ -293,3 +293,57 @@ M2a/M2c.
     assignment). There is no protected-device count.
   - Privacy: the acknowledge audit row records the inventory row id, never the MAC. Rows whose MAC is protected are purged at startup and on every ingest.
   - integration-006 also widens `parent_alerts.kind` with `inventory_stalled` and gives `inventory_state` `incomplete_since` and `last_stall_alert_at`; its inventory objects stay `IF NOT EXISTS`, because a database whose `dispatch_steps` is rebuilt by 002 re-runs the file (the integration-002 upgrade test).
+
+## 9. M1d scope administration (router, admin-only)
+
+The live `rpc-allowed` changes ONLY through three root, interactive `cfctl` verbs (`router/lib/core.sh` `cf_scope_main`,
+`router/cfctl` before the bootstrap boundary). None of them is in the `cfctl-ssh` grammar (unchanged allow-list), and
+nothing in `rpc.sh` or `activity.sh` writes the scope.
+
+| command | effect |
+|---|---|
+| `cfctl scope-preview <MAC>` | read-only. Prints the address type (locally administered bit), current br-lan evidence (neighbour state; unexpired lease inside the br-lan IPv4 subnet, with the hostname through the shared sanitiser: `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`, else `(unnamed)`), the current `scopeSha`, whether add/remove would be refused (and why), and a WARNING listing protected MACs with no evidence now (a rotated adult address hint). Final line is JSON (`addRefusal`, `removeRefusal`, `protectedAbsent`, ...). |
+| `cfctl scope-add <MAC> --base <scopeSha>` | adds one MAC. |
+| `cfctl scope-remove <MAC> --base <scopeSha>` | removes one MAC. |
+
+Commit flow (add/remove): (1) argv shape, the service marker and a TTY on stdin are checked and the typed confirmation
+(the last 6 hex digits of the MAC, no colons) is read in `cfctl` BEFORE platform admission, so no platform lock, policy lock or
+admission deadline is held while a human types; (2) admission, read-only load; (3) `trap '' TSTP`, `cf_lock`; (4) under the lock:
+install gate, ready+complete generation, single-read scope snapshot, `--base` CAS against it, every refusal, then `cf_ssh_guard`;
+(5) `logger -t couvrefeu` INTENT line (refused if it cannot be logged); (6) candidate `runtime/.scope.<pid>` created with `set -C`, umask
+077, mode 600, same filesystem as `/etc/couvrefeu`, re-validated with the runtime validators (format, floor, protected-disjoint, every
+P MAC kept), `sync`, rename over `rpc-allowed`, `sync`; (7) COMMIT log line; old and new `scopeSha` printed. A crash at any step leaves the
+old or the new complete file; a leftover candidate is swept under `cf_lock` and allowed by the uninstall runtime whitelist. The floor
+(`backup/*.staged`, `*.after`) is never written.
+
+Refusal codes (JSON `{"ok":false,"errors":[code]}`): `invalid_command`, `scope_mac_not_canonical` (only lowercase colon form),
+`scope_mac_invalid` (multicast/zero), `scope_forced_command_refused` (`CF_SERVICE_FORCED_COMMAND` set; `cfctl-ssh` now exports it to its
+child), `scope_base_invalid`, `scope_tty_required`, `scope_confirmation_mismatch`, `scope_confirmation_required`, `scope_admin_invalid`,
+`scope_unscoped_install`, `inactive_generation` (not ready+complete), `installation_in_progress`, `locked`, `scope_base_conflict` (stale
+`--base`), `scope_mac_is_ssh_client`, `scope_mac_protected`, `scope_no_evidence` (add only; remove works for an absent/rotated MAC),
+`scope_mac_present`, `scope_full` (256), `scope_mac_absent`, `scope_mac_in_floor` (needs a fresh install + rebind), `scope_mac_in_use` (a
+person record uses it), `scope_audit_unavailable`, plus the guard's `ssh_client_*` codes. The service host (CT107) has no router-side
+configuration; it is refused because it MUST be protected (SAD-H1), never by a hardcoded address.
+
+Per-admin wrapper `/usr/sbin/cfctl-scope <admin>` (`router/cfctl-scope`): `<admin>` is `[a-z]{1,16}` from its single argv (set by the
+`command=` option); `SSH_ORIGINAL_COMMAND` must be exactly one of the three forms above (canonical MAC, 64 lowercase hex base, at most 128
+bytes, tokens only); anything else exits 2 without running anything. It execs `env -i PATH LC_ALL SSH_CONNECTION SSH_CLIENT
+CF_SCOPE_ADMIN=<admin> /usr/sbin/cfctl ...`; the admin name appears in both audit lines. It is installed like `cfctl-ssh`: copied from the
+verified release (mode 755), journaled (`usr_sbin_cfctl-scope.*`, fresh installs only; older journals keep their inventory), drift-checked,
+in sysupgrade.conf and `release.sha256`, removed on uninstall. It still contains a CF_TEST_MODE fixture block of the same 9-line shape as
+`cfctl-ssh`; M4's emitted tree must strip it too.
+
+Operator procedure (each run is its own approved invocation; release id cited):
+1. Read the address from the device's OWN Wi-Fi settings ("Fixed"/non-rotating private address). Never copy a MAC from the app: the app
+   only shows `cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>` and never a paste-ready command.
+2. From your own LAN computer, which is protected and has a fixed MAC, use your OWN admin key. Never use the service key, and never run this
+   on or through CT107: `ssh -t router 'cfctl scope-preview <MAC>'`. Check the evidence, the address type and any WARNING. The evidence can be
+   forged by a LAN host; it is not a gate.
+3. `ssh -t router 'cfctl scope-add <MAC> --base <scopeSha from step 2>'`, then type the last 6 hex digits when asked. `-t` is required,
+   because the confirm needs a TTY; the admin key line must allow a pty (unlike the service template's `restrict`).
+4. Wait for the app to observe the new `scope`/`scopeSha`, then enroll in the UI. Rollback: unenroll in the UI, then `scope-remove`;
+   a floor MAC needs a fresh install and rebind. Uninstall restores the original bytes whatever the scope became.
+
+Admin key line (template; JD and Bryn each have their own key, both keys are passphrase-protected, never on CT107, no agent forwarding):
+`command="/usr/sbin/cfctl-scope <admin>",no-port-forwarding,no-agent-forwarding,no-X11-forwarding <key-type> <PUBLIC_KEY_BLOB> <label>`.
+UNVERIFIED on the target Dropbear: logging of the key fingerprint, and pty behaviour with a forced command (rehearsal GL1).
