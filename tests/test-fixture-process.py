@@ -27,6 +27,10 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+# None: gone; Z: zombie; X: dead (transient /proc state between exit and reap).
+STOPPED_STATES = (None, "Z", "X")
+
+
 def process_state(pid):
     status = Path("/proc") / str(pid) / "stat"
     try:
@@ -56,11 +60,19 @@ class FixtureProcessTests(unittest.TestCase):
             return None
         return started
 
+    def test_dead_process_state_counts_as_stopped(self):
+        original = globals()["process_state"]
+        globals()["process_state"] = lambda pid: "X"
+        try:
+            self.assert_stopped(0)
+        finally:
+            globals()["process_state"] = original
+
     def assert_stopped(self, pid):
         deadline = time.monotonic() + 2
-        while process_state(pid) not in (None, "Z") and time.monotonic() < deadline:
+        while process_state(pid) not in STOPPED_STATES and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertIn(process_state(pid), (None, "Z"), "owned descendant is still running")
+        self.assertIn(process_state(pid), STOPPED_STATES, "owned descendant is still running")
 
     def test_router_timeout_stops_actual_backend_before_fixture_cleanup(self):
         fixture = RouterFixture()
@@ -77,15 +89,15 @@ class FixtureProcessTests(unittest.TestCase):
                 fixture.run("sync", document=policy(), timeout=3,
                             started=self.backend_started(fixture, root / "backend-pid"))
             child_pid = int((root / "backend-pid").read_text())
-            self.assertIn(process_state(child_pid), (None, "Z"), "backend can still write during fixture cleanup")
+            self.assertIn(process_state(child_pid), STOPPED_STATES, "backend can still write during fixture cleanup")
             fixture.close()
             self.assertFalse(root.exists())
-            self.assertIn(process_state(child_pid), (None, "Z"))
+            self.assertIn(process_state(child_pid), STOPPED_STATES)
         finally:
             marker = root / "backend-pid"
             if child_pid is None and marker.exists():
                 child_pid = int(marker.read_text())
-            if child_pid is not None and process_state(child_pid) not in (None, "Z"):
+            if child_pid is not None and process_state(child_pid) not in STOPPED_STATES:
                 os.kill(child_pid, signal.SIGKILL)
             fixture.close()
 
@@ -164,7 +176,7 @@ raise SystemExit(int(os.environ['EXIT_STATUS']))
                     finally:
                         if marker.exists():
                             pid = int(marker.read_text())
-                            if process_state(pid) not in (None, "Z"):
+                            if process_state(pid) not in STOPPED_STATES:
                                 os.kill(pid, signal.SIGKILL)
                         fixture.close()
 
@@ -186,7 +198,7 @@ raise SystemExit(int(os.environ['EXIT_STATUS']))
             self.assert_stopped(int(marker.read_text()))
         finally:
             marker = fixture.root / "child"
-            if marker.exists() and process_state(int(marker.read_text())) not in (None, "Z"):
+            if marker.exists() and process_state(int(marker.read_text())) not in STOPPED_STATES:
                 os.kill(int(marker.read_text()), signal.SIGKILL)
             fixture.close()
 
@@ -271,7 +283,7 @@ finally:
                 self.assert_stopped(int((root / "backend-pid").read_text()))
             finally:
                 marker = root / "backend-pid"
-                if marker.exists() and process_state(int(marker.read_text())) not in (None, "Z"):
+                if marker.exists() and process_state(int(marker.read_text())) not in STOPPED_STATES:
                     os.kill(int(marker.read_text()), signal.SIGKILL)
 
     def test_lane_timeout_unwinds_manual_session_with_open_stdin(self):

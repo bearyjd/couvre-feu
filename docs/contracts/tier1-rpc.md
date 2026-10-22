@@ -381,3 +381,5 @@ UNVERIFIED on the target Dropbear: logging of the key fingerprint, and pty behav
 Rehearsal checklist additions (M1d review): (a) with logd stopped, does `logger` exit non-zero (is `scope_audit_unavailable` reachable on
 the device)? Record the answer; until then the router audit line is UNVERIFIED-on-device; (b) is `stty` present, and does `ssh -t`
 leave IXON off for the session; (c) Ctrl-Z / Ctrl-S during `scope-preview` and during the confirmation prompt leave `rpc-status` usable.
+(d) every `/sys/class/net/*/address` on the GL device is readable and one line (a tunnel or cellular interface that is not
+would make every scope-add refuse with `scope_router_interfaces_unreadable`, fail closed).
