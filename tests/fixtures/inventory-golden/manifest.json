@@ -1,0 +1,32 @@
+{
+  "generation": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "protectedMacs": [
+    "02:00:00:00:00:aa"
+  ],
+  "replies": {
+    "baseline": {
+      "exit": 0,
+      "file": "baseline.json"
+    },
+    "dropped-row": {
+      "exit": 0,
+      "file": "dropped-row.json"
+    },
+    "invalid-clock": {
+      "exit": 0,
+      "file": "invalid-clock.json"
+    },
+    "mixed": {
+      "exit": 0,
+      "file": "mixed.json"
+    },
+    "refusal": {
+      "exit": 1,
+      "file": "refusal.json"
+    },
+    "truncated": {
+      "exit": 0,
+      "file": "truncated.json"
+    }
+  }
+}

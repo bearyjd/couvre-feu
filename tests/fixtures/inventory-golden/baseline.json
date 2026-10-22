@@ -1,0 +1,1 @@
+{"inventory_version":1,"generation":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a","routerTime":1736204400,"devices":[{"mac":"02:00:00:00:00:01","ipv4":["192.168.1.20","192.168.1.21"],"hostname":"fixture","source":"both"},{"mac":"02:00:00:00:00:02","ipv4":["192.168.1.22"],"hostname":"fixture2","source":"both"}],"truncated":false,"errors":[]}

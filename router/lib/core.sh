@@ -391,15 +391,18 @@ cf_ssh_guard() {
 cf_mac_local() { case $1 in ?[2367abef]:*) return 0;; esac; return 1; }
 # Shared display sanitiser (docs/contracts/tier1-rpc.md 2.1): reject, never strip.
 cf_hostname_sanitise() { awk '{if($0!~/^[A-Za-z0-9][A-Za-z0-9._-]*$/||length($0)>63)print "(unnamed)";else print}'; }
+# CF_LAN_PREFIX: the prefix length (8-32) of the br-lan inet entry carrying CF_LAN_IP, from cf_addr4
+# (br-lan addresses, set by cf_network in firewall.sh). Shared by cf_scope_evidence and rpc-inventory.
+cf_lan_prefix() {
+    # shellcheck disable=SC2154
+    CF_LAN_PREFIX=$(printf '%s\n' "$cf_addr4" | awk -v ip="$CF_LAN_IP" '{for(i=1;i<NF;i++)if($i=="inet"){split($(i+1),a,"/");if(a[1]==ip&&a[2]~/^[0-9]+$/&&a[2]+0>=8&&a[2]+0<=32){print a[2]+0;exit}}}')
+    [ -n "$CF_LAN_PREFIX" ] || { cf_fail lan_address_mismatch;return 1; }
+}
 # CF_SCOPE_EVIDENCE rows: N<TAB>ip<TAB>mac<TAB>state (live br-lan neighbour) and
 # L<TAB>ip<TAB>mac<TAB>expiry<TAB>hostname (unexpired lease inside the br-lan IPv4 subnet).
 # Any LAN host can forge these: they are printed and required to exist, never trusted.
 cf_scope_evidence() {
-    cf_network || return 1
-    # cf_addr4 (br-lan addresses) is set by cf_network in firewall.sh.
-    # shellcheck disable=SC2154
-    cf_ev_prefix=$(printf '%s\n' "$cf_addr4" | awk -v ip="$CF_LAN_IP" '{for(i=1;i<NF;i++)if($i=="inet"){split($(i+1),a,"/");if(a[1]==ip&&a[2]~/^[0-9]+$/&&a[2]+0>=8&&a[2]+0<=32){print a[2]+0;exit}}}')
-    [ -n "$cf_ev_prefix" ] || { cf_fail lan_address_mismatch;return 1; }
+    cf_network && cf_lan_prefix || return 1
     cf_ev_n4=$(cf_backend ip -4 neigh show dev br-lan) && cf_ev_n6=$(cf_backend ip -6 neigh show dev br-lan) || { cf_fail neighbor_inspection_failed;return 1; }
     cf_ev_leases=
     if [ -e "$CF_BASE/tmp/dhcp.leases" ] || [ -L "$CF_BASE/tmp/dhcp.leases" ];then
@@ -407,7 +410,7 @@ cf_scope_evidence() {
         cf_ev_leases=$(awk 'NF>=4{print "L",$3,tolower($2),$1,$4}' "$CF_BASE/tmp/dhcp.leases") || { cf_fail unsafe_lease_file;return 1; }
     fi
     # awk `function mac()` below is a copy of cf_mac_valid; keep them in step (parity-tested).
-    CF_SCOPE_EVIDENCE=$(printf '%s\n%s\n%s\n' "$cf_ev_n4" "$cf_ev_n6" "$cf_ev_leases" | awk -v now="$CF_NOW_VALUE" -v lan="$CF_LAN_IP" -v prefix="$cf_ev_prefix" '
+    CF_SCOPE_EVIDENCE=$(printf '%s\n%s\n%s\n' "$cf_ev_n4" "$cf_ev_n6" "$cf_ev_leases" | awk -v now="$CF_NOW_VALUE" -v lan="$CF_LAN_IP" -v prefix="$CF_LAN_PREFIX" '
     function ip4(s,a,n,i){n=split(s,a,".");if(n!=4)return 0;for(i=1;i<=4;i++)if(a[i]!~/^(0|[1-9][0-9]*)$/||length(a[i])>3||a[i]+0>255)return 0;return 1}
     function ip6(s){return s~/^[0-9a-f:]+$/&&length(s)<=39&&index(s,":")>0}
     function num(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
@@ -780,8 +783,8 @@ cf_main() {
     case $cf_action in
         rpc-sync|rpc-status) cf_rpc_main "$@";return $?;;
         scope-preview|scope-add|scope-remove) cf_scope_main "$@";return $?;;
-        activity|rpc-activity) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; }
-            if [ "$cf_action" = activity ];then cf_activity;else cf_rpc_activity;fi;return $?;;
+        activity|rpc-activity|rpc-inventory) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; }
+            case $cf_action in activity) cf_activity;; rpc-activity) cf_rpc_activity;; *) cf_rpc_inventory;; esac;return $?;;
         check) [ "$#" = 1 ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_check;return $?;;
         status) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_status;return 0;;
         pause) if [ "$#" = 2 ]; then cf_until=0;elif [ "$#" = 4 ] && [ "$3" = --until ];then cf_until=$4;else cf_action=invalid;fi;;

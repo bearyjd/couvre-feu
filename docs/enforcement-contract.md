@@ -63,7 +63,7 @@ Changed policy needs a newer revision; identical normalized same-revision sync i
 
 ## Activity counters
 
-`cfctl activity --json` and `cfctl rpc-activity --json` are read-only and lockless. `cfctl-ssh` admits both, and `--rpc-only` admits only `rpc-activity`. The output contract is exactly:
+`cfctl activity --json` and `cfctl rpc-activity --json` are read-only and lockless. `cfctl-ssh` admits both. With `--rpc-only` it admits only `rpc-sync`, `rpc-status`, `rpc-activity` and `rpc-inventory` (`router/cfctl-ssh:35`), so `rpc-activity` but not `activity`. The read-only device inventory (`cfctl rpc-inventory --json`) is specified in `docs/contracts/tier1-rpc.md` section 2. The output contract is exactly:
 
 `{"version":1,"router_epoch":<int>,"counter_epoch":<int>,"offload":"on|off|unknown","devices":[{"person":"<id>","mac":"aa:bb:..","ip":"<ipv4>"|null,"neighbor":"REACHABLE|STALE|DELAY|PROBE|FAILED|ABSENT","tx_bytes":<int>,"rx_bytes":<int>,"tx_packets":<int>,"rx_packets":<int>,"blocked_packets":<int>}],"errors":[...]}`
 

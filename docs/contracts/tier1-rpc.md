@@ -58,22 +58,46 @@ Exact argv: `cfctl rpc-inventory --json`. One JSON object, strict keys, no unkno
 | `errors` | <= 16 codes, each matching `^[a-z][a-z0-9_]{0,63}$` |
 
 Size bound holds by construction: 256 devices x 4 addresses is about 51 KB, under the 131072 byte stdout cap
-(`service/src/ssh-router.ts:82`). There is no "set truncated when over the size limit" rule.
+(`service/src/ssh-router.ts:82`). The router also keeps a defensive byte guard (`CF_INVENTORY_MAX_BYTES`): it would drop
+whole trailing devices and set `truncated` if a reply reached the cap. It is unreachable in production and is exercised only
+by the test hook that lowers the limit (`tests/test-inventory.py` SizeGuardTests).
 
-Scope of the listing: br-lan only. Sources are br-lan neighbours (`ip -4 neigh show dev br-lan`,
-`router/lib/core.sh:296`) and leases whose IPv4 lies in the br-lan subnet. `/tmp/dhcp.leases` covers every dnsmasq pool
-including guest (`core.sh:313-315`), so the subnet filter is required. `neigh` means state REACHABLE, PERMANENT, STALE,
-DELAY or PROBE (the set `cf_addresses` already treats as live, `core.sh:305-340`).
+Scope of the listing: br-lan only. Both sources are filtered to the br-lan IPv4 subnet: br-lan neighbours
+(`ip -4 neigh show dev br-lan`) and dnsmasq leases. `/tmp/dhcp.leases` covers every dnsmasq pool including guest, and
+ARP lets any LAN host place any address in the neighbour table, so the subnet filter applies to both. The subnet is the
+prefix of the br-lan `inet` entry carrying the LAN address (`cf_lan_prefix`, `router/lib/core.sh:396`, shared with
+`cf_scope_evidence`), /8 to /32. No such entry (no mask, IPv6-only br-lan, a prefix below /8, or only other
+addresses) refuses with `lan_address_mismatch`; failing `ip -4 addr` refuses with `lan_inspection_failed`. A failing
+`ip -4 neigh` or a lease file that is a symlink, not a regular file or unreadable is not a refusal: the other source is
+still listed, with `neighbor_inspection_failed` or `lease_inspection_failed`. `neigh` means state REACHABLE, PERMANENT,
+STALE, DELAY or PROBE (the set `cf_addresses` already treats as live, `core.sh:302-360`).
 
-Truncation: whole devices only. Neighbour-present devices are kept before lease-only ones, and kid MACs first. The service
-must not infer "gone" or "New" from a truncated reply.
+Row order and `inventory_row_dropped`: each row is scoped first (subnet, then lease expiry) and validated afterwards. Rows
+any LAN or guest client can induce are skipped SILENTLY: off-subnet or expired rows, and rows whose MAC is not a canonical
+unicast MAC (dnsmasq's hwtype-prefixed form for htype != 1, a wrong length, multicast or all-zero). `inventory_row_dropped`
+is reported, once, only for a row inside the subnet whose address or expiry field is malformed, which dnsmasq and `ip`
+never write. A NUL byte in the lease file becomes \001 before parsing, so a hostname holding one is null: a shell command
+substitution would drop the NUL (a strip, `ok\0evil` -> `okevil`), and BusyBox awk would end the record at the NUL and
+parse the rest of the line as a lease row of its own. The SERVICE must treat `inventory_row_dropped` as a
+non-structural WARNING, like `invalid_clock`, that does not make the poll incomplete. That service-side change is made
+separately on its own branch.
+
+Truncation: whole devices only. Neighbour-present devices are kept before lease-only ones, and kid MACs first. Intake is
+also capped at 4096 distinct MACs per poll (`CF_INVENTORY_MAX_INTAKE`; kid MACs exempt, neighbours read before leases) to
+bound time and memory under a flood; reaching it sets `truncated`, and the lease-only tier is then the lowest MACs among
+those taken in, not among all. The service must not infer "gone" or "New" from a truncated reply.
 
 Refusal body: the same keys with `devices` empty, mirroring `cf_activity_refuse` (`router/lib/activity.sh:248-251`),
-which carries the error code in `errors`. An invalid clock yields `routerTime:0` and `invalid_clock`.
+which carries the error code in `errors`. Collection failures name their code (for example `lan_address_mismatch`),
+not a generic `inventory_unavailable`. An invalid clock yields `routerTime:0` and `invalid_clock`, and expired leases are
+then kept, as in `cf_scope_evidence`.
 
-Protected management MACs are never listed. The reader is new: the lease parse in `core.sh:315` is
-`awk 'NF>=3{print "L\t" $3 "\t" tolower($2) "\t" $1}'`, which drops field 4 (hostname) (VERIFIED), and `cf_addresses`
-emits only kid and protected bindings (VERIFIED, `core.sh:341-345`).
+Protected management MACs are never listed. The protected list is checked at admission (`cf_protected_valid`) and read
+again for the listing; if that read fails or yields an invalid MAC the reply is a refusal with
+`inventory_protected_unreadable`, and an empty list refuses with `inventory_protected_empty` (an installation always has
+at least one protected MAC). It never fails open into a listing. The reader is new: the lease parse in
+`cf_addresses` (`core.sh:326`) is `awk 'NF>=3{print "L\t" $3 "\t" tolower($2) "\t" $1}'`, which drops field 4
+(hostname) (VERIFIED), and `cf_addresses` emits only kid and protected bindings (VERIFIED, `core.sh:340-360`).
 
 ### 2.1 Hostnames
 
@@ -114,7 +138,7 @@ Execution model:
 
 - `router/cfctl-ssh:35`: append `|rpc-inventory` to the `--rpc-only` allowlist.
 - `router/cfctl-ssh:46`: add `rpc-inventory` to the `status|activity|rpc-activity` arm (`[ "$#" = 2 ] && [ "$2" = --json ]`).
-- `router/lib/core.sh:565`: add `rpc-inventory` to the `activity|rpc-activity` arm.
+- `router/lib/core.sh:786-787`: add `rpc-inventory` to the `activity|rpc-activity` arm.
 
 ## 3. Receipt semantics the service relies on
 

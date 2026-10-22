@@ -106,7 +106,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
                               env=environment, text=True, capture_output=True, timeout=5)
 
     def service_commands(self):
-        commands = ['cfctl rpc-sync', 'cfctl rpc-activity --json', 'cfctl rpc-status --json']
+        commands = ['cfctl rpc-sync', 'cfctl rpc-activity --json', 'cfctl rpc-inventory --json', 'cfctl rpc-status --json']
         return commands + ['cfctl rpc-status --json ' + op for op in self.OPERATION_IDS]
 
     def test_every_service_command_is_admitted_with_rpc_only(self):
@@ -131,7 +131,8 @@ class RpcOnlyWrapperTests(unittest.TestCase):
                   'cfctl rpc-status --json ' + 'x' * 65, 'cfctl rpc-activity', 'cfctl rpc-activity --json op_1',
                   "cfctl rpc-sync 'x'", 'CFCTL rpc-sync', 'cfctl rpc-sync ' + 'x' * 200,
                   'cfctl rpc-status op_1', 'cfctl rpc-status --json -', 'foo rpc-sync', 'sh rpc-sync', 'rpc-sync rpc-sync',
-                  'x rpc-activity --json', 'rpc-status --json op_1', 'rpc-sync', 'rpc-activity --json')
+                  'x rpc-activity --json', 'rpc-status --json op_1', 'rpc-sync', 'rpc-activity --json',
+                  'cfctl rpc-inventory', 'cfctl rpc-inventory --json op_1', 'rpc-inventory --json')
         for command in legacy + shells:
             with self.subTest(command=command):
                 self.log.unlink(missing_ok=True)
@@ -248,7 +249,7 @@ class StrippedProductionCopyTests(unittest.TestCase):
         if Path('/usr/sbin/cfctl').exists():
             self.skipTest('host has /usr/sbin/cfctl; not executing it')
         plain = {key: value for key, value in self.fixture.env.items() if not key.startswith('CF_')}
-        accepted = ['cfctl rpc-sync', 'cfctl rpc-activity --json', 'cfctl rpc-status --json', 'cfctl rpc-status --json op_1']
+        accepted = ['cfctl rpc-sync', 'cfctl rpc-activity --json', 'cfctl rpc-inventory --json', 'cfctl rpc-status --json', 'cfctl rpc-status --json op_1']
         rejected = ['cfctl status --json', 'cfctl rpc-sync; id', 'cfctl rpc-status --json -x', 'cfctl rpc-status --json --json', 'sh', '']
         for command in accepted:
             with self.subTest(accepted=command):

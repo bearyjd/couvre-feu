@@ -32,7 +32,7 @@ set -- $cf_ssh_command
 [ "$#" -ge 2 ] && [ "$1" = cfctl ] || exit 2
 shift
 if [ "$cf_rpc_only" = 1 ];then
-    case $1 in rpc-sync|rpc-status|rpc-activity);;*)exit 2;;esac
+    case $1 in rpc-sync|rpc-status|rpc-activity|rpc-inventory);;*)exit 2;;esac
 fi
 case $1 in
     rpc-sync) [ "$#" = 1 ] || exit 2;;
@@ -43,7 +43,7 @@ case $1 in
             case $3 in ''|[!a-z0-9]*|*[!a-z0-9_-]*)exit 2;;esac
             [ "${#3}" -le 64 ] || exit 2
         fi;;
-    status|activity|rpc-activity) [ "$#" = 2 ] && [ "$2" = --json ] || exit 2;;
+    status|activity|rpc-activity|rpc-inventory) [ "$#" = 2 ] && [ "$2" = --json ] || exit 2;;
     sync|expire|apply-fw) [ "$#" = 1 ] || exit 2;;
     pause)
         if [ "$#" = 2 ];then :;elif [ "$#" = 4 ] && [ "$3" = --until ];then
