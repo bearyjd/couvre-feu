@@ -1152,6 +1152,13 @@ $CF_SLOT" ] || return 1
                 elif [ "${CF_ZERO_BASELINE:-0}" = 1 ];then [ "$cf_zr_content" = "$CF_PREFLIGHT_RECORD" ] || return 1
                 else return 1;fi
                 printf '%s\n' "$cf_zr_file";;
+            .scope.*)
+                # Scope snapshot of a killed reader (cf_scope_bind); owned, removed after proofs.
+                cf_zr_pid=${cf_zr_file##*/};cf_zr_pid=${cf_zr_pid#.scope.}
+                case $cf_zr_pid in ''|*[!0-9]*)return 1;;esac
+                # A live reader may delete its copy between enumeration and this test.
+                cf_safe_file "$cf_zr_file" || { [ ! -e "$cf_zr_file" ] && [ ! -L "$cf_zr_file" ] && continue;return 1; }
+                printf '%s\n' "$cf_zr_file";;
             lock)
                 cf_private_dir "$cf_zr_file" && cf_safe_file "$cf_zr_file/pid" && [ "$(awk 'NR==1{print}' "$cf_zr_file/pid")" = "$$" ] || return 1
                 for cf_zr_child in "$cf_zr_file"/* "$cf_zr_file"/.[!.]* "$cf_zr_file"/..?*;do

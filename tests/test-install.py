@@ -86,10 +86,10 @@ class RecoveryTests(unittest.TestCase):
                 result[str(p.relative_to(self.root))] = (p.read_bytes(), exact_signature(p))
         return result
 
-    def make_journal(self, absent=False, partial=False):
+    def make_journal(self, absent=False, partial=False, files=FILES):
         originals = {}
         if not absent:
-            for i, rel in enumerate(FILES):
+            for i, rel in enumerate(files):
                 p = self.root / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(f'original-{i}\n\x00 exact bytes\n'.encode())
@@ -102,7 +102,7 @@ class RecoveryTests(unittest.TestCase):
         backup.parent.chmod(0o700)
         for rel, mode in modes.items():
             (backup / ('dir_' + rel.replace('/', '_'))).write_text(mode + '\n')
-        for i, rel in enumerate(FILES):
+        for i, rel in enumerate(files):
             p = self.root / rel
             k = rel.replace('/', '_')
             before = signature(p)
@@ -111,7 +111,7 @@ class RecoveryTests(unittest.TestCase):
             if before != 'absent':
                 shutil.copy2(p, backup / (k + '.original'))
             staged = backup / (k + '.staged')
-            staged.write_text('02:00:00:00:00:01\n' if rel.endswith('/protected') else f'installed-{i}\n')
+            staged.write_text('02:00:00:00:00:01\n' if rel.endswith(('/protected', '/rpc-allowed')) else f'installed-{i}\n')
             staged.chmod(0o600)
             (backup / (k + '.after')).write_text(signature(staged) + '\n')
             if not partial or i % 2 == 0:
@@ -213,6 +213,94 @@ class RecoveryTests(unittest.TestCase):
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.snapshot(), original)
+
+
+SCOPED_FILES = FILES + ('etc/couvrefeu/rpc-allowed',)
+FLOOR_LINE = '02:00:00:00:00:01\n'
+
+
+class LiveScopeRecoveryTests(unittest.TestCase):
+    """The live rpc-allowed may grow past its immutable floor; uninstall must still restore."""
+    setUp = RecoveryTests.setUp
+    tearDown = RecoveryTests.tearDown
+    run_script = RecoveryTests.run_script
+    snapshot = RecoveryTests.snapshot
+    make_journal = RecoveryTests.make_journal
+    FLOOR = '02:00:00:00:00:01\n'
+
+    def journal(self, **kwargs):
+        return self.make_journal(files=SCOPED_FILES, **kwargs)
+
+    def set_live(self, content, mode=0o600):
+        live = self.root / 'etc/couvrefeu/rpc-allowed'
+        live.write_bytes(content if isinstance(content, bytes) else content.encode())
+        live.chmod(mode)
+
+    def runtime_file(self, name):
+        runtime = self.root / 'etc/couvrefeu/runtime'
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        runtime.chmod(0o700)
+        (runtime / name).write_text('stray\n')
+        (runtime / name).chmod(0o600)
+
+    def test_grown_scope_restores_exact_originals(self):
+        original = self.journal()
+        self.set_live(self.FLOOR + '02:00:00:00:00:02\n02:00:00:00:00:03\n')
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), original)
+
+    def test_grown_scope_with_absent_original_leaves_nothing_behind(self):
+        self.journal(absent=True)
+        self.set_live(self.FLOOR + '02:00:00:00:00:02\n')
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_stray_scope_snapshot_is_owned_runtime_and_removed(self):
+        self.journal(absent=True)
+        self.set_live(self.FLOOR + '02:00:00:00:00:02\n')
+        self.runtime_file('.scope.123')
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_non_numeric_scope_snapshot_name_is_still_unowned(self):
+        self.journal(absent=True)
+        self.runtime_file('.scope.abc')
+        before = self.snapshot()
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unowned runtime file', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_invalid_or_floorless_live_scope_is_refused_without_mutation(self):
+        for name, content, mode, text in (
+                ('floor-missing', '02:00:00:00:00:02\n', 0o600, 'floor'),
+                ('unsorted', '02:00:00:00:00:02\n' + FLOOR_LINE, 0o600, 'invalid RPC scope'),
+                ('duplicate', FLOOR_LINE * 2, 0o600, 'invalid RPC scope'),
+                ('no-final-newline', FLOOR_LINE + '02:00:00:00:00:02', 0o600, 'invalid RPC scope'),
+                ('multicast', FLOOR_LINE + '03:00:00:00:00:01\n', 0o600, 'invalid RPC scope'),
+                ('empty', '', 0o600, 'invalid RPC scope'),
+                ('mode', FLOOR_LINE + '02:00:00:00:00:02\n', 0o644, 'metadata drift')):
+            with self.subTest(name=name):
+                self.journal(absent=True)
+                self.set_live(content, mode)
+                before = self.snapshot()
+                result = self.run_script('uninstall.sh')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(text, result.stderr)
+                self.assertEqual(self.snapshot(), before)
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+
+    def test_oversized_live_scope_is_refused(self):
+        self.journal(absent=True)
+        many = [FLOOR_LINE] + ['02:00:00:01:{:02x}:{:02x}\n'.format(i // 256, i % 256) for i in range(1, 257)]
+        self.set_live(''.join(many))
+        result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('invalid RPC scope', result.stderr)
 
 
 NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh')

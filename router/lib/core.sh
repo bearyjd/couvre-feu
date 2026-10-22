@@ -60,8 +60,8 @@ cf_mac_valid() {
 }
 # RPC scope file: 1..256 canonical unicast MACs, LF-terminated, unique and
 # LC_ALL=C sorted. Prints the space-joined set; never an empty (unscoped) value.
-# Reads the root-private file several times (awk, wc, sort/cmp); callers bind it
-# first (installer stage dir, or cmp with the signed staged copy at runtime).
+# Reads the file several times (awk, wc, sort/cmp), so the path must be stable:
+# the installer stage dir, or the private single-read snapshot (cf_scope_bind).
 cf_scope_file() {
     cf_sf_list=$(awk '
     length($0)!=17 {exit 1}

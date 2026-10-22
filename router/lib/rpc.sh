@@ -9,8 +9,32 @@ cf_rpc_checkpoint() {
     fi
 }
 cf_operation_valid() { case $1 in ''|-|*[!a-z0-9_-]*)return 1;;esac;[ "${#1}" -le 64 ]; }
+# The live scope may be any valid superset of the immutable install-time floor
+# (.staged). It is copied ONCE into a private runtime file; the format check, the
+# floor check and the digest all use those bytes, never the live path again. The
+# copy is removed at once; a leftover from a killed reader is `.scope.<pid>`.
+cf_scope_check() {
+    CF_SCOPE=$(cf_scope_file "$1") && [ -n "$CF_SCOPE" ] || return 1
+    [ -s "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" ] || return 1
+    # String membership: every floor MAC must be a line of the snapshot.
+    awk 'NR==FNR{if(!($0 in need)){need[$0]=1;n++}next}($0 in need){got[$0]=1}END{c=0;for(k in got)c++;exit c!=n}' "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" "$1" || return 1
+    # The file is canonical and LF-terminated, so its bytes are scope.join(newline)+newline.
+    CF_SCOPE_SHA=$(sha256sum "$1" | awk '{print $1}')
+    [ "${#CF_SCOPE_SHA}" = 64 ]
+}
+cf_scope_bind() {
+    cf_sb_snap=$CF_RUNTIME/.scope.$$
+    cf_private_dir "$CF_RUNTIME" && cf_safe_file "$CF_DIR/rpc-allowed" || { cf_fail invalid_rpc_scope;return 1; }
+    # A stale copy under this pid is ours to drop; creation is then exclusive (noclobber).
+    rm -f "$cf_sb_snap"
+    ( umask 077;set -C;cat "$CF_DIR/rpc-allowed" > "$cf_sb_snap" ) 2>/dev/null && chmod 600 "$cf_sb_snap" || { rm -f "$cf_sb_snap";cf_fail invalid_rpc_scope;return 1; }
+    cf_rpc_checkpoint after_scope_snapshot
+    if cf_scope_check "$cf_sb_snap";then cf_sb_ok=1;else cf_sb_ok=0;fi
+    rm -f "$cf_sb_snap"
+    [ "$cf_sb_ok" = 1 ] || { CF_SCOPE=;CF_SCOPE_SHA=;cf_fail invalid_rpc_scope;return 1; }
+}
 cf_rpc_binding() {
-    CF_SCOPE=
+    CF_SCOPE=;CF_SCOPE_SHA=
     if [ -z "$CF_METADATA" ];then
         # Missing state metadata cannot silently downgrade a recorded scope.
         for cf_scope_journal in "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.after" "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged";do
@@ -24,11 +48,9 @@ cf_rpc_binding() {
     if [ "${CF_INSTALL_AUTH:-0}" != 1 ];then
         cf_safe_file "$CF_DIR/backup/complete" && [ "$(wc -c < "$CF_DIR/backup/complete")" = 2 ] && [ "$(cat "$CF_DIR/backup/complete")" = 1 ] || { cf_fail inactive_generation;return 1; }
     fi
-    cf_safe_file "$CF_DIR/rpc-allowed" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_state.staged" || { cf_fail invalid_rpc_scope;return 1; }
-    cmp -s "$CF_DIR/rpc-allowed" "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" || { cf_fail invalid_rpc_scope;return 1; }
-    # Validated only after cmp against the signed staged copy; later policy and
-    # activity checks use this in-memory value, never the file again.
-    CF_SCOPE=$(cf_scope_file "$CF_DIR/rpc-allowed") && [ -n "$CF_SCOPE" ] || { CF_SCOPE=;cf_fail invalid_rpc_scope;return 1; }
+    cf_safe_file "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" && cf_safe_file "$CF_DIR/backup/etc_couvrefeu_state.staged" || { cf_fail invalid_rpc_scope;return 1; }
+    # remove-fw never uses the scope: uninstall must work whatever the live file became.
+    [ "${cf_action-}" = remove-fw ] || cf_scope_bind || return 1
     [ "$(wc -c < "$CF_DIR/backup/etc_couvrefeu_state.staged")" -le 131072 ] || { cf_fail inactive_generation;return 1; }
     cf_binding_meta=$(awk -v mode=meta -f "$CF_LIB/state.awk" "$CF_DIR/backup/etc_couvrefeu_state.staged") || { cf_fail inactive_generation;return 1; }
     [ "$(printf '%s\n' "$cf_binding_meta" | awk -F '\t' '$1=="G"{print $2}')" = "$CF_GENERATION" ] || { cf_fail inactive_generation;return 1; }
@@ -64,8 +86,13 @@ cf_rpc_response() {
     [ -z "$CF_CURRENT" ] || [ "$CF_CURRENT" = - ] || cf_rpc_current="\"$CF_CURRENT\""
     cf_rpc_generation=null
     [ -z "$CF_GENERATION" ] || cf_rpc_generation="\"$CF_GENERATION\""
+    # Scope and digest come from the one snapshot cf_state_load validated; absent for legacy unscoped installs.
+    cf_rpc_scope=
+    if [ -n "$CF_SCOPE" ] && [ -n "$CF_SCOPE_SHA" ];then
+        cf_rpc_scope=$(printf '%s\n' "$CF_SCOPE" | awk -v sha="$CF_SCOPE_SHA" '{printf ",\"scope\":[";for(i=1;i<=NF;i++)printf "%s\"%s\"",(i>1?",":""),$i;printf "],\"scopeSha\":\"%s\"",sha}')
+    fi
     cf_rpc_checkpoint before_reply
-    cf_rpc_output=$(printf '{"rpc_version":1,"generation":%s,"acceptedPolicy":%s,"policyDigest":"%s","currentOperationId":%s,"routerTime":%s,"receipt":%s,"status":%s,"errors":%s}' "$cf_rpc_generation" "$cf_rpc_policy" "$CF_DIGEST" "$cf_rpc_current" "${CF_NOW_VALUE:-0}" "$(cf_receipt_json "${CF_RESPONSE_ID:-$CF_CURRENT}")" "$cf_rpc_status" "$cf_rpc_errors")
+    cf_rpc_output=$(printf '{"rpc_version":1,"generation":%s,"acceptedPolicy":%s,"policyDigest":"%s","currentOperationId":%s,"routerTime":%s,"receipt":%s,"status":%s,"errors":%s%s}' "$cf_rpc_generation" "$cf_rpc_policy" "$CF_DIGEST" "$cf_rpc_current" "${CF_NOW_VALUE:-0}" "$(cf_receipt_json "${CF_RESPONSE_ID:-$CF_CURRENT}")" "$cf_rpc_status" "$cf_rpc_errors" "$cf_rpc_scope")
     [ "${#cf_rpc_output}" -lt 131072 ] || { printf '%s\n' '{"rpc_version":1,"errors":["response_too_large"]}';return 1; }
     printf '%s\n' "$cf_rpc_output"
     [ -z "$cf_rpc_error" ]

@@ -236,6 +236,21 @@ valid_protection() {
         END {if(NR < 1 || NR > 128) exit 1}
     ' "$1"
 }
+# Live RPC scope: 1..256 canonical unicast MACs, LF-terminated, unique, LC_ALL=C
+# ascending. Mirrors core.sh cf_scope_file (which preflight cannot source).
+valid_scope() {
+    awk '
+        length($0)!=17 {exit 1}
+        {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00")exit 1}
+        END {if(NR<1||NR>256)exit 1}
+    ' "$1" || return 1
+    [ "$(wc -c < "$1")" -eq $(( $(awk 'END {print NR}' "$1") * 18 )) ] || return 1
+    LC_ALL=C sort -u "$1" | cmp -s - "$1"
+}
+# Every floor MAC (first file) is a line of the live scope (second file); string keys.
+scope_has_floor() {
+    awk 'NR==FNR {if(!($0 in need)){need[$0]=1;n++};next} ($0 in need) {got[$0]=1} END {c=0;for(k in got)c++;exit c!=n}' "$1" "$2"
+}
 metadata() { stat -c '%a:%u:%g' "$1"; }
 
 valid_signature_record() {
@@ -362,6 +377,13 @@ preflight() {
             fi
             valid_protection "$ROOT/$rel" || fail 'invalid protected list'
             awk 'NR==FNR {baseline[++n]=$0; next} FNR<=n && $0!=baseline[FNR] {exit 1} END {if(FNR<n) exit 1}' "$BACKUP/$k.staged" "$ROOT/$rel" || fail 'protected baseline was changed'
+        elif [ "$rel" = etc/couvrefeu/rpc-allowed ] && [ "$current" != "$before" ] && [ "$current" != "$after" ]; then
+            # The live scope may grow past its immutable floor (.staged), like protected.
+            if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
+                fail 'RPC scope metadata drift'
+            fi
+            valid_scope "$ROOT/$rel" || fail 'invalid RPC scope'
+            scope_has_floor "$BACKUP/$k.staged" "$ROOT/$rel" || fail 'RPC scope floor was changed'
         elif [ "$rel" = etc/couvrefeu/state ] && [ "$current" != "$before" ]; then
             if ! { [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
                 fail 'runtime state metadata drift'
@@ -671,7 +693,7 @@ runtime_preflight() {
                 done
                 continue;;
             confirmed|error|firewall.snapshot|firewall.owned|firewall.intent|firewall.preflight|firewall.cleanup|expiry|schedule.clock|activity.epoch) ;;
-            .candidate.*|.protected.*|.fw.*|.input.*|.error.*|.confirmed.*|.snapshot.*|.expiry.*|.intent.*|.cleanup.*)
+            .candidate.*|.protected.*|.fw.*|.input.*|.error.*|.confirmed.*|.snapshot.*|.expiry.*|.intent.*|.cleanup.*|.scope.*)
                 suffix=${name##*.}
                 case "$suffix" in ''|*[!0-9]*) fail "unowned runtime file: $name";; esac;;
             *) fail "unowned runtime file: $name";;
