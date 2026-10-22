@@ -54,16 +54,14 @@ export class IntegrationStore extends Store {
         }
         // integration-003 widens operations.action for device enrollment. operations is a parent table, so the rebuild runs with
         // foreign keys off (a no-op inside a transaction) and must leave no dangling reference behind before it commits.
-        if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='operations'")!.sql.includes("'enroll'")) {
-            this.db.exec('PRAGMA foreign_keys=OFF');
-            try {
-                this.transaction(() => {
-                    this.db.exec(readFileSync(new URL('../migrations/integration-003.sql', import.meta.url), 'utf8'));
-                    if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
-                });
-            } catch (error) { this.close(); throw error; }
-            finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
-        }
+        this.runMigration('integration-003.sql', 'operations', "'enroll'");
+        // integration-004: scope tracking tables, ParentAlerts storage and the widened operations.action. One marker covers the whole step: the
+        // transaction is atomic, so 'pause_all' in operations.sql means every table in the file exists.
+        this.runMigration('integration-004.sql', 'operations', "'pause_all'");
+        // integration-005: devices may be `moving` between children (M2b). Same marker pattern: the table's own SQL carries the new state.
+        this.runMigration('integration-005.sql', 'devices', "'moving'");
+        // integration-006 (M2c): inventory tables, the `inventory` step kind and the `new_device` alert kind. The marker is the step-kind CHECK.
+        this.runMigration('integration-006.sql', 'dispatch_steps', "'inventory'");
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));
@@ -81,6 +79,21 @@ export class IntegrationStore extends Store {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS dispatch_live_claims ON dispatch_steps(state,lease_until)`);
         // Startup never releases an uncertain claim or starts dispatch.
+    }
+    /**
+     * Applies a table-rebuilding migration once: it runs only while `table`'s own SQL lacks `marker`. Foreign keys are off outside the
+     * transaction (a no-op inside one) and foreign_key_check must be clean before commit, or the migration is rolled back and the store closes.
+     */
+    private runMigration(file: string, table: string, marker: string): void {
+        if (this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", table)!.sql.includes(marker)) return;
+        this.db.exec('PRAGMA foreign_keys=OFF');
+        try {
+            this.transaction(() => {
+                this.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
+                if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
+            });
+        } catch (error) { this.close(); throw error; }
+        finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
     }
     /** A rebind can rewrite the marker under a running process. Mutate and dispatch transactions re-check it and fail closed. */
     assertIdentity(): void {
@@ -110,7 +123,7 @@ export class IntegrationStore extends Store {
         if (!this.db.isTransaction) throw new Error('read_retention_requires_transaction');
         const old = this.all<{batch_id: string}>(`SELECT p.batch_id FROM automatic_read_polls p
             JOIN dispatch_steps s ON s.batch_id=p.batch_id AND s.ordinal=1
-            WHERE s.kind IN ('observe','receipt') AND s.state<>'consumed'
+            WHERE s.kind IN ('observe','receipt','inventory') AND s.state<>'consumed'
             ORDER BY p.sequence DESC LIMIT -1 OFFSET ?`, AUTOMATIC_READ_RETENTION);
         for (const row of old) {
             // No consumed callback survives this selection; do not remove its fence witness.

@@ -16,9 +16,15 @@ import type { ChildRow } from './integration-children.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
+}
+/** What a bulk operation means for the household right now; only a healthy confirmation counts as in force. */
+function bulkEffect(action: IntegrationOperation['action'], state: OperationState, healthy: boolean): Pick<OperationDTO, 'effect'> | Record<string, never> {
+    if (action === 'pause_all') return {effect: state === 'confirmed' && healthy ? 'blocking' : 'not_blocking'};
+    if (action === 'resume_all') return {effect: state === 'confirmed' && healthy ? 'unblocked' : state === 'failed' ? 'unchanged' : 'may_still_be_blocked'};
+    return {};
 }
 export class IntegrationPolicy {
     readonly store: IntegrationStore;
@@ -41,29 +47,42 @@ export class IntegrationPolicy {
         if (!row) throw new AppError(404, 'operation_not_found');
         return normalizeEnvelope(JSON.parse(row.envelope_json));
     }
-    private dto(op: IntegrationOperation): OperationDTO {
+    /**
+     * Every child an operation touches. operation_people is the authority; operations.person_id is only a representative and is
+     * always unioned in, so an operation written before M2b (no rows) is still covered and a row set can never be empty.
+     */
+    affectedPeople(op: Pick<IntegrationOperation, 'id' | 'person_id'>): string[] {
+        const rows = this.store.all<{person_id: string}>('SELECT person_id FROM operation_people WHERE operation_id=? ORDER BY person_id', op.id).map(r => r.person_id);
+        return [...new Set([op.person_id, ...rows])].sort();
+    }
+    /** Visibility is "any row": a viewer sees an operation through any child they manage. */
+    private visibleTo(actor: Actor, op: IntegrationOperation): boolean { return this.affectedPeople(op).some(person => actor.personIds.includes(person)); }
+    private dto(op: IntegrationOperation, viewer?: Actor): OperationDTO {
         const r = this.store.get<{phase: string; delivery: string}>('SELECT phase,delivery FROM operation_rpc WHERE operation_id=?', op.id)!;
         const o = this.store.observation().value, e = this.envelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && exactHealthy(o, e);
         const superseded = fresh && o !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
         const uncertainClaim = r.phase === 'claimed' && (this.store.get<{lease_until: number}>('SELECT lease_until FROM operation_rpc WHERE operation_id=?', op.id)!.lease_until <= this.now());
-        return {...this.store.config.provenance, id: op.id, personId: op.person_id, action: op.action, revision: op.revision,
+        const state: OperationState = uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state;
+        // A bulk operation's representative child may be outside the viewer's scope: name one they can see instead.
+        const personId = viewer ? this.affectedPeople(op).find(person => viewer.personIds.includes(person)) ?? op.person_id : op.person_id;
+        return {...this.store.config.provenance, id: op.id, personId, action: op.action, revision: op.revision, ...bulkEffect(op.action, state, healthy),
             // A historical confirmation is retained in confirmedAt, never rendered as current enforcement.
-            state: uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state, createdAt: op.created_at, updatedAt: op.updated_at,
+            state, createdAt: op.created_at, updatedAt: op.updated_at,
             error: uncertainClaim ? 'dispatch_lease_expired_remote_outcome_unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'router_receipt_historical' : 'current_router_confirmation_unavailable' : op.error, confirmedAt: op.confirmed_at,
             currentHealthy: healthy, accepted: r.delivery === 'accepted', dispatch: r.phase === 'queued' ? this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch' : r.phase === 'claimed' ? 'consumed' : r.phase === 'uncertain' ? 'uncertain' : 'resolved'};
     }
     operation(actor: Actor, id: string): OperationDTO {
         const op = this.row(id);
-        if (!op || !actor.personIds.includes(op.person_id)) throw new AppError(404, 'operation_not_found');
-        return this.dto(op);
+        if (!op || !this.visibleTo(actor, op)) throw new AppError(404, 'operation_not_found');
+        return this.dto(op, actor);
     }
     private state() { return this.store.get<{desired_json: string; highwater: number; last_confirmation_at: number | null}>('SELECT * FROM service_state WHERE singleton=1')!; }
     private token(): string | null {
         const o = this.store.observation().value;
         return this.fresh() && o ? `"s${this.state().highwater}-r${o.acceptedPolicy.revision}-${o.policyDigest}"` : null;
     }
-    result(op: IntegrationOperation): {status: number; result: OperationResult} {
-        const dto = this.dto(op);
+    result(op: IntegrationOperation, viewer?: Actor): {status: number; result: OperationResult} {
+        const dto = this.dto(op, viewer);
         return {status: dto.currentHealthy && op.state === 'confirmed' ? 200 : op.state === 'conflict' ? 409 : op.state === 'failed' ? 502 : 202,
             result: {...this.store.config.provenance, operation: dto, operationUrl: `/operations/${op.id}`}};
     }
@@ -92,7 +111,7 @@ export class IntegrationPolicy {
      * records local intent (e.g. a device row) under the new operation id before the result is validated.
      */
     queue(actor: Actor, person: string, action: IntegrationOperation['action'], request: string, key: string, precondition: string | null,
-        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void): IntegrationOperation {
+        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person]): IntegrationOperation {
         if (!this.store.db.isTransaction) throw new Error('queue_requires_transaction');
         if (!this.fresh()) throw new AppError(503, 'approved_router_observation_required');
         const o = this.store.observation().value!;
@@ -105,6 +124,7 @@ export class IntegrationPolicy {
         validateManagedPolicy(policy, this.store.config, this.store, false);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
         this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
+        for (const child of new Set(affected)) this.store.run('INSERT INTO operation_people(operation_id,person_id) VALUES(?,?)', id, child);
         this.store.run("INSERT INTO operation_rpc(operation_id,generation,base_digest,request_digest,envelope_json,phase) VALUES(?,?,?,?,?,'queued')", id, o.generation, o.policyDigest, requestDigest(envelope), JSON.stringify(envelope));
         this.store.run('UPDATE integration_state SET active_operation_id=? WHERE singleton=1', id);
         this.store.run('UPDATE service_state SET desired_json=?,highwater=highwater+1 WHERE singleton=1', policyJSON(policy));
@@ -126,10 +146,10 @@ export class IntegrationPolicy {
         const people = children.map(child => {
             const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id);
             if (!enrolled) allEnrolled = false;
-            const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE person_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
-            const dto = latest ? this.dto(latest) : null;
+            const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
+            const dto = latest ? this.dto(latest, actor) : null;
             if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
-            return {id: child.id, name: child.name, kind: child.kind, devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, ...(d.state === 'active' ? {} : {change: d.state === 'enrolling' ? 'adding' as const : 'removing' as const}),
+            return {id: child.id, name: child.name, kind: child.kind, devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, ...(d.state === 'active' ? {} : {change: d.state === 'enrolling' ? 'adding' as const : d.state === 'moving' ? 'moving' as const : 'removing' as const}),
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,

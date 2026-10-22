@@ -128,7 +128,9 @@ test('device add refuses protected, duplicate, out-of-scope, multicast and unlis
         const add = (mac: string) => f.act(op, 'device_add', 'pilot', {label: 'Extra', mac, precondition: f.token()});
         await assert.rejects(add(PROTECTED), code('device_mac_protected'));
         await assert.rejects(add(SEED), code('device_already_enrolled'));
-        await assert.rejects(add(OUTSIDE), code('device_outside_router_scope'));
+        // Outside the router scope: not an error but a recorded request awaiting router approval (design H2: no command comes back).
+        const pending = await add(OUTSIDE);
+        assert.equal(pending.status, 409); assert.equal(pending.body.error.code, 'device_pending_router_scope');
         await assert.rejects(add('03:10:20:30:40:52'), code('invalid_mac'));
         await assert.rejects(add('not-a-mac'), code('invalid_mac'));
         await assert.rejects(f.act(op, 'device_add', 'pilot', {label: '', mac: TABLET, precondition: f.token()}), code('invalid_label'));

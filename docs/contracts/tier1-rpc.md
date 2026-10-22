@@ -79,7 +79,8 @@ emits only kid and protected bindings (VERIFIED, `core.sh:341-345`).
 
 - The router maps dnsmasq `*` or empty to `null`. Any character outside `[A-Za-z0-9._-]`, length > 63, or a first
   character that is not alphanumeric gives `null`. REJECT, never strip.
-- The service validates again with `parseJSON(text, true, ...)` and rejects the WHOLE reply on any violation.
+- The service validates again and rejects the WHOLE reply on any violation. It uses the non-router parse mode (`parseJSON(text, false, ...)`: router mode rejects the camelCase `routerTime` key) behind a raw-text
+  pre-check: printable ASCII only, no backslash (so no `\u` escapes) and integer-only numbers (`1.0`, `5e0` and `-0` are rejected). Field patterns then pin every string.
 - One shared sanitiser is used for both inventory hostnames and scope-preview terminal output.
 - The UI renders with `textContent` only, labelled "name reported by device". Hostnames are never identity, never in
   alerts, audit rows or logs. Any alert text defangs dots.
@@ -129,8 +130,8 @@ Placement: integration migrations (`service/migrations/integration-NNN.sql`, app
 `service/src/integration-db.ts:50-62`) are a separate chain from the main chain (`001`..`008`). 004 needs main migration
 008 (`people`) to have run first, because `scope_requests.person_id` references `people(id)`.
 
-Detection: one marker for 004. Run it unless `operations` sql contains `'pause_all'` AND `dispatch_steps` sql contains
-`'inventory'` (both from `sqlite_master`; 003 detects `"'enroll'"`, `integration-db.ts:57`). Rebuilds: `operations` follows
+Detection: one marker for 004. Run it unless `operations` sql contains `'pause_all'` (from `sqlite_master`; 003 detects `"'enroll'"`, `integration-db.ts:57`). The
+`dispatch_steps` `'inventory'` marker belongs to integration-006 (M2c), which carries the `inventory` step kind; 004 does not touch it. Rebuilds: `operations` follows
 003's `_next` pattern; `dispatch_steps` follows integration-002's RENAME-to-`_v1` pattern. Set `PRAGMA foreign_keys=OFF`
 OUTSIDE the transaction (a no-op inside), then `PRAGMA foreign_key_check` before commit. Never rename a parent table away
 first: SQLite >= 3.26 rewrites child FK references to the renamed name. Always create `X_next`, copy, drop `X`, rename.
@@ -217,3 +218,78 @@ dispatch; visibility (`service/src/integration-policy.ts:57`, `:129`) becomes "a
 
 Exact `operations.person_id` representative value for multi-child operations, and the alert settings UI, are decided in
 M2a/M2c.
+
+## 7. M2a decisions (resolved from the open points above)
+
+- Parser context: `normalizeObservation(value, {protectedMacs, floor})` and `parseObservation(text, context)`. The shared parser checks format,
+  order, digest and the accepted-policy superset on its own; the disjoint-from-protected and floor-superset rules need the manifest, so the
+  worker always passes it. The context argument is required: `ssh-router.ts` parses with the named `FORMAT_ONLY` marker first (format only);
+  the worker's second pass enforces the manifest rules.
+  Any violation rejects the whole observation (fail closed, `router_observation_invalid`).
+- A reply with `errors` is treated like a reply without scope: scope stays unknown and the remembered scope is not replaced.
+- integration-004 holds only what M2a needs: the `operations.action` widening (pause_all, resume_all, move), `operation_people`,
+  `scope_requests`, `router_scope_observed`, `scope_changes` and `parent_alerts` (the integration chain skips main 004.sql, so ParentAlerts had
+  no table; new kind `router_scope_change`). One detection marker: `operations` sql contains `'pause_all'`. The `dispatch_steps` /
+  `automatic_read_summary` rebuilds and `inventory_*` tables are NOT in 004; M2c adds them (integration-006), so 004 is not amended after M2a ships.
+- integration-005 (M2b) is the device move migration: `devices.state` gains `moving` and `devices.move_to` (target child) is added; the table is rebuilt in place
+  (marker: `devices` sql contains `'moving'`). Routes: `POST /bulk/pause-all`, `POST /bulk/resume-all` (one operation, one rpc-sync, one receipt) and the admin device
+  move; every one needs a fresh step-up bound to the exact change. Operations returned for `pause_all`/`resume_all` carry an `effect` field
+  (`blocking`, `not_blocking`, `unblocked`, `unchanged`, `may_still_be_blocked`); it states what the router is doing now, not what was requested.
+  `tr-` is a reserved idempotency-key prefix (the time-request service's re-pause keys); client keys starting with it are refused as missing.
+  A move whose observation shows the device under neither child, or under a child that is no longer active, keeps the device active under its source child and the
+  operation carries `device_move_drift`.
+- `router_scope_observed` gains `generation` and `scope_json` (the contract table had only the digest, which cannot yield added/removed MACs).
+- Baseline: with no remembered scope the comparison base is the manifest floor, so growth that happened while the service was away alerts.
+  A rebind deletes `router_scope_observed` (new generation, new baseline).
+- A change is "matched" only when it is pure growth and every added MAC has a pending request of the same generation; mixed changes alert
+  but still resolve the requests whose MAC appeared. Removal is always unmatched (warning). Every change raises one `router_scope_change` alert
+  (admins only): `info` when matched, `critical` for unmatched growth, `warning` for pure removal. Alert details carry counts, `matched` and the change
+  id, never MACs; the `audit` row (never pruned) carries the MACs, requesters, request ids and digests as JSON.
+- A rebind cancels every pending scope request (`cancelled`); pending rows are also keyed by generation (dedupe, per-child cap, matching).
+- The first observation after a rebind onto a router whose live scope is larger than the new manifest floor raises exactly one `critical` unmatched
+  alert, because the baseline is the floor. That is intended: the admin acknowledges it after checking the router.
+- `device_add` checks the device limits and the revision precondition before it may create a scope request, and reads the router scope only from the
+  generation-checked `router_scope_observed` row. `scope_request_conflict` (another child already has a pending request for that MAC) is an accepted
+  information leak of the same kind as `device_already_enrolled`.
+- `scope_requests` caps: 4 pending per child (`scope_request_limit`), one pending per MAC (a second child asking gets `scope_request_conflict`),
+  7-day expiry (also enforced by CHECK). Resolved rows older than 90 days go unless a scope change references them.
+- `device_add` for a MAC outside the floor and outside a fresh observed scope answers 409 `device_pending_router_scope` (committed, not thrown, so
+  the request and audit row persist). The body carries `mac` and `requestId` as fields and only the placeholder text
+  `cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>`.
+- Protected cap is 128 in the service (`PROTECTED_MAC_LIMIT`), pinned to `router/lib/install-common.sh` `valid_protection` by a drift test.
+- Observed scope is not part of `targetDigest`; rebind validates stored devices against the NEW manifest floor only.
+
+## 8. M2c decisions (inventory, service side)
+
+- Parser: `shared/src/router-inventory.ts` uses `parseJSON(text, false, 131071)`, not router mode, because router mode rejects the contract's camelCase key `routerTime`. ASCII is enforced field by field
+  (hostname, address, code and generation patterns). `inventory_version` is checked before the strict key check; a missing or non-1 version is `unknown_inventory_version`. The reply is rejected as a whole for a
+  protected MAC (`protected_mac_listed`), any hostname outside `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`, an unsorted or duplicate address or MAC, or a size of 131072 bytes or more.
+- `ipv4` "sorted" means C-locale string order (what `sort -u` prints: `192.0.2.10` before `192.0.2.9`). M1e must emit exactly that. MACs are strictly ascending.
+- Error strings stored only in `inventory_state.last_error`: `inventory_unavailable:<code>` for old routers (`old_router` for an empty exit 2, `invalid_command` for the exact body), `unknown_inventory_version`,
+  `invalid_router_inventory`, `empty_reply`, `protected_mac_listed` and transport codes such as `ssh_timeout`; ssh exit 255 is stored as `inventory_transport_error:ssh_exit_255` so it is never shown as an unavailable inventory;
+  an incomplete (errors or truncated) reply is `inventory_incomplete:<code|truncated>`. `RouterTransportError.exitCode` carries the remote exit status.
+- integration-006: `dispatch_steps.kind` gains `inventory`, `parent_alerts.kind` gains `new_device` (ids and AUTOINCREMENT high-water kept), plus `inventory_devices` (with `alerted_at`), the 1024-row trigger and
+  `inventory_state` (with `generation`, `last_attempt_at`, `refresh_pending`). `automatic_read_summary` is not widened: an inventory poll records `automatic_read_polls` only, so its steps are pruned with the other automatic reads.
+- Execution: a poll is a generated permit under the automatic owner only (no operator form). It runs at the start of `cycle()` when no operation is active, every 60 s (`last_attempt_at`) or when `refresh_pending`.
+  The step is always settled `resolved`; the result is fenced by epoch and step ownership; `dispatch_stopped` is neither read nor written. Failures are caught inside `pollInventory`.
+- Incomplete polls (errors or truncated) refresh devices already known and store nothing new, so they can neither baseline nor produce "New" nor imply "gone". "New" rows carry `alerted_at`: a device whose alert was
+  coalesced away is alerted by a later complete poll. Alert limits (1 per poll, 1 per hour, 12 per 24 h from the first alert of the window) are global because all admins share one system `new_device` alert; its details are a count only.
+- "Unassigned" = the MAC is in neither the `devices` table nor the desired policy. Routes (admin only, 403 `admin_required` otherwise): `GET /admin/inventory`, `POST /admin/inventory/acknowledge {mac}`,
+  `POST /admin/inventory/refresh {}` (202; 409 `inventory_dispatch_disabled`; 429 `inventory_refresh_rate_limited`). Retention: `CF_INVENTORY_RETENTION_DAYS`, default 30, at most 90.
+- Review fixes (M2c):
+  - Parser: `ipv4` must be strictly ascending C-locale order; a violation is reported as `ipv4_not_sorted` (stored as `inventory_unavailable:ipv4_not_sorted`) so the router side knows exactly what failed. The raw-text pre-check of section 2.1 applies.
+  - `invalid_clock` (routerTime 0) is the one non-structural router error: devices still ingest (the service clock stamps first_seen/last_seen; routerTime is never used) and the poll may baseline and alert, with
+    `last_error` `inventory_warning:invalid_clock`. Any other error code, truncation, or a refusal body with no devices is an incomplete poll.
+  - Stalls (SM-1): no complete poll for 30 minutes raises the system alert `inventory_stalled` (counts and a cause only, at most once per 6 hours, shared with the row-cap alert). A re-baseline over an existing baseline
+    (store emptied, or the last complete poll older than the retention) is not silent: it raises `new_device` with `{count, rebaselined: true}` ("accepted without review"). The very first baseline stays silent.
+    Truncated replies still never imply gone or New.
+  - Row cap (1024): eviction takes only long-unseen rows the reply does not list, that nobody acknowledged and that are not New devices still waiting for their alert. At the cap with nothing evictable no new row is stored,
+    `last_error` is `inventory_row_cap` and `inventory_stalled` (cause `row_cap`) is raised.
+  - Daily alert cap: once 12 alerts were raised in a window, further New devices are marked alerted and only increment the existing `new_device` alert's count; it is never re-opened.
+  - Execution: the inventory step is settled `resolved` by claim token and dispatch epoch alone (reads have no lease semantics). A reply later than the 10 s lease is not applied (`inventory_unavailable:lease_expired`). Bookkeeping runs in a
+    savepoint, so a failing bookkeeping step cannot leave the step `consumed` or `uncertain`. A poll that could not start (refused claim, fence) is `inventory_not_run:<code>`, distinct from a router failure. After an inventory poll
+    the next cycle's delay is `max(0, pollSeconds - inventorySeconds)` so poll + inventory + observe stays inside the 30 s observation freshness window.
+  - DTO: `personId` / `personName` name the child that owns the MAC (children admin `devices`, else the desired policy) only when the viewing admin manages that child; otherwise both are null (`flags.unassigned` still reflects
+    assignment). There is no protected-device count.
+  - Privacy: the acknowledge audit row records the inventory row id, never the MAC. Rows whose MAC is protected are purged at startup and on every ingest.
+  - integration-006 also widens `parent_alerts.kind` with `inventory_stalled` and gives `inventory_state` `incomplete_since` and `last_stall_alert_at`; its inventory objects stay `IF NOT EXISTS`, because a database whose `dispatch_steps` is rebuilt by 002 re-runs the file (the integration-002 upgrade test).
