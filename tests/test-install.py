@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Filesystem recovery fixtures; never invokes router/system backends."""
+import atexit
 import hashlib
 import os
 from pathlib import Path
@@ -18,6 +19,21 @@ FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/rpc.sh', 'usr/lib/couvr
          'etc/config/firewall', 'etc/sysupgrade.conf', 'etc/crontabs/root',
          'etc/couvrefeu/protected', 'etc/couvrefeu/state')
 DIRS = ('etc', 'usr', 'usr/sbin', 'usr/lib', 'usr/lib/couvrefeu', 'etc/config', 'etc/crontabs', 'etc/couvrefeu')
+
+
+_EMITTED = []
+
+
+def emitted_router():
+    """The shippable tree (release.sha256 hashes its stripped wrappers); the repo router/ keeps CF_TEST_MODE."""
+    if not _EMITTED:
+        tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-emitted-')
+        atexit.register(tmp.cleanup)
+        tree = Path(tmp.name) / 'router'
+        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(tree)],
+                       check=True, capture_output=True)
+        _EMITTED.append(tree)
+    return _EMITTED[0]
 
 
 def signature(path):
@@ -72,7 +88,7 @@ class RecoveryTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_script(self, name, *args):
-        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(REPO / 'router' / name), *args],
+        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(emitted_router() / name), *args],
                               env=self.env, capture_output=True, text=True)
 
     def snapshot(self):
