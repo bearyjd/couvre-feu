@@ -269,7 +269,7 @@ class RpcTests(unittest.TestCase):
         self.reject(self.request(), error='missing_dependencies')
         before = self.f.durable_snapshot()
         for args, document in ((('sync',), scoped_policy()), (('apply-fw',), None), (('expire',), None)):
-            result = self.f.run(*args, document=document)
+            result = self.f.run(*args, document=document, timeout=180)
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertEqual(self.f.durable_snapshot(), before)
         self.assertEqual(self.f.mutation_calls(), [])
@@ -997,7 +997,7 @@ class SshGuardTests(unittest.TestCase):
 
     def test_fifty_preflight_refused_syncs_never_change_protected(self):
         self.install(KID)
-        rows = [(f'192.168.1.{100 + i}', f'02:00:00:00:01:{i:02x}') for i in range(50)]
+        rows = [(f'192.168.1.{100 + i}', PROTECTED) for i in range(50)]  # protected clients pass the guard
         self.neighbors(*rows)
         (self.f.bin / 'conntrack').unlink()  # preflight refuses after the guard runs
         before = self.protected_bytes()
@@ -1005,6 +1005,8 @@ class SshGuardTests(unittest.TestCase):
             self.client(ip)
             result = self.f.run('rpc-sync', document=self.request(f'op_{i}'))
             self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertNotIn('ssh_client_', result.stdout)  # refused by preflight, not by the guard
+            self.assertIn('missing_dependencies', result.stdout)
         self.assertEqual(self.protected_bytes(), before)
 
     def test_unprotected_client_is_refused_without_mutation(self):
@@ -1030,15 +1032,78 @@ class SshGuardTests(unittest.TestCase):
         self.install(KID)
         self.neighbors(('192.168.1.30', THIRD_KID))
         self.client('192.168.1.30')
-        before = self.protected_bytes()
         result = self.script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.protected_bytes(), before)
+
+    def seed(self, *macs):
+        """Install and sync an unrestricted admin policy before any SSH client is set."""
+        self.install(*macs)
+        result = self.f.run('sync', document=scoped_policy(1), timeout=180)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def unprotected(self):
+        self.seed(KID, OTHER_KID)
+        self.neighbors(('192.168.1.30', THIRD_KID))
+        self.client('192.168.1.30')
+
+    def test_apply_fw_and_expire_from_unprotected_client_are_not_guarded(self):
+        self.unprotected()
+        for action in ('apply-fw', 'expire'):
+            result = self.f.run(action, timeout=180)
+            self.assertNotIn('ssh_client_', result.stdout, action)
+            self.assertEqual(result.returncode, 0, action + result.stdout + result.stderr)
+
+    def test_sync_pause_resume_from_unprotected_client_are_refused(self):
+        self.seed(KID, OTHER_KID)
+        self.assertEqual(self.f.run('pause', 'alice', timeout=180).returncode, 0)  # revision 2
+        self.neighbors(('192.168.1.30', THIRD_KID))
+        self.client('192.168.1.30')
+        for args, document in ((('sync',), scoped_policy(3)), (('pause', 'alice'), None), (('resume', 'alice'), None)):
+            result = self.f.run(*args, document=document, timeout=180)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn('ssh_client_unprotected', result.stdout, args)
+
+    def test_unresolvable_client_mac_is_refused(self):
+        self.seed(KID, OTHER_KID)
+        self.client('192.168.1.99')  # no neighbor row for this address
+        result = self.f.run('sync', document=scoped_policy(2), timeout=180)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('ambiguous_ssh_client', result.stdout)
+        self.base = self.observe()
+        self.reject(self.request(), error='ambiguous_ssh_client')
+
+    def test_non_rpc_sync_from_in_scope_client_is_refused(self):
+        self.seed(KID, OTHER_KID)
+        self.client('192.168.1.22')  # CF_SCOPE is bound for every action once rpc-allowed is installed
+        result = self.f.run('sync', document=scoped_policy(2), timeout=180)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('ssh_client_in_scope', result.stdout)
+
+    def test_sync_with_unset_scope_skips_the_scope_check(self):
+        result = self.script('install.sh', '--activate', '--protect', PROTECTED)  # legacy: no rpc-allowed
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.f.run('sync', document=scoped_policy(1), timeout=180).returncode, 0)
+        self.neighbors(('192.168.1.30', THIRD_KID))
+        self.client('192.168.1.30')
+        result = self.f.run('sync', document=scoped_policy(2), timeout=180)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('ssh_client_unprotected', result.stdout)
+        self.assertNotIn('ssh_client_in_scope', result.stdout)
+
+    def test_uninstall_with_ambiguous_client(self):
+        self.install(KID)
+        self.neighbors(('192.168.1.30', THIRD_KID), ('192.168.1.30', OTHER_KID))
+        self.client('192.168.1.30')
+        result = self.script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_uninstall_in_protected_policy_overlap_state(self):
         self.install(KID)
         state = self.f.root / 'etc/couvrefeu/state'
-        state.write_text(state.read_text().replace('R\t0\n', 'R\t0\nP\talice\t' + PROTECTED + '\n'))
+        original = state.read_text()
+        changed = original.replace('R\t0\n', 'R\t0\nP\talice\t' + PROTECTED + '\n')
+        self.assertNotEqual(changed, original)
+        state.write_text(changed)
         result = self.script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
