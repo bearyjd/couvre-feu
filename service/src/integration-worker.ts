@@ -41,8 +41,9 @@ export class IntegrationWorker {
     constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000), inventoryRetentionDays = DEFAULT_INVENTORY_RETENTION_DAYS) {
         this.store = store; this.router = router; this.now = now; this.policy = new IntegrationPolicy(store, now);
         this.activity = new ActivityStore(store, {now, provenance: store.config.provenance});
-        this.scope = new ScopeTracker(store, new ParentAlerts(store, null, now), now);
-        this.inventory = new InventoryStore(store, new ParentAlerts(store, null, now), now, inventoryRetentionDays);
+        const alerts = new ParentAlerts(store, null, now);
+        this.scope = new ScopeTracker(store, alerts, now);
+        this.inventory = new InventoryStore(store, alerts, now, inventoryRetentionDays);
     }
     /** Preparing a review artifact performs no network call and grants no authorization. */
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
@@ -88,8 +89,10 @@ export class IntegrationWorker {
             this.inventory.recordAttempt(this.now());
             await this.executeAutomatic('inventory', owner);
         } catch (error) {
-            const code = error instanceof RouterTransportError || error instanceof AppError ? error.code : 'invalid_router_inventory';
-            try { this.inventory.recordFailure(inventoryFailureLabel(code)); } catch { /* the store itself is unavailable; the next cycle's own work reports it */ }
+            // A transport failure is the router's; anything else (a refused claim, a fence, a local fault) says the poll did not run.
+            const label = error instanceof RouterTransportError ? inventoryFailureLabel(error.code)
+                : `inventory_not_run:${(error instanceof AppError ? error.code : 'internal_error').replace(/[^a-z0-9_]/g, '_').slice(0, 64)}`;
+            try { this.inventory.recordFailure(label); } catch { /* the store itself is unavailable; the next cycle's own work reports it */ }
         }
     }
     private async run(plan: PreparedDispatch, owner: {token: string; epoch: number} | null): Promise<void> {
@@ -182,9 +185,10 @@ export class IntegrationWorker {
         });
     }
     /**
-     * Read-only listing. The step is ALWAYS settled (a lingering `consumed` step would make the next observe fail with dispatch_in_progress)
-     * and is `resolved` even on failure, since a read leaves no uncertain remote state (an `uncertain` step would also block a rebind). Fencing
-     * is by epoch and step ownership; dispatch_stopped is neither read nor written.
+     * Read-only listing. The step is ALWAYS settled `resolved`, by claim token and dispatch epoch alone: a read has no lease semantics and leaves
+     * no uncertain remote state, and a lingering `consumed` or `uncertain` step would block a rebind and the next claim (dispatch_in_progress).
+     * A reply that arrives after the lease is not applied (`inventory_unavailable:lease_expired`). The bookkeeping runs in a savepoint: if it
+     * throws, only the bookkeeping is lost and the step is settled on its own. dispatch_stopped is neither read nor written.
      */
     private async runInventory(batchId: string, token: string, epoch: number, invocation: FrozenInvocation): Promise<void> {
         let reply: RouterInventory | null = null, failure: RouterTransportError | null = null;
@@ -192,18 +196,34 @@ export class IntegrationWorker {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             reply = await this.router.invokeInventory(invocation);
         } catch (error) { failure = error instanceof RouterTransportError ? error : new RouterTransportError('invalid_router_inventory'); }
-        this.store.transaction(() => {
+        const settle = () => {
             const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
-            if (!step || step.claim_token !== token || step.state !== 'consumed' || s.dispatch_epoch !== epoch || s.generation !== this.store.config.router.generation || step.lease_until < this.now()) return;
+            if (!step || step.claim_token !== token || s.dispatch_epoch !== epoch || !['consumed', 'uncertain'].includes(step.state)) return null;
             this.store.run("UPDATE dispatch_steps SET state='resolved' WHERE batch_id=? AND ordinal=1 AND claim_token=?", batchId, token);
             this.store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
+            return {late: step.lease_until < this.now(), current: s.generation === this.store.config.router.generation};
+        };
+        const bookkeeping = (late: boolean) => {
             let label = failure ? inventoryFailureLabel(failure.code) : null;
+            if (late) { label = inventoryFailureLabel('inventory_unavailable:lease_expired'); reply = null; }
             if (reply) {
                 try { this.inventory.ingest(reply, this.now()); } catch { label = inventoryFailureLabel('inventory_unavailable:ingest_failed'); }
             }
             if (label) this.inventory.recordFailure(label);
             this.store.pruneAutomaticReads();
-        });
+        };
+        try {
+            this.store.transaction(() => {
+                const settled = settle();
+                if (!settled || !settled.current) return;
+                this.store.db.exec('SAVEPOINT inventory_bookkeeping');
+                try { bookkeeping(settled.late); this.store.db.exec('RELEASE inventory_bookkeeping'); }
+                catch { this.store.db.exec('ROLLBACK TO inventory_bookkeeping'); this.store.db.exec('RELEASE inventory_bookkeeping'); }
+            });
+        } catch {
+            // The transaction itself failed (e.g. at commit): settle the step alone, which is what keeps the next claim and a rebind unblocked.
+            try { this.store.transaction(() => { settle(); }); } catch { /* the store is unavailable; recovery settles the step */ }
+        }
     }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {
         this.store.transaction(() => {

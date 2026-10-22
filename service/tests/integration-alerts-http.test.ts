@@ -13,7 +13,7 @@ const SEED = '02:10:20:30:40:50', LAPTOP = '02:10:20:30:40:53';
 const shaOf = (scope: string[]) => sha256(scope.join('\n') + '\n');
 
 test('S1: the integration entry point serves /alerts (ParentAlerts wired, no scheduled sources)', () => {
-    const main = readFileSync(new URL('../src/integration-main.ts', import.meta.url), 'utf8');
+    const main = readFileSync(new URL('../src/integration-wiring.ts', import.meta.url), 'utf8');
     assert.match(main, /new ParentAlerts\(store, null\)/);
     assert.doesNotMatch(main, /appServer\([^;]*, undefined, activity\)/);
 });

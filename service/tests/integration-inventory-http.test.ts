@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { readFileSync } from 'node:fs';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
 import { AutomaticDispatch } from '../src/integration-automatic.ts';
+import { wireIntegration } from '../src/integration-wiring.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import type { InventoryDevice } from '../../shared/src/router-inventory.ts';
 
@@ -102,10 +102,29 @@ test('refresh: 409 when dispatch is off, otherwise 202 once per 10 s (429), and 
         assert.equal(w.router.calls.length, 0);
     } finally { await w.close(); }
 });
-test('integration-main wires the store, the retention and a periodic prune (and keeps the literal ParentAlerts wiring)', () => {
-    const main = readFileSync(new URL('../src/integration-main.ts', import.meta.url), 'utf8');
-    assert.match(main, /new ParentAlerts\(store, null\)/);
-    assert.match(main, /inventoryRetentionDays\(\)/);
-    assert.match(main, /worker\.inventory/);
-    assert.match(main, /inventory\.prune\(\)/);
+test('the production wiring serves the inventory routes, applies the configured retention and prunes on its own schedule', async () => {
+    const f = integrationFixture(), port = 26000 + (process.pid + 7 * worlds++) % 9000, origin = `http://localhost:${port}`;
+    const wired = wireIntegration(f.config, f.store, f.router, {CF_INVENTORY_RETENTION_DAYS: '7'});
+    const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
+    const server = wired.app(auth, {...f.config, port, origin, host: `localhost:${port}`});
+    server.listen(port, '127.0.0.1'); await once(server, 'listening');
+    try {
+        assert.equal(wired.worker.inventory.retentionDays, 7);
+        const seed = (mac: string, seen: number) => f.store.run("INSERT INTO inventory_devices(generation,mac,ipv4_json,hostname,source,first_seen,last_seen) VALUES(?,?,'[]',NULL,'both',?,?)", f.config.router.generation, mac, seen, seen);
+        const real = Math.floor(Date.now() / 1000); seed(m(1), real); seed(m(2), real - 8 * 86400); // the wiring runs on the real clock
+        wired.prune();
+        assert.deepEqual(f.store.all<{mac: string}>('SELECT mac FROM inventory_devices').map(r => r.mac), [m(1)]);
+        const cookies = new Map<string, string>(); let csrf = '';
+        const call = async (path: string, input?: unknown) => {
+            const response = await fetch(origin + path, {method: input === undefined ? 'GET' : 'POST', headers: {Origin: origin, Cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join('; '), ...(csrf ? {'X-CSRF-Token': csrf} : {}), ...(input === undefined ? {} : {'Content-Type': 'application/json'})}, body: input === undefined ? undefined : JSON.stringify(input)});
+            for (const entry of response.headers.getSetCookie()) { const [k, v] = entry.split(';')[0].split('='); cookies.set(k, v); }
+            return {status: response.status, body: await response.json() as Record<string, any>};
+        };
+        const key = new TestAuthenticator(), options = await call('/auth/register/options', {token: issueOperatorBootstrap(f.store, 'operator', f.now())});
+        const verified = await call('/auth/register/verify', {challengeId: options.body.challengeId, response: key.register(options.body.options, origin)});
+        csrf = verified.body.csrfToken;
+        const listed = await call('/admin/inventory');
+        assert.equal(listed.status, 200); assert.deepEqual(listed.body.inventory.devices.map((d: {mac: string}) => d.mac), [m(1)]);
+        assert.ok('personId' in listed.body.inventory.devices[0] && 'personName' in listed.body.inventory.devices[0]);
+    } finally { const closed = once(server, 'close'); server.close(); server.closeAllConnections(); await closed; f.cleanup(); }
 });

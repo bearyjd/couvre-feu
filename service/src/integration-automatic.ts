@@ -10,6 +10,8 @@ export class AutomaticDispatch {
     private flight: Promise<void> | null = null;
     private stopped = false;
     private delay: number;
+    /** Seconds the last cycle spent in the inventory poll; the next delay shortens by that much so observations stay on cadence. */
+    private inventorySeconds = 0;
     constructor(worker: IntegrationWorker) {
         this.worker = worker;
         const {store, now} = worker, settings = store.config.dispatch;
@@ -43,7 +45,9 @@ export class AutomaticDispatch {
         // Inventory first, only while nothing is in flight and on its own cadence. It cannot fail the cycle: pollInventory records
         // every outcome in inventory_state alone.
         if (!active && this.worker.inventory.due(this.worker.now())) {
+            const began = this.worker.now();
             await this.worker.pollInventory(this.owner);
+            this.inventorySeconds = Math.max(0, this.worker.now() - began);
             if (!this.authorized()) return;
         }
         const rpc = active ? store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active) : null;
@@ -52,6 +56,17 @@ export class AutomaticDispatch {
         active = store.integrationState().active_operation_id;
         const pending = active ? store.get<{phase: string; attempt_count: number}>('SELECT phase,attempt_count FROM operation_rpc WHERE operation_id=?', active) : null;
         if (pending?.phase === 'queued' && pending.attempt_count === 0) await this.worker.executeAutomatic('apply', this.owner, active!);
+    }
+    /**
+     * Seconds until the next cycle. After a failure the backoff doubles. Otherwise the cycle is kept to the poll cadence by subtracting the time an
+     * inventory poll took: poll + inventory + observe must not stretch the gap between observations past the 30 s freshness window.
+     */
+    nextDelaySeconds(): number {
+        const settings = this.worker.store.config.dispatch!, spent = this.inventorySeconds;
+        this.inventorySeconds = 0;
+        if (this.worker.store.integrationState().observation_error) return this.delay = Math.min(settings.maxBackoffSeconds, this.delay * 2);
+        this.delay = settings.pollSeconds;
+        return Math.max(0, settings.pollSeconds - spent);
     }
     start(): void {
         if (this.timer || this.stopped) return;
@@ -63,9 +78,7 @@ export class AutomaticDispatch {
                 if (this.authorized()) this.worker.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', error instanceof AppError ? error.code : 'automatic_dispatch_failed');
             }
             if (!this.authorized()) return;
-            const settings = this.worker.store.config.dispatch!;
-            this.delay = this.worker.store.integrationState().observation_error ? Math.min(settings.maxBackoffSeconds, this.delay * 2) : settings.pollSeconds;
-            this.timer = setTimeout(poll, this.delay * 1000);
+            this.timer = setTimeout(poll, this.nextDelaySeconds() * 1000);
         };
         this.timer = setTimeout(poll, 0);
     }

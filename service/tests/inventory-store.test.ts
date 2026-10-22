@@ -71,8 +71,8 @@ test('a TRUNCATED poll never baselines: truncated subset, then complete superset
 test('a poll with errors never baselines or alerts, and records the incomplete state', () => {
     const f = world();
     try {
-        f.poll([dev(1)], {errors: ['invalid_clock'], routerTime: 0});
-        assert.equal(f.inv.list(actor).status.baselineAt, null); assert.equal(f.inv.list(actor).status.lastError, 'inventory_incomplete:invalid_clock');
+        f.poll([dev(1)], {errors: ['inventory_unreadable'], routerTime: 0});
+        assert.equal(f.inv.list(actor).status.baselineAt, null); assert.equal(f.inv.list(actor).status.lastError, 'inventory_incomplete:inventory_unreadable');
         f.poll([], {errors: ['inventory_refused']}); assert.equal(f.inv.list(actor).status.lastOkAt, null);
     } finally { f.cleanup(); }
 });
@@ -111,21 +111,22 @@ test('alert coalescing: at most 1 per hour, at most 12 per day, and a suppressed
         next(31); assert.equal(f.raised(), 2, 'an hour after the first: the suppressed device is now covered');
         assert.equal(f.store.get<{n: number}>('SELECT count(*) n FROM inventory_devices WHERE alerted_at IS NULL AND first_seen > (SELECT baseline_at FROM inventory_state)')!.n, 0);
         for (let i = 0; i < 20; i++) next(61);
-        assert.equal(f.raised(), 12, 'the daily cap holds');
-        const unalerted = f.store.get<{n: number}>('SELECT count(*) n FROM inventory_devices WHERE alerted_at IS NULL AND first_seen > (SELECT baseline_at FROM inventory_state)')!.n;
-        assert.ok(unalerted > 0, 'capped devices stay un-alerted');
-        f.advance(DAY); f.poll(Array.from({length: n - 1}, (_, i) => dev(i + 1))); assert.equal(f.raised(), 13, 'the next day alerts once, covering all capped devices');
-        assert.equal(f.store.get<{n: number}>('SELECT count(*) n FROM inventory_devices WHERE alerted_at IS NULL AND first_seen > (SELECT baseline_at FROM inventory_state)')!.n, 0);
+        assert.equal(f.store.get<{n: number}>('SELECT alert_day_count n FROM inventory_state')!.n, 12, 'the daily cap holds: no more than 12 alert events');
+        assert.equal(f.raised(), 22, 'past the cap the existing alert row only counts the occurrence (SL-2)');
+        assert.equal(f.store.get<{n: number}>('SELECT count(*) n FROM inventory_devices WHERE alerted_at IS NULL AND first_seen > (SELECT baseline_at FROM inventory_state)')!.n, 0, 'capped devices are consumed, not re-counted');
+        f.advance(DAY); next(1); assert.equal(f.raised(), 23, 'the next day alerts normally again');
     } finally { f.cleanup(); }
 });
-test('re-baseline is silent when the store is empty or last_ok_at is older than the retention', () => {
+test('re-baseline over an existing baseline (emptied store, or last_ok_at older than the retention) is a counted alert, never silent (SM-1b)', () => {
     const f = world();
     try {
         f.poll([dev(1)]); f.advance(60); f.store.run('DELETE FROM inventory_devices');
-        f.poll([dev(1), dev(2)]); assert.equal(f.raised(), 0); assert.equal(f.inv.list(actor).status.baselineAt, f.now());
+        f.poll([dev(1), dev(2)]); assert.equal(f.raised(), 1); assert.equal(f.inv.list(actor).status.baselineAt, f.now());
+        assert.deepEqual(JSON.parse(f.alertRows()[0].details), {count: 2, rebaselined: true});
         f.advance(31 * DAY); f.poll([dev(1), dev(2), dev(3)]);
-        assert.equal(f.raised(), 0, 'last_ok_at older than 30 days: silent'); assert.equal(f.inv.list(actor).status.baselineAt, f.now());
-        f.advance(60); f.poll([dev(1), dev(2), dev(3), dev(4)]); assert.equal(f.raised(), 1);
+        assert.equal(f.raised(), 2, 'last_ok_at older than 30 days: counted'); assert.equal(f.inv.list(actor).status.baselineAt, f.now());
+        assert.deepEqual(f.inv.list(actor).devices.map(d => d.flags.new), [false, false, false], 'accepted devices are not New');
+        f.advance(60); f.poll([dev(1), dev(2), dev(3), dev(4)]); assert.equal(f.raised(), 3);
     } finally { f.cleanup(); }
 });
 test('retention: default 30 days, configurable up to 90; stale rows are pruned', () => {

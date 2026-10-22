@@ -1,5 +1,6 @@
 -- M2c: network inventory. Applied in one transaction by IntegrationStore (marker: dispatch_steps sql contains 'inventory').
--- The inventory objects are IF NOT EXISTS so a database whose dispatch_steps is rebuilt again (e.g. by 002) can safely re-run this file.
+-- The inventory objects are IF NOT EXISTS so a database whose dispatch_steps is rebuilt again (e.g. by 002) can safely re-run this file
+-- (integration-activity.test.ts "integration-002 upgrades a legacy database" depends on it, so they cannot be plain CREATEs).
 -- 1. dispatch_steps admits the read-only `inventory` permit kind (the 002 RENAME-to-_v1 pattern; nothing references dispatch_steps).
 ALTER TABLE dispatch_steps RENAME TO dispatch_steps_v1;
 CREATE TABLE dispatch_steps (
@@ -21,7 +22,7 @@ ALTER TABLE parent_alerts RENAME TO parent_alerts_v1;
 CREATE TABLE parent_alerts (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
  person_id TEXT,
- kind TEXT NOT NULL CHECK(kind IN ('enforcement_unhealthy','sync_failed','apply_pending_too_long','possible_bypass','repeated_blocked_attempts','time_request_pending','router_scope_change','new_device')),
+ kind TEXT NOT NULL CHECK(kind IN ('enforcement_unhealthy','sync_failed','apply_pending_too_long','possible_bypass','repeated_blocked_attempts','time_request_pending','router_scope_change','new_device','inventory_stalled')),
  severity TEXT NOT NULL CHECK(severity IN ('info','warning','critical')),
  created_at INTEGER NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
  count INTEGER NOT NULL CHECK(count >= 1),
@@ -59,4 +60,6 @@ CREATE TRIGGER IF NOT EXISTS inventory_devices_cap BEFORE INSERT ON inventory_de
 CREATE TABLE IF NOT EXISTS inventory_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  generation TEXT, baseline_at INTEGER, last_ok_at INTEGER, last_attempt_at INTEGER, last_error TEXT, refresh_requested_at INTEGER,
  refresh_pending INTEGER NOT NULL DEFAULT 0 CHECK(refresh_pending IN (0,1)),
- alert_day_start INTEGER, alert_day_count INTEGER NOT NULL DEFAULT 0, last_alert_at INTEGER) STRICT;
+ alert_day_start INTEGER, alert_day_count INTEGER NOT NULL DEFAULT 0, last_alert_at INTEGER,
+ -- incomplete_since: start of the current run without a complete poll (the last complete poll, or the first failure); last_stall_alert_at rate-limits inventory_stalled.
+ incomplete_since INTEGER, last_stall_alert_at INTEGER) STRICT;

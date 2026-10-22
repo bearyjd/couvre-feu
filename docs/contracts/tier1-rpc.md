@@ -72,7 +72,8 @@ emits only kid and protected bindings (VERIFIED, `core.sh:341-345`).
 
 - The router maps dnsmasq `*` or empty to `null`. Any character outside `[A-Za-z0-9._-]`, length > 63, or a first
   character that is not alphanumeric gives `null`. REJECT, never strip.
-- The service validates again with `parseJSON(text, true, ...)` and rejects the WHOLE reply on any violation.
+- The service validates again and rejects the WHOLE reply on any violation. It uses the non-router parse mode (`parseJSON(text, false, ...)`: router mode rejects the camelCase `routerTime` key) behind a raw-text
+  pre-check: printable ASCII only, no backslash (so no `\u` escapes) and integer-only numbers (`1.0`, `5e0` and `-0` are rejected). Field patterns then pin every string.
 - One shared sanitiser is used for both inventory hostnames and scope-preview terminal output.
 - The UI renders with `textContent` only, labelled "name reported by device". Hostnames are never identity, never in
   alerts, audit rows or logs. Any alert text defangs dots.
@@ -122,8 +123,8 @@ Placement: integration migrations (`service/migrations/integration-NNN.sql`, app
 `service/src/integration-db.ts:50-62`) are a separate chain from the main chain (`001`..`008`). 004 needs main migration
 008 (`people`) to have run first, because `scope_requests.person_id` references `people(id)`.
 
-Detection: one marker for 004. Run it unless `operations` sql contains `'pause_all'` AND `dispatch_steps` sql contains
-`'inventory'` (both from `sqlite_master`; 003 detects `"'enroll'"`, `integration-db.ts:57`). Rebuilds: `operations` follows
+Detection: one marker for 004. Run it unless `operations` sql contains `'pause_all'` (from `sqlite_master`; 003 detects `"'enroll'"`, `integration-db.ts:57`). The
+`dispatch_steps` `'inventory'` marker belongs to integration-006 (M2c), which carries the `inventory` step kind; 004 does not touch it. Rebuilds: `operations` follows
 003's `_next` pattern; `dispatch_steps` follows integration-002's RENAME-to-`_v1` pattern. Set `PRAGMA foreign_keys=OFF`
 OUTSIDE the transaction (a no-op inside), then `PRAGMA foreign_key_check` before commit. Never rename a parent table away
 first: SQLite >= 3.26 rewrites child FK references to the renamed name. Always create `X_next`, copy, drop `X`, rename.
@@ -268,3 +269,20 @@ M2a/M2c.
   coalesced away is alerted by a later complete poll. Alert limits (1 per poll, 1 per hour, 12 per 24 h from the first alert of the window) are global because all admins share one system `new_device` alert; its details are a count only.
 - "Unassigned" = the MAC is in neither the `devices` table nor the desired policy. Routes (admin only, 403 `admin_required` otherwise): `GET /admin/inventory`, `POST /admin/inventory/acknowledge {mac}`,
   `POST /admin/inventory/refresh {}` (202; 409 `inventory_dispatch_disabled`; 429 `inventory_refresh_rate_limited`). Retention: `CF_INVENTORY_RETENTION_DAYS`, default 30, at most 90.
+- Review fixes (M2c):
+  - Parser: `ipv4` must be strictly ascending C-locale order; a violation is reported as `ipv4_not_sorted` (stored as `inventory_unavailable:ipv4_not_sorted`) so the router side knows exactly what failed. The raw-text pre-check of section 2.1 applies.
+  - `invalid_clock` (routerTime 0) is the one non-structural router error: devices still ingest (the service clock stamps first_seen/last_seen; routerTime is never used) and the poll may baseline and alert, with
+    `last_error` `inventory_warning:invalid_clock`. Any other error code, truncation, or a refusal body with no devices is an incomplete poll.
+  - Stalls (SM-1): no complete poll for 30 minutes raises the system alert `inventory_stalled` (counts and a cause only, at most once per 6 hours, shared with the row-cap alert). A re-baseline over an existing baseline
+    (store emptied, or the last complete poll older than the retention) is not silent: it raises `new_device` with `{count, rebaselined: true}` ("accepted without review"). The very first baseline stays silent.
+    Truncated replies still never imply gone or New.
+  - Row cap (1024): eviction takes only long-unseen rows the reply does not list, that nobody acknowledged and that are not New devices still waiting for their alert. At the cap with nothing evictable no new row is stored,
+    `last_error` is `inventory_row_cap` and `inventory_stalled` (cause `row_cap`) is raised.
+  - Daily alert cap: once 12 alerts were raised in a window, further New devices are marked alerted and only increment the existing `new_device` alert's count; it is never re-opened.
+  - Execution: the inventory step is settled `resolved` by claim token and dispatch epoch alone (reads have no lease semantics). A reply later than the 10 s lease is not applied (`inventory_unavailable:lease_expired`). Bookkeeping runs in a
+    savepoint, so a failing bookkeeping step cannot leave the step `consumed` or `uncertain`. A poll that could not start (refused claim, fence) is `inventory_not_run:<code>`, distinct from a router failure. After an inventory poll
+    the next cycle's delay is `max(0, pollSeconds - inventorySeconds)` so poll + inventory + observe stays inside the 30 s observation freshness window.
+  - DTO: `personId` / `personName` name the child that owns the MAC (children admin `devices`, else the desired policy) only when the viewing admin manages that child; otherwise both are null (`flags.unassigned` still reflects
+    assignment). There is no protected-device count.
+  - Privacy: the acknowledge audit row records the inventory row id, never the MAC. Rows whose MAC is protected are purged at startup and on every ingest.
+  - integration-006 also widens `parent_alerts.kind` with `inventory_stalled` and gives `inventory_state` `incomplete_since` and `last_stall_alert_at`; its inventory objects stay `IF NOT EXISTS`, because a database whose `dispatch_steps` is rebuilt by 002 re-runs the file (the integration-002 upgrade test).

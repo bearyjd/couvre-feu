@@ -22,6 +22,8 @@ export type InventoryClassification = {ok: true; inventory: RouterInventory} | {
 const HOSTNAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const IPV4 = /^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/;
+/** Violations the poller reports under their own name, so inventory_state.last_error tells the router side exactly what failed. */
+const DISTINCT_CODES = ['protected_mac_listed', 'ipv4_not_sorted'];
 const invalid = (): never => { throw new AppError(400, 'invalid_router_inventory'); };
 function ipv4(value: unknown): string {
     if (typeof value !== 'string' || !IPV4.test(value) || value.split('.').some(part => Number(part) > 255)) invalid();
@@ -32,7 +34,7 @@ function device(value: unknown): InventoryDevice {
     if (!Array.isArray(o.ipv4) || o.ipv4.length > MAX_INVENTORY_IPV4) invalid();
     const addresses = (o.ipv4 as unknown[]).map(ipv4);
     // Strictly ascending in C-locale string order (what `sort -u` emits) is both "sorted" and "unique".
-    if (addresses.some((a, i) => i > 0 && !(addresses[i - 1] < a))) invalid();
+    if (addresses.some((a, i) => i > 0 && !(addresses[i - 1] < a))) throw new AppError(400, 'ipv4_not_sorted');
     if (o.hostname !== null && (typeof o.hostname !== 'string' || !HOSTNAME.test(o.hostname))) invalid();
     if (typeof o.source !== 'string' || !(INVENTORY_SOURCES as readonly string[]).includes(o.source)) invalid();
     return {mac: mac(o.mac), ipv4: addresses, hostname: o.hostname as string | null, source: o.source as InventorySource};
@@ -53,15 +55,24 @@ export function normalizeRouterInventory(value: unknown, context: InventoryConte
         if (devices.some(d => context.protectedMacs.includes(d.mac))) throw new AppError(400, 'protected_mac_listed');
         return {inventory_version: 1, generation: o.generation as string, routerTime: o.routerTime as number, devices, truncated: o.truncated as boolean, errors};
     } catch (error) {
-        throw error instanceof AppError && error.code === 'protected_mac_listed' ? error : new AppError(400, 'invalid_router_inventory');
+        throw error instanceof AppError && DISTINCT_CODES.includes(error.code) ? error : new AppError(400, 'invalid_router_inventory');
     }
 }
 /**
- * Untrusted router stdout. Not the router-mode JSON: that mode rejects the contract's camelCase `routerTime` key.
- * ASCII-only is instead enforced field by field (hostnames, addresses, codes and the generation are all pattern-checked).
+ * Raw-text gate run before JSON.parse: printable ASCII (plus JSON whitespace), no backslash (so no \\u escapes) and integer-only numbers
+ * (no 1.0, 5e0 or -0). Strings contain no backslash, so they are exactly the `"[^"]*"` runs; numbers are what remains outside them.
+ */
+export function assertPlainInventoryText(text: string): void {
+    if (/[^\x20-\x7e\n\r\t]/.test(text) || text.includes('\\')) invalid();
+    for (const token of text.replace(/"[^"]*"/g, '""').match(/-?[0-9][0-9.eE+-]*/g) ?? []) if (!/^(?:0|[1-9][0-9]*)$/.test(token)) invalid();
+}
+/**
+ * Untrusted router stdout. Not the router-mode JSON: that mode rejects the contract's camelCase `routerTime` key, so this is the non-router
+ * parse mode plus assertPlainInventoryText above. The field patterns (hostnames, addresses, codes, generation) then pin the rest.
  */
 export function parseRouterInventory(text: string, context: InventoryContext): RouterInventory {
     if (typeof text !== 'string') invalid();
+    try { assertPlainInventoryText(text); } catch { return invalid(); }
     let parsed: unknown;
     try { parsed = parseJSON(text, false, MAX_INVENTORY_BYTES - 1); } catch { return invalid(); }
     return normalizeRouterInventory(parsed, context);
@@ -75,9 +86,9 @@ export function classifyInventoryReply(text: string, context: InventoryContext):
             && Array.isArray(parsed.errors) && parsed.errors.length === 1 && parsed.errors[0] === 'invalid_command') return {ok: false, code: 'invalid_command'};
     } catch { return {ok: false, code: 'invalid_router_inventory'}; }
     try { return {ok: true, inventory: parseRouterInventory(text, context)}; }
-    catch (error) { return {ok: false, code: error instanceof AppError && ['unknown_inventory_version', 'protected_mac_listed'].includes(error.code) ? error.code : 'invalid_router_inventory'}; }
+    catch (error) { return {ok: false, code: error instanceof AppError && ['unknown_inventory_version', ...DISTINCT_CODES].includes(error.code) ? error.code : 'invalid_router_inventory'}; }
 }
 /** "Private address" hint: the locally-administered bit, i.e. the second hex digit of the first octet is one of 2367abef. Never a gate. */
-export function isPrivateAddress(address: string): boolean {
-    return /^[0-9a-f][2367abef]:/.test(address);
+export function isPrivateAddress(mac: string): boolean {
+    return /^[0-9a-f][2367abef]:/.test(mac);
 }

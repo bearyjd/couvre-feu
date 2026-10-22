@@ -66,7 +66,7 @@ test('ISOLATION: every inventory failure leaves observation_error NULL, the obse
         ['timeout', f => { f.router.inventoryFailure = new RouterTransportError('ssh_timeout'); }, 'inventory_unavailable:ssh_timeout'],
         ['ssh 255 stays distinct', f => { f.router.inventoryFailure = new RouterTransportError('ssh_exit_255', 'possible', 255); }, 'inventory_transport_error:ssh_exit_255'],
         ['non-transport throw', f => { f.router.invokeInventory = async () => { throw new Error('boom'); }; }, 'inventory_unavailable:invalid_router_inventory'],
-        ['claim refused (409)', f => { const run = f.worker.executeAutomatic.bind(f.worker); f.worker.executeAutomatic = async (kind, owner, op) => { if (kind === 'inventory') throw new AppError(409, 'dispatch_in_progress'); return run(kind, owner, op); }; }, 'inventory_unavailable:dispatch_in_progress'],
+        ['claim refused (409)', f => { const run = f.worker.executeAutomatic.bind(f.worker); f.worker.executeAutomatic = async (kind, owner, op) => { if (kind === 'inventory') throw new AppError(409, 'dispatch_in_progress'); return run(kind, owner, op); }; }, 'inventory_not_run:dispatch_in_progress'],
     ];
     for (const [name, arrange, label] of cases) {
         const f = enabled();

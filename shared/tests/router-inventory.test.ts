@@ -77,3 +77,33 @@ test('isPrivateAddress is the locally-administered bit: second hex digit in 2367
     for (const d of '014589cd') assert.equal(isPrivateAddress(`0${d}:00:5e:00:53:01`), false, d);
     assert.equal(isPrivateAddress('00:00:5e:00:53:01'), false); assert.equal(isPrivateAddress('02:00:00:00:00:01'), true);
 });
+
+// ---- review fixes: SL-4 (raw-text pre-check) and CM-4 (distinct ordering code) ----
+test('SL-4: non-integer numbers, negative zero, backslashes and non-printable or non-ASCII text are rejected before parsing', () => {
+    const base = text(reply());
+    for (const [name, bad] of [
+        ['float routerTime', base.replace('"routerTime":1791691200', '"routerTime":1791691200.0')],
+        ['exponent routerTime', base.replace('"routerTime":1791691200', '"routerTime":1791691200e0')],
+        ['capital exponent', base.replace('"routerTime":1791691200', '"routerTime":17916912E2')],
+        ['negative zero', base.replace('"routerTime":1791691200', '"routerTime":-0')],
+        ['unicode escape in a string', base.replace('host-a', 'host\\u002da')],
+        ['any backslash', base.replace('host-a', 'host\\-a')],
+        ['non-ASCII text', base.replace('host-a', 'hôst-a')],
+        ['control character', base.replace('host-a', 'host\u0001a')],
+    ] as const) {
+        assert.throws(() => parseRouterInventory(bad, ctx), (e: {code?: string}) => e.code === 'invalid_router_inventory', name);
+        const c = classifyInventoryReply(bad, ctx); assert.equal(c.ok, false, name);
+    }
+});
+test('SL-4: a pretty-printed reply and digits or an e inside strings still parse', () => {
+    const pretty = JSON.stringify(reply({devices: [dev({hostname: 'host-1e5', ipv4: ['192.0.2.10']})]}), null, 2) + '\n';
+    assert.equal(parseRouterInventory(pretty, ctx).devices[0].hostname, 'host-1e5');
+});
+test('CM-4: an unsorted or duplicate ipv4 list has its own code, everything else keeps invalid_router_inventory', () => {
+    for (const ipv4 of [['192.0.2.9', '192.0.2.10'], ['192.0.2.10', '192.0.2.10']]) {
+        const c = classifyInventoryReply(text(reply({devices: [dev({ipv4})]})), ctx);
+        assert.deepEqual(c, {ok: false, code: 'ipv4_not_sorted'});
+        assert.throws(() => parseRouterInventory(text(reply({devices: [dev({ipv4})]})), ctx), (e: {code?: string}) => e.code === 'ipv4_not_sorted');
+    }
+    assert.deepEqual(classifyInventoryReply(text(reply({devices: [dev({ipv4: ['192.0.2.300']})]})), ctx), {ok: false, code: 'invalid_router_inventory'});
+});
