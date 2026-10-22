@@ -311,7 +311,7 @@ function addip(m,ip,k,i){k=nip[m]+0;for(i=1;i<=k;i++)if(ipl[m,i]==ip)return
     ipl[m,i+1]=ip;nip[m]=k+1}
 # Admit a MAC; past the intake cap only kids (stream order puts neighbours before leases) are admitted.
 function see(m){if(m in dev)return 1;if(nd>=maxin+0&&!(m in kid)){capped=1;return 0}dev[m]=1;order[++nd]=m;return 1}
-BEGIN{RANK=".0123456789:abcdef";span=2^(32-prefix);net=int(num(lan_ip)/span);n=split(errors,a," ");for(i=1;i<=n;i++)err(a[i])}
+BEGIN{RANK=".0123456789:abcdef";span=1;for(sp_k=32-prefix;sp_k>0;sp_k--)span*=2;net=int(num(lan_ip)/span);n=split(errors,a," ");for(i=1;i<=n;i++)err(a[i])}
 {t=substr($0,1,2);line=substr($0,3)}
 t=="P "{if(!mac(line))bad=1;prot[line]=1;np++;next}
 t=="X "{bad=1;next}
