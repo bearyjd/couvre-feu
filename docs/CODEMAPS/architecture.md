@@ -17,7 +17,7 @@ Entry points
 - `npm run demo:start` main.ts: fake router (demo-router/) + synthetic data.
 - `npm run integration:start <manifest>` integration-main.ts: real router over SSH; dispatch only if manifest `dispatch.enabled`.
 - `integration:bootstrap` issues CLI-only enrollment token; `integration:dispatch` operator dispatch.
-- Router: install.sh / uninstall.sh / cfctl, release pinned by router/release.sha256 (tools/freeze-router-release.py).
+- Router: install.sh / uninstall.sh / cfctl, release pinned by router/release.sha256 (tools/freeze-router-release.py). The shipped tree is `--emit`ted: cfctl-ssh and cfctl-scope lose their CF_TEST_MODE block (tools/strip-test-mode.py); release.sha256 and CF_RELEASE_ID cover the stripped wrapper bytes.
 
 Trust boundaries
 - Service never gets a shell: cfctl-ssh accepts only `cfctl rpc-*|status|pause|resume|sync|expire|apply-fw` tokens.

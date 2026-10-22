@@ -345,7 +345,7 @@ class OperationalFlowTests(unittest.TestCase):
             text=text.replace("'%u:%g:%a' /tmp)","'%u:%g:%a' "+str(f.root/'tmp')+')').replace('0:0:1777',f'{os.getuid()}:{os.getgid()}:1777')
             text=text.replace('        vp_transaction_check >/dev/null','        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
             bootstrap.write_text(text)
-            compiler=(REPO/'tools/freeze-router-release.py').read_text().replace("router = Path(__file__).resolve().parents[1] / 'router'",'router = Path('+repr(str(release))+')')
+            compiler=(REPO/'tools/freeze-router-release.py').read_text().replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'",'router = Path('+repr(str(release))+')')
             subprocess.run(['python3','-c',compiler],capture_output=True,check=True)
             env=dict(f.env,CF_TEST_INSTALL_KERNEL='1');rows=[]
             def run(label,argv,raw=None):

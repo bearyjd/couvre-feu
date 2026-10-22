@@ -29,6 +29,8 @@ TOOL = Path(__file__).resolve()
 REPO = TOOL.parents[2]
 TEMPLATE_PATH = 'tools/live/first-rehearsal.sh'
 SOURCE_DIRS = ('router', 'tools/live')
+STRIPPER_PATH = 'tools/strip-test-mode.py'
+SOURCE_PATHS = SOURCE_DIRS + (STRIPPER_PATH,)
 PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
 DEFAULT_PROFILE = 'gl-xe3000-4.8.3-os-trust-v1'
 ROLES = ('management', 'jd_adult', 'penn_child')
@@ -181,27 +183,27 @@ def blob_id(data):
 
 
 def head_source():
-    """HEAD blobs for router/ and tools/live, refused unless disk and index match exactly."""
+    """HEAD blobs for router/, tools/live and the wrapper stripper, refused unless disk and index match exactly."""
     commit = git('rev-parse', 'HEAD').strip()
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise Refusal('unexpected source commit format (SHA-1 repository required)')
     tree = {}
-    for entry in filter(None, git('ls-tree', '-r', '-z', '--full-tree', 'HEAD', '--', *SOURCE_DIRS).split('\0')):
+    for entry in filter(None, git('ls-tree', '-r', '-z', '--full-tree', 'HEAD', '--', *SOURCE_PATHS).split('\0')):
         meta, path = entry.split('\t', 1)
         mode, kind, sha = meta.split()
         if kind != 'blob' or mode not in ('100644', '100755'):
             raise Refusal(f'{path}: only regular committed files may be embedded')
         tree[path] = (mode, sha)
-    if not any(path.startswith('router/') for path in tree) or TEMPLATE_PATH not in tree:
-        raise Refusal('HEAD lacks router/ or the remote script template')
+    if not any(path.startswith('router/') for path in tree) or TEMPLATE_PATH not in tree or STRIPPER_PATH not in tree:
+        raise Refusal(f'HEAD lacks router/, the remote script template or {STRIPPER_PATH}')
     index = {}
-    for entry in filter(None, git('ls-files', '-s', '-z', '--', *SOURCE_DIRS).split('\0')):
+    for entry in filter(None, git('ls-files', '-s', '-z', '--', *SOURCE_PATHS).split('\0')):
         meta, path = entry.split('\t', 1)
         mode, sha, stage_number = meta.split()
         index[path] = (mode, sha, stage_number)
     if index != {path: (mode, sha, '0') for path, (mode, sha) in tree.items()}:
-        raise Refusal('index differs from HEAD for router/ or tools/live')
-    for entry in filter(None, git('ls-files', '-v', '-z', '--', *SOURCE_DIRS).split('\0')):
+        raise Refusal('index differs from HEAD for router/, tools/live or the wrapper stripper')
+    for entry in filter(None, git('ls-files', '-v', '-z', '--', *SOURCE_PATHS).split('\0')):
         if entry[0] != 'H':
             raise Refusal(f'{entry[2:]}: skip-worktree, assume-unchanged or unusual index flag')
     disk = {}
@@ -214,6 +216,10 @@ def head_source():
             for name in files:
                 path = os.path.join(directory, name)
                 disk[os.path.relpath(path, REPO).replace(os.sep, '/')] = Path(path).read_bytes()
+    stripper_disk = REPO / STRIPPER_PATH
+    if stripper_disk.is_symlink() or not stripper_disk.is_file():
+        raise Refusal(f'{STRIPPER_PATH}: symlink or special file')
+    disk[STRIPPER_PATH] = stripper_disk.read_bytes()
     if set(disk) != set(tree):
         extra, missing = sorted(set(disk) - set(tree)), sorted(set(tree) - set(disk))
         raise Refusal(f'disk differs from HEAD (untracked/ignored {extra[:5]}, missing {missing[:5]})')
@@ -225,7 +231,36 @@ def head_source():
         if blob_id(data) != sha:
             raise Refusal(f'{path}: blob integrity check failed')
         blobs[path] = data
-    return commit, blobs
+    return commit, ship_stripped_wrappers(blobs)
+
+
+def ship_stripped_wrappers(blobs):
+    """The live tools ship the emitted tree: wrappers without CF_TEST_MODE, checked against release.sha256.
+
+    The stripper is the HEAD blob (already bound to disk and index), compiled and run from memory, never from disk."""
+    try:
+        namespace = {'__name__': 'strip_test_mode'}
+        exec(compile(blobs[STRIPPER_PATH], STRIPPER_PATH, 'exec'), namespace)
+        block_lines, strip = namespace['BLOCK_LINES'], namespace['strip']
+    except Exception as error:
+        raise Refusal(f'{STRIPPER_PATH}: cannot load committed stripper: {type(error).__name__}') from None
+    shipped = dict(blobs)
+    for name, lines in block_lines.items():
+        wrapper = blobs.get('router/' + name)
+        if wrapper is None:
+            raise Refusal(f'router/{name}: wrapper missing from HEAD')
+        try:
+            shipped['router/' + name] = strip(wrapper.decode('utf-8'), lines).encode('utf-8')
+        except ValueError as error:
+            raise Refusal(f'router/{name}: {error}') from None
+    for line in blobs['router/release.sha256'].decode('utf-8').splitlines():
+        fields = line.split()
+        if len(fields) != 2 or 'router/' + fields[1] not in shipped:
+            raise Refusal(f'router/release.sha256: unknown or malformed entry {line[:80]!r}')
+        digest, rel = fields
+        if hashlib.sha256(shipped['router/' + rel]).hexdigest() != digest:
+            raise Refusal(f'router/{rel}: shipped bytes do not match release.sha256')
+    return shipped
 
 
 def release_id(blobs):
@@ -355,6 +390,7 @@ def plan(config, env):
     payload, script_sha = build_payload(config, commit, blobs)
     argv = ssh_argv(config, env)
     details = {'tool': 'tools/live/first-rehearsal.py', 'sourceCommit': commit, 'releaseId': release_id(blobs),
+               'stripperBlobSha1': blob_id(blobs[STRIPPER_PATH]),
                'platformProfile': config['platformProfile'], 'payloadSha256': hashlib.sha256(payload).hexdigest(),
                'payloadBytes': len(payload), 'remoteScriptSha256': script_sha, 'sshArgv': argv,
                'sshCommandLine': shlex.join(argv), 'remoteTimeoutSeconds': config['remoteTimeoutSeconds'],

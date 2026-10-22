@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Filesystem recovery fixtures; never invokes router/system backends."""
+import atexit
 import hashlib
 import os
 from pathlib import Path
@@ -18,6 +19,21 @@ FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/rpc.sh', 'usr/lib/couvr
          'etc/config/firewall', 'etc/sysupgrade.conf', 'etc/crontabs/root',
          'etc/couvrefeu/protected', 'etc/couvrefeu/state')
 DIRS = ('etc', 'usr', 'usr/sbin', 'usr/lib', 'usr/lib/couvrefeu', 'etc/config', 'etc/crontabs', 'etc/couvrefeu')
+
+
+_EMITTED = []
+
+
+def emitted_router():
+    """The shippable tree (release.sha256 hashes its stripped wrappers); the repo router/ keeps CF_TEST_MODE."""
+    if not _EMITTED:
+        tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-emitted-')
+        atexit.register(tmp.cleanup)
+        tree = Path(tmp.name) / 'router'
+        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(tree)],
+                       check=True, capture_output=True)
+        _EMITTED.append(tree)
+    return _EMITTED[0]
 
 
 def signature(path):
@@ -72,7 +88,7 @@ class RecoveryTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_script(self, name, *args):
-        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(REPO / 'router' / name), *args],
+        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(emitted_router() / name), *args],
                               env=self.env, capture_output=True, text=True)
 
     def snapshot(self):
@@ -1836,11 +1852,14 @@ class ReleaseRetirementTests(unittest.TestCase):
         release = self.release()
         (release / 'lib').mkdir(parents=True, mode=0o700)
         release.chmod(0o700)
-        for line in (REPO / 'router/release.sha256').read_text().splitlines():
+        emitted = self.root / 'emitted-release'
+        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+                       check=True, capture_output=True)
+        for line in (emitted / 'release.sha256').read_text().splitlines():
             name = line.split()[1]
-            shutil.copyfile(REPO / 'router' / name, release / name)
+            shutil.copyfile(emitted / name, release / name)
             (release / name).chmod(0o644 if name.startswith('lib/') else 0o755)
-        shutil.copyfile(REPO / 'router/release.sha256', release / 'release.sha256')
+        shutil.copyfile(emitted / 'release.sha256', release / 'release.sha256')
         (release / 'release.sha256').chmod(0o600)
         before = self.snapshot()
         self.assertEqual(self.install('--activate').returncode, 0)

@@ -100,7 +100,7 @@ class StrictEntryTests(unittest.TestCase):
         stop = source.index('platform_verify_modules()', start)
         source = source[:start] + f'platform_bootstrap_vendor() {{ touch "{marker}"; exit 99; }}\n' + source[stop:]
         bootstrap.write_text(source)
-        compiler = (REPO / 'tools/freeze-router-release.py').read_text().replace("router = Path(__file__).resolve().parents[1] / 'router'", 'router = Path(' + repr(str(self.source)) + ')')
+        compiler = (REPO / 'tools/freeze-router-release.py').read_text().replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'", 'router = Path(' + repr(str(self.source)) + ')')
         subprocess.run(['python3', '-c', compiler], check=True, capture_output=True)
         for mode, root in [('1', '/'), ('1', '/tmp'), ('2', str(self.root)), ('0', str(self.root))]:
             for name in ['install.sh', 'uninstall.sh']:
@@ -238,7 +238,7 @@ class VendorRecoveryTests(unittest.TestCase):
         source = source.replace('        vp_transaction_check >/dev/null', '        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
         bootstrap.write_text(source)
         compiler = (REPO / 'tools/freeze-router-release.py').read_text()
-        compiler = compiler.replace("router = Path(__file__).resolve().parents[1] / 'router'", 'router = Path(' + repr(str(self.source)) + ')')
+        compiler = compiler.replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'", 'router = Path(' + repr(str(self.source)) + ')')
         result = subprocess.run(['python3', '-c', compiler], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
