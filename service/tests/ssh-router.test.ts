@@ -16,6 +16,26 @@ test('SSH invocation uses fixed public-key-only pinned argv, no forwarding, shel
     await assert.rejects(router.invoke({...i, argv: [...i.argv, ';reboot']}), /invocation_changed/);
     await assert.rejects(router.invoke(i), e => e instanceof Error && e.message === 'private_transport_configuration_unavailable' && 'delivery' in e && e.delivery === 'not_delivered');
 });
+test('every SSH invocation kind hardens argv and sends only the three RPC remote commands as the final arg', () => {
+    const c = testConfig('/tmp/cf-argv-test'), router = new SSHRouter(c), policy = {...c.enrollment, revision: 1};
+    const envelope = {rpc_version: 1 as const, generation: c.router.generation, operation_id: 'op_1', expected_revision: 0, expected_digest: policyDigest(c.enrollment), policy};
+    const cases = [router.invocation('observe'), router.invocation('activity'), router.invocation('receipt', undefined, 'op_1'), router.invocation('apply', envelope)];
+    const remote = /^(cfctl rpc-sync|cfctl rpc-status --json( [a-z0-9_-]{1,64})?|cfctl rpc-activity --json)$/;
+    for (const i of cases) {
+        const sep = i.argv.indexOf('--'), flags = i.argv.slice(0, sep);
+        for (const forbidden of ['-A', '-t', '-tt', '-X', '-Y', '-L', '-R', '-D', '-W', '-N', '-s', '-J']) assert.ok(!i.argv.includes(forbidden), forbidden);
+        for (const flag of flags.filter(a => a.startsWith('-'))) assert.ok(['-F', '-T', '-p', '-i', '-o'].includes(flag), flag);
+        assert.ok(flags.includes('-T'));
+        for (const required of ['ForwardAgent=no', 'ClearAllForwardings=yes', 'StrictHostKeyChecking=yes', 'IdentitiesOnly=yes']) assert.ok(flags.includes(required), required);
+        assert.ok(flags.some(a => a.startsWith('UserKnownHostsFile=')));
+        for (const bad of ['ForwardAgent=yes', 'ClearAllForwardings=no', 'StrictHostKeyChecking=no', 'IdentitiesOnly=no']) assert.ok(!flags.includes(bad), bad);
+        assert.deepEqual(i.argv.slice(sep, sep + 2), ['--', 'root@192.168.1.1']);
+        assert.equal(i.argv.length, sep + 3);
+        assert.match(i.argv.at(-1)!, remote);
+        assert.deepEqual(new Set(i.argv.filter(a => a.startsWith('cfctl '))), new Set([i.argv.at(-1)]));
+    }
+    assert.deepEqual(cases.map(i => i.argv.at(-1)), ['cfctl rpc-status --json', 'cfctl rpc-activity --json', 'cfctl rpc-status --json op_1', 'cfctl rpc-sync']);
+});
 test('bounded real child distinguishes spawn failure from possibly delivered exit and truncation', async () => {
     await assert.rejects(boundedChild('/definitely/missing/cf-test-child', [], '', 1000, {}), e => e instanceof Error && e.message === 'ssh_spawn_failed' && 'delivery' in e && e.delivery === 'not_delivered');
     await assert.rejects(boundedChild(process.execPath, ['service/tests/fixtures/transport-child.ts', 'exit'], '', 1000, {}), /ssh_exit_failed/);

@@ -23,6 +23,7 @@ python3 tests/test-os-trust.py
 python3 tests/test-client-probe.py
 python3 tests/test-live-rehearsal.py
 python3 tests/test-deploy-units.py
+python3 tests/test-service-key-entry.py
 
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck --version

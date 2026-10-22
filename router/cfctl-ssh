@@ -40,7 +40,7 @@ case $1 in
         [ "$#" = 2 ] || [ "$#" = 3 ] || exit 2
         [ "$2" = --json ] || exit 2
         if [ "$#" = 3 ];then
-            case $3 in ''|-|*[!a-z0-9_-]*)exit 2;;esac
+            case $3 in ''|[!a-z0-9]*|*[!a-z0-9_-]*)exit 2;;esac
             [ "${#3}" -le 64 ] || exit 2
         fi;;
     status|activity|rpc-activity) [ "$#" = 2 ] && [ "$2" = --json ] || exit 2;;
