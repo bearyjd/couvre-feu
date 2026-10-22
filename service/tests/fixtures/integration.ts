@@ -12,7 +12,7 @@ import type { RouterActivity } from '../../../shared/src/router-activity.ts';
 import type { AsyncRouter, FrozenInvocation, DispatchKind } from '../../src/router-transport.ts';
 import { normalizeEnvelope, policyDigest, requestDigest } from '../../../shared/src/router-rpc.ts';
 import type { RPCObservation, RPCEnvelope, RPCReceipt } from '../../../shared/src/router-rpc.ts';
-import { normalizePolicy, effectivePauses } from '../../../shared/src/router-schema.ts';
+import { normalizePolicy, effectivePauses, effectiveAllowances } from '../../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../../shared/src/router-schema.ts';
 import type { Actor } from '../../../shared/src/contracts.ts';
 
@@ -29,6 +29,7 @@ export function observation(config: IntegrationConfig, policy: RouterPolicy, tim
     const kids = policy.people.flatMap(p => p.macs).sort(), effective = effectivePauses(policy, time);
     return {rpc_version: 1, generation: config.router.generation, acceptedPolicy: policy, policyDigest: policyDigest(policy), currentOperationId: receipt?.current ? receipt.operationId : null,
         routerTime: time, receipt, errors: [], status: {ok: true, desiredRevision: policy.revision, confirmedRevision: policy.revision, desiredPauses: policy.pauses, effectivePauses: effective,
+            ...(policy.allowances ? {desiredAllowances: policy.allowances, effectiveAllowances: effectiveAllowances(policy, time)} : {}),
             observed: {kids, paused: effective.flatMap(p => policy.people.find(person => person.id === p.person)!.macs).sort()}, drift: false, errors: [], capabilities: {ipv6: true, conntrack: true, nativeKernelConfirmed: true, addressCoverageComplete: true, routerCompatibilityVerified: false}}};
 }
 /** Explicit fake transport for integration tests; never imported by an integration entry point. */

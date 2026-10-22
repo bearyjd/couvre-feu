@@ -222,7 +222,14 @@ M2a/M2c.
 - integration-004 holds only what M2a needs: the `operations.action` widening (pause_all, resume_all, move), `operation_people`,
   `scope_requests`, `router_scope_observed`, `scope_changes` and `parent_alerts` (the integration chain skips main 004.sql, so ParentAlerts had
   no table; new kind `router_scope_change`). One detection marker: `operations` sql contains `'pause_all'`. The `dispatch_steps` /
-  `automatic_read_summary` rebuilds and `inventory_*` tables are NOT in 004; M2c adds them (integration-005), so 004 is not amended after M2a ships.
+  `automatic_read_summary` rebuilds and `inventory_*` tables are NOT in 004; M2c adds them (integration-006), so 004 is not amended after M2a ships.
+- integration-005 (M2b) is the device move migration: `devices.state` gains `moving` and `devices.move_to` (target child) is added; the table is rebuilt in place
+  (marker: `devices` sql contains `'moving'`). Routes: `POST /bulk/pause-all`, `POST /bulk/resume-all` (one operation, one rpc-sync, one receipt) and the admin device
+  move; every one needs a fresh step-up bound to the exact change. Operations returned for `pause_all`/`resume_all` carry an `effect` field
+  (`blocking`, `not_blocking`, `unblocked`, `unchanged`, `may_still_be_blocked`); it states what the router is doing now, not what was requested.
+  `tr-` is a reserved idempotency-key prefix (the time-request service's re-pause keys); client keys starting with it are refused as missing.
+  A move whose observation shows the device under neither child, or under a child that is no longer active, keeps the device active under its source child and the
+  operation carries `device_move_drift`.
 - `router_scope_observed` gains `generation` and `scope_json` (the contract table had only the digest, which cannot yield added/removed MACs).
 - Baseline: with no remembered scope the comparison base is the manifest floor, so growth that happened while the service was away alerts.
   A rebind deletes `router_scope_observed` (new generation, new baseline).

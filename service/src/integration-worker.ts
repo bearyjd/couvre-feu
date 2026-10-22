@@ -92,16 +92,22 @@ export class IntegrationWorker {
                 const id = invocation.operationId!, op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
                 const rpc = this.store.get<{phase: string; attempt_count: number}>('SELECT * FROM operation_rpc WHERE operation_id=?', id);
                 if (!op || !rpc || rpc.phase !== 'queued' || rpc.attempt_count !== 0 || op.state !== 'pending' || this.store.integrationState().active_operation_id !== id) throw new AppError(409, 'operation_dispatch_not_eligible');
+                const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
+                // The actor must (still) manage EVERY child the operation names, and every one must still exist; the representative alone proves nothing.
+                // This holds for an operator-approved dispatch as much as for an automatic one: the approval covers the script, not a narrowed scope.
+                const scope: string[] = actor ? JSON.parse(actor.person_ids) : [];
+                const authorized = this.policy.affectedPeople(op).every(person => scope.includes(person) && this.store.get('SELECT id FROM people WHERE id=? AND active=1', person));
+                let allowed = Boolean(authorized);
                 if (owner) {
-                    const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
                     const request = JSON.parse(op.request_json) as {permissionVersion?: string};
-                    const roleAllowed = ['enroll', 'unenroll'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
-                    if (!actor?.active || !roleAllowed || !JSON.parse(actor.person_ids).includes(op.person_id) || String(actor.permission_version) !== request.permissionVersion) {
-                        this.updateOperation(id, 'failed', 'actor_permission_changed_before_dispatch');
-                        this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
-                        this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
-                        return;
-                    }
+                    const roleAllowed = ['enroll', 'unenroll', 'move'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
+                    allowed = allowed && Boolean(actor?.active) && roleAllowed && String(actor!.permission_version) === request.permissionVersion;
+                }
+                if (!allowed) {
+                    this.updateOperation(id, 'failed', 'actor_permission_changed_before_dispatch');
+                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
+                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+                    return;
                 }
                 if (!this.policy.fresh()) throw new AppError(503, 'approved_router_observation_required');
                 const o = this.store.observation().value!, e = this.policy.envelope(id);
@@ -209,6 +215,29 @@ export class IntegrationWorker {
             }
         });
     }
+    /**
+     * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so
+     * the device stays with its source child; anything else is decided by the stored OBSERVATION, never by the receipt alone
+     * (a receipt can be accepted yet superseded). Held under an active target => it moves; under the source => it stays. Anything
+     * else (held under neither, or under a target that is no longer active) is drift: the row is KEPT, active under the source
+     * (never deleted, so the label survives and the device is not silently unmanaged), and the code is returned for the operation.
+     */
+    private settleMoves(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): string | null {
+        if (state === 'unknown') return null;
+        const o = state === 'failed' ? null : this.store.observation().value;
+        if (state !== 'failed' && !o) return null;
+        let drift: string | null = null;
+        for (const row of this.store.all<{id: string; person_id: string; identifier: string; move_to: string}>("SELECT id,person_id,identifier,move_to FROM devices WHERE operation_id=? AND state='moving'", op.id)) {
+            const heldBy = (child: string) => o!.acceptedPolicy.people.some(p => p.id === child && p.macs.includes(row.identifier));
+            const targetActive = Boolean(this.store.get('SELECT id FROM people WHERE id=? AND active=1', row.move_to));
+            if (state !== 'failed' && heldBy(row.move_to) && targetActive) this.store.run("UPDATE devices SET person_id=move_to,move_to=NULL,state='active',operation_id=NULL WHERE id=?", row.id);
+            else {
+                this.store.run("UPDATE devices SET move_to=NULL,state='active',operation_id=NULL WHERE id=?", row.id);
+                if (state !== 'failed' && (heldBy(row.move_to) || !heldBy(row.person_id))) drift = 'device_move_drift';
+            }
+        }
+        return drift;
+    }
     private refusedBeforeWrite(o: RPCObservation, e: ReturnType<IntegrationPolicy['envelope']>): boolean {
         return o.receipt === null && o.currentOperationId !== e.operation_id && o.generation === e.generation && o.acceptedPolicy.revision === e.expected_revision &&
             o.policyDigest === e.expected_digest && o.errors.length > 0 && o.errors.every(code => PRE_WRITE_REJECTIONS.has(code));
@@ -216,28 +245,30 @@ export class IntegrationWorker {
     private updateOperation(id: string, state: 'confirmed' | 'unknown' | 'failed' | 'conflict', error: string | null, confirmedAt: number | null = null): void {
         const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id)!;
         if (op.state === state && op.error === error && (confirmedAt === null || op.confirmed_at === confirmedAt)) return;
-        this.settleDevices(op, state);
-        this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, error, confirmedAt, this.now(), id);
+        const drift = this.settleDevices(op, state);
+        this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, drift ?? error, confirmedAt, this.now(), id);
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, id, op.action, op.revision, this.now(), state);
     }
     /**
      * Device rows staged by an enroll/unenroll operation settle with it; an unknown outcome leaves them pending. A conflict
      * may follow an accepted receipt that was later superseded, so it settles from the stored router observation instead.
      */
-    private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): void {
-        if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return;
+    private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): string | null {
+        if (op.action === 'move') return this.settleMoves(op, state);
+        if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return null;
         const pending = op.action === 'enroll' ? 'enrolling' : 'removing';
         let held: boolean;
         if (state === 'conflict') {
             const o = this.store.observation().value;
-            if (!o) return;
+            if (!o) return null;
             for (const row of this.store.all<{id: string; identifier: string}>('SELECT id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
                 held = o.acceptedPolicy.people.some(p => p.id === op.person_id && p.macs.includes(row.identifier));
                 this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE id=?" : 'DELETE FROM devices WHERE id=?', row.id);
             }
-            return;
+            return null;
         }
         held = (state === 'confirmed') === (op.action === 'enroll');
         this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state=?" : 'DELETE FROM devices WHERE operation_id=? AND state=?', op.id, pending);
+        return null;
     }
 }

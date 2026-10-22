@@ -54,29 +54,12 @@ export class IntegrationStore extends Store {
         }
         // integration-003 widens operations.action for device enrollment. operations is a parent table, so the rebuild runs with
         // foreign keys off (a no-op inside a transaction) and must leave no dangling reference behind before it commits.
-        if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='operations'")!.sql.includes("'enroll'")) {
-            this.db.exec('PRAGMA foreign_keys=OFF');
-            try {
-                this.transaction(() => {
-                    this.db.exec(readFileSync(new URL('../migrations/integration-003.sql', import.meta.url), 'utf8'));
-                    if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
-                });
-            } catch (error) { this.close(); throw error; }
-            finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
-        }
-        // integration-004: scope tracking tables, ParentAlerts storage and the widened operations.action. operations is rebuilt exactly as
-        // for 003 (foreign keys off outside the transaction, foreign_key_check before commit). One marker covers the whole step: the
+        this.runMigration('integration-003.sql', 'operations', "'enroll'");
+        // integration-004: scope tracking tables, ParentAlerts storage and the widened operations.action. One marker covers the whole step: the
         // transaction is atomic, so 'pause_all' in operations.sql means every table in the file exists.
-        if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='operations'")!.sql.includes("'pause_all'")) {
-            this.db.exec('PRAGMA foreign_keys=OFF');
-            try {
-                this.transaction(() => {
-                    this.db.exec(readFileSync(new URL('../migrations/integration-004.sql', import.meta.url), 'utf8'));
-                    if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
-                });
-            } catch (error) { this.close(); throw error; }
-            finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
-        }
+        this.runMigration('integration-004.sql', 'operations', "'pause_all'");
+        // integration-005: devices may be `moving` between children (M2b). Same marker pattern: the table's own SQL carries the new state.
+        this.runMigration('integration-005.sql', 'devices', "'moving'");
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));
@@ -94,6 +77,21 @@ export class IntegrationStore extends Store {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS dispatch_live_claims ON dispatch_steps(state,lease_until)`);
         // Startup never releases an uncertain claim or starts dispatch.
+    }
+    /**
+     * Applies a table-rebuilding migration once: it runs only while `table`'s own SQL lacks `marker`. Foreign keys are off outside the
+     * transaction (a no-op inside one) and foreign_key_check must be clean before commit, or the migration is rolled back and the store closes.
+     */
+    private runMigration(file: string, table: string, marker: string): void {
+        if (this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", table)!.sql.includes(marker)) return;
+        this.db.exec('PRAGMA foreign_keys=OFF');
+        try {
+            this.transaction(() => {
+                this.db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
+                if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
+            });
+        } catch (error) { this.close(); throw error; }
+        finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
     }
     /** A rebind can rewrite the marker under a running process. Mutate and dispatch transactions re-check it and fail closed. */
     assertIdentity(): void {
