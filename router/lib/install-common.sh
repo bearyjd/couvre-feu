@@ -236,6 +236,11 @@ valid_protection() {
         END {if(NR < 1 || NR > 128) exit 1}
     ' "$1"
 }
+# Live RPC scope validation is the runtime's (core.sh cf_scope_file / cf_scope_has_floor),
+# sourced in a subshell so its globals stay out of the installer: one validator, no mirror.
+scope_core() ( CF_BASE=$ROOT CF_LIB=${SOURCE:-$HERE}/lib; . "$CF_LIB/core.sh"; "$@" )
+valid_scope() { scope_core cf_scope_file "$1" >/dev/null; }
+scope_has_floor() { scope_core cf_scope_has_floor "$1" "$2"; }
 metadata() { stat -c '%a:%u:%g' "$1"; }
 
 valid_signature_record() {
@@ -362,6 +367,13 @@ preflight() {
             fi
             valid_protection "$ROOT/$rel" || fail 'invalid protected list'
             awk 'NR==FNR {baseline[++n]=$0; next} FNR<=n && $0!=baseline[FNR] {exit 1} END {if(FNR<n) exit 1}' "$BACKUP/$k.staged" "$ROOT/$rel" || fail 'protected baseline was changed'
+        elif [ "$rel" = etc/couvrefeu/rpc-allowed ] && [ "$current" != "$before" ] && [ "$current" != "$after" ]; then
+            # The live scope may grow past its immutable floor (.staged), like protected.
+            if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
+                fail 'RPC scope metadata drift'
+            fi
+            valid_scope "$ROOT/$rel" || fail 'invalid RPC scope'
+            scope_has_floor "$BACKUP/$k.staged" "$ROOT/$rel" || fail 'RPC scope floor was changed'
         elif [ "$rel" = etc/couvrefeu/state ] && [ "$current" != "$before" ]; then
             if ! { [ -f "$ROOT/$rel" ] && [ "$(metadata "$ROOT/$rel")" = "$(metadata "$BACKUP/$k.staged")" ]; }; then
                 fail 'runtime state metadata drift'
@@ -671,7 +683,7 @@ runtime_preflight() {
                 done
                 continue;;
             confirmed|error|firewall.snapshot|firewall.owned|firewall.intent|firewall.preflight|firewall.cleanup|expiry|schedule.clock|activity.epoch) ;;
-            .candidate.*|.protected.*|.fw.*|.input.*|.error.*|.confirmed.*|.snapshot.*|.expiry.*|.intent.*|.cleanup.*)
+            .candidate.*|.protected.*|.fw.*|.input.*|.error.*|.confirmed.*|.snapshot.*|.expiry.*|.intent.*|.cleanup.*|.scope.*)
                 suffix=${name##*.}
                 case "$suffix" in ''|*[!0-9]*) fail "unowned runtime file: $name";; esac;;
             *) fail "unowned runtime file: $name";;

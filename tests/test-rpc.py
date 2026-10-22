@@ -22,14 +22,8 @@ def scoped_policy(revision=1):
     return result
 
 
-class RpcTests(unittest.TestCase):
-    def setUp(self):
-        self.f = RouterFixture()
-        self.install()
-        self.base = self.observe()
-
-    def tearDown(self):
-        self.f.close()
+class RpcCommon:
+    """Command runners shared by the RPC test classes."""
 
     def script(self, name, *args, env=None):
         script_env = env or self.f.env
@@ -38,22 +32,11 @@ class RpcTests(unittest.TestCase):
         return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *args],
                               env=script_env, capture_output=True, text=True, timeout=60)
 
-    def install(self, **kwargs):
-        result = self.script('install.sh', '--activate', '--protect', PROTECTED, '--rpc-allow', KID, **kwargs)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return result
-
     def observe(self, identifier=None):
         args = ('rpc-status', '--json') + ((identifier,) if identifier else ())
         result = self.f.run(*args)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return json.loads(result.stdout)
-
-    def request(self, identifier='op_1', base=None, document=None):
-        base = base or self.base
-        return dict(rpc_version=1, generation=base['generation'], operation_id=identifier,
-                    expected_revision=base['acceptedPolicy']['revision'], expected_digest=base['policyDigest'],
-                    policy=document or scoped_policy(base['acceptedPolicy']['revision'] + 1))
 
     def accept(self, request):
         result = self.f.run('rpc-sync', document=request)
@@ -71,6 +54,27 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(self.f.durable_snapshot(), before)
         self.assertEqual(len(self.f.mutation_calls()), count)
         return response
+
+
+class RpcTests(RpcCommon, unittest.TestCase):
+    def setUp(self):
+        self.f = RouterFixture()
+        self.install()
+        self.base = self.observe()
+
+    def tearDown(self):
+        self.f.close()
+
+    def install(self, **kwargs):
+        result = self.script('install.sh', '--activate', '--protect', PROTECTED, '--rpc-allow', KID, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def request(self, identifier='op_1', base=None, document=None):
+        base = base or self.base
+        return dict(rpc_version=1, generation=base['generation'], operation_id=identifier,
+                    expected_revision=base['acceptedPolicy']['revision'], expected_digest=base['policyDigest'],
+                    policy=document or scoped_policy(base['acceptedPolicy']['revision'] + 1))
 
     def test_exact_acceptance_and_readonly_replay(self):
         request = self.request()
@@ -880,21 +884,8 @@ class NumericLookingIdTests(unittest.TestCase):
         self.assertEqual(self.observe('1e2')['receipt']['operationId'], '1e2')
 
 
-class MultiScopeRpcTests(unittest.TestCase):
-    """Repeatable --rpc-allow: an immutable, sorted per-generation set of MACs."""
-
-    def setUp(self):
-        self.f = RouterFixture()
-        self.install(OTHER_KID, KID)
-        self.base = self.observe()
-
-    def tearDown(self):
-        self.f.close()
-
-    script = RpcTests.script
-    observe = RpcTests.observe
-    accept = RpcTests.accept
-    reject = RpcTests.reject
+class ScopedRpcMixin:
+    """Install, request and attach helpers for scoped (--rpc-allow) fixtures."""
 
     def install(self, *macs, env=None, ok=True):
         result = self.script('install.sh', '--activate', '--protect', PROTECTED, *scope_args(*macs), env=env)
@@ -923,6 +914,30 @@ class MultiScopeRpcTests(unittest.TestCase):
             self.assertIn(text, result.stderr)
         self.assertEqual(self.f.durable_snapshot(), before)
         self.assertEqual(len(self.f.mutation_calls()), count)
+
+    def attach(self, *macs):
+        # rpc-sync fails closed without current address coverage for every enrolled MAC.
+        neighbors = self.f.backend()['neighbors']
+        leases = self.f.root / 'tmp/dhcp.leases'
+        lines = leases.read_text()
+        for index, mac in enumerate(macs):
+            ip = '192.168.{}.{}'.format(1 + (index + 30) // 250, 2 + (index + 30) % 250)
+            neighbors.append({'ip': ip, 'mac': mac})
+            lines += '0 {} {} host{} *\n'.format(mac, ip, index)
+        self.f.update_backend(neighbors=neighbors)
+        leases.write_text(lines)
+
+
+class MultiScopeRpcTests(ScopedRpcMixin, RpcCommon, unittest.TestCase):
+    """Repeatable --rpc-allow: an immutable, sorted per-generation set of MACs."""
+
+    def setUp(self):
+        self.f = RouterFixture()
+        self.install(OTHER_KID, KID)
+        self.base = self.observe()
+
+    def tearDown(self):
+        self.f.close()
 
     def test_scope_file_is_lc_all_c_sorted_and_staged(self):
         expected = (KID + '\n' + OTHER_KID + '\n').encode()
@@ -978,18 +993,6 @@ class MultiScopeRpcTests(unittest.TestCase):
         self.attach(THIRD_KID)
         self.accept(self.request('fresh', base=new, document=self.two_people(
             new['acceptedPolicy']['revision'] + 1, bob=(THIRD_KID,))))
-
-    def attach(self, *macs):
-        # rpc-sync fails closed without current address coverage for every enrolled MAC.
-        neighbors = self.f.backend()['neighbors']
-        leases = self.f.root / 'tmp/dhcp.leases'
-        lines = leases.read_text()
-        for index, mac in enumerate(macs):
-            ip = '192.168.{}.{}'.format(1 + (index + 30) // 250, 2 + (index + 30) % 250)
-            neighbors.append({'ip': ip, 'mac': mac})
-            lines += '0 {} {} host{} *\n'.format(mac, ip, index)
-        self.f.update_backend(neighbors=neighbors)
-        leases.write_text(lines)
 
     def test_install_refuses_protected_duplicate_malformed_and_oversized_scope(self):
         self.assertEqual(self.script('uninstall.sh').returncode, 0)
@@ -1077,6 +1080,373 @@ class MultiScopeRpcTests(unittest.TestCase):
         self.assertEqual(self.script('uninstall.sh').returncode, 0)
         self.assertEqual(original.read_bytes(), content)
         self.assertEqual(original.stat().st_mode & 0o777, 0o640)
+
+
+def independent_scope_sha(macs):
+    """sha256 of the C-sorted newline-joined list, via sort(1) and sha256sum(1), not the router code."""
+    listing = ''.join(mac + '\n' for mac in macs).encode()
+    ordered = subprocess.run(['sort'], input=listing, capture_output=True, env=dict(os.environ, LC_ALL='C'), check=True).stdout
+    return subprocess.run(['sha256sum'], input=ordered, capture_output=True, check=True).stdout.split()[0].decode()
+
+
+def scope_fixtures():
+    """(name, bytes, valid) shared by the runtime and the installer validator tests."""
+    k, o, t = KID.encode(), OTHER_KID.encode(), THIRD_KID.encode()
+    many = [KID] + ['02:00:00:01:{:02x}:{:02x}'.format(i // 256, i % 256) for i in range(2, 258)]
+    return [('floor-only', k + b'\n', True), ('grown', k + b'\n' + o + b'\n' + t + b'\n', True),
+            ('256', ''.join(m + '\n' for m in sorted(many[:256])).encode(), True),
+            ('empty', b'', False), ('blank', b'\n', False), ('unsorted', o + b'\n' + k + b'\n', False),
+            ('duplicate', k + b'\n' + o + b'\n' + o + b'\n', False), ('uppercase', k + b'\n02:00:00:00:00:0A\n', False),
+            ('crlf', k + b'\r\n' + o + b'\r\n', False), ('no-final-newline', k + b'\n' + o, False),
+            ('blank-line', k + b'\n\n' + o + b'\n', False), ('nul', k + b'\n' + o + b'\x00\n', False),
+            ('space', k + b'\n ' + o + b'\n', False), ('multicast', k + b'\n03:00:00:00:00:01\n', False),
+            ('zero', b'00:00:00:00:00:00\n' + k + b'\n', False), ('257', ''.join(m + '\n' for m in sorted(many)).encode(), False),
+            ('first-only-unsorted', t + b'\n' + k + b'\n', False)]
+
+
+def stopped_at(fixture, checkpoint, *args, stdin=None):
+    """Start cfctl with a fixture checkpoint; return once it is stopped there (60 s cap, not a fixed wait)."""
+    marker = fixture.root / 'rpc-stopped'
+    marker.unlink(missing_ok=True)
+    child = subprocess.Popen(fixture.shell + [str(REPO / 'router/cfctl'), *args], env=dict(fixture.env, CF_TEST_RPC_STOP=checkpoint),
+                             stdin=subprocess.PIPE if stdin is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+    if stdin is not None:
+        child.stdin.write(stdin);child.stdin.close();child.stdin = None
+    deadline = time.monotonic() + 60
+    while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
+        time.sleep(.05)
+    if not marker.exists():
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        raise AssertionError('checkpoint %s not reached: %s' % (checkpoint, ''.join(child.communicate(timeout=10))))
+    return child
+
+
+class LiveScopeTests(ScopedRpcMixin, RpcCommon, unittest.TestCase):
+    """The live rpc-allowed may be any valid superset of the install-time floor (.staged)."""
+
+    def setUp(self):
+        self.f = RouterFixture()
+        self.install(KID)
+        self.base = self.observe()
+        self.live = self.f.root / 'etc/couvrefeu/rpc-allowed'
+        self.runtime = self.f.root / 'etc/couvrefeu/runtime'
+
+    def tearDown(self):
+        self.f.close()
+
+    def set_live(self, content):
+        if isinstance(content, (list, tuple)):
+            content = ''.join(mac + '\n' for mac in content)
+        self.live.write_bytes(content if isinstance(content, bytes) else content.encode())
+        self.live.chmod(0o600)
+
+    def residue(self):
+        return sorted(path.name for path in self.runtime.glob('.scope.*'))
+
+    def tree(self):
+        result = {}
+        for top in ('etc', 'usr'):
+            for path in sorted((self.f.root / top).rglob('*')):
+                if path.is_file():
+                    result[str(path.relative_to(self.f.root))] = (path.read_bytes(), path.stat().st_mode & 0o7777)
+        return result
+
+    def test_floor_only_reports_scope_and_independent_digest(self):
+        observed = self.observe()
+        self.assertEqual(observed['scope'], [KID])
+        self.assertEqual(observed['scopeSha'], independent_scope_sha([KID]))
+        self.assertEqual(self.residue(), [])
+
+    def test_grown_scope_is_listed_with_digest_and_usable(self):
+        grown = [KID, OTHER_KID, THIRD_KID]
+        self.set_live(grown)
+        observed = self.observe()
+        self.assertEqual(observed['scope'], grown)
+        self.assertEqual(observed['scopeSha'], independent_scope_sha(grown))
+        self.assertEqual(hashlib.sha256(('\n'.join(grown) + '\n').encode()).hexdigest(), observed['scopeSha'])
+        self.assertEqual(self.residue(), [])
+        # A MAC only in the grown scope may now be enrolled; the sync reply carries the same scope.
+        self.attach(KID, OTHER_KID)
+        accepted = self.accept(self.request('grown', base=observed))
+        self.assertEqual((accepted['scope'], accepted['scopeSha']), (grown, independent_scope_sha(grown)))
+        devices = json.loads(self.f.run('rpc-activity', '--json').stdout)['devices']
+        self.assertEqual(sorted(d['mac'] for d in devices), [KID, OTHER_KID])
+
+    def test_missing_floor_mac_is_invalid_rpc_scope(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        self.install(KID, OTHER_KID)
+        self.set_live([KID, THIRD_KID])
+        self.assertEqual(self.refused_status(), 'invalid_rpc_scope')
+        response = self.reject(self.request(base=self.base))
+        self.assertIn('invalid_rpc_scope', response['errors'])
+        self.assertEqual(self.residue(), [])
+
+    def refused_status(self):
+        result = self.f.run('rpc-status', '--json')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout)
+        self.assertNotIn('acceptedPolicy', response)
+        self.assertNotIn('scope', response)
+        activity = self.f.run('rpc-activity', '--json')
+        self.assertNotEqual(activity.returncode, 0)
+        self.assertEqual(json.loads(activity.stdout)['devices'], [])
+        return response['errors'][0]
+
+    def test_overlap_with_protected_is_refused(self):
+        self.set_live([KID, PROTECTED])
+        self.assertEqual(self.refused_status(), 'protected_mac_overlap')
+
+    def test_noncanonical_unsorted_duplicate_and_oversized_scopes_are_refused(self):
+        many = [KID] + ['02:00:00:01:{:02x}:{:02x}'.format(i // 256, i % 256) for i in range(2, 258)]
+        for name, content, valid in scope_fixtures():
+            if valid:
+                continue
+            with self.subTest(name=name):
+                self.set_live(content)
+                self.assertEqual(self.refused_status(), 'invalid_rpc_scope')
+                self.assertEqual(self.residue(), [])
+        self.set_live(sorted(many[:256]))
+        self.assertEqual(len(self.observe()['scope']), 256)
+
+    def test_wrong_mode_or_symlink_live_scope_is_refused(self):
+        self.live.chmod(0o644)
+        self.assertEqual(self.refused_status(), 'invalid_rpc_scope')
+        self.live.chmod(0o600)
+        target = self.f.root / 'elsewhere'
+        target.write_text(KID + '\n');target.chmod(0o600)
+        self.live.unlink();self.live.symlink_to(target)
+        self.assertEqual(self.refused_status(), 'invalid_rpc_scope')
+
+    def dead_pid(self):
+        child = subprocess.Popen(['true']);child.wait()
+        return child.pid
+
+    def plant(self, pid, content=THIRD_KID + '\n'):
+        path = self.runtime / ('.scope.%d' % pid)
+        path.write_text(content);path.chmod(0o600)
+        return path
+
+    def test_stale_snapshot_of_a_dead_reader_is_never_trusted_and_is_swept(self):
+        self.set_live([KID, OTHER_KID])
+        stale = self.plant(self.dead_pid())
+        # The pid the router will use is unknowable; the sweep is what removes stale files.
+        self.assertEqual(self.observe()['scope'], [KID, OTHER_KID])
+        self.assertFalse(stale.exists(), 'dead reader snapshot must be swept by the next call')
+        self.assertEqual(self.residue(), [])
+
+    def test_snapshot_of_a_live_other_reader_is_not_removed(self):
+        other = subprocess.Popen(['sleep', '120'])
+        try:
+            live = self.plant(other.pid)
+            self.assertEqual(self.observe()['scope'], [KID])
+            self.assertTrue(live.exists(), 'a live reader owns its snapshot')
+        finally:
+            other.kill();other.wait()
+        self.observe()
+        self.assertEqual(self.residue(), [])
+
+    def test_hup_and_term_during_snapshot_window_leave_no_snapshot(self):
+        for sig, rc in ((signal.SIGTERM, 129), (signal.SIGHUP, 129)):
+            with self.subTest(signal=sig.name):
+                child = stopped_at(self.f, 'after_scope_snapshot', 'rpc-status', '--json')
+                self.assertEqual(len(self.residue()), 1)
+                os.killpg(child.pid, sig);os.killpg(child.pid, signal.SIGCONT)
+                stdout, stderr = child.communicate(timeout=60)
+                self.assertEqual(child.returncode, rc, stdout + stderr)
+                self.assertEqual(self.residue(), [])
+
+    def test_signal_after_the_snapshot_window_still_releases_the_lock(self):
+        child = stopped_at(self.f, 'before_reply', 'rpc-status', '--json')
+        self.assertTrue((self.runtime / 'lock').is_dir())
+        os.killpg(child.pid, signal.SIGTERM);os.killpg(child.pid, signal.SIGCONT)
+        child.communicate(timeout=60)
+        self.assertEqual(child.returncode, 143)
+        self.assertFalse((self.runtime / 'lock').exists(), 'lock traps must survive the snapshot window')
+        self.assertEqual(self.residue(), [])
+
+    def test_scope_swapped_after_the_safety_check_never_reaches_the_reply(self):
+        self.set_live([KID, OTHER_KID])
+        self.attach(KID, OTHER_KID)
+        self.accept(self.request('both'))
+        for name, swapped in (('shrunk', [KID]), ('grown', [KID, OTHER_KID, THIRD_KID])):
+            with self.subTest(swap=name):
+                self.set_live([KID, OTHER_KID])
+                child = stopped_at(self.f, 'before_response', 'rpc-status', '--json')
+                self.set_live(swapped)
+                os.killpg(child.pid, signal.SIGCONT)
+                stdout, stderr = child.communicate(timeout=60)
+                self.assertNotEqual(child.returncode, 0, stdout + stderr)
+                response = json.loads(stdout)
+                self.assertIn('operation_in_progress', response['errors'])
+                self.assertNotIn('scope', response)
+                self.assertNotIn('scopeSha', response)
+                self.assertEqual(self.residue(), [])
+
+    def test_apply_fw_refuses_an_invalid_or_protected_overlapping_live_scope(self):
+        lock = self.f.root / '.couvrefeu-install.lock'
+        aside = self.f.root / '.lock.aside'
+        lock.mkdir(mode=0o700)
+        for name, value in (('pid', str(os.getpid())), ('token', '0' * 64)):
+            target = lock / name;target.write_text(value + '\n');target.chmod(0o600)
+        lock.rename(aside)
+        authed = dict(self.f.env, CF_INSTALL_TOKEN='0' * 64)
+        for name, content in (('invalid', [OTHER_KID, KID]), ('overlap', [KID, PROTECTED])):
+            self.set_live(content)
+            for label in ('plain', 'install-authorised'):
+                with self.subTest(live=name, path=label):
+                    if label == 'install-authorised':
+                        aside.rename(lock)
+                    before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
+                    try:
+                        result = self.f.run('apply-fw', env=authed if label != 'plain' else None)
+                    finally:
+                        if lock.exists():
+                            lock.rename(aside)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.f.durable_snapshot(), before)
+                    self.assertEqual(len(self.f.mutation_calls()), count)
+
+    def core(self, snippet, *args):
+        env = dict(self.f.env, CF_BASE=str(self.f.root), CF_LIB=str(REPO / 'router/lib'))
+        return subprocess.run(self.f.shell + ['-c', '. "$CF_LIB/core.sh"; ' + snippet, 'sh', *map(str, args)],
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_empty_floor_is_a_hard_error_in_the_shared_floor_check(self):
+        floor = self.f.root / 'empty-floor';floor.write_bytes(b'')
+        self.set_live([KID])
+        self.assertNotEqual(self.core('cf_scope_has_floor "$1" "$2"', floor, self.live).returncode, 0)
+        # Both files empty is the case a vacuous awk comparison would wave through.
+        empty_live = self.f.root / 'empty-live';empty_live.write_bytes(b'')
+        self.assertNotEqual(self.core('cf_scope_has_floor "$1" "$2"', floor, empty_live).returncode, 0)
+        full = self.f.root / 'full-floor';full.write_text(KID + '\n')
+        self.assertEqual(self.core('cf_scope_has_floor "$1" "$2"', full, self.live).returncode, 0)
+
+    def test_digest_is_computed_on_the_snapshot_bytes_not_the_live_path(self):
+        snapshot = self.f.root / 'snapshot';snapshot.write_text(KID + '\n' + OTHER_KID + '\n');snapshot.chmod(0o600)
+        self.set_live([KID])
+        result = self.core('. "$CF_LIB/rpc.sh"; cf_scope_check "$1" && printf "%s" "$CF_SCOPE_SHA"', snapshot)
+        self.assertEqual(result.stdout, independent_scope_sha([KID, OTHER_KID]), result.stderr)
+
+    def test_remove_fw_ignores_a_broken_live_scope_when_installer_authorised(self):
+        lock = self.f.root / '.couvrefeu-install.lock'
+        lock.mkdir(mode=0o700)
+        for name, value in (('pid', str(os.getpid())), ('token', '0' * 64)):
+            target = lock / name;target.write_text(value + '\n');target.chmod(0o600)
+        self.set_live([OTHER_KID, KID])
+        result = self.f.run('remove-fw', env=dict(self.f.env, CF_INSTALL_TOKEN='0' * 64))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('invalid_rpc_scope', result.stdout)
+
+    def test_resume_with_the_live_scope_removed_fails_loud_and_uninstall_still_restores(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        pristine = self.tree()
+        self.install(KID)
+        self.live.unlink()
+        self.refused_install(*scope_args(KID), text='live RPC scope missing')
+        self.assertFalse(self.live.exists(), 'the floor must not be silently restored')
+        result = self.script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tree(), pristine)
+
+    def test_resume_refuses_a_fifo_symlink_or_oversized_live_scope_without_hanging(self):
+        # Refusal comes from the installer's early safe_paths/scope checks; the point is: no hang, no mutation.
+        elsewhere = self.f.root / 'elsewhere';elsewhere.write_text(KID + '\n');elsewhere.chmod(0o600)
+        for name in ('fifo', 'symlink', 'oversized'):
+            with self.subTest(live=name):
+                self.live.unlink(missing_ok=True)
+                if name == 'fifo':
+                    os.mkfifo(self.live, 0o600)
+                elif name == 'symlink':
+                    self.live.symlink_to(elsewhere)
+                else:
+                    self.set_live(b'\0' * 2_000_000)
+                self.refused_install(*scope_args(KID))
+        self.live.unlink(missing_ok=True)
+        self.set_live([KID])
+
+    def test_runtime_and_installer_validators_accept_and_reject_the_same_scopes(self):
+        for name, content, valid in scope_fixtures():
+            with self.subTest(fixture=name):
+                self.set_live(content)
+                runtime = self.f.run('rpc-status', '--json').returncode == 0
+                installer = self.script('install.sh', '--activate', '--protect', PROTECTED, *scope_args(KID)).returncode == 0
+                self.assertEqual((runtime, installer), (valid, valid))
+        self.set_live([KID])
+
+    def test_unlocked_activity_reads_scope_once_consistently(self):
+        self.set_live([KID, OTHER_KID])
+        self.attach(KID, OTHER_KID)
+        self.accept(self.request('both'))
+        child = stopped_at(self.f, 'after_scope_snapshot', 'rpc-activity', '--json')
+        # Two concurrent scope renames after the snapshot: a different valid scope, then garbage.
+        for content in (KID + '\n', 'not a mac\n'):
+            replacement = self.live.with_name('rpc-allowed.new')
+            replacement.write_text(content);replacement.chmod(0o600)
+            os.rename(replacement, self.live)
+        os.killpg(child.pid, signal.SIGCONT)
+        stdout, stderr = child.communicate(timeout=60)
+        self.assertEqual(child.returncode, 0, stdout + stderr)
+        # Only the snapshot taken before the renames could produce both devices.
+        self.assertEqual(sorted(d['mac'] for d in json.loads(stdout)['devices']), [KID, OTHER_KID])
+        self.assertEqual(self.live.read_text(), 'not a mac\n')
+        self.assertEqual(self.residue(), [])
+        later = self.f.run('rpc-activity', '--json')
+        self.assertNotEqual(later.returncode, 0, 'the next call must read the live (now invalid) scope')
+
+    def test_resume_keeps_grown_scope_and_checks_policy_against_live_scope(self):
+        self.set_live([KID, OTHER_KID])
+        self.attach(KID, OTHER_KID)
+        self.accept(self.request('both'))
+        before = self.live.read_bytes()
+        self.install(KID)
+        self.assertEqual(self.live.read_bytes(), before)
+        self.assertEqual(self.observe()['scope'], [KID, OTHER_KID])
+
+    def test_resume_refuses_overlap_and_missing_floor_without_mutation(self):
+        for name, content in (('overlap', [KID, PROTECTED]), ('missing-floor', [OTHER_KID]), ('invalid', [OTHER_KID, KID])):
+            with self.subTest(name=name):
+                self.set_live(content)
+                self.refused_install(*scope_args(KID))
+                self.assertEqual(self.live.read_text(), ''.join(m + '\n' for m in content))
+
+    def test_uninstall_restores_exact_bytes_with_grown_scope_and_stray_snapshot(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        pristine = self.tree()
+        self.assertNotIn('etc/couvrefeu/rpc-allowed', pristine)
+        for stray in (False, True):
+            with self.subTest(stray=stray):
+                self.install(KID)
+                self.set_live([KID, OTHER_KID, THIRD_KID])
+                if stray:
+                    (self.runtime / '.scope.123').write_text(OTHER_KID + '\n');(self.runtime / '.scope.123').chmod(0o600)
+                result = self.script('uninstall.sh')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.tree(), pristine)
+                self.assertFalse(self.live.exists())
+
+    def test_uninstall_refuses_a_scope_that_lost_its_floor_then_succeeds_after_repair(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        self.install(KID, OTHER_KID)
+        self.set_live([KID, THIRD_KID])
+        before = self.f.durable_snapshot()
+        result = self.script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('floor', result.stderr)
+        self.assertEqual(self.f.durable_snapshot(), before)
+        self.set_live([KID, OTHER_KID, THIRD_KID])
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+
+    def test_legacy_unscoped_install_has_no_scope_and_no_residue(self):
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
+        result = self.script('install.sh', '--activate', '--protect', PROTECTED)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = self.f.run('status', '--json')
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertFalse((self.f.root / 'etc/couvrefeu/rpc-allowed').exists())
+        self.assertEqual(self.residue(), [])
+        self.assertEqual(self.script('uninstall.sh').returncode, 0)
 
 
 class SshGuardTests(unittest.TestCase):

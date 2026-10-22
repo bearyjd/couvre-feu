@@ -60,8 +60,8 @@ cf_mac_valid() {
 }
 # RPC scope file: 1..256 canonical unicast MACs, LF-terminated, unique and
 # LC_ALL=C sorted. Prints the space-joined set; never an empty (unscoped) value.
-# Reads the root-private file several times (awk, wc, sort/cmp); callers bind it
-# first (installer stage dir, or cmp with the signed staged copy at runtime).
+# Reads the file several times (awk, wc, sort/cmp), so the path must be stable:
+# an installer-private copy, or the runtime's private single-read snapshot (cf_scope_bind).
 cf_scope_file() {
     cf_sf_list=$(awk '
     length($0)!=17 {exit 1}
@@ -74,6 +74,13 @@ cf_scope_file() {
     # Order and uniqueness use the tool that produced the file, not awk comparisons.
     LC_ALL=C sort -u "$1" | cmp -s - "$1" || return 1
     printf '%s\n' "$cf_sf_list"
+}
+# Every floor MAC (first file) is a line of the scope (second file); string keys.
+# This and cf_scope_file are the ONLY scope validators: install-common.sh wraps them.
+# An empty or unreadable floor is an error, never vacuously satisfied.
+cf_scope_has_floor() {
+    [ -s "$1" ] || return 1
+    awk 'NR==FNR{if(!($0 in need)){need[$0]=1;n++}next}($0 in need){got[$0]=1}END{if(n<1)exit 1;c=0;for(k in got)c++;exit c!=n}' "$1" "$2"
 }
 cf_id_valid() { case $1 in ''|*[!a-z0-9_]*|[!a-z]*) return 1;; esac; [ "${#1}" -le 32 ]; }
 cf_number_valid() {
@@ -506,7 +513,9 @@ cf_status() {
     fi
     cf_status_error=$CF_ERROR
     # Status is the last step of every command and must stay read-only, even
-    # after a refused command left CF_TRANSITION/CF_SLOT loaded.
+    # after a refused command left CF_TRANSITION/CF_SLOT loaded. The one exception
+    # is the transient private scope snapshot of a scoped install (cf_scope_bind):
+    # it is removed before status returns and never affects policy or runtime state.
     CF_STATUS_READ_ONLY=1
     cf_ok=true; cf_drift=false; cf_confirmed=null
     CF_REVISION=0; CF_POLICY=; CF_DIGEST=

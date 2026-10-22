@@ -91,8 +91,8 @@ The service independently admits only the configured person/device/MAC binding.
 
 Fresh activation creates a random generation. Interrupted activation reuses its
 staged generation; completed uninstall followed by activation creates a different
-one. Active installation journals and immutable scope/generation must match before
-writes. Runtime/install lock interlocks prevent restoration beneath an active write.
+one. Active installation journals and the immutable scope floor/generation must match before
+writes; the live `rpc-allowed` may grow past the floor but never lose a floor MAC. Runtime/install lock interlocks prevent restoration beneath an active write.
 Delayed pre-lock requests reject absent installation or the new generation.
 An existing legacy installation requires a separately reviewed migration.
 

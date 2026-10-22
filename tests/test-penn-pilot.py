@@ -956,6 +956,16 @@ class PilotPlanTests(PilotBase):
     def test_scope_reply_must_be_a_clean_rejection(self):
         reply, gen, digest, kids = self.scope_reply()
         self.assertEqual(self.scope_clean(reply), '0')
+        suffix = f',"scope":{kids},"scopeSha":"{"c" * 64}"}}'
+        scoped = reply.replace(']}\n', ']' + suffix + '\n')
+        self.assertNotEqual(scoped, reply)
+        self.assertEqual(self.scope_clean(scoped), '0')
+        for name, text in {'scope_mac_in_scope': scoped.replace(f',"scopeSha"', ',"x":"02:00:00:00:00:99","scopeSha"'),
+                           'short_sha': scoped.replace('c' * 64, 'c' * 63),
+                           'trailing_key': scoped.replace('"}\n', '","extra":1}\n'),
+                           'scope_before_errors': scoped.replace('"errors":["rpc_scope_overlap"]', '"errors":["rpc_scope_overlap"],"scope":[]')}.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.scope_clean(text), '1')
         receipt = ('"receipt":{"operationId":"penn-pilot-scope-1","requestDigest":"x","baseRevision":1,"baseDigest":"x",'
                    '"acceptedRevision":2,"acceptedDigest":"x","outcome":"accepted","current":true},')
         bad = {

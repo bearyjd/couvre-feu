@@ -22,10 +22,17 @@ Rules for the service parser:
 - `scope` must contain the floor, be disjoint from `protectedMacs`, and contain every MAC in `acceptedPolicy`.
 - Absent, busy or failed replies mean scope is `unknown` for alerting and audit, and only "the floor" for authorization.
   A busy reply must never look like scope shrinkage (see `scope_changes` below).
-- `rpc-allowed` lives in `/etc/couvrefeu` (`router/lib/rpc.sh:31` reads `$CF_DIR/rpc-allowed`; `router/install.sh:200`
-  writes it). Only a per-call snapshot may live in the private runtime dir. The snapshot is UNVERIFIED: no such snapshot
-  exists in `rpc.sh` today, so the "status and validation read the same bytes" property is a router requirement, not current
-  behaviour.
+- `rpc-allowed` lives in `/etc/couvrefeu` (`router/lib/rpc.sh` `cf_scope_bind`; written by `router/install.sh`). The install-time set is the
+  immutable **floor** (`backup/etc_couvrefeu_rpc-allowed.staged`); the live file may be any valid superset of it.
+- Implemented behaviour: each call copies the live file once (bounded to 4609 bytes) into a private `runtime/.scope.<pid>` snapshot and
+  validates the format, the floor, and computes `scopeSha` on exactly those bytes; the live path is never re-read for that call. The snapshot
+  is removed at once (and on HUP/INT/TERM/PIPE); a leftover from a SIGKILLed reader is swept under `cf_lock` when its pid is gone.
+- `rpc-status` reports `scope`/`scopeSha` from a snapshot whose sha equals the one safety-checked under `cf_lock`; a reload whose sha differs
+  is refused as `operation_in_progress` (never a reply carrying an unchecked scope).
+- `remove-fw` (uninstall) ignores the live scope, so uninstall works whatever the file became. Legacy unscoped installs omit both fields.
+  A missing floor MAC, an invalid file, or a protected overlap gives `invalid_rpc_scope` / `protected_mac_overlap`.
+- **M1d requirement:** any writer of the live `rpc-allowed` MUST hold `cf_lock` for the whole replace (write a temp file, `rename` over the live
+  path, mode 600) and keep the floor; a writer that does not can make an in-flight call refuse as busy, and must not be relied upon for safety.
 
 ## 2. rpc-inventory v1 (read-only, LOCKED format)
 

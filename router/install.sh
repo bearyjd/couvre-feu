@@ -58,7 +58,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=dc6d85c7400d18c67daa331c2a5122ca42ae90aed60564753d0bc883ab0b89c7
+CF_BOOTSTRAP_PIN=90e8ce0682bdbee44e24ceb80da77aea595d70a5b6dba9f40c5eae2a09128f08
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -167,7 +167,7 @@ journal_rollback() {
 }
 cleanup() {
     journal_rollback
-    for file in cfctl cfctl-ssh include protected state rpc-allowed generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
+    for file in cfctl cfctl-ssh include protected state rpc-allowed rpc-allowed.live generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
     for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
@@ -224,6 +224,12 @@ if [ -n "$RPC_ALLOW" ];then
         printf 'X\t1\nG\t%s\nC\t-\n' "$GENERATION" >> "$STAGE/state"
         chmod 600 "$STAGE/state"
     fi
+    # A completed scoped install whose live scope vanished is not silently re-floored (that
+    # would shrink a grown scope unannounced): fail loud. Uninstall still restores the originals.
+    # Non-regular files and symlinks are already refused by safe_paths (install-common.sh).
+    if [ -f "$BACKUP/complete" ];then
+        [ -e "$BASE/rpc-allowed" ] || [ -L "$BASE/rpc-allowed" ] || fail 'live RPC scope missing'
+    fi
     # Every scoped admission, including initial activation, precedes managed writes.
     (
         # shellcheck disable=SC2034
@@ -234,7 +240,17 @@ if [ -n "$RPC_ALLOW" ];then
         stage_json=$(printf '%s\n' "$stage_records" | cf_state_json -) || exit 1
         stage_valid=$(printf '%s\n' "$stage_json" | awk -f "$SOURCE/lib/json.awk") || exit 1
         [ "$(printf '%s\n' "$stage_valid" | cf_canonical)" = "$(printf '%s\n' "$stage_records" | cf_canonical)" ] || exit 1
-        printf '%s\n' "$stage_records" | awk -F '\t' 'NR==FNR{allowed[$0]=1;next}$1=="P"&&$3!="-"&&!($3 in allowed){exit 1}' "$STAGE/rpc-allowed" - || exit 1
+        # Resume of a completed scoped install: the live scope may have grown past the
+        # floor ($STAGE/rpc-allowed). One private, bounded copy serves every live-scope check.
+        scope_file=$STAGE/rpc-allowed
+        if [ -f "$BACKUP/complete" ];then
+            head -c 4609 "$BASE/rpc-allowed" > "$STAGE/rpc-allowed.live" && chmod 600 "$STAGE/rpc-allowed.live" || exit 1
+            cf_scope_file "$STAGE/rpc-allowed.live" >/dev/null || exit 1
+            cf_scope_has_floor "$STAGE/rpc-allowed" "$STAGE/rpc-allowed.live" || exit 1
+            awk 'NR==FNR{protected[$0]=1;next}$0 in protected{exit 1}' "$STAGE/protected" "$STAGE/rpc-allowed.live" || exit 1
+            scope_file=$STAGE/rpc-allowed.live
+        fi
+        printf '%s\n' "$stage_records" | awk -F '\t' 'NR==FNR{allowed[$0]=1;next}$1=="P"&&$3!="-"&&!($3 in allowed){exit 1}' "$scope_file" - || exit 1
         printf '%s\n' "$stage_records" | awk -F '\t' 'NR==FNR{protected[$1]=1;next}$1=="P"&&protected[$3]{exit 1}' "$STAGE/protected" -
     ) || fail 'initial state violates scoped policy or protected identities'
 elif [ -e "$BACKUP/etc_couvrefeu_rpc-allowed.after" ];then
@@ -397,7 +413,7 @@ for rel in $FILES; do
     platform_initial_write
     mkdir -p "$install_parent"
     # Reinstall/resume never overwrites legitimate mutable runtime contents.
-    case "$rel" in etc/couvrefeu/state|etc/couvrefeu/protected)
+    case "$rel" in etc/couvrefeu/state|etc/couvrefeu/protected|etc/couvrefeu/rpc-allowed)
         if [ -f "$BACKUP/complete" ]; then continue; fi;;
     esac
     atomic_copy "$BACKUP/$k.staged" "$ROOT/$rel" durable "$k"

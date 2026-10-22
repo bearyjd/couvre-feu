@@ -124,11 +124,13 @@ database — `integration.sqlite` together with `integration.sqlite-wal` and
   adults' devices can never be added — changing protection stays a manifest edit plus
   rebind), never already managed by any entry (`device_already_enrolled`, without naming
   the owner).
-- **Router scope.** The router's `--rpc-allow` set is fixed at install time and is **not**
-  reported over RPC by routers before the scope release (newer routers add `scope`/`scopeSha`, see `docs/contracts/tier1-rpc.md` section 7; the manifest list stays the floor). The manifest therefore
-  carries an optional `routerScope` list that the operator must keep identical to the
-  installed `--rpc-allow` set; a device outside it is refused with
-  `device_pending_router_scope` (a recorded request, not an error) before anything is queued. Absent, the scope is the seed
+- **Router scope.** The router's `--rpc-allow` set is the install-time floor; the live
+  `rpc-allowed` may grow past it, and `rpc-status` reports `scope`/`scopeSha` on scoped installs
+  (see `docs/contracts/tier1-rpc.md` section 7; routers before the scope release do not report
+  them). The manifest carries an optional `routerScope` list that the operator must keep
+  identical to the installed `--rpc-allow` floor; a device outside the observed scope (or the
+  floor when the router reports none) is refused with `device_pending_router_scope` (a recorded
+  request, not an error) before anything is queued. Absent, the scope is the seed
   device alone (a single-MAC installation). Adding `routerScope` changes the manifest and
   target digest: use `integration:rebind`. The dispatch script header then reads
   `# Allowed MACs: …` instead of `# Allowed MAC: …`. Upgrade the service before the router.

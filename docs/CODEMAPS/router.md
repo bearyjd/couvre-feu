@@ -18,6 +18,6 @@
 
 Slot model: two slots a/b. Static hooks cf_fwd, cf_input, cf_dns (filter v4/v6 + nat v4) jump (`cf:v2` comment) to active `cf2_{s}_f|i|d`; `cf2_{s}_g` guard chain. ipsets `cf2_{s}_{k,p,d4,d6,u}` (kids, paused, DoH v4/v6, allowance). Apply builds the idle slot, verifies, swaps hooks, flushes conntrack, tears down the old slot. Owned names matched by cf_owned_chain/cf_owned_set only.
 
-State under /etc/couvrefeu: state (versioned policy + history), rpc-allowed (scope MACs), protected, runtime/ (firewall.owned: line 2 = slot), backup/ (originals, ready/complete markers, *.staged, restoring, kernel-cleaned, no-kernel-mutations). Installed code: /usr/sbin/cfctl, /usr/lib/couvrefeu/, /etc/crontabs/root entry.
+State under /etc/couvrefeu: state (versioned policy + history), rpc-allowed (live scope MACs: a valid superset of the immutable install-time floor `backup/*rpc-allowed.staged`), protected, runtime/ (firewall.owned: line 2 = slot), backup/ (originals, ready/complete markers, *.staged, restoring, kernel-cleaned, no-kernel-mutations). Installed code: /usr/sbin/cfctl, /usr/lib/couvrefeu/, /etc/crontabs/root entry.
 
 Exactness: uninstall runs drift preflight, same-filesystem rename-only restore, persists kernel-cleanup before touching helpers, retires journal last; refuses on drift. `remove-fw` refused without installer token.
