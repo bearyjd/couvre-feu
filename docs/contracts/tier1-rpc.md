@@ -271,8 +271,9 @@ M2a/M2c.
   `POST /admin/inventory/refresh {}` (202; 409 `inventory_dispatch_disabled`; 429 `inventory_refresh_rate_limited`). Retention: `CF_INVENTORY_RETENTION_DAYS`, default 30, at most 90.
 - Review fixes (M2c):
   - Parser: `ipv4` must be strictly ascending C-locale order; a violation is reported as `ipv4_not_sorted` (stored as `inventory_unavailable:ipv4_not_sorted`) so the router side knows exactly what failed. The raw-text pre-check of section 2.1 applies.
-  - `invalid_clock` (routerTime 0) is the one non-structural router error: devices still ingest (the service clock stamps first_seen/last_seen; routerTime is never used) and the poll may baseline and alert, with
-    `last_error` `inventory_warning:invalid_clock`. Any other error code, truncation, or a refusal body with no devices is an incomplete poll.
+  - `invalid_clock` (routerTime 0) and `inventory_row_dropped` (the router skipped a malformed in-subnet unexpired lease row) are the only non-structural router errors (`BENIGN_ROUTER_ERRORS`): devices still ingest (the service clock stamps
+    first_seen/last_seen; routerTime is never used) and the poll may baseline and alert, with `last_error` `inventory_warning:<first code>` (e.g. `inventory_warning:inventory_row_dropped`). Any other error code, truncation, or a refusal body
+    with no devices is an incomplete poll.
   - Stalls (SM-1): no complete poll for 30 minutes raises the system alert `inventory_stalled` (counts and a cause only, at most once per 6 hours, shared with the row-cap alert). A re-baseline over an existing baseline
     (store emptied, or the last complete poll older than the retention) is not silent: it raises `new_device` with `{count, rebaselined: true}` ("accepted without review"). The very first baseline stays silent.
     Truncated replies still never imply gone or New.

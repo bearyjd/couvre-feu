@@ -16,8 +16,8 @@ export const INVENTORY_ROW_CAP = 1024;
 /** No complete poll for this long raises `inventory_stalled`, then at most once per STALL_ALERT_INTERVAL_SECONDS. */
 export const STALL_SECONDS = 1800;
 export const STALL_ALERT_INTERVAL_SECONDS = 6 * 3600;
-/** The one router error that does not make a poll incomplete: devices are still listed, only routerTime (0) is untrusted. */
-export const BENIGN_ROUTER_ERROR = 'invalid_clock';
+/** Router error codes that do not make a poll incomplete: devices are still listed (invalid_clock: routerTime 0 is untrusted; inventory_row_dropped: a malformed in-subnet row was skipped). */
+export const BENIGN_ROUTER_ERRORS: readonly string[] = ['invalid_clock', 'inventory_row_dropped'];
 export const DEFAULT_INVENTORY_RETENTION_DAYS = 30;
 export const MAX_INVENTORY_RETENTION_DAYS = 90;
 const DAY = 86400;
@@ -143,8 +143,8 @@ export class InventoryStore {
             this.purgeProtected();
             this.pruneAt(at);
             const g = this.generation;
-            // invalid_clock alone is not structural, but a refusal body (errors and no devices) lists nothing and is never a baseline.
-            const other = reply.errors.find(e => e !== BENIGN_ROUTER_ERROR);
+            // Warning codes alone are not structural, but a refusal body (errors and no devices) lists nothing and is never a baseline.
+            const other = reply.errors.find(e => !BENIGN_ROUTER_ERRORS.includes(e));
             if (other !== undefined || reply.truncated || (reply.errors.length > 0 && reply.devices.length === 0)) {
                 for (const d of reply.devices) this.refresh(g, d, at);
                 this.store.run('UPDATE inventory_state SET last_error=? WHERE singleton=1', `inventory_incomplete:${other ?? reply.errors[0] ?? 'truncated'}`);
@@ -163,7 +163,7 @@ export class InventoryStore {
             }
             const dropped = fresh.length - stored.size;
             this.store.run('UPDATE inventory_state SET baseline_at=?,last_ok_at=?,last_error=?,incomplete_since=NULL WHERE singleton=1', rebaseline ? at : state.baseline_at, at,
-                dropped > 0 ? 'inventory_row_cap' : reply.errors.length > 0 ? `inventory_warning:${BENIGN_ROUTER_ERROR}` : null);
+                dropped > 0 ? 'inventory_row_cap' : reply.errors.length > 0 ? `inventory_warning:${reply.errors[0]}` : null);
             if (dropped > 0) this.raiseStalled('row_cap', dropped, at);
             // A re-baseline over an existing baseline accepts every device it lists without review: say so, with a count.
             if (rebaseline && state.baseline_at !== null && stored.size > 0) this.alerts.raise({kind: 'new_device', personId: null, severity: 'warning', details: {count: stored.size, rebaselined: true}});
