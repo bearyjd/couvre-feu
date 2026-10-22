@@ -55,3 +55,22 @@ test('an admin sees a router_scope_change alert with counts only and its matched
   expect(await feed.innerText()).not.toMatch(/[0-9a-f]{2}(:[0-9a-f]{2}){5}/);
   expect(errors).toEqual([]);
 });
+
+test('an admin sees new_device and inventory_stalled alerts with titles and counts only', async ({ page, demo }) => {
+  const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message));
+  const alert = (id: number, kind: string, details: object) => ({ id, personId: null, kind, severity: 'warning', createdAt: nowSeconds(), firstSeen: nowSeconds(), lastSeen: nowSeconds(), count: 1,
+    state: 'open', acknowledgedAt: null, resolvedAt: null, details });
+  // The demo database has no inventory kinds, so the response is fixed here; the real server path is covered in service tests.
+  await page.route('**/alerts', (route) => route.fulfill({ json: { alerts: [alert(3, 'inventory_stalled', { cause: 'no_complete_poll', count: 45 }), alert(2, 'new_device', { count: 3 }), alert(1, 'new_device', { count: 1 })], nextBefore: null, openCount: 3 } }));
+  await enroll(page, demo, 'jd');
+  const feed = page.locator('#parent-alert-feed');
+  await expect(feed.locator('.parent-alert')).toHaveCount(3);
+  await expect(feed).toContainText('Network inventory has not completed recently');
+  await expect(feed).toContainText('No complete device scan for about 45 minutes.');
+  await expect(feed).toContainText('New device on the network');
+  await expect(feed).toContainText('3 new devices appeared on the network. Review them under Devices on the network.');
+  await expect(feed).toContainText('1 new device appeared on the network.');
+  expect(await feed.innerText()).not.toMatch(/[0-9a-f]{2}(:[0-9a-f]{2}){5}/i);
+  await expect(page.locator('#alert-badge')).toHaveText('3');
+  expect(errors).toEqual([]);
+});

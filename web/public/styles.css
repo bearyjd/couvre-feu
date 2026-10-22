@@ -847,6 +847,8 @@ footer {
 .extra-time .reason-detail {
   display:block;
   margin-top:6px
+}
+
 .activity-panel {
   margin:24px 0;
   padding:24px;
@@ -967,3 +969,14 @@ footer {
 .bulk-confirm { display: grid; gap: .5rem; padding: .75rem; border: 1px solid var(--line); border-left: 4px solid var(--amber); border-radius: var(--radius); background: var(--surface); overflow-wrap: anywhere; min-width: 0; }
 .bulk-confirm ul { margin: 0; padding-left: 1.25rem; }
 .move-controls select { min-width: 0; max-width: 100%; }
+
+/* Devices on the network (admins): rows reuse the stacked-card language; names are untrusted text and must wrap, never widen the page. */
+#inventory-panel .button, #inventory-panel select { min-height: 44px; }
+#inventory-panel [data-live]:empty { margin: 0; }
+.inventory-row { min-width: 0; grid-template-columns: minmax(0, 1fr); } /* a 300-character unbroken name must wrap inside the card, not widen the track */
+.inventory-row > * { min-width: 0; }
+.inventory-name { font-weight: 650; overflow-wrap: anywhere; word-break: break-word; unicode-bidi: plaintext; }
+.inventory-flags, .inventory-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; min-width: 0; }
+.inventory-flag { font-size: 12px; font-weight: 650; line-height: 1.4; padding: 4px 10px; border-radius: 99px; background: var(--surface); border: 1px solid var(--line); }
+.inventory-flag.flag-new { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
+.inventory-flag.flag-private { border-style: dashed; }

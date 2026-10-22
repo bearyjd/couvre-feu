@@ -36,7 +36,7 @@ function el(tag, props = {}, ...children) {
 
 export function createChildren({ session, revisionToken, refresh, version }) {
   const root = document.querySelector('#children-panel');
-  let key = '', data = null, notice = '', busy = false, lastVersion = null, pending = [];
+  let key = '', data = null, notice = '', busy = false, lastVersion = null, pending = [], prefill = null, focusPrefill = false;
   const moveChoice = new Map(); // device id -> chosen target child, kept across redraws
   const enabled = () => document.documentElement.dataset.source === 'real-router-integration' && session()?.actor.role === 'admin';
 
@@ -116,15 +116,18 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       ...moveControls(entry, device));
   }
   function addForm(entry) {
+    const filled = prefill?.id === entry.id ? prefill : null; // from the network list: the address lives only in this form field
     const form = el('form', { class: 'account-form', 'data-add-device': entry.id },
+      ...(filled ? [el('p', { class: 'notice', role: 'note', 'data-prefill-warning': '' }, "Confirm the address in the device's own Wi-Fi settings before approving")] : []),
       el('label', { for: `device-label-${entry.id}` }, `New device name for ${entry.name}`),
-      el('input', { id: `device-label-${entry.id}`, name: 'label', required: true, maxLength: 64, autocomplete: 'off' }),
+      el('input', { id: `device-label-${entry.id}`, name: 'label', required: true, maxLength: 64, autocomplete: 'off', value: filled?.label ?? '' }),
       el('label', { for: `device-mac-${entry.id}` }, `Wi-Fi address (MAC) for ${entry.name}`),
-      el('input', { id: `device-mac-${entry.id}`, name: 'mac', required: true, maxLength: 17, autocomplete: 'off', autocapitalize: 'none', spellcheck: false, placeholder: 'aa:bb:cc:dd:ee:ff' }),
+      el('input', { id: `device-mac-${entry.id}`, name: 'mac', required: true, maxLength: 17, autocomplete: 'off', autocapitalize: 'none', spellcheck: false, placeholder: 'aa:bb:cc:dd:ee:ff', value: filled?.mac ?? '' }),
       el('button', { class: 'button primary', type: 'submit', disabled: busy }, 'Add device'));
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       const params = { label: form.elements.label.value.trim(), mac: form.elements.mac.value.trim(), precondition: revisionToken() };
+      if (prefill?.id === entry.id) prefill = null;
       void confirmed('device_add', entry.id, params, `/admin/children/${entry.id}/devices`, queued);
     });
     return form;
@@ -155,6 +158,8 @@ export function createChildren({ session, revisionToken, refresh, version }) {
   function draw() {
     if (!enabled() || !data) { root.hidden = true; root.replaceChildren(); return; }
     if (root.contains(document.activeElement) && document.activeElement.matches('input, select')) return; // never rebuild while typing
+    const open = prefill && root.querySelector(`[data-add-device="${CSS.escape(prefill.id)}"]`);
+    if (open && !focusPrefill) prefill = { ...prefill, label: open.elements.label.value, mac: open.elements.mac.value }; // keep what the parent typed over the original prefill
     root.replaceChildren(
       el('h2', { id: 'children-title' }, 'Children and device groups'),
       el('p', { class: 'fine-print' }, `Adults' protected devices can never be added. The router holds at most ${data.limits.children} entries, ${data.limits.devicesPerChild} devices each and ${data.limits.devices} in total; every device must be in its installed allow list. Each change needs your passkey and a router confirmation.`),
@@ -164,15 +169,31 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       el('ul', { class: 'account-list', 'aria-label': 'Children and device groups' }, ...data.children.map(card)),
       ...(data.canCreate ? [el('h3', {}, 'Add a child or device group'), createForm()] : []));
     root.hidden = false;
+    if (focusPrefill) {
+      focusPrefill = false;
+      const input = prefill && root.querySelector(`[data-add-device="${CSS.escape(prefill.id)}"] input[name="label"]`);
+      input?.scrollIntoView({ block: 'center' }); input?.focus();
+    }
   }
+  // Used by the network list: open one child's add form with a name and address filled in. Nothing is sent from here.
+  function startAdd(id, values) {
+    if (!enabled() || !data?.children.some((c) => c.id === id)) return false;
+    prefill = { id, label: String(values.label ?? '').slice(0, 64), mac: String(values.mac ?? '') };
+    notice = ''; focusPrefill = true;
+    document.activeElement?.blur?.();
+    draw();
+    return true;
+  }
+  function clearPrefill() { if (prefill) { prefill = null; draw(); } }
+  const entries = () => (data?.children ?? []).map((c) => ({ id: c.id, name: c.name }));
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
-    if (next !== key) { key = next; data = null; notice = ''; pending = []; moveChoice.clear(); draw(); if (next) void load(); return; }
+    if (next !== key) { key = next; data = null; notice = ''; pending = []; prefill = null; moveChoice.clear(); draw(); if (next) void load(); return; }
     // Router observations settle queued device changes; reload when the status snapshot moves.
     const seen = version();
     if (next && seen !== lastVersion) { lastVersion = seen; void load(); }
   }
-  return { update, load };
+  return { update, load, startAdd, clearPrefill, entries };
 }
 
 // "Block all kids" / "Unblock all": one router change for every child the signed-in account manages. Admins and parents alike.
@@ -276,4 +297,176 @@ export function createBulk({ gate = () => null, session, people, revisionToken, 
     draw();
   }
   return { update };
+}
+
+// "Devices on the network" (admins only): what the router has seen on the home network, newest first. A device name is text the DEVICE
+// chose and often holds a real person's name, so it is only ever set with textContent and is labelled as such. A list from the router is a
+// hint, never proof: a stalled or failed scan never reads as "all clear". Addresses (MACs) are not shown; they only travel into the add form.
+const STALL_SECONDS = 1800;
+const FLAGS = [['new', 'New'], ['private', 'Private address'], ['unassigned', 'Unassigned']];
+const PRIVATE_HINT = 'may rotate — set a fixed Wi-Fi address on this device';
+const DISPATCH_OFF = 'Inventory polling is off until router dispatch is enabled', RATE_LIMITED = 'Try again in a few seconds';
+const REFRESH_FAILURES = new Map([['inventory_dispatch_disabled', DISPATCH_OFF], ['inventory_refresh_rate_limited', RATE_LIMITED]]); // a Map: a code like "constructor" finds nothing
+const REFRESH_STATUS = new Map([[409, DISPATCH_OFF], [429, RATE_LIMITED]]);
+const NOTE_SECONDS = 30;
+
+function causeText(error) {
+  if (error === 'inventory_unavailable:old_router') return 'Router too old for inventory.';
+  if (error === 'inventory_warning:invalid_clock') return 'The router clock looks wrong, so times may be off.';
+  if (error === 'inventory_row_cap') return 'The router lists more devices than can be kept; the oldest unseen ones were left out.';
+  if (error.startsWith('inventory_incomplete:')) return 'The last scan was incomplete.';
+  if (error.startsWith('inventory_transport_error:') || error.startsWith('inventory_unavailable:')) return 'Router connection problem.';
+  return 'The last scan did not complete.';
+}
+// Plain wording for the scan state. `clear` is true only when a recent complete scan is the latest word AND nothing is wrong.
+export function inventoryStatus(status, nowSeconds, time) {
+  const error = status.lastError ?? '', since = status.lastOkAt ? ` Showing the last complete scan from ${time(status.lastOkAt)}.` : '';
+  if (!status.lastOkAt && !error) return { kind: 'none', clear: false, text: 'No complete scan yet. The router has not reported its devices.' };
+  const stalled = !status.lastOkAt || nowSeconds - status.lastOkAt > STALL_SECONDS;
+  if (stalled) return { kind: 'stalled', clear: false, text: `Inventory is stalled — check the router.${error ? ` ${causeText(error)}` : ''}${since}` };
+  if (error === 'inventory_unavailable:old_router') return { kind: 'old_router', clear: false, text: `${causeText(error)}${since}` };
+  if (error === 'inventory_warning:invalid_clock') return { kind: 'clock_warning', clear: false, text: `Last complete scan ${time(status.lastOkAt)}. ${causeText(error)}` }; // times are doubtful, so no all-clear
+  if (error) return { kind: 'degraded', clear: false, text: `${causeText(error)}${since}` };
+  return { kind: 'ok', clear: status.baselineAt !== null, text: `Last complete scan ${time(status.lastOkAt)}.` };
+}
+
+export function createInventory({ session, gate, offline, time, children, version }) {
+  const root = document.querySelector('#inventory-panel');
+  let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null;
+  let serverNow = null, loadedPerf = 0, mounted = false; // serverNow: the service clock at the last load, advanced by this page's own elapsed time
+  const title = el('h2', { id: 'inventory-title', tabindex: -1 }, 'Devices on the network');
+  const live = el('p', { class: 'fine-print', role: 'status', 'aria-live': 'polite', 'data-live': '', 'data-refresh-status': '' }); // one node for the life of the panel, so screen readers hear changes
+  const body = el('div');
+  const enabled = () => document.documentElement.dataset.source === 'real-router-integration' && session()?.actor.role === 'admin';
+  // Scan age is measured on the SERVER's clock. Unknown (an older service) counts as stalled: never an all-clear on a guess.
+  const nowSeconds = () => (serverNow === null ? Number.POSITIVE_INFINITY : serverNow + Math.floor((performance.now() - loadedPerf) / 1000));
+  const closed = () => busy || Boolean(gate());
+  const sorted = (list) => [...list].sort((a, b) => b.firstSeen - a.firstSeen || b.lastSeen - a.lastSeen);
+  function setNote(text) {
+    refreshNote = text; clearTimeout(noteTimer);
+    noteTimer = setTimeout(() => { refreshNote = ''; draw(); }, NOTE_SECONDS * 1000);
+  }
+
+  async function call(path, body) {
+    const response = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'X-CSRF-Token': session().csrfToken },
+      body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000),
+    });
+    const result = await readJson(response);
+    if (!response.ok || result === null) { const error = new Error(result?.error?.message ?? 'The request could not be completed.'); error.status = response.status; error.code = result?.error?.code; throw error; }
+    return result;
+  }
+  async function load() {
+    if (!enabled()) { data = null; draw(); return; }
+    if (offline()) { draw(); return; } // keep the saved list; it is labelled as saved
+    const mine = key;
+    try {
+      const result = await call('/admin/inventory');
+      if (mine !== key) return;
+      data = result.inventory; loadFailed = false;
+      serverNow = Number.isFinite(result.now) ? result.now : null; loadedPerf = performance.now(); loadedAt = serverNow ?? Math.floor(Date.now() / 1000);
+      refreshNote = ''; clearTimeout(noteTimer); // a request note is stale once a newer list has arrived
+    } catch (error) {
+      if (mine !== key) return;
+      if (error.status === 401 || error.status === 403) data = null; else loadFailed = true;
+    }
+    draw();
+  }
+  async function acknowledge(device) {
+    if (closed()) { draw(); return; }
+    const position = sorted(data.devices).filter((d) => d.flags.new).indexOf(device);
+    busy = true; notice = ''; refreshNote = ''; draw();
+    try { await call('/admin/inventory/acknowledge', { mac: device.mac }); notice = `Acknowledged ${(device.hostname ?? 'device').slice(0, 40)}.`; } catch (error) { notice = error.status === 404 ? 'That device is no longer listed.' : error.message; }
+    busy = false;
+    await load();
+    refocus(position);
+  }
+  // The button that was pressed is gone after a redraw; keep keyboard and screen-reader users in the list instead of dropping them on the page.
+  function refocus(position) {
+    const active = document.activeElement;
+    if (!mounted || (active && active !== document.body && !root.contains(active))) return;
+    const buttons = Array.from(root.querySelectorAll('[data-ack]:not(:disabled)'));
+    (buttons[Math.min(Math.max(position, 0), buttons.length - 1)] ?? title).focus();
+  }
+  async function refreshNow() {
+    if (closed()) { draw(); return; }
+    busy = true; refreshNote = ''; notice = ''; draw();
+    try {
+      await call('/admin/inventory/refresh', {});
+      setNote('Refresh requested. The list updates when the router answers.');
+      clearTimeout(timer); timer = setTimeout(() => void load(), 5000);
+    } catch (error) { setNote(REFRESH_FAILURES.get(error.code) ?? REFRESH_STATUS.get(error.status) ?? error.message); }
+    busy = false;
+    draw();
+  }
+  function startAssign(device) {
+    if (closed()) { draw(); return; }
+    const label = device.hostname ?? '';
+    if (!choice || !children.startAdd(choice, { label, mac: device.mac })) { notice = 'Choose a child or device group first.'; draw(); return; }
+    picking = null; choice = ''; notice = ''; draw();
+  }
+  function picker(device, name) {
+    const options = children.entries();
+    if (!options.length) return [el('p', { class: 'fine-print' }, 'Add a child or device group first (below), then come back.')];
+    const select = el('select', { 'aria-label': `Child for ${name}`, onchange: () => { choice = select.value; } },
+      el('option', { value: '' }, 'Choose…'), ...options.map((c) => el('option', { value: c.id }, c.name)));
+    select.value = options.some((c) => c.id === choice) ? choice : '';
+    return [el('div', { class: 'inventory-actions' }, select,
+      el('button', { class: 'button primary', type: 'button', onclick: () => startAssign(device) }, 'Continue'),
+      el('button', { class: 'button secondary', type: 'button', onclick: () => { picking = null; choice = ''; children.clearPrefill(); draw(); } }, 'Cancel'))];
+  }
+  function deviceRow(device, locked) {
+    const name = device.hostname ?? 'No name reported', short = name.slice(0, 40);
+    const flags = FLAGS.filter(([flag]) => device.flags[flag]);
+    return el('li', { class: 'passkey-row inventory-row' },
+      el('span', { class: 'inventory-name', 'data-name': '', dir: 'auto' }, name),
+      ...(device.hostname === null ? [] : [el('span', { class: 'fine-print' }, 'name reported by device')]),
+      ...(flags.length ? [el('span', { class: 'inventory-flags' }, ...flags.map(([flag, label]) => el('span', { class: `inventory-flag flag-${flag}`, 'data-flag': flag }, label)))] : []),
+      ...(device.flags.private ? [el('span', { class: 'fine-print' }, `Private address: ${PRIVATE_HINT}`)] : []),
+      el('span', { class: 'fine-print' }, `${device.ipv4.length ? device.ipv4.join(', ') : 'No IPv4 address'} · Last seen ${time(device.lastSeen)}`),
+      el('span', { class: 'fine-print' }, `First seen ${time(device.firstSeen)}`),
+      ...(device.personName ? [el('span', { class: 'fine-print' }, `Belongs to ${device.personName}`)] : []),
+      el('div', { class: 'inventory-actions' },
+        ...(device.flags.new ? [el('button', { class: 'button secondary', type: 'button', disabled: locked, 'data-ack': '', 'aria-label': `Acknowledge ${short}`, onclick: () => void acknowledge(device) }, 'Acknowledge')] : []),
+        ...(device.flags.unassigned ? [el('button', { class: 'button secondary', type: 'button', disabled: locked, 'aria-label': `Add to a child: ${short}`,
+          onclick: () => { if (closed()) { draw(); return; } picking = device.mac; choice = ''; notice = ''; draw(); } }, 'Add to a child…')] : [])),
+      ...(picking === device.mac && !locked ? picker(device, short) : []));
+  }
+  function draw() {
+    if (!enabled() || !data) { drawn = ''; mounted = false; root.hidden = true; root.replaceChildren(); live.textContent = ''; return; }
+    if (!mounted) { root.replaceChildren(title, live, body); mounted = true; }
+    const liveText = refreshNote || notice;
+    if (live.textContent !== liveText) live.textContent = liveText;
+    const stale = offline() || loadFailed;
+    const reason = gate() ?? '', locked = busy || Boolean(reason);
+    const ordered = sorted(data.devices);
+    const status = inventoryStatus(data.status, nowSeconds(), time);
+    const newCount = ordered.filter((d) => d.flags.new).length;
+    const clear = status.clear && !stale && newCount === 0;
+    const summary = clear ? 'No new devices.' : newCount ? `${newCount} new device${newCount === 1 ? '' : 's'} to review.` : '';
+    const signature = JSON.stringify([data, reason, stale, loadedAt, status.text, summary, notice, refreshNote, picking, busy, children.entries()]);
+    if (signature === drawn) return; // never rebuild (and drop keyboard focus) when nothing changed
+    if (root.contains(document.activeElement) && document.activeElement.matches('select')) { drawn = ''; return; }
+    drawn = signature;
+    body.replaceChildren(
+      el('p', { class: 'fine-print' }, 'What the router has seen. Device names are chosen by the devices themselves and are not verified. Protected devices are never listed.'),
+      el('p', { class: 'notice', 'data-inventory-status': status.kind }, status.text, ...(summary ? [' ', el('strong', clear ? { 'data-all-clear': '' } : {}, summary)] : [])),
+      ...(stale ? [el('p', { class: 'fine-print', 'data-inventory-snapshot': '' }, `Showing a saved list from ${time(loadedAt)}. It updates when the connection returns.`)] : []),
+      el('p', { class: 'fine-print', 'data-inventory-reason': '', hidden: !reason }, reason),
+      el('div', { class: 'inventory-actions' }, el('button', { class: 'button secondary', type: 'button', disabled: locked, onclick: () => void refreshNow() }, 'Refresh now')),
+      el('ul', { class: 'account-list', 'aria-label': 'Devices on the network' }, ...ordered.map((device) => deviceRow(device, locked))));
+    root.hidden = false;
+  }
+  function update() {
+    const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
+    if (next !== key) {
+      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
+      draw(); if (next) void load(); return;
+    }
+    const seen = version();
+    if (next && seen !== lastVersion) { lastVersion = seen; void load(); return; }
+    draw();
+  }
+  return { update, load };
 }

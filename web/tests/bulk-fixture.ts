@@ -26,7 +26,7 @@ export const test = base.extend<{ integration: World }>({
     f.store.run('UPDATE accounts SET person_ids=? WHERE id=?', JSON.stringify(['pilot', 'kid2']), 'parent');
     f.router.policy = normalizePolicy({ version: 1, revision: 1, people: [{ id: 'pilot', macs: [SEED] }, { id: 'kid2', macs: [K2] }, { id: 'kid3', macs: [K3] }], pauses: [], schedules: [] }, f.config.protectedMacs);
     const auth = new Auth(f.store, origin, f.now, { provenance: f.config.provenance, rpName: 'Private integration test' });
-    const server = appServer(auth, f.policy, { ...f.config, port, origin, host: `localhost:${port}` });
+    const server = appServer(auth, f.policy, { ...f.config, port, origin, host: `localhost:${port}` }, undefined, undefined, undefined, f.worker.inventory);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     await f.observe();
     try { await use({ ...f, origin }); } finally {
