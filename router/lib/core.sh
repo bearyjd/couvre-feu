@@ -362,12 +362,9 @@ cf_ssh_guard() {
     [ "$(printf '%s\n' "$cf_macs" | awk 'NF{n++}END{print n+0}')" = 1 ] || { cf_fail ambiguous_ssh_client; return 1; }
     cf_mac_valid "$cf_macs" || { cf_fail unknown_ssh_client; return 1; }
     printf '%s\n' "$CF_POLICY" | awk -F '\t' -v mac="$cf_macs" '$1=="P"&&$3==mac{exit 1}' || { cf_fail ssh_client_overlap; return 1; }
-    if ! awk -v mac="$cf_macs" '$0==mac{yes=1}END{exit !yes}' "$CF_PROTECTED"; then
-        cf_temp=$CF_RUNTIME/.protected.$$
-        [ ! -e "$cf_temp" ] && [ ! -L "$cf_temp" ] || { cf_fail unsafe_temporary; return 1; }
-        platform_initial_write
-        { awk '{print}' "$CF_PROTECTED"; printf '%s\n' "$cf_macs"; } > "$cf_temp" && chmod 600 "$cf_temp" && mv -f "$cf_temp" "$CF_PROTECTED" || { cf_fail protected_update_failed; return 1; }
-    fi
+    # The guard only reads: a refused request must never grow `protected`.
+    awk -v mac="$cf_macs" -v scope="${CF_SCOPE-}" 'BEGIN{n=split(scope,s," ");for(i=1;i<=n;i++)if(s[i]==mac)exit 1}' || { cf_fail ssh_client_in_scope; return 1; }
+    awk -v mac="$cf_macs" '$0==mac{yes=1}END{exit !yes}' "$CF_PROTECTED" || { cf_fail ssh_client_unprotected; return 1; }
 }
 cf_write_policy() {
     platform_deadline_check
@@ -574,12 +571,16 @@ cf_main() {
     if [ "$cf_action" = invalid ]; then printf '%s\n' '{"ok":false,"errors":["invalid_command"]}';return 2;fi
     if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
     if [ "$cf_action" = apply-fw ] && cf_reentrant_include; then return 0;fi
-    if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock || ! cf_policy_safe; then cf_status;return 1;fi
+    if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock; then cf_status;return 1;fi
+    # remove-fw skips cf_policy_safe so uninstall still works in an inconsistent policy state.
+    if [ "$cf_action" != remove-fw ] && ! cf_policy_safe;then cf_status;return 1;fi
     if [ "$cf_action" = sync ] && ! cf_sync_stage 0;then cf_status;return 1;fi
     if ! cf_lock;then cf_busy_result;return 1;fi
     if ! cf_install_gate "$cf_action";then cf_busy_result;return 1;fi
     # A different operation may have committed between the first read and mkdir.
-    if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock || ! cf_policy_safe;then cf_status;return 1;fi
+    if ! cf_control_dirs || ! cf_protected_valid || ! cf_state_load || ! cf_clock;then cf_status;return 1;fi
+    # remove-fw skips cf_policy_safe (see above).
+    if [ "$cf_action" != remove-fw ] && ! cf_policy_safe;then cf_status;return 1;fi
     CF_OLD_POLICY=$CF_POLICY
     CF_OLD_DIGEST=$CF_DIGEST
     case $cf_action in
@@ -588,7 +589,13 @@ cf_main() {
         resume) cf_resume_edit "$2" || { cf_status;return 1; };;
     esac
     if ! cf_backend_available sync;then cf_fail missing_dependencies;cf_status;return 1;fi
-    if ! cf_policy_safe || ! cf_ssh_guard; then cf_status;return 1;fi
+    # remove-fw skips policy, scope and guard checks so uninstall works in inconsistent states.
+    # Only policy-changing actions face the SSH-client guard: apply-fw and expire
+    # re-enforce the existing policy and must work from any admin device.
+    case $cf_action in
+        sync|pause|resume) cf_policy_safe && cf_ssh_guard || { cf_status;return 1; };;
+        apply-fw|expire) cf_policy_safe || { cf_status;return 1; };;
+    esac
     if [ "$cf_action" = remove-fw ];then
         cf_remove_fw || { cf_error_record;cf_status;return 1; }
         if [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ]; then

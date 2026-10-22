@@ -586,7 +586,11 @@ cf_preflight() {
 cf_transition_identity() {
     cf_ti_save=$CF_POLICY
     CF_POLICY=$(printf '%s\n%s\n' "${CF_OLD_POLICY-}" "$CF_POLICY" | awk -F '\t' '$1=="P"&&$3!="-"{print}' | sort -u)
-    cf_policy_safe && cf_ssh_guard || { CF_POLICY=$cf_ti_save;return 1; }
+    # apply-fw and expire only re-enforce the existing policy: no SSH-client guard.
+    case ${cf_action-} in
+        apply-fw|expire) cf_policy_safe || { CF_POLICY=$cf_ti_save;return 1; };;
+        *) cf_policy_safe && cf_ssh_guard || { CF_POLICY=$cf_ti_save;return 1; };;
+    esac
     CF_UNION=$(cf_kids)
     CF_UNION_ADDRESSES=$(cf_addresses) || { CF_POLICY=$cf_ti_save;return 1; }
     CF_POLICY=$cf_ti_save
