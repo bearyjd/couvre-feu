@@ -84,6 +84,26 @@ test('CM-2: an invalid_clock refusal with no devices is not a baseline', () => {
     } finally { f.cleanup(); }
 });
 
+test('inventory_row_dropped is a non-structural warning like invalid_clock: ingests, baselines, alerts; any other code or truncation stays incomplete', () => {
+    const f = world();
+    try {
+        f.poll([dev(1)], {errors: ['inventory_row_dropped']});
+        assert.equal(f.inv.list(actor).status.baselineAt, f.now());
+        assert.equal(f.lastError(), 'inventory_warning:inventory_row_dropped');
+        f.advance(60); f.poll([dev(1), dev(2)], {errors: ['inventory_row_dropped']});
+        assert.equal(f.rows('new_device').length, 1, 'a warned poll still alerts New');
+        assert.equal(f.has(2), true);
+        f.advance(60); f.poll([dev(1), dev(2), dev(3)], {errors: ['inventory_row_dropped', 'neighbor_inspection_failed']});
+        assert.equal(f.has(3), false, 'any other code: incomplete, nothing new stored');
+        assert.equal(f.lastError(), 'inventory_incomplete:neighbor_inspection_failed');
+        f.advance(60); f.poll([dev(1), dev(2), dev(3)], {errors: ['inventory_row_dropped'], truncated: true});
+        assert.equal(f.has(3), false, 'truncated with the warning: still incomplete');
+        assert.equal(f.lastError(), 'inventory_incomplete:inventory_row_dropped');
+        f.advance(60); f.poll([dev(1), dev(2), dev(3)], {errors: ['invalid_clock', 'inventory_row_dropped'], routerTime: 0});
+        assert.equal(f.has(3), true, 'both warnings together are still complete');
+    } finally { f.cleanup(); }
+});
+
 // ---- CM-3 ----
 test('CM-3: the owning child is listed for the viewer only, never a protected count', () => {
     const f = world();
