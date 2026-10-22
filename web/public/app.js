@@ -5,7 +5,7 @@ import { createParentAlerts } from './parent-alerts.js';
 import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
 import { createAccounts } from './accounts.js';
-import { createChildren } from './children.js';
+import { createChildren, createBulk, effectText } from './children.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -21,6 +21,7 @@ const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.s
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
+const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
@@ -82,9 +83,14 @@ function deviceEvidenceLabel(device) {
   return `${source} · ${enrollment}${observed} · Activity unavailable`;
 }
 function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
-function canControl() {
-  return Boolean(state.session && state.people && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh && !unsettled() && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now());
+// Why mutating controls are unavailable right now (null = available). One source for per-person controls and the bulk panel.
+function controlBlock() {
+  if (state.offline) return 'Offline';
+  if (state.busy || unsettled()) return 'A change is already in progress';
+  const fresh = state.session && state.people && !state.refreshing && !state.needsRefresh && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now();
+  return fresh ? null : 'Status is out of date — refresh';
 }
+function canControl() { return controlBlock() === null; }
 
 function resetView() {
   state.generation++;
@@ -300,6 +306,9 @@ async function mutate(personId, action, presetSeconds) {
 const COVERAGE_REFUSALS = ['incomplete_address_coverage', 'incomplete_transition_address_coverage'];
 function operationText(operation) {
   const verb = actionVerb(operation.action);
+  // A bulk change says what is in force right now (its `effect`), in every mode; the generic fake-router text below never describes it.
+  const effect = effectText(operation, verb);
+  if (effect) return effect;
   if (isReal()) return ({
     pending: operation.dispatch === 'awaiting_automatic_dispatch' ? `${verb} pending. Waiting for automatic router confirmation.` : operation.dispatch === 'consumed' ? `${verb} pending. Waiting for the router receipt.` : `${verb} pending. Waiting for an exact operator-approved router invocation.`,
     confirmed: `${verb} confirmed by a fresh router receipt and current runtime observation. Packet behavior remains unmeasured.`,
@@ -356,6 +365,7 @@ function renderControlState() {
   const enabled = canControl();
   for (const button of document.querySelectorAll('[data-control], [data-quick-pause]')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
+  bulk.update();
   $('#refresh').disabled = state.busy || state.refreshing || state.offline;
   scheduleEditor.render();
 }
@@ -387,7 +397,7 @@ function renderPeople() {
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
       <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${person.kind === 'device_group' ? 'Device group' : isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
       <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
-      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}${device.change ? ` · ${device.change === 'adding' ? 'being added' : 'being removed'}` : ''}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
+      <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}${device.change ? ` · ${device.change === 'adding' ? 'being added' : device.change === 'moving' ? 'being moved' : 'being removed'}` : ''}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="quick-pauses" role="group" aria-label="Quick pause for ${label}">${[[900, '15'], [1800, '30'], [3600, '60']].map(([seconds, minutes]) => `<button class="button primary" type="button" data-quick-pause="${seconds}" data-person-id="${id}" data-focus-key="quick-${seconds}-${id}" aria-label="Pause ${label} for ${minutes} minutes">Pause ${minutes} min</button>`).join('')}</div>
       ${timedPause ? `<p class="remaining" role="timer" aria-label="Time remaining on ${label} timed pause">Time left: <strong data-remaining="${effectiveManual.until}"></strong></p>` : ''}
       <p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: the router policy has no allowance concept yet, so a schedule block cannot be lifted temporarily. Pausing and ending a pause work as shown.</span></p>
@@ -463,6 +473,7 @@ function render() {
   parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
   timeRequests.update();
   accounts.update();
+  bulk.update();
   children.update();
 }
 
