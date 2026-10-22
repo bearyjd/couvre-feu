@@ -21,7 +21,7 @@ const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.s
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
-const bulk = createBulk({ session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
+const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
@@ -83,9 +83,14 @@ function deviceEvidenceLabel(device) {
   return `${source} · ${enrollment}${observed} · Activity unavailable`;
 }
 function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
-function canControl() {
-  return Boolean(state.session && state.people && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh && !unsettled() && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now());
+// Why mutating controls are unavailable right now (null = available). One source for per-person controls and the bulk panel.
+function controlBlock() {
+  if (state.offline) return 'Offline';
+  if (state.busy || unsettled()) return 'A change is already in progress';
+  const fresh = state.session && state.people && !state.refreshing && !state.needsRefresh && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now();
+  return fresh ? null : 'Status is out of date — refresh';
 }
+function canControl() { return controlBlock() === null; }
 
 function resetView() {
   state.generation++;
@@ -360,6 +365,7 @@ function renderControlState() {
   const enabled = canControl();
   for (const button of document.querySelectorAll('[data-control], [data-quick-pause]')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
+  bulk.update();
   $('#refresh').disabled = state.busy || state.refreshing || state.offline;
   scheduleEditor.render();
 }

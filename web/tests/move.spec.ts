@@ -82,3 +82,12 @@ test('hostile child and device names are rendered as text in the move controls',
   await expect(panel.locator('[data-device="d_kid2"] option', { hasText: hostile })).toHaveCount(1);
   expect(await page.locator('#pwn, #pwn2').count()).toBe(0);
 });
+
+test('touch targets: the move select and buttons are at least 44px tall', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  const row = page.locator('#children-panel [data-entry="kid2"] [data-device="d_kid2"]');
+  for (const control of [row.getByLabel('Move Device kid2 to'), row.getByRole('button', { name: 'Move device Device kid2', exact: true }), row.getByRole('button', { name: /^Remove device/ })]) {
+    await control.scrollIntoViewIfNeeded();
+    expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  }
+});

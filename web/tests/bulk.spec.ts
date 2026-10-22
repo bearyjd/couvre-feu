@@ -130,3 +130,93 @@ test('the bulk panel is hidden when the account manages no child', async ({ page
   await page.getByRole('button', { name: 'Refresh status' }).click();
   await expect(page.locator('#bulk-panel')).toBeHidden();
 });
+
+// --- Review fixes: send-boundary honesty (M1) ---
+const blockAll = async (page: import('@playwright/test').Page) => {
+  const panel = page.locator('#bulk-panel');
+  await panel.getByRole('button', { name: 'Block all kids' }).click();
+  await panel.getByRole('button', { name: 'Confirm with passkey' }).click();
+};
+
+test('M1: a POST lost after it was sent says the outcome is unknown, and the immediate retry reuses the same Idempotency-Key', async ({ page, integration: f }) => {
+  const keys: (string | undefined)[] = [];
+  let attempts = 0;
+  await page.route('**/bulk/pause-all', (route) => { keys.push(route.request().headers()['idempotency-key']); return ++attempts === 1 ? route.abort('connectionreset') : route.continue(); });
+  await signIn(page, f, 'operator');
+  const status = page.locator('#bulk-panel [data-bulk-status]');
+  await blockAll(page);
+  await expect(status).toContainText('may have reached the router');
+  await expect(status).toContainText('outcome unknown');
+  await expect(status).toContainText('Check the status below before trying again');
+  await expect(status).not.toContainText('Nothing was sent');
+  await expect(page.locator('#bulk-panel').getByRole('button', { name: 'Block all kids' })).toBeEnabled();
+  await blockAll(page);
+  await expect(status).toContainText('Sent to the router');
+  expect(keys).toHaveLength(2);
+  expect(keys[0]).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+  expect(keys[1]).toBe(keys[0]);
+});
+
+test('M1: a 502 with an HTML body gets friendly unknown-outcome text, never a JSON parse message', async ({ page, integration: f }) => {
+  await page.route('**/bulk/pause-all', (route) => route.fulfill({ status: 502, contentType: 'text/html', body: '<html><body>Bad Gateway</body></html>' }));
+  await signIn(page, f, 'operator');
+  const status = page.locator('#bulk-panel [data-bulk-status]');
+  await blockAll(page);
+  await expect(status).toContainText('may have reached the router');
+  await expect(status).not.toContainText(/JSON|Unexpected|token|<html/i);
+  await expect(status).not.toContainText('Nothing was sent');
+});
+
+test('M1: a step-up refusal before any POST still says "Nothing was sent"', async ({ page, integration: f }) => {
+  const posts: string[] = [];
+  page.on('request', (r) => { if (r.method() === 'POST' && r.url().includes('/bulk/')) posts.push(r.url()); });
+  await page.route('**/step-up/options', (route) => route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'step_up_refused', message: 'Step-up is not available.' } }) }));
+  await signIn(page, f, 'operator');
+  const status = page.locator('#bulk-panel [data-bulk-status]');
+  await blockAll(page);
+  await expect(status).toContainText('Step-up is not available.');
+  await expect(status).toContainText('Nothing was sent');
+  expect(posts).toEqual([]);
+});
+
+// --- Review fixes: shared control gating (M2) ---
+const reason = (page: import('@playwright/test').Page) => page.locator('#bulk-panel [data-bulk-reason]');
+const bulkButtons = (page: import('@playwright/test').Page) => page.locator('#bulk-panel .bulk-actions button');
+
+test('M2: offline disables both bulk buttons and says why', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  await expect(bulkButtons(page).first()).toBeEnabled();
+  await page.context().setOffline(true);
+  await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+  for (const button of await bulkButtons(page).all()) await expect(button).toBeDisabled();
+  await expect(reason(page)).toHaveText('Offline');
+});
+
+test('M2: a stale snapshot disables bulk with a refresh hint', async ({ page, integration: f }) => {
+  await page.route('**/people', async (route) => {
+    const response = await route.fetch(); const body = await response.json(); body.observedAt -= 120;
+    await route.fulfill({ response, json: body });
+  });
+  await signIn(page, f, 'operator');
+  for (const button of await bulkButtons(page).all()) await expect(button).toBeDisabled();
+  await expect(reason(page)).toHaveText('Status is out of date — refresh');
+});
+
+test('M2: a per-person mutation in flight disables bulk, and it comes back afterwards', async ({ page, integration: f }) => {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/people/kid2/pause', async (route) => { await held; await route.continue(); });
+  await signIn(page, f, 'operator');
+  await expect(bulkButtons(page).first()).toBeEnabled();
+  await page.locator('[data-person="kid2"] [data-control="pause"]').click();
+  for (const button of await bulkButtons(page).all()) await expect(button).toBeDisabled();
+  await expect(reason(page)).toHaveText('A change is already in progress');
+  release();
+});
+
+test('touch targets: every bulk control is at least 44px tall', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  const panel = page.locator('#bulk-panel');
+  await panel.getByRole('button', { name: 'Block all kids' }).click();
+  for (const button of await panel.getByRole('button').all()) expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+});

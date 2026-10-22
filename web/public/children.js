@@ -18,6 +18,11 @@ export function effectText(operation, verb) {
   return `${verb}: ${lead ? `${lead} ` : ''}${effect}`;
 }
 
+// A body that is not JSON (a 502 page from a proxy, say) is null, never a raw parse error for the person to read.
+async function readJson(response) {
+  try { const body = await response.json(); return body !== null && typeof body === 'object' ? body : null; } catch { return null; }
+}
+
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
@@ -41,8 +46,8 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'X-CSRF-Token': session().csrfToken },
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(130000),
     });
-    const result = await response.json();
-    if (!response.ok) { const error = new Error(result.error?.message ?? 'The request could not be completed.'); error.status = response.status; error.code = result.error?.code; throw error; }
+    const result = await readJson(response);
+    if (!response.ok || result === null) { const error = new Error(result?.error?.message ?? 'The request could not be completed.'); error.status = response.status; error.code = result?.error?.code; throw error; }
     return result;
   }
   async function load() {
@@ -172,14 +177,15 @@ export function createChildren({ session, revisionToken, refresh, version }) {
 
 // "Block all kids" / "Unblock all": one router change for every child the signed-in account manages. Admins and parents alike.
 // The confirmation is in the page (never window.confirm), names the children, and comes before the passkey step-up.
+const UNKNOWN_OUTCOME = 'The request may have reached the router — outcome unknown. Check the status below before trying again.';
 const BULK = {
   pause_all: { path: '/bulk/pause-all', button: 'Block all kids', confirm: 'Confirm block all kids', verb: 'Block all', intro: 'Block internet for these children until you unblock them:', params: (precondition) => ({ until: 0, precondition }) },
   resume_all: { path: '/bulk/resume-all', button: 'Unblock all', confirm: 'Confirm unblock all', verb: 'Unblock all', intro: 'Lift manual blocks for these children (a schedule can still block):', params: (precondition) => ({ precondition }) },
 };
 
-export function createBulk({ session, people, revisionToken, refresh, version }) {
+export function createBulk({ gate = () => null, session, people, revisionToken, refresh, version }) {
   const root = document.querySelector('#bulk-panel');
-  let key = '', confirming = null, busy = false, notice = '', operation = null, lastVersion = null, drawn = '', focus = '';
+  let key = '', confirming = null, busy = false, notice = '', operation = null, lastVersion = null, drawn = '', focus = '', retry = null;
   const enabled = () => document.documentElement.dataset.source === 'real-router-integration' && Boolean(session()) && people().length > 0;
 
   async function call(path, body, idempotencyKey) {
@@ -188,24 +194,41 @@ export function createBulk({ session, people, revisionToken, refresh, version })
       headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'X-CSRF-Token': session().csrfToken, ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(130000),
     });
-    const result = await response.json();
-    if (!response.ok && !result.operation) throw new Error(result.error?.message ?? 'The request could not be completed.');
+    const result = await readJson(response);
+    if (result === null || !response.ok && !result.operation) {
+      // Only a readable answer below 500 is the service's own decision; anything else leaves the outcome open.
+      const error = new Error(result?.error?.message ?? 'The request could not be completed.');
+      error.definitive = result !== null && response.status < 500;
+      throw error;
+    }
     return result;
+  }
+  // One key per exact change, reused for an immediate retry after an unknown outcome so a retry cannot apply twice.
+  function keyFor(action, precondition) {
+    const signature = JSON.stringify([action, precondition, [...people()].map((p) => p.id).sort()]);
+    if (retry?.signature !== signature) retry = { signature, key: `bulk_${crypto.randomUUID().replaceAll('-', '')}` };
+    return retry.key;
   }
   async function run(action) {
     const precondition = revisionToken();
     confirming = null;
     if (busy) return;
-    if (!precondition) { notice = 'The router status is not confirmed right now, so nothing was sent. Refresh the status and try again.'; draw(); return; }
+    const blocked = gate();
+    if (blocked || !precondition) { notice = `${blocked ?? 'The router status is not confirmed right now'}, so nothing was sent. Refresh the status and try again.`; draw(); return; }
     busy = true; operation = null; notice = 'Confirm with your passkey to continue.'; draw();
     const params = BULK[action].params(precondition);
+    let posted = false;
     try {
       const start = await call('/step-up/options', { action, params });
       const response = await getPasskey(start.options);
-      const result = await call(BULK[action].path, { ...params, stepUp: { challengeId: start.challengeId, response } }, `bulk_${crypto.randomUUID().replaceAll('-', '')}`);
-      operation = result.operation; notice = '';
+      const key = keyFor(action, precondition);
+      posted = true; // from here the request may have left, whatever happens next
+      const result = await call(BULK[action].path, { ...params, stepUp: { challengeId: start.challengeId, response } }, key);
+      operation = result.operation; notice = ''; retry = null;
     } catch (error) {
-      notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : `${error.message} Nothing was sent.`;
+      if (!posted) notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : `${error.message} Nothing was sent.`;
+      else if (error.definitive) { retry = null; notice = `${error.message} The change was not made.`; }
+      else notice = UNKNOWN_OUTCOME;
     }
     busy = false; draw(); refresh();
   }
@@ -226,15 +249,18 @@ export function createBulk({ session, people, revisionToken, refresh, version })
   }
   function draw() {
     if (!enabled()) { drawn = ''; root.hidden = true; root.replaceChildren(); return; }
-    const locked = busy || revisionToken() === null;
+    const unsettled = busy || (operation && ['pending', 'unknown'].includes(operation.state));
+    const reason = (unsettled ? 'A change is already in progress' : gate()) ?? (revisionToken() === null ? 'Status is out of date — refresh' : '');
+    const locked = Boolean(reason);
     const text = operation ? effectText(operation, BULK[operation.action]?.verb ?? 'Change') ?? '' : notice;
-    const signature = JSON.stringify([locked, confirming, text, people().map((p) => p.name)]);
+    const signature = JSON.stringify([reason, confirming, text, people().map((p) => p.name)]);
     if (signature === drawn && !focus) return; // never rebuild (and drop keyboard focus) when nothing changed
     drawn = signature;
     root.replaceChildren(
       el('h2', { id: 'bulk-title' }, 'Block or unblock everything'),
       el('p', { class: 'fine-print' }, 'Applies to every child you manage, in one change. Each change needs your passkey and the router\'s confirmation. Block all lasts until you unblock.'),
       el('p', { class: 'notice', role: 'status', 'data-bulk-status': '', hidden: !text }, text),
+      el('p', { class: 'fine-print', 'data-bulk-reason': '', hidden: !reason }, reason),
       el('div', { class: 'bulk-actions' },
         ...Object.entries(BULK).map(([action, spec]) => el('button', { class: action === 'pause_all' ? 'button primary' : 'button secondary', type: 'button', disabled: locked,
           'data-action': action, onclick: () => { confirming = action; notice = ''; focus = '.bulk-confirm .button'; draw(); } }, spec.button))),
@@ -244,7 +270,7 @@ export function createBulk({ session, people, revisionToken, refresh, version })
   }
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
-    if (next !== key) { key = next; confirming = null; busy = false; notice = ''; operation = null; lastVersion = null; draw(); return; }
+    if (next !== key) { key = next; confirming = null; busy = false; notice = ''; operation = null; lastVersion = null; retry = null; draw(); return; }
     const seen = version();
     if (next && seen !== lastVersion) { lastVersion = seen; void follow(); }
     draw();
