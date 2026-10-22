@@ -7,6 +7,8 @@ const TITLES = {
   repeated_blocked_attempts: 'Repeated blocked attempts',
   time_request_pending: 'Time request waiting',
   router_scope_change: 'Router device list changed',
+  new_device: 'New device on the network',
+  inventory_stalled: 'Network inventory has not completed recently',
 };
 const SEVERITIES = ['info', 'warning', 'critical'];
 const STATES = ['open', 'acknowledged', 'resolved'];
@@ -27,6 +29,14 @@ export function alertSummary(alert) {
       const added = count(d.added), removed = count(d.removed);
       return `${added} device${added === 1 ? '' : 's'} added and ${removed} removed from the router's allowed list. ${d.matched === true ? 'A request exists.' : 'No matching request — check with the router administrator.'}`;
     }
+    case 'new_device': {
+      // Counts only: names and addresses of devices are never put in an alert.
+      const n = count(d.count);
+      return `${n} new device${n === 1 ? '' : 's'} appeared on the network.${n > 1 ? ' Review them under Devices on the network.' : ''}`;
+    }
+    case 'inventory_stalled':
+      return d.cause === 'row_cap' ? 'The router lists more devices than the inventory can keep, so some may be missing.'
+        : `No complete device scan for about ${count(d.count).toLocaleString()} minute${count(d.count) === 1 ? '' : 's'}. New devices may go unnoticed until the router answers.`;
     default: return '';
   }
 }
