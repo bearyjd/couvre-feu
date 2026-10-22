@@ -19,10 +19,12 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import unittest
@@ -988,6 +990,32 @@ class ScopeReviewFixTests(ScopeCommon, unittest.TestCase):
         ssh = dict(self.f.env, SSH_CONNECTION='192.168.1.10 40000 192.168.1.1 22', SSH_CLIENT='192.168.1.10 40000 22')
         # The SSH client is looked up once per add (cf_scope_assess); cf_ssh_guard reuses that lookup.
         self.assertEqual(neighbour_reads(NEW2, ssh) - neighbour_reads(NEW, None), 1)
+
+
+class NoAwkLibmTests(unittest.TestCase):
+    """BusyBox awk may be built without libm: `^`, `**`, sqrt/exp/log/sin/cos/atan2/rand/srand abort at parse time."""
+    LIBM = re.compile(r'[0-9A-Za-z_)]\s*\^\s*[0-9A-Za-z_(]|\*\*|(?<![\w.$-])(?:sqrt|exp|log|sin|cos|atan2|srand|rand)\s*\(')
+
+    def hits(self, root):
+        found = []
+        for path in sorted(Path(root).rglob('*')):
+            if not path.is_file():
+                continue
+            try:
+                lines = path.read_text().splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            found += [f'{path}:{n}: {line.strip()[:80]}' for n, line in enumerate(lines, 1)
+                      if not line.lstrip().startswith('#') and self.LIBM.search(line)]
+        return found
+
+    def test_router_awk_uses_no_libm_operator_or_function(self):
+        self.assertEqual(self.hits(REPO / 'router'), [])
+
+    def test_guard_flags_power_operator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'x.sh').write_text("awk 'BEGIN{span=2^(32-prefix)}'\nawk '$1~/^(a|b)$/&&$2!~/[^0-9]/{x=int(y)}'\n")
+            self.assertEqual(len(self.hits(tmp)), 1)
 
 
 class ScopeStaticTests(unittest.TestCase):

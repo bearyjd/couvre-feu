@@ -412,7 +412,7 @@ cf_scope_evidence() {
     function ip6(s){return s~/^[0-9a-f:]+$/&&length(s)<=39&&index(s,":")>0}
     function num(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
     function mac(s,a,n,i){if(length(s)!=17)return 0;n=split(s,a,":");if(n!=6)return 0;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)return 0;return index("02468ace",substr(a[1],2,1))&&s!="00:00:00:00:00:00"}
-    BEGIN{span=2^(32-prefix);net=int(num(lan)/span)}
+    BEGIN{span=1;for(sp_k=32-prefix;sp_k>0;sp_k--)span*=2;net=int(num(lan)/span)}
     $1=="L"{if(NF!=5||!mac($3)||!ip4($2)||$4!~/^(0|[1-9][0-9]*)$/||length($4)>10)next;if($4!=0&&$4+0<=now+0)next;if(int(num($2)/span)!=net)next;print "L\t" $2 "\t" $3 "\t" $4 "\t" $5;next}
     NF{ip=tolower($1);m="";st="";for(i=2;i<=NF;i++){if($i=="lladdr"&&i<NF)m=tolower($(i+1));else if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE)$/)st=$i}
         if(st!=""&&mac(m)&&(ip4(ip)||ip6(ip)))print "N\t" ip "\t" m "\t" st}')
