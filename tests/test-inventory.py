@@ -6,7 +6,10 @@ Isolated fixtures only (no SSH, Dropbear, router or packets). All MACs are ficti
 Mutation checks (each applied to a COPY of the repository, re-frozen, and required to turn this suite red):
   include protected devices; count FAILED neighbours; sort IPv4 numerically; strip instead of reject
   hostnames; take the lock; write a file; drop the guest-subnet filter; drop the size guard; emit the keys
-  in a different order.
+  in a different order; drop cf_protected_valid from admission; validate lease rows before the subnet and
+  expiry filters; ignore a protected-list read error; default the prefix to 0 when the br-lan mask is
+  missing; lose the collect error code in the subshell; drop the neighbour subnet filter; remove the
+  distinct-MAC intake cap.
 
 Golden replies (tests/fixtures/inventory-golden) are produced by this router fixture and parsed by the REAL
 service parser in shared/tests/router-inventory-golden.test.ts. Regenerate with CF_INVENTORY_GOLDEN_WRITE=1.
@@ -15,8 +18,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import time
 import unittest
 
 sys.dont_write_bytecode = True
@@ -28,7 +33,7 @@ DEVICE_KEYS = ['mac', 'ipv4', 'hostname', 'source']
 NOW = 1736204400
 GOLDEN = REPO / 'tests/fixtures/inventory-golden'
 GOLDEN_GENERATION = '5a' * 32
-BUSYBOX = Path.home() / '.local/bin/busybox'
+BUSYBOX = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')  # CI installs it on PATH
 # Raw-reply shape the service enforces before JSON.parse (shared/src/router-inventory.ts assertPlainInventoryText).
 PLAIN = re.compile(r'^[\x20-\x7e]*\n$')
 
@@ -97,6 +102,29 @@ class InventoryCommon:
 
     def by_mac(self, document):
         return {device['mac']: device for device in document['devices']}
+
+    def core_shell(self, body):
+        prelude = ('set -f;PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;umask 077;CF_LOCAL_TEST=1;CF_BASE=$CF_ROOT\n'
+                   'CF_LIB=' + str(REPO / 'router/lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
+                   'platform_entry_root_validate;platform_choose runtime "$CF_BASE"\n. "$CF_LIB/core.sh"\n'
+                   'platform_admit runtime "$CF_BASE" "$CF_LIB"\n. "$CF_LIB/rpc.sh";. "$CF_LIB/firewall.sh";. "$CF_LIB/activity.sh"\n')
+        return subprocess.run(self.f.shell + ['-c', prelude + body], env=self.f.env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=120)
+
+    def busybox_inventory(self):
+        """The real collection under BusyBox awk (the router's awk): cfctl itself needs busybox on the system PATH."""
+        if not os.access(BUSYBOX, os.X_OK):
+            self.skipTest('busybox unavailable')
+        result = self.core_shell('awk(){ %s awk "$@"; }\ncf_rpc_inventory' % BUSYBOX)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, PLAIN)
+        return json.loads(result.stdout)
+
+    def refused(self, document, code):
+        self.assertEqual(document['devices'], [])
+        self.assertIs(document['truncated'], False)
+        self.assertEqual(document['routerTime'], 0)
+        self.assertEqual(document['errors'], [code])
 
     def tree(self):
         """Every file and directory of the private root except the fake backend's own bookkeeping."""
@@ -279,6 +307,194 @@ class InventoryTests(InventoryCommon, unittest.TestCase):
         self.assertEqual(self.inventory()['errors'], [])
 
 
+class FilterOrderTests(InventoryCommon, unittest.TestCase):
+    """S1/S4: rows a LAN or guest client can induce are skipped silently; only in-scope corruption is reported."""
+
+    def test_client_induced_lease_rows_are_skipped_silently(self):
+        # dnsmasq writes hwtype-prefixed MACs for htype != 1 and keeps multicast/zero chaddr as given.
+        self.leases('0 06-02:00:00:00:00:01 192.168.8.50 guest-hw *\n'
+                    '0 01:00:5e:00:00:02 192.168.8.51 guest-mcast *\n'
+                    'never 01:00:5e:00:00:03 192.168.8.52 guest-badexpiry *\n'
+                    '{} 01:00:5e:00:00:04 192.168.1.80 expired-mcast *\n'
+                    '{} 06-02:00:00:00:00:05 192.168.1.81 expired-hw *\n'
+                    '0 06-02:00:00:00:00:06 192.168.1.82 lan-hw *\n'
+                    '0 01:00:5e:00:00:07 192.168.1.83 lan-mcast *\n'
+                    '0 00:00:00:00:00:00 192.168.1.84 lan-zero *\n'
+                    '0 02:00:00:00:00 192.168.1.85 lan-short *\n'
+                    '0 {} 192.168.1.86 good *\n'.format(NOW - 1, NOW - 5, mac(5)))
+        document = self.inventory()
+        self.assertEqual(document['errors'], [])
+        self.assertEqual(sorted(self.by_mac(document)), [KID, OTHER_KID, mac(5)])
+
+    def test_client_induced_neighbour_rows_are_skipped_silently(self):
+        self.neighbours([{'ip': '192.168.1.20', 'mac': KID}, {'ip': '192.168.1.70', 'mac': '01:00:5e:00:00:01'},
+                         {'ip': '192.168.1.71', 'mac': '00:00:00:00:00:00'}, {'ip': '192.168.1.72', 'mac': mac(7)}])
+        document = self.inventory()
+        self.assertEqual(document['errors'], [])
+        self.assertEqual(sorted(self.by_mac(document)), [KID, OTHER_KID, mac(7)])  # OTHER_KID: lease only
+
+    def test_in_scope_malformed_lease_row_is_reported_once(self):
+        self.leases('never {} 192.168.1.84 badexpiry *\n12345678901 {} 192.168.1.85 longexpiry *\n'
+                    '0 {} 192.168.1.86 good *\n'.format(mac(3), mac(4), mac(5)))
+        document = self.inventory()
+        self.assertEqual(document['errors'], ['inventory_row_dropped'])
+        self.assertEqual(sorted(self.by_mac(document)), [KID, OTHER_KID, mac(5)])
+
+    def test_single_in_scope_malformed_row_reports_exactly_one_error(self):
+        self.leases('never {} 192.168.1.84 badexpiry *\n'.format(mac(3)))
+        self.assertEqual(self.inventory()['errors'], ['inventory_row_dropped'])
+
+    def test_neighbours_outside_the_br_lan_subnet_are_not_listed(self):
+        # ARP can place any address on br-lan; only the br-lan subnet is reported, like leases.
+        self.neighbours([{'ip': '192.168.1.20', 'mac': KID}, {'ip': '192.168.8.40', 'mac': mac(8)},
+                         {'ip': '10.9.9.9', 'mac': mac(9), 'state': 'STALE'}, {'ip': '192.168.8.41', 'mac': KID}])
+        document = self.inventory()
+        self.assertEqual(document['errors'], [])
+        self.assertEqual(document['devices'], [
+            {'mac': KID, 'ipv4': ['192.168.1.20'], 'hostname': 'fixture', 'source': 'both'},
+            {'mac': OTHER_KID, 'ipv4': ['192.168.1.22'], 'hostname': 'fixture2', 'source': 'lease'}])
+
+    def setUp(self):
+        super().setUp()
+        self.leases('0 {} 192.168.1.20 fixture *\n0 {} 192.168.1.22 fixture2 *\n'.format(KID, OTHER_KID))
+
+    def test_double_space_and_nul_rows_never_forge_a_lease(self):
+        # BusyBox awk ends a record at NUL: the bytes after it would otherwise parse as a lease row of their own.
+        # The row holding the NUL is dnsmasq's own: it stays, with its now ambiguous hostname null.
+        self.leases(b'0 ' + mac(401).encode() + b' 192.168.1.5 ok\x000 ' + mac(402).encode() + b' 192.168.1.6 forged *\n'
+                    b'0  ' + mac(403).encode() + b' 192.168.1.7 spaced *\n')
+        for runtime, document in (('awk', self.inventory()), ('busybox', self.busybox_inventory())):
+            with self.subTest(runtime=runtime):
+                self.nul_checks(document)
+
+    def nul_checks(self, document):
+        found = self.by_mac(document)
+        self.assertNotIn(mac(402), found)
+        self.assertNotIn(mac(403), found)
+        self.assertNotIn('forged', json.dumps(document))
+        self.assertEqual(found[mac(401)], {'mac': mac(401), 'ipv4': ['192.168.1.5'], 'hostname': None, 'source': 'lease'})
+        self.assertEqual(sorted(found), [KID, OTHER_KID, mac(401)])
+
+
+class ProtectedListTests(InventoryCommon, unittest.TestCase):
+    """S2: the protected list fails closed at admission AND when it changes before collection."""
+
+    def setUp(self):
+        super().setUp()
+        self.protected = self.f.root / 'etc/couvrefeu/protected'
+        self.content = self.protected.read_bytes()
+
+    def restore(self):
+        self.protected.unlink(missing_ok=True)
+        self.protected.write_bytes(self.content)
+        self.protected.chmod(0o600)
+
+    def test_admission_refuses_every_unsafe_protected_file(self):
+        target = self.f.root / 'protected-copy'
+        cases = [('missing', lambda: self.protected.unlink(), 'unsafe_protected_file'),
+                 ('symlink', lambda: (target.write_bytes(self.content), target.chmod(0o600), self.protected.unlink(),
+                                      self.protected.symlink_to(target)), 'unsafe_protected_file'),
+                 ('invalid', lambda: self.protected.write_text('garbage\n'), 'invalid_protected_mac'),
+                 ('empty', lambda: self.protected.write_bytes(b''), 'unsafe_protected_file')]
+        if os.geteuid() != 0:
+            cases.append(('unreadable', lambda: self.protected.chmod(0), 'unsafe_protected_file'))
+        for name, damage, code in cases:
+            with self.subTest(name=name):
+                damage()
+                try:
+                    self.refused(self.inventory(code=1), code)
+                finally:
+                    self.restore()
+                self.assertEqual(self.inventory()['errors'], [])
+
+    def test_protected_list_changed_after_admission_fails_closed(self):
+        # cf_network runs after admission, inside collection: damage the list there (the race).
+        stub = ('cf_network(){ %s;CF_LAN_IP=192.168.1.1;cf_addr4="2: br-lan    inet 192.168.1.1/24 scope global br-lan"; }\n'
+                'cf_rpc_inventory')
+        cases = [('missing', 'rm -f "$CF_PROTECTED"', 'inventory_protected_unreadable'),
+                 ('invalid', 'printf "garbage\\n" >"$CF_PROTECTED"', 'inventory_protected_unreadable'),
+                 ('empty', ': >"$CF_PROTECTED"', 'inventory_protected_empty')]
+        if os.geteuid() != 0:
+            cases.append(('unreadable', 'chmod 000 "$CF_PROTECTED"', 'inventory_protected_unreadable'))
+        for name, damage, code in cases:
+            with self.subTest(name=name):
+                result = self.core_shell(stub % damage)
+                self.restore()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertRegex(result.stdout, PLAIN)
+                document = json.loads(result.stdout)
+                self.assertEqual(list(document), KEYS)
+                self.refused(document, code)
+                self.assertNotIn(PROTECTED, result.stdout)
+
+
+class NetworkRefusalTests(InventoryCommon, unittest.TestCase):
+    """S3/C1: br-lan subnet and source failures name their code and never yield an unfiltered listing."""
+
+    def setUp(self):
+        super().setUp()
+        self.generation()
+        self.leases('0 {} 192.168.1.20 fixture *\n0 {} 192.168.8.50 guest *\n0 {} 10.0.0.9 other *\n'
+                    .format(KID, mac(301), mac(302)))
+
+    def addresses(self, *rows):
+        self.f.update_backend(addresses4=list(rows))
+
+    def test_br_lan_address_shapes_that_are_refused(self):
+        cases = [('no mask', ['2: br-lan    inet 192.168.1.1 scope global br-lan'], 'lan_address_mismatch'),
+                 ('ipv6 only', [], 'lan_address_mismatch'),
+                 ('below /8', ['2: br-lan    inet 192.168.1.1/7 scope global br-lan'], 'lan_address_mismatch'),
+                 ('other address only', ['2: br-lan    inet 10.0.0.1/8 scope global br-lan'], 'lan_address_mismatch')]
+        for name, rows, code in cases:
+            with self.subTest(name=name):
+                self.addresses(*rows)
+                self.refused(self.inventory(code=1), code)
+
+    def test_host_prefix_lists_nothing_outside_the_router_address(self):
+        self.addresses('2: br-lan    inet 192.168.1.1/32 scope global br-lan')
+        document = self.inventory()
+        self.assertEqual((document['devices'], document['errors'], document['truncated']), ([], [], False))
+
+    def test_two_br_lan_addresses_use_the_lan_entry_in_either_order(self):
+        lan, other = '2: br-lan    inet 192.168.1.1/24 scope global br-lan', '2: br-lan    inet 10.0.0.1/8 scope global br-lan'
+        for rows in ((lan, other), (other, lan)):
+            with self.subTest(rows=rows):
+                self.addresses(*rows)
+                document = self.inventory()
+                self.assertEqual(sorted(self.by_mac(document)), [KID, OTHER_KID])
+                self.assertEqual(document['errors'], [])
+
+    def test_address_inspection_failure_names_its_code(self):
+        self.f.update_backend(failures=[{'command': 'ip', 'contains': ['-4', 'addr'], 'remaining': 100}])
+        self.refused(self.inventory(code=1), 'lan_inspection_failed')
+
+    def test_neighbour_inspection_failure_keeps_filtered_leases(self):
+        self.f.update_backend(failures=[{'command': 'ip', 'contains': ['-4', 'neigh'], 'remaining': 100}])
+        document = self.inventory()
+        self.assertEqual(document['errors'], ['neighbor_inspection_failed'])
+        self.assertEqual(document['devices'], [{'mac': KID, 'ipv4': ['192.168.1.20'], 'hostname': 'fixture', 'source': 'lease'}])
+
+    def test_lease_file_symlink_or_unreadable_keeps_filtered_neighbours(self):
+        path = self.f.root / 'tmp/dhcp.leases'
+        target = self.f.root / 'tmp/leases-target'
+        path.rename(target)
+        path.symlink_to(target)
+        cases = [('symlink', None)]
+        if os.geteuid() != 0:
+            cases.append(('unreadable', lambda: (path.unlink(), target.rename(path), path.chmod(0))))
+        self.neighbours([{'ip': '192.168.1.20', 'mac': KID}, {'ip': '192.168.8.40', 'mac': mac(8)}])
+        for name, damage in cases:
+            with self.subTest(name=name):
+                if damage:
+                    damage()
+                result = self.f.run('rpc-inventory', '--json')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for leak in ('Permission', 'denied', 'awk', 'tr:', 'dhcp.leases', 'No such'):
+                    self.assertNotIn(leak, result.stdout)
+                document = json.loads(result.stdout)
+                self.assertEqual(document['errors'], ['lease_inspection_failed'])
+                self.assertEqual(document['devices'], [{'mac': KID, 'ipv4': ['192.168.1.20'], 'hostname': None, 'source': 'neigh'}])
+
 class NotInstalledTests(unittest.TestCase):
     def test_not_installed_refusal(self):
         fixture = RouterFixture()
@@ -299,7 +515,7 @@ class TruncationTests(InventoryCommon, unittest.TestCase):
     def install(self, *floor):
         super().install(KID, HIGH_KID)
 
-    def test_cap_keeps_kids_then_neighbours_then_lowest_macs_as_whole_devices(self):
+    def enrol_high_kid(self):
         # Enrolment needs the kid attached; it is lease-only afterwards.
         self.neighbours(self.f.backend()['neighbors'] + [{'ip': '192.168.1.250', 'mac': HIGH_KID}])
         status = json.loads(self.f.run('rpc-status', '--json').stdout)
@@ -310,6 +526,9 @@ class TruncationTests(InventoryCommon, unittest.TestCase):
                        policy=document)
         result = self.f.run('rpc-sync', document=request)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cap_keeps_kids_then_neighbours_then_lowest_macs_as_whole_devices(self):
+        self.enrol_high_kid()
         # 300 lease-only devices, 10 neighbour-only devices with the HIGHEST MACs, and the kid (lease-only, high MAC).
         lease_macs = [mac(256 + n) for n in range(300)]
         neigh_macs = [mac(60000 + n) for n in range(10)]
@@ -328,15 +547,25 @@ class TruncationTests(InventoryCommon, unittest.TestCase):
         self.assertTrue(all(len(found[m]['ipv4']) == 1 for m in macs))
 
 
-class SizeGuardTests(InventoryCommon, unittest.TestCase):
-    def core_shell(self, body):
-        prelude = ('set -f;PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;umask 077;CF_LOCAL_TEST=1;CF_BASE=$CF_ROOT\n'
-                   'CF_LIB=' + str(REPO / 'router/lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
-                   'platform_entry_root_validate;platform_choose runtime "$CF_BASE"\n. "$CF_LIB/core.sh"\n'
-                   'platform_admit runtime "$CF_BASE" "$CF_LIB"\n. "$CF_LIB/rpc.sh";. "$CF_LIB/firewall.sh";. "$CF_LIB/activity.sh"\n')
-        return subprocess.run(self.f.shell + ['-c', prelude + body], env=self.f.env, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=120)
+    def test_distinct_mac_intake_is_capped_and_kids_still_kept(self):
+        # A lease flood: 4096 distinct high MACs first, then 1904 LOWER MACs, then the lease-only kid. Intake stops
+        # at 4096 distinct MACs (kids exempt), so the lower late MACs are never seen and the kid is still kept.
+        self.enrol_high_kid()
+        self.neighbours([])
+        first = [mac(10000 + n) for n in range(4096)]
+        late = [mac(256 + n) for n in range(1904)]
+        self.leases(''.join('0 {} 192.168.1.{} f{} *\n'.format(m, 2 + n % 200, n) for n, m in enumerate(first + late))
+                    + '0 {} 192.168.1.250 kid *\n'.format(HIGH_KID))
+        for runtime, run in (('awk', self.inventory), ('busybox', self.busybox_inventory)):
+            with self.subTest(runtime=runtime):
+                started = time.monotonic()
+                inventory = run()
+                print('\n[flood] {} 6001 lease rows: {:.2f}s'.format(runtime, time.monotonic() - started), file=sys.stderr)
+                self.assertIs(inventory['truncated'], True)
+                self.assertEqual(inventory['errors'], [])
+                self.assertEqual([d['mac'] for d in inventory['devices']], c_sorted([HIGH_KID] + first[:255]))
 
+class SizeGuardTests(InventoryCommon, unittest.TestCase):
     def test_byte_guard_drops_whole_trailing_devices_and_sets_truncated(self):
         self.leases(''.join('0 {} 192.168.1.{} host-{} *\n'.format(mac(256 + n), 2 + n, n) for n in range(40)))
         full = self.inventory()
@@ -432,7 +661,7 @@ class GoldenTests(InventoryCommon, unittest.TestCase):
         elif name == 'invalid-clock':
             return dict(self.f.env, CF_NOW='0'), 0
         elif name == 'dropped-row':
-            self.leases('0 01:00:5e:00:00:01 192.168.1.80 multicast *\n0 {} 192.168.1.20 fixture *\n'.format(KID))
+            self.leases('never {} 192.168.1.80 badexpiry *\n0 {} 192.168.1.20 fixture *\n'.format(mac(3), KID))
         elif name == 'truncated':
             self.leases(''.join('0 {} 192.168.1.{} h{} *\n'.format(mac(256 + n), 2 + n % 200, n) for n in range(300)))
         elif name == 'refusal':

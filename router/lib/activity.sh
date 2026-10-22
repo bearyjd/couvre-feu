@@ -272,6 +272,8 @@ cf_rpc_activity() {
 CF_INVENTORY_MAX_DEVICES=256
 # The reply (with its newline) stays strictly below the transport stdout cap.
 CF_INVENTORY_MAX_BYTES=131072
+# Distinct MACs taken in per poll (kid MACs exempt): bounds time and memory under a lease or ARP flood.
+CF_INVENTORY_MAX_INTAKE=4096
 cf_inventory_refuse() {
     cf_ir_generation=$CF_GENERATION
     case $cf_ir_generation in *[!0-9a-f]*|'') cf_ir_generation=0000000000000000000000000000000000000000000000000000000000000000;; esac
@@ -283,92 +285,110 @@ cf_inventory_refuse() {
     printf '{"inventory_version":1,"generation":"%s","routerTime":0,"devices":[],"truncated":false,"errors":["%s"]}\n' "$cf_ir_generation" "$cf_ir_code"
     return 1
 }
-# Read-only: no lock, no runtime writes, no kernel mutation. Sources are br-lan neighbours in a live
-# state and unexpired dnsmasq leases inside the br-lan IPv4 subnet; protected MACs are never listed.
+# One tagged input row per line: P protected MAC, X protected list unreadable, K kid MAC, N `ip -4 neigh`
+# row, L raw dnsmasq lease row (tabs kept). Rows are scoped (br-lan subnet, then lease expiry) BEFORE
+# they are validated, so whatever a LAN or guest client can make dnsmasq or the kernel write is skipped
+# silently; inventory_row_dropped reports only an in-scope row whose address or expiry field is malformed,
+# which dnsmasq and ip never write. Exit 3: protected list unreadable or invalid; 4: protected list empty.
+# shellcheck disable=SC2016
+CF_INVENTORY_AWK='
+# Copy of cf_mac_valid (parity-tested in tests/test-inventory.py).
+function mac(s,a,n,i){if(length(s)!=17)return 0;n=split(s,a,":");if(n!=6)return 0;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)return 0;return index("02468ace",substr(a[1],2,1))&&s!="00:00:00:00:00:00"}
+# Same rule as cf_hostname_sanitise (reject, never strip); "" means null.
+function hname(s){if(s!~/^[A-Za-z0-9][A-Za-z0-9._-]*$/||length(s)>63)return "";return s}
+# Same ip4 and num as cf_scope_evidence (core.sh).
+function ip4(s,a,n,i){n=split(s,a,".");if(n!=4)return 0;for(i=1;i<=4;i++)if(a[i]!~/^(0|[1-9][0-9]*)$/||length(a[i])>3||a[i]+0>255)return 0;return 1}
+function num(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
+function lan(s){return int(num(s)/span)==net}
+# C-locale (byte) order without sort(1) or awk string collation: rank each character by its
+# position in RANK, which lists the reply alphabet in ASCII order; a proper prefix sorts first.
+function lt(a,b,i,n,m,x,y){n=length(a);m=length(b);for(i=1;i<=n&&i<=m;i++){x=index(RANK,substr(a,i,1));y=index(RANK,substr(b,i,1));if(x!=y)return x<y}return n<m}
+function err(c){if(!(c in eseen)&&ne<16){eseen[c]=1;elist[++ne]=c}}
+# Up to four distinct addresses per MAC, kept in C order by insertion.
+function addip(m,ip,k,i){k=nip[m]+0;for(i=1;i<=k;i++)if(ipl[m,i]==ip)return
+    if(k==4){if(!lt(ip,ipl[m,4]))return;k=3}
+    for(i=k;i>=1&&lt(ip,ipl[m,i]);i--)ipl[m,i+1]=ipl[m,i]
+    ipl[m,i+1]=ip;nip[m]=k+1}
+# Admit a MAC; past the intake cap only kids (stream order puts neighbours before leases) are admitted.
+function see(m){if(m in dev)return 1;if(nd>=maxin+0&&!(m in kid)){capped=1;return 0}dev[m]=1;order[++nd]=m;return 1}
+BEGIN{RANK=".0123456789:abcdef";span=2^(32-prefix);net=int(num(lan_ip)/span);n=split(errors,a," ");for(i=1;i<=n;i++)err(a[i])}
+{t=substr($0,1,2);line=substr($0,3)}
+t=="P "{if(!mac(line))bad=1;prot[line]=1;np++;next}
+t=="X "{bad=1;next}
+t=="K "{kid[line]=1;next}
+t=="N "{n=split(line,f," ");ip=f[1];m="";st="";d=""
+    for(i=2;i<=n;i++){if(f[i]=="dev"&&i<n)d=f[++i];else if(f[i]=="lladdr"&&i<n)m=tolower(f[++i]);else if(f[i]~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE)$/)st=f[i]}
+    if((d!=""&&d!="br-lan")||st!~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE)$/)next
+    if(!ip4(ip)){err("inventory_row_dropped");next}
+    # Off-subnet (ARP can claim any address) or a multicast/zero lladdr: not a br-lan device.
+    if(!lan(ip)||!mac(m)||(m in prot)||!see(m))next
+    neigh[m]=1;addip(m,ip);next}
+t=="L "{n=split(line,f,"[ ]");if(line==""||f[1]=="duid")next
+    # IPv6 lease; also a double-spaced row, whose third field is then the MAC.
+    if(n>=3&&index(f[3],":"))next
+    if(n<4||!ip4(f[3])){err("inventory_row_dropped");next}
+    if(!lan(f[3]))next
+    if(f[1]!~/^(0|[1-9][0-9]*)$/||length(f[1])>10){err("inventory_row_dropped");next}
+    # An invalid clock (now=0) keeps expired leases, as cf_scope_evidence does.
+    if(now>0&&f[1]!="0"&&f[1]+0<=now+0)next
+    # A hwtype-prefixed (htype != 1), short, multicast or zero chaddr is never a manageable br-lan device.
+    m=tolower(f[2]);if(!mac(m)||(m in prot)||!see(m))next
+    lease[m]=1;addip(m,f[3])
+    # dnsmasq writes five fields; with more, the hostname is ambiguous and stays null.
+    if(!(m in name)&&n<=5){h=hname(f[4]);if(h!="")name[m]=h}
+    next}
+END{
+    if(bad)exit 3
+    if(np<1)exit 4
+    # Merge sort of the MACs (ascending C order).
+    for(i=1;i<=nd;i++)s[i]=order[i]
+    for(w=1;w<nd;w*=2){for(lo=1;lo<=nd;lo+=2*w){mid=lo+w;hi=lo+2*w;if(mid>nd+1)mid=nd+1;if(hi>nd+1)hi=nd+1;i=lo;j=mid;k=lo
+        while(i<mid&&j<hi){if(lt(s[j],s[i]))tmp[k++]=s[j++];else tmp[k++]=s[i++]}
+        while(i<mid)tmp[k++]=s[i++];while(j<hi)tmp[k++]=s[j++]}
+        for(i=1;i<=nd;i++)s[i]=tmp[i]}
+    head="{\"inventory_version\":1,\"generation\":\"" generation "\",\"routerTime\":" now ",\"devices\":["
+    tailerr="";for(i=1;i<=ne;i++){sep=(i>1?",":"");tailerr=tailerr sep "\"" elist[i] "\""}
+    # Sized with "false" (the longer literal) so the guard holds whatever truncated becomes.
+    total=length(head)+length("],\"truncated\":false,\"errors\":[" tailerr "]}")+1
+    for(i=1;i<=nd;i++){m=s[i];e="{\"mac\":\"" m "\",\"ipv4\":[";for(k=1;k<=nip[m];k++){sep=(k>1?",":"");e=e sep "\"" ipl[m,k] "\""}
+        e=e "],\"hostname\":" ((m in name)?"\"" name[m] "\"":"null") ",\"source\":\"" ((m in neigh)?((m in lease)?"both":"neigh"):"lease") "\"}";enc[m]=e}
+    # Keep whole devices: kids, then neighbour-present, then lease-only; each tier in MAC order.
+    # The byte guard is defensive: 256 devices x 4 addresses stay far below maxbytes.
+    full=0;kept=0;trunc=capped+0
+    for(tier=0;tier<3&&!full;tier++)for(i=1;i<=nd&&!full;i++){m=s[i]
+        if((tier==0)!=(m in kid)||(tier==1&&!(m in neigh))||(tier==2&&(m in neigh)))continue
+        if(kept>=maxdev+0||total+length(enc[m])+(kept?1:0)>=maxbytes+0){full=1;trunc=1;break}
+        total+=length(enc[m])+(kept?1:0);keep[m]=1;kept++}
+    printf "%s",head;c=0
+    for(i=1;i<=nd;i++)if(s[i] in keep)printf "%s%s",(c++?",":""),enc[s[i]]
+    printf "],\"truncated\":%s,\"errors\":[%s]}\n",(trunc?"true":"false"),tailerr
+}'
+# Read-only: no lock, no runtime writes, no kernel mutation. Sources are live br-lan neighbours and
+# unexpired dnsmasq leases, both inside the br-lan IPv4 subnet; protected MACs are never listed.
+# Runs in a command substitution, so a failure prints ONLY its error code for the caller's refusal.
 cf_inventory_collect() {
     cf_iv_errors=
     cf_iv_now=0
     if cf_clock;then cf_iv_now=$CF_NOW_VALUE;else cf_iv_errors="$cf_iv_errors invalid_clock";fi
-    cf_network || return 1
-    # Same br-lan prefix derivation as cf_scope_evidence: the inet entry carrying CF_LAN_IP.
-    # shellcheck disable=SC2154
-    cf_iv_prefix=$(printf '%s\n' "$cf_addr4" | awk -v ip="$CF_LAN_IP" '{for(i=1;i<NF;i++)if($i=="inet"){split($(i+1),a,"/");if(a[1]==ip&&a[2]~/^[0-9]+$/&&a[2]+0>=8&&a[2]+0<=32){print a[2]+0;exit}}}')
-    [ -n "$cf_iv_prefix" ] || { cf_fail lan_address_mismatch;return 1; }
+    cf_network && cf_lan_prefix || { printf '%s\n' "$CF_ERROR";return 1; }
     cf_iv_neigh=$(cf_backend ip -4 neigh show dev br-lan) || { cf_iv_neigh=;cf_iv_errors="$cf_iv_errors neighbor_inspection_failed"; }
-    cf_iv_leases=/dev/null
-    if [ -e "$CF_BASE/tmp/dhcp.leases" ] || [ -L "$CF_BASE/tmp/dhcp.leases" ];then
-        if [ -f "$CF_BASE/tmp/dhcp.leases" ] && [ ! -L "$CF_BASE/tmp/dhcp.leases" ];then cf_iv_leases=$CF_BASE/tmp/dhcp.leases
-        else cf_iv_errors="$cf_iv_errors lease_inspection_failed";fi
+    # NUL becomes \001, which every field rule rejects: BusyBox awk would end the record at a NUL and
+    # parse the rest of the line as a lease row of its own. Read errors stay out of the reply.
+    cf_iv_leases=
+    cf_iv_file=$CF_BASE/tmp/dhcp.leases
+    if [ -e "$cf_iv_file" ] || [ -L "$cf_iv_file" ];then
+        if [ -f "$cf_iv_file" ] && [ ! -L "$cf_iv_file" ] && cf_iv_leases=$(tr '\000' '\001' 2>/dev/null <"$cf_iv_file");then :
+        else cf_iv_leases=;cf_iv_errors="$cf_iv_errors lease_inspection_failed";fi
     fi
-    # One tagged stream: P protected, K kid (assigned), N neighbour, L lease (raw line, tabs kept).
     {
-        awk '{print "P " $0}' "$CF_PROTECTED"
+        awk '{print "P " $0}' "$CF_PROTECTED" || printf '%s\n' 'X unreadable'
         printf '%s\n' "$CF_POLICY" | awk -F '\t' '$1=="P"&&$3!="-"{print "K " $3}'
         printf '%s\n' "$cf_iv_neigh" | awk 'NF{print "N " $0}'
-        awk '{print "L " $0}' "$cf_iv_leases" || printf '%s\n' 'E lease_inspection_failed'
-    } | awk -v now="$cf_iv_now" -v lan="$CF_LAN_IP" -v prefix="$cf_iv_prefix" -v generation="$CF_GENERATION" -v errors="$cf_iv_errors" \
-        -v maxdev="$CF_INVENTORY_MAX_DEVICES" -v maxbytes="$CF_INVENTORY_MAX_BYTES" '
-    # Copy of cf_mac_valid (parity-tested in tests/test-inventory.py).
-    function mac(s,a,n,i){if(length(s)!=17)return 0;n=split(s,a,":");if(n!=6)return 0;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)return 0;return index("02468ace",substr(a[1],2,1))&&s!="00:00:00:00:00:00"}
-    # Same rule as cf_hostname_sanitise (reject, never strip); "" means null.
-    function hname(s){if(s!~/^[A-Za-z0-9][A-Za-z0-9._-]*$/||length(s)>63)return "";return s}
-    function ip4(s,a,n,i){n=split(s,a,".");if(n!=4)return 0;for(i=1;i<=4;i++)if(a[i]!~/^(0|[1-9][0-9]*)$/||length(a[i])>3||a[i]+0>255)return 0;return 1}
-    function num(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
-    # C-locale (byte) order without sort(1) or awk string collation: rank each character by its
-    # position in RANK, which lists the reply alphabet in ASCII order; a proper prefix sorts first.
-    function lt(a,b,i,n,m,x,y){n=length(a);m=length(b);for(i=1;i<=n&&i<=m;i++){x=index(RANK,substr(a,i,1));y=index(RANK,substr(b,i,1));if(x!=y)return x<y}return n<m}
-    function err(c){if(!(c in eseen)&&ne<16){eseen[c]=1;elist[++ne]=c}}
-    # Up to four distinct addresses per MAC, kept in C order by insertion.
-    function addip(m,ip,k,i){k=nip[m]+0;for(i=1;i<=k;i++)if(ipl[m,i]==ip)return
-        if(k==4){if(!lt(ip,ipl[m,4]))return;k=3}
-        for(i=k;i>=1&&lt(ip,ipl[m,i]);i--)ipl[m,i+1]=ipl[m,i]
-        ipl[m,i+1]=ip;nip[m]=k+1}
-    function see(m){if(!(m in dev)){dev[m]=1;order[++nd]=m}}
-    BEGIN{RANK=".0123456789:abcdef";span=2^(32-prefix);net=int(num(lan)/span);n=split(errors,a," ");for(i=1;i<=n;i++)err(a[i])}
-    {t=substr($0,1,2);line=substr($0,3)}
-    t=="P "{prot[line]=1;next}
-    t=="K "{kid[line]=1;next}
-    t=="E "{err(line);next}
-    t=="N "{n=split(line,f," ");ip=f[1];m="";st="";d=""
-        for(i=2;i<=n;i++){if(f[i]=="dev"&&i<n)d=f[++i];else if(f[i]=="lladdr"&&i<n)m=tolower(f[++i]);else if(f[i]~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE)$/)st=f[i]}
-        if((d!=""&&d!="br-lan")||st!~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE)$/)next
-        if(!mac(m)||!ip4(ip)){err("inventory_row_dropped");next}
-        if(m in prot)next
-        see(m);neigh[m]=1;addip(m,ip);next}
-    t=="L "{n=split(line,f,"[ ]");if(line==""||f[1]=="duid")next
-        if(n>=3&&index(f[3],":"))next
-        if(n<4){err("inventory_row_dropped");next}
-        m=tolower(f[2]);ip=f[3]
-        if(!mac(m)||!ip4(ip)||f[1]!~/^(0|[1-9][0-9]*)$/||length(f[1])>10){err("inventory_row_dropped");next}
-        if(now>0&&f[1]!="0"&&f[1]+0<=now+0)next
-        if(int(num(ip)/span)!=net)next
-        if(m in prot)next
-        see(m);lease[m]=1;addip(m,ip)
-        if(!(m in name)&&n<=5){h=hname(f[4]);if(h!="")name[m]=h}
-        next}
-    END{
-        # Merge sort of the MACs (ascending C order).
-        for(i=1;i<=nd;i++)s[i]=order[i]
-        for(w=1;w<nd;w*=2){for(lo=1;lo<=nd;lo+=2*w){mid=lo+w;hi=lo+2*w;if(mid>nd+1)mid=nd+1;if(hi>nd+1)hi=nd+1;i=lo;j=mid;k=lo
-            while(i<mid&&j<hi){if(lt(s[j],s[i]))tmp[k++]=s[j++];else tmp[k++]=s[i++]}
-            while(i<mid)tmp[k++]=s[i++];while(j<hi)tmp[k++]=s[j++]}
-            for(i=1;i<=nd;i++)s[i]=tmp[i]}
-        head="{\"inventory_version\":1,\"generation\":\"" generation "\",\"routerTime\":" now ",\"devices\":["
-        tailerr="";for(i=1;i<=ne;i++){sep=(i>1?",":"");tailerr=tailerr sep "\"" elist[i] "\""}
-        # Sized with "false" (the longer literal) so the guard holds whatever truncated becomes.
-        total=length(head)+length("],\"truncated\":false,\"errors\":[" tailerr "]}")+1
-        for(i=1;i<=nd;i++){m=s[i];e="{\"mac\":\"" m "\",\"ipv4\":[";for(k=1;k<=nip[m];k++){sep=(k>1?",":"");e=e sep "\"" ipl[m,k] "\""}
-            e=e "],\"hostname\":" ((m in name)?"\"" name[m] "\"":"null") ",\"source\":\"" ((m in neigh)?((m in lease)?"both":"neigh"):"lease") "\"}";enc[m]=e}
-        # Keep whole devices: kids, then neighbour-present, then lease-only; each tier in MAC order.
-        full=0;kept=0;trunc=0
-        for(tier=0;tier<3&&!full;tier++)for(i=1;i<=nd&&!full;i++){m=s[i]
-            if((tier==0)!=(m in kid)||(tier==1&&!(m in neigh))||(tier==2&&(m in neigh)))continue
-            if(kept>=maxdev+0||total+length(enc[m])+(kept?1:0)>=maxbytes+0){full=1;trunc=1;break}
-            total+=length(enc[m])+(kept?1:0);keep[m]=1;kept++}
-        printf "%s",head;c=0
-        for(i=1;i<=nd;i++)if(s[i] in keep)printf "%s%s",(c++?",":""),enc[s[i]]
-        printf "],\"truncated\":%s,\"errors\":[%s]}\n",(trunc?"true":"false"),tailerr
-    }'
+        printf '%s\n' "$cf_iv_leases" | awk '{print "L " $0}'
+    } | awk -v now="$cf_iv_now" -v lan_ip="$CF_LAN_IP" -v prefix="$CF_LAN_PREFIX" -v generation="$CF_GENERATION" -v errors="$cf_iv_errors" \
+        -v maxdev="$CF_INVENTORY_MAX_DEVICES" -v maxbytes="$CF_INVENTORY_MAX_BYTES" -v maxin="$CF_INVENTORY_MAX_INTAKE" "$CF_INVENTORY_AWK" && return 0
+    case $? in 3)printf '%s\n' inventory_protected_unreadable;;4)printf '%s\n' inventory_protected_empty;;*)printf '%s\n' inventory_unavailable;;esac
+    return 1
 }
 cf_rpc_inventory() {
     # Same admission as rpc-activity (install gate, ready+complete generation, single-read scope
@@ -377,6 +397,6 @@ cf_rpc_inventory() {
     cf_install_gate rpc-inventory && cf_control_dirs && cf_state_load || { cf_inventory_refuse;return 1; }
     [ -n "$CF_GENERATION" ] || { cf_fail rpc_disabled;cf_inventory_refuse;return 1; }
     cf_private_dir "$CF_RUNTIME" && cf_protected_valid && cf_policy_safe || { cf_inventory_refuse;return 1; }
-    cf_ri_json=$(cf_inventory_collect) || { cf_inventory_refuse;return 1; }
+    cf_ri_json=$(cf_inventory_collect) || { CF_ERROR=$cf_ri_json;cf_inventory_refuse;return 1; }
     printf '%s\n' "$cf_ri_json"
 }
