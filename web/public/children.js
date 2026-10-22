@@ -158,6 +158,8 @@ export function createChildren({ session, revisionToken, refresh, version }) {
   function draw() {
     if (!enabled() || !data) { root.hidden = true; root.replaceChildren(); return; }
     if (root.contains(document.activeElement) && document.activeElement.matches('input, select')) return; // never rebuild while typing
+    const open = prefill && root.querySelector(`[data-add-device="${CSS.escape(prefill.id)}"]`);
+    if (open && !focusPrefill) prefill = { ...prefill, label: open.elements.label.value, mac: open.elements.mac.value }; // keep what the parent typed over the original prefill
     root.replaceChildren(
       el('h2', { id: 'children-title' }, 'Children and device groups'),
       el('p', { class: 'fine-print' }, `Adults' protected devices can never be added. The router holds at most ${data.limits.children} entries, ${data.limits.devicesPerChild} devices each and ${data.limits.devices} in total; every device must be in its installed allow list. Each change needs your passkey and a router confirmation.`),
@@ -182,6 +184,7 @@ export function createChildren({ session, revisionToken, refresh, version }) {
     draw();
     return true;
   }
+  function clearPrefill() { if (prefill) { prefill = null; draw(); } }
   const entries = () => (data?.children ?? []).map((c) => ({ id: c.id, name: c.name }));
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
@@ -190,7 +193,7 @@ export function createChildren({ session, revisionToken, refresh, version }) {
     const seen = version();
     if (next && seen !== lastVersion) { lastVersion = seen; void load(); }
   }
-  return { update, load, startAdd, entries };
+  return { update, load, startAdd, clearPrefill, entries };
 }
 
 // "Block all kids" / "Unblock all": one router change for every child the signed-in account manages. Admins and parents alike.
@@ -302,8 +305,10 @@ export function createBulk({ gate = () => null, session, people, revisionToken, 
 const STALL_SECONDS = 1800;
 const FLAGS = [['new', 'New'], ['private', 'Private address'], ['unassigned', 'Unassigned']];
 const PRIVATE_HINT = 'may rotate — set a fixed Wi-Fi address on this device';
-const REFRESH_FAILURES = { inventory_dispatch_disabled: 'Inventory polling is off until router dispatch is enabled', inventory_refresh_rate_limited: 'Try again in a few seconds' };
-const REFRESH_STATUS = { 409: REFRESH_FAILURES.inventory_dispatch_disabled, 429: REFRESH_FAILURES.inventory_refresh_rate_limited };
+const DISPATCH_OFF = 'Inventory polling is off until router dispatch is enabled', RATE_LIMITED = 'Try again in a few seconds';
+const REFRESH_FAILURES = new Map([['inventory_dispatch_disabled', DISPATCH_OFF], ['inventory_refresh_rate_limited', RATE_LIMITED]]); // a Map: a code like "constructor" finds nothing
+const REFRESH_STATUS = new Map([[409, DISPATCH_OFF], [429, RATE_LIMITED]]);
+const NOTE_SECONDS = 30;
 
 function causeText(error) {
   if (error === 'inventory_unavailable:old_router') return 'Router too old for inventory.';
@@ -320,15 +325,27 @@ export function inventoryStatus(status, nowSeconds, time) {
   const stalled = !status.lastOkAt || nowSeconds - status.lastOkAt > STALL_SECONDS;
   if (stalled) return { kind: 'stalled', clear: false, text: `Inventory is stalled — check the router.${error ? ` ${causeText(error)}` : ''}${since}` };
   if (error === 'inventory_unavailable:old_router') return { kind: 'old_router', clear: false, text: `${causeText(error)}${since}` };
-  if (error && error !== 'inventory_warning:invalid_clock') return { kind: 'degraded', clear: false, text: `${causeText(error)}${since}` };
-  return { kind: 'ok', clear: status.baselineAt !== null, text: `Last complete scan ${time(status.lastOkAt)}.${error ? ` ${causeText(error)}` : ''}` };
+  if (error === 'inventory_warning:invalid_clock') return { kind: 'clock_warning', clear: false, text: `Last complete scan ${time(status.lastOkAt)}. ${causeText(error)}` }; // times are doubtful, so no all-clear
+  if (error) return { kind: 'degraded', clear: false, text: `${causeText(error)}${since}` };
+  return { kind: 'ok', clear: status.baselineAt !== null, text: `Last complete scan ${time(status.lastOkAt)}.` };
 }
 
 export function createInventory({ session, gate, offline, time, children, version }) {
   const root = document.querySelector('#inventory-panel');
-  let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null;
+  let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null;
+  let serverNow = null, loadedPerf = 0, mounted = false; // serverNow: the service clock at the last load, advanced by this page's own elapsed time
+  const title = el('h2', { id: 'inventory-title', tabindex: -1 }, 'Devices on the network');
+  const live = el('p', { class: 'fine-print', role: 'status', 'aria-live': 'polite', 'data-live': '', 'data-refresh-status': '' }); // one node for the life of the panel, so screen readers hear changes
+  const body = el('div');
   const enabled = () => document.documentElement.dataset.source === 'real-router-integration' && session()?.actor.role === 'admin';
-  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  // Scan age is measured on the SERVER's clock. Unknown (an older service) counts as stalled: never an all-clear on a guess.
+  const nowSeconds = () => (serverNow === null ? Number.POSITIVE_INFINITY : serverNow + Math.floor((performance.now() - loadedPerf) / 1000));
+  const closed = () => busy || Boolean(gate());
+  const sorted = (list) => [...list].sort((a, b) => b.firstSeen - a.firstSeen || b.lastSeen - a.lastSeen);
+  function setNote(text) {
+    refreshNote = text; clearTimeout(noteTimer);
+    noteTimer = setTimeout(() => { refreshNote = ''; draw(); }, NOTE_SECONDS * 1000);
+  }
 
   async function call(path, body) {
     const response = await fetch(path, {
@@ -345,9 +362,11 @@ export function createInventory({ session, gate, offline, time, children, versio
     if (offline()) { draw(); return; } // keep the saved list; it is labelled as saved
     const mine = key;
     try {
-      const body = await call('/admin/inventory');
+      const result = await call('/admin/inventory');
       if (mine !== key) return;
-      data = body.inventory; loadedAt = nowSeconds(); loadFailed = false;
+      data = result.inventory; loadFailed = false;
+      serverNow = Number.isFinite(result.now) ? result.now : null; loadedPerf = performance.now(); loadedAt = serverNow ?? Math.floor(Date.now() / 1000);
+      refreshNote = ''; clearTimeout(noteTimer); // a request note is stale once a newer list has arrived
     } catch (error) {
       if (mine !== key) return;
       if (error.status === 401 || error.status === 403) data = null; else loadFailed = true;
@@ -355,24 +374,34 @@ export function createInventory({ session, gate, offline, time, children, versio
     draw();
   }
   async function acknowledge(device) {
-    if (busy) return;
-    busy = true; notice = ''; draw();
-    try { await call('/admin/inventory/acknowledge', { mac: device.mac }); } catch (error) { notice = error.status === 404 ? 'That device is no longer listed.' : error.message; }
+    if (closed()) { draw(); return; }
+    const position = sorted(data.devices).filter((d) => d.flags.new).indexOf(device);
+    busy = true; notice = ''; refreshNote = ''; draw();
+    try { await call('/admin/inventory/acknowledge', { mac: device.mac }); notice = `Acknowledged ${(device.hostname ?? 'device').slice(0, 40)}.`; } catch (error) { notice = error.status === 404 ? 'That device is no longer listed.' : error.message; }
     busy = false;
     await load();
+    refocus(position);
+  }
+  // The button that was pressed is gone after a redraw; keep keyboard and screen-reader users in the list instead of dropping them on the page.
+  function refocus(position) {
+    const active = document.activeElement;
+    if (!mounted || (active && active !== document.body && !root.contains(active))) return;
+    const buttons = Array.from(root.querySelectorAll('[data-ack]:not(:disabled)'));
+    (buttons[Math.min(Math.max(position, 0), buttons.length - 1)] ?? title).focus();
   }
   async function refreshNow() {
-    if (busy) return;
-    busy = true; refreshNote = ''; draw();
+    if (closed()) { draw(); return; }
+    busy = true; refreshNote = ''; notice = ''; draw();
     try {
       await call('/admin/inventory/refresh', {});
-      refreshNote = 'Refresh requested. The list updates when the router answers.';
+      setNote('Refresh requested. The list updates when the router answers.');
       clearTimeout(timer); timer = setTimeout(() => void load(), 5000);
-    } catch (error) { refreshNote = REFRESH_FAILURES[error.code] ?? REFRESH_STATUS[error.status] ?? error.message; }
+    } catch (error) { setNote(REFRESH_FAILURES.get(error.code) ?? REFRESH_STATUS.get(error.status) ?? error.message); }
     busy = false;
     draw();
   }
   function startAssign(device) {
+    if (closed()) { draw(); return; }
     const label = device.hostname ?? '';
     if (!choice || !children.startAdd(choice, { label, mac: device.mac })) { notice = 'Choose a child or device group first.'; draw(); return; }
     picking = null; choice = ''; notice = ''; draw();
@@ -385,7 +414,7 @@ export function createInventory({ session, gate, offline, time, children, versio
     select.value = options.some((c) => c.id === choice) ? choice : '';
     return [el('div', { class: 'inventory-actions' }, select,
       el('button', { class: 'button primary', type: 'button', onclick: () => startAssign(device) }, 'Continue'),
-      el('button', { class: 'button secondary', type: 'button', onclick: () => { picking = null; choice = ''; draw(); } }, 'Cancel'))];
+      el('button', { class: 'button secondary', type: 'button', onclick: () => { picking = null; choice = ''; children.clearPrefill(); draw(); } }, 'Cancel'))];
   }
   function deviceRow(device, locked) {
     const name = device.hostname ?? 'No name reported', short = name.slice(0, 40);
@@ -399,40 +428,40 @@ export function createInventory({ session, gate, offline, time, children, versio
       el('span', { class: 'fine-print' }, `First seen ${time(device.firstSeen)}`),
       ...(device.personName ? [el('span', { class: 'fine-print' }, `Belongs to ${device.personName}`)] : []),
       el('div', { class: 'inventory-actions' },
-        ...(device.flags.new ? [el('button', { class: 'button secondary', type: 'button', disabled: locked, 'aria-label': `Acknowledge ${short}`, onclick: () => void acknowledge(device) }, 'Acknowledge')] : []),
+        ...(device.flags.new ? [el('button', { class: 'button secondary', type: 'button', disabled: locked, 'data-ack': '', 'aria-label': `Acknowledge ${short}`, onclick: () => void acknowledge(device) }, 'Acknowledge')] : []),
         ...(device.flags.unassigned ? [el('button', { class: 'button secondary', type: 'button', disabled: locked, 'aria-label': `Add to a child: ${short}`,
-          onclick: () => { picking = device.mac; choice = ''; notice = ''; draw(); } }, 'Add to a child…')] : [])),
+          onclick: () => { if (closed()) { draw(); return; } picking = device.mac; choice = ''; notice = ''; draw(); } }, 'Add to a child…')] : [])),
       ...(picking === device.mac && !locked ? picker(device, short) : []));
   }
   function draw() {
-    if (!enabled() || !data) { drawn = ''; root.hidden = true; root.replaceChildren(); return; }
+    if (!enabled() || !data) { drawn = ''; mounted = false; root.hidden = true; root.replaceChildren(); live.textContent = ''; return; }
+    if (!mounted) { root.replaceChildren(title, live, body); mounted = true; }
+    const liveText = refreshNote || notice;
+    if (live.textContent !== liveText) live.textContent = liveText;
     const stale = offline() || loadFailed;
     const reason = gate() ?? '', locked = busy || Boolean(reason);
-    const sorted = [...data.devices].sort((a, b) => b.firstSeen - a.firstSeen || b.lastSeen - a.lastSeen);
+    const ordered = sorted(data.devices);
     const status = inventoryStatus(data.status, nowSeconds(), time);
-    const newCount = sorted.filter((d) => d.flags.new).length;
+    const newCount = ordered.filter((d) => d.flags.new).length;
     const clear = status.clear && !stale && newCount === 0;
     const summary = clear ? 'No new devices.' : newCount ? `${newCount} new device${newCount === 1 ? '' : 's'} to review.` : '';
     const signature = JSON.stringify([data, reason, stale, loadedAt, status.text, summary, notice, refreshNote, picking, busy, children.entries()]);
     if (signature === drawn) return; // never rebuild (and drop keyboard focus) when nothing changed
     if (root.contains(document.activeElement) && document.activeElement.matches('select')) { drawn = ''; return; }
     drawn = signature;
-    root.replaceChildren(
-      el('h2', { id: 'inventory-title' }, 'Devices on the network'),
+    body.replaceChildren(
       el('p', { class: 'fine-print' }, 'What the router has seen. Device names are chosen by the devices themselves and are not verified. Protected devices are never listed.'),
-      el('p', { class: 'notice', role: 'status', 'data-inventory-status': status.kind }, status.text, ...(summary ? [' ', el('strong', clear ? { 'data-all-clear': '' } : {}, summary)] : [])),
+      el('p', { class: 'notice', 'data-inventory-status': status.kind }, status.text, ...(summary ? [' ', el('strong', clear ? { 'data-all-clear': '' } : {}, summary)] : [])),
       ...(stale ? [el('p', { class: 'fine-print', 'data-inventory-snapshot': '' }, `Showing a saved list from ${time(loadedAt)}. It updates when the connection returns.`)] : []),
       el('p', { class: 'fine-print', 'data-inventory-reason': '', hidden: !reason }, reason),
       el('div', { class: 'inventory-actions' }, el('button', { class: 'button secondary', type: 'button', disabled: locked, onclick: () => void refreshNow() }, 'Refresh now')),
-      el('p', { class: 'fine-print', role: 'status', 'data-refresh-status': '', hidden: !refreshNote }, refreshNote),
-      el('p', { class: 'notice', role: 'status', hidden: !notice }, notice),
-      el('ul', { class: 'account-list', 'aria-label': 'Devices on the network' }, ...sorted.map((device) => deviceRow(device, locked))));
+      el('ul', { class: 'account-list', 'aria-label': 'Devices on the network' }, ...ordered.map((device) => deviceRow(device, locked))));
     root.hidden = false;
   }
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
     if (next !== key) {
-      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; drawn = ''; clearTimeout(timer);
+      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
       draw(); if (next) void load(); return;
     }
     const seen = version();

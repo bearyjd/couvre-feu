@@ -5,10 +5,11 @@ import type { Routed } from './time-requests-http.ts';
 
 /**
  * Admin-only inventory routes (session and, for POST, Origin and CSRF are checked by the caller; the store refuses non-admins with 403).
+ * `now` is the service clock: the page measures scan age against it, never against the viewer's own clock.
  * Hostnames leave here as plain strings that the device chose (`reportedByDevice: true`); the client must render them as text only.
  */
 export function inventoryGet(inventory: InventoryStore | null, session: AuthSession, path: string): Routed | null {
-    return inventory && path === '/admin/inventory' ? {status: 200, body: {inventory: inventory.list(session.dto.actor)}} : null;
+    return inventory && path === '/admin/inventory' ? {status: 200, body: {inventory: inventory.list(session.dto.actor), now: inventory.now()}} : null;
 }
 export function inventoryPost(inventory: InventoryStore | null, session: AuthSession, path: string, payload: unknown): Routed | null {
     if (!inventory) return null;

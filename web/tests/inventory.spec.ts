@@ -1,4 +1,4 @@
-import { test, expect, signIn, noHorizontalScroll, dispatchPending, SEED, K2, OUTSIDE } from './bulk-fixture.ts';
+import { test, expect, signIn, noHorizontalScroll, dispatchPending, K2, OUTSIDE } from './bulk-fixture.ts';
 import type { World } from './bulk-fixture.ts';
 import type { Page } from '@playwright/test';
 import { actor } from '../../service/tests/fixtures/integration.ts';
@@ -216,5 +216,150 @@ test('touch targets are at least 44px and nothing scrolls sideways at 390px', as
   for (const button of buttons) expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   for (const select of await panel(page).locator('select').all()) expect((await select.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   expect(await noHorizontalScroll(page)).toBe(true);
-  expect(SEED).toBeTruthy();
+});
+
+// ---- review fixes ----
+const ALL_MACS = [K2, LAPTOP, NEW_TV, OUTSIDE, NEW_PHONE];
+const enableDispatch = (f: World) => {
+  f.config.dispatch = { enabled: true, pollSeconds: 2, maxBackoffSeconds: 8 };
+  f.store.run('INSERT INTO automatic_dispatch(singleton,epoch,owner_token,enabled) VALUES(1,?,?,1)', f.store.integrationState().dispatch_epoch, 'test-owner');
+};
+
+test('M1: no Wi-Fi address in markup, aria/title/data attributes, storage or caches (picker open)', async ({ page, integration: f }) => {
+  seed(f);
+  await signIn(page, f, 'operator');
+  await row(page, 'new-tv').getByRole('button', { name: /^Add to a child/ }).click();
+  await expect(row(page, 'new-tv').getByLabel(/^Child for/)).toBeVisible();
+  await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
+  const found = await page.evaluate(async (macs) => {
+    const ANY = /[0-9a-f]{2}([:-][0-9a-f]{2}){5}|\b[0-9a-f]{12}\b/i;
+    const known = macs.flatMap((m) => [m, m.toUpperCase(), m.replace(/:/g, ''), m.replace(/:/g, '').toUpperCase()]);
+    const hit = (text: string) => ANY.test(text) || known.some((k) => text.includes(k));
+    const out: string[] = [];
+    const root = document.querySelector('#inventory-panel')!;
+    const copy = root.cloneNode(true) as HTMLElement;
+    copy.querySelectorAll('input, textarea').forEach((i) => i.removeAttribute('value')); // form field values are the one allowed place
+    if (hit(copy.innerHTML)) out.push('innerHTML');
+    let scanned = 0;
+    for (const node of [root, ...Array.from(root.querySelectorAll('*'))]) {
+      for (const a of Array.from(node.attributes)) if (/^(aria-|data-)/.test(a.name) || a.name === 'title') { scanned++; if (hit(a.value)) out.push(`${node.tagName}[${a.name}]`); }
+    }
+    if (scanned < 5) out.push('too few attributes scanned');
+    for (const store of [localStorage, sessionStorage]) for (let i = 0; i < store.length; i++) { const k = store.key(i)!; if (hit(k) || hit(store.getItem(k) ?? '')) out.push(`storage:${k}`); }
+    for (const name of await caches.keys()) {
+      if (hit(name)) out.push(`cache name ${name}`);
+      const cache = await caches.open(name);
+      for (const req of await cache.keys()) {
+        if (hit(req.url)) out.push(`cache url ${req.url}`);
+        const body = await (await cache.match(req))!.text();
+        if (known.some((k) => body.includes(k))) out.push(`cache body ${req.url}`);
+      }
+    }
+    return out;
+  }, ALL_MACS);
+  expect(found).toEqual([]);
+});
+
+test('M2: stall detection follows the server clock, not a phone clock that is hours off', async ({ page, integration: f }) => {
+  seed(f); markAllAcknowledged(f);
+  f.store.run('UPDATE inventory_state SET last_error=NULL, last_ok_at=?', f.now() - 7200); // stale by the SERVER clock
+  await page.addInitScript(() => { const real = Date.now.bind(Date); Date.now = () => real() - 3 * 3600 * 1000; }); // phone is 3 hours slow
+  await signIn(page, f, 'operator');
+  await expect(status(page)).toContainText('Inventory is stalled — check the router');
+  await expect(panel(page)).not.toContainText(/no new devices/i);
+});
+
+test('M3: a router-clock warning never comes with an all-clear sentence', async ({ page, integration: f }) => {
+  seed(f); markAllAcknowledged(f);
+  f.store.run("UPDATE inventory_state SET last_error='inventory_warning:invalid_clock', last_ok_at=?", f.now());
+  await signIn(page, f, 'operator');
+  await expect(status(page)).toContainText('router clock looks wrong');
+  await expect(panel(page)).not.toContainText(/no new devices/i);
+  await expect(panel(page).locator('[data-all-clear]')).toHaveCount(0);
+});
+
+test('M4: results go to one persistent polite live region and focus stays inside the panel after Acknowledge', async ({ page, integration: f }) => {
+  seed(f); enableDispatch(f);
+  await signIn(page, f, 'operator');
+  await expect(row(page, 'new-tv')).toBeVisible();
+  await expect(panel(page).locator('[role="status"]')).toHaveCount(1);
+  const live = panel(page).locator('[data-live]');
+  await expect(live).toHaveAttribute('role', 'status');
+  await expect(live).toHaveAttribute('aria-live', 'polite');
+  await live.evaluate((n) => { (window as unknown as { __live: Element }).__live = n; });
+  await panel(page).getByRole('button', { name: 'Refresh now' }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const n = document.querySelector('#inventory-panel [data-live]');
+    return n === (window as unknown as { __live: Element }).__live && n!.isConnected ? n!.textContent : 'REPLACED';
+  })).toContain('Refresh requested');
+  await row(page, 'new-tv').getByRole('button', { name: /^Acknowledge/ }).click();
+  await expect(row(page, 'new-tv').getByRole('button', { name: /^Acknowledge/ })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => {
+    const a = document.activeElement, n = document.querySelector('#inventory-panel [data-live]');
+    return { inPanel: !!a && a !== document.body && !!a.closest('#inventory-panel'), same: n === (window as unknown as { __live: Element }).__live, text: n?.textContent ?? '' };
+  })).toMatchObject({ inPanel: true, same: true, text: expect.stringContaining('Acknowledged') });
+});
+
+for (const code of ['constructor', '__proto__', 'toString']) {
+  test(`L2: refresh error code "${code}" cannot select a built-in as the message`, async ({ page, integration: f }) => {
+    seed(f);
+    await page.route('**/admin/inventory/refresh', (route) => route.fulfill({ status: 400, json: { error: { code, message: 'Refused for test' } } }));
+    await signIn(page, f, 'operator');
+    await panel(page).getByRole('button', { name: 'Refresh now' }).click();
+    await expect(panel(page).locator('[data-refresh-status]')).toHaveText('Refused for test');
+  });
+}
+
+test('L3: the "Refresh requested" note goes away after the next successful load', async ({ page, integration: f }) => {
+  seed(f); enableDispatch(f);
+  await signIn(page, f, 'operator');
+  const message = panel(page).locator('[data-refresh-status]');
+  await panel(page).getByRole('button', { name: 'Refresh now' }).click();
+  await expect(message).toContainText('Refresh requested');
+  await expect(message).toHaveText('', { timeout: 15000 });
+});
+
+test('L6: a button forced enabled still refuses to act while the gate is closed', async ({ page, integration: f }) => {
+  seed(f); enableDispatch(f);
+  await page.route('**/people', async (route) => {
+    const response = await route.fetch(); const body = await response.json(); body.observedAt -= 120;
+    await route.fulfill({ response, json: body });
+  });
+  const posts: string[] = []; page.on('request', (r) => { if (r.method() === 'POST') posts.push(new URL(r.url()).pathname); });
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('[data-inventory-reason]')).toHaveText('Status is out of date — refresh');
+  await page.evaluate(() => {
+    for (const b of Array.from(document.querySelectorAll<HTMLButtonElement>('#inventory-panel button'))) { b.disabled = false; b.click(); }
+  });
+  await page.waitForTimeout(600);
+  expect(posts.filter((p) => p.startsWith('/admin/inventory'))).toEqual([]);
+});
+
+test('L1: a label edited after the prefill survives a redraw, and Cancel drops a stale prefill', async ({ page, integration: f }) => {
+  seed(f);
+  await signIn(page, f, 'operator');
+  const children = page.locator('#children-panel');
+  const form = children.locator('[data-add-device="pilot"]');
+  await row(page, 'outside-box').getByRole('button', { name: /^Add to a child/ }).click();
+  await row(page, 'outside-box').getByLabel(/^Child for/).selectOption({ label: 'Explicit test person' });
+  await row(page, 'outside-box').getByRole('button', { name: 'Continue' }).click();
+  const label = form.getByLabel('New device name for Explicit test person');
+  await expect(label).toHaveValue('outside-box');
+  await label.fill('edited label');
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); // focus leaves the form, so a redraw is allowed
+  await form.evaluate((n) => { (window as unknown as { __form: Element }).__form = n; });
+  await page.route('**/people', async (route) => { // a new snapshot version makes the children panel reload and redraw
+    const response = await route.fetch(); const body = await response.json(); body.observedAt -= 1;
+    await route.fulfill({ response, json: body });
+  });
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  // wait until the children panel has really been rebuilt (a new form node), then the typed text must still be there
+  await expect.poll(() => page.evaluate(() => {
+    const n = document.querySelector<HTMLFormElement>('#children-panel [data-add-device="pilot"]');
+    return n && n !== (window as unknown as { __form: Element }).__form ? n.elements.namedItem('label') && (n.elements.namedItem('label') as HTMLInputElement).value : 'NOT-REDRAWN';
+  })).toBe('edited label');
+
+  await row(page, 'new-tv').getByRole('button', { name: /^Add to a child/ }).click();
+  await row(page, 'new-tv').getByRole('button', { name: 'Cancel' }).click();
+  await expect(label).toHaveValue('');
 });

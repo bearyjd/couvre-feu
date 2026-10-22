@@ -50,6 +50,7 @@ test('admin lists the inventory: flags, hostnames as device-reported strings, no
         assert.equal(one.hostname, 'host-1'); assert.equal(one.reportedByDevice, true); assert.equal(typeof one.hostname, 'string'); assert.equal(two.hostname, null);
         assert.deepEqual(two.flags, {new: true, private: false, unassigned: true});
         assert.equal(r.body.inventory.status.pollSeconds, 60);
+        assert.equal(r.body.now, w.now()); // the SERVER clock, so the page never compares a router timestamp with the phone clock
         assert.ok(!JSON.stringify(r.body).includes(w.config.protectedMacs[0]));
     } finally { await w.close(); }
 });

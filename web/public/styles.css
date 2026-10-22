@@ -972,6 +972,7 @@ footer {
 
 /* Devices on the network (admins): rows reuse the stacked-card language; names are untrusted text and must wrap, never widen the page. */
 #inventory-panel .button, #inventory-panel select { min-height: 44px; }
+#inventory-panel [data-live]:empty { margin: 0; }
 .inventory-row { min-width: 0; grid-template-columns: minmax(0, 1fr); } /* a 300-character unbroken name must wrap inside the card, not widen the track */
 .inventory-row > * { min-width: 0; }
 .inventory-name { font-weight: 650; overflow-wrap: anywhere; word-break: break-word; unicode-bidi: plaintext; }
