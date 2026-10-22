@@ -372,7 +372,8 @@ cf_inventory_collect() {
     if cf_clock;then cf_iv_now=$CF_NOW_VALUE;else cf_iv_errors="$cf_iv_errors invalid_clock";fi
     cf_network && cf_lan_prefix || { printf '%s\n' "$CF_ERROR";return 1; }
     cf_iv_neigh=$(cf_backend ip -4 neigh show dev br-lan) || { cf_iv_neigh=;cf_iv_errors="$cf_iv_errors neighbor_inspection_failed"; }
-    # NUL becomes \001, which every field rule rejects: BusyBox awk would end the record at a NUL and
+    # NUL becomes \001, which every field rule rejects (reject, never strip): the command substitution
+    # would drop a bare NUL ('ok\0evil' -> 'okevil'), and BusyBox awk would end the record at it and
     # parse the rest of the line as a lease row of its own. Read errors stay out of the reply.
     cf_iv_leases=
     cf_iv_file=$CF_BASE/tmp/dhcp.leases

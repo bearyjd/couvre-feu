@@ -76,8 +76,9 @@ Row order and `inventory_row_dropped`: each row is scoped first (subnet, then le
 any LAN or guest client can induce are skipped SILENTLY: off-subnet or expired rows, and rows whose MAC is not a canonical
 unicast MAC (dnsmasq's hwtype-prefixed form for htype != 1, a wrong length, multicast or all-zero). `inventory_row_dropped`
 is reported, once, only for a row inside the subnet whose address or expiry field is malformed, which dnsmasq and `ip`
-never write. A NUL byte in the lease file becomes \001 before parsing (BusyBox awk would otherwise end the record at the
-NUL and parse the rest of the line as a lease row of its own). The SERVICE must treat `inventory_row_dropped` as a
+never write. A NUL byte in the lease file becomes \001 before parsing, so a hostname holding one is null: a shell command
+substitution would drop the NUL (a strip, `ok\0evil` -> `okevil`), and BusyBox awk would end the record at the NUL and
+parse the rest of the line as a lease row of its own. The SERVICE must treat `inventory_row_dropped` as a
 non-structural WARNING, like `invalid_clock`, that does not make the poll incomplete. That service-side change is made
 separately on its own branch.
 

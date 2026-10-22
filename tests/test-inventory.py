@@ -362,7 +362,9 @@ class FilterOrderTests(InventoryCommon, unittest.TestCase):
         # BusyBox awk ends a record at NUL: the bytes after it would otherwise parse as a lease row of their own.
         # The row holding the NUL is dnsmasq's own: it stays, with its now ambiguous hostname null.
         self.leases(b'0 ' + mac(401).encode() + b' 192.168.1.5 ok\x000 ' + mac(402).encode() + b' 192.168.1.6 forged *\n'
-                    b'0  ' + mac(403).encode() + b' 192.168.1.7 spaced *\n')
+                    b'0  ' + mac(403).encode() + b' 192.168.1.7 spaced *\n'
+                    # A shell command substitution drops NUL silently: 'ok\0evil' would become the valid 'okevil'.
+                    b'0 ' + mac(404).encode() + b' 192.168.1.8 ok\x00evil *\n')
         for runtime, document in (('awk', self.inventory()), ('busybox', self.busybox_inventory())):
             with self.subTest(runtime=runtime):
                 self.nul_checks(document)
@@ -373,7 +375,9 @@ class FilterOrderTests(InventoryCommon, unittest.TestCase):
         self.assertNotIn(mac(403), found)
         self.assertNotIn('forged', json.dumps(document))
         self.assertEqual(found[mac(401)], {'mac': mac(401), 'ipv4': ['192.168.1.5'], 'hostname': None, 'source': 'lease'})
-        self.assertEqual(sorted(found), [KID, OTHER_KID, mac(401)])
+        self.assertIsNone(found[mac(404)]['hostname'])
+        self.assertNotIn('okevil', json.dumps(document))
+        self.assertEqual(sorted(found), [KID, OTHER_KID, mac(401), mac(404)])
 
 
 class ProtectedListTests(InventoryCommon, unittest.TestCase):
