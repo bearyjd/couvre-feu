@@ -308,13 +308,31 @@ nothing in `rpc.sh` or `activity.sh` writes the scope.
 
 Commit flow (add/remove): (1) argv shape, the service marker and a TTY on stdin are checked and the typed confirmation
 (the last 6 hex digits of the MAC, no colons) is read in `cfctl` BEFORE platform admission, so no platform lock, policy lock or
-admission deadline is held while a human types; (2) admission, read-only load; (3) `trap '' TSTP`, `cf_lock`; (4) under the lock:
+admission deadline is held while a human types (`trap '' TSTP TTIN TTOU` and, on an output TTY, `stty -ixon` are set first, for all three
+verbs); (2) admission, read-only load; (3) `cf_lock`; (4) under the lock:
 install gate, ready+complete generation, single-read scope snapshot, `--base` CAS against it, every refusal, then `cf_ssh_guard`;
 (5) `logger -t couvrefeu` INTENT line (refused if it cannot be logged); (6) candidate `runtime/.scope.<pid>` created with `set -C`, umask
 077, mode 600, same filesystem as `/etc/couvrefeu`, re-validated with the runtime validators (format, floor, protected-disjoint, every
-P MAC kept), `sync`, rename over `rpc-allowed`, `sync`; (7) COMMIT log line; old and new `scopeSha` printed. A crash at any step leaves the
+P MAC kept), `sync`, rename over `rpc-allowed`, `sync`; (7) COMMIT log line; (8) `cf_unlock` and platform lock release, THEN the buffered
+result (old and new `scopeSha`, or the refusal) is printed. A crash at any step leaves the
 old or the new complete file; a leftover candidate is swept under `cf_lock` and allowed by the uninstall runtime whitelist. The floor
 (`backup/*.staged`, `*.after`) is never written.
+
+Terminal and lock hazard (review S-M1): a write to a stopped or flow-controlled terminal blocks, and a write under a lock would hold
+`cf_lock` and the platform lock (and so every `rpc-sync`, cron `expire` and fw3-include `apply-fw`, which then fail with
+`locked`/`transaction_contention`). Solved: preview and commit output (and refusals under the lock, and the commit-audit warning on
+stderr) are buffered and written only after both locks are released; job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
+early block to exit; XON/XOFF is switched off on an output TTY (`stty` presence in the GL BusyBox build is UNVERIFIED-on-device; absence
+is tolerated). Residual, documented, not solved: (a) SIGSTOP cannot be ignored: only another root process can send it to this
+process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) a
+`platform_fail`/admission-deadline exit still writes one short line to stdout/stderr while a lock is held (the trap releases it right
+after; with `-ixon` and under 4 KiB of prior output this cannot block). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
+stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. Recovery for a wedged owner: kill the PID in `/etc/couvrefeu/runtime/lock/pid`; on a
+vendor profile, `cfctl recover-platform-lock` once that PID is gone. A "stopped owner counts as dead" lock watchdog was evaluated and
+rejected: it would break mutual exclusion when the owner is continued (two writers) and the fixture checkpoints that deliberately hold
+the lock stopped.
+
+Exit status: 2 for `invalid_command`, 1 for every other refusal, on both the early (`cfctl`, pre-admission) and the core path.
 
 Refusal codes (JSON `{"ok":false,"errors":[code]}`): `invalid_command`, `scope_mac_not_canonical` (only lowercase colon form),
 `scope_mac_invalid` (multicast/zero), `scope_forced_command_refused` (`CF_SERVICE_FORCED_COMMAND` set; `cfctl-ssh` now exports it to its
@@ -322,7 +340,10 @@ child), `scope_base_invalid`, `scope_tty_required`, `scope_confirmation_mismatch
 `scope_unscoped_install`, `inactive_generation` (not ready+complete), `installation_in_progress`, `locked`, `scope_base_conflict` (stale
 `--base`), `scope_mac_is_ssh_client`, `scope_mac_protected`, `scope_no_evidence` (add only; remove works for an absent/rotated MAC),
 `scope_mac_present`, `scope_full` (256), `scope_mac_absent`, `scope_mac_in_floor` (needs a fresh install + rebind), `scope_mac_in_use` (a
-person record uses it), `scope_audit_unavailable`, plus the guard's `ssh_client_*` codes. The service host (CT107) has no router-side
+person record uses it), `scope_audit_unavailable`, `scope_mac_is_router_interface` (equals one of the router's own interface MACs,
+`/sys/class/net/*/address`; preview prints a WARNING), `scope_router_interfaces_unreadable` (no interface, or an unreadable/malformed
+address file: fail closed), `scope_state_unreadable` (the protected list or the floor could not be read while checking membership: fail
+closed), plus the guard's `ssh_client_*` codes. The service host (CT107) has no router-side
 configuration; it is refused because it MUST be protected (SAD-H1), never by a hardcoded address.
 
 Per-admin wrapper `/usr/sbin/cfctl-scope <admin>` (`router/cfctl-scope`): `<admin>` is `[a-z]{1,16}` from its single argv (set by the
@@ -330,15 +351,25 @@ Per-admin wrapper `/usr/sbin/cfctl-scope <admin>` (`router/cfctl-scope`): `<admi
 bytes, tokens only); anything else exits 2 without running anything. It execs `env -i PATH LC_ALL SSH_CONNECTION SSH_CLIENT
 CF_SCOPE_ADMIN=<admin> /usr/sbin/cfctl ...`; the admin name appears in both audit lines. It is installed like `cfctl-ssh`: copied from the
 verified release (mode 755), journaled (`usr_sbin_cfctl-scope.*`, fresh installs only; older journals keep their inventory), drift-checked,
-in sysupgrade.conf and `release.sha256`, removed on uninstall. It still contains a CF_TEST_MODE fixture block of the same 9-line shape as
-`cfctl-ssh`; M4's emitted tree must strip it too.
+in sysupgrade.conf and `release.sha256`, removed on uninstall. Its CF_TEST_MODE fixture block (14 lines; marked private root under
+`/tmp/couvre-feu-*`, canonical paths, and owned by the caller: root `700`, backend directory, marker and target not group/other-writable)
+has the same marker as `cfctl-ssh`'s. M4's production copy MUST be generated WITHOUT the CF_TEST_MODE block for BOTH wrappers:
+`tools/strip-test-mode.py OUTPUT cfctl-ssh` and `tools/strip-test-mode.py OUTPUT cfctl-scope` (prints the SHA-256 to disclose).
+
+Trust limits (review S-L6/L-7): the `admin=` attribution is trustworthy only through `cfctl-scope`; a direct root login (Dropbear root
+password login is enabled on the target) can set `CF_SCOPE_ADMIN` to any valid name. The TTY requirement and the typed confirmation are
+typo guards, not authentication: the admin key (or root) is the gate. The intent line is refused if `logger` fails, but BusyBox `logger`
+usually exits 0 even when logd is down and logd keeps a RAM ring buffer, so a router audit line is UNVERIFIED-on-device and may be lost; the
+app-side database audit (`scope_requests`, `scope_changes`) is the real record. `scope-preview` marks STALE neighbour entries and IPv6
+link-local-only rows as "weak evidence"; evidence is never a gate.
 
 Operator procedure (each run is its own approved invocation; release id cited):
 1. Read the address from the device's OWN Wi-Fi settings ("Fixed"/non-rotating private address). Never copy a MAC from the app: the app
    only shows `cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>` and never a paste-ready command.
 2. From your own LAN computer, which is protected and has a fixed MAC, use your OWN admin key. Never use the service key, and never run this
    on or through CT107: `ssh -t router 'cfctl scope-preview <MAC>'`. Check the evidence, the address type and any WARNING. The evidence can be
-   forged by a LAN host; it is not a gate.
+   forged by a LAN host; it is not a gate. Never scope a router interface or infrastructure: Wi-Fi extenders in NAT mode, access points and
+   other infrastructure belong in `--protect` at install time (`scope_mac_is_router_interface` catches only the router's own addresses).
 3. `ssh -t router 'cfctl scope-add <MAC> --base <scopeSha from step 2>'`, then type the last 6 hex digits when asked. `-t` is required,
    because the confirm needs a TTY; the admin key line must allow a pty (unlike the service template's `restrict`).
 4. Wait for the app to observe the new `scope`/`scopeSha`, then enroll in the UI. Rollback: unenroll in the UI, then `scope-remove`;
@@ -347,3 +378,6 @@ Operator procedure (each run is its own approved invocation; release id cited):
 Admin key line (template; JD and Bryn each have their own key, both keys are passphrase-protected, never on CT107, no agent forwarding):
 `command="/usr/sbin/cfctl-scope <admin>",no-port-forwarding,no-agent-forwarding,no-X11-forwarding <key-type> <PUBLIC_KEY_BLOB> <label>`.
 UNVERIFIED on the target Dropbear: logging of the key fingerprint, and pty behaviour with a forced command (rehearsal GL1).
+Rehearsal checklist additions (M1d review): (a) with logd stopped, does `logger` exit non-zero (is `scope_audit_unavailable` reachable on
+the device)? Record the answer; until then the router audit line is UNVERIFIED-on-device; (b) is `stty` present, and does `ssh -t`
+leave IXON off for the session; (c) Ctrl-Z / Ctrl-S during `scope-preview` and during the confirmation prompt leave `rpc-status` usable.

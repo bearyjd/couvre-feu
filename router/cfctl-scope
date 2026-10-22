@@ -22,6 +22,11 @@ if [ "${CF_TEST_MODE-}" = 1 ];then
     [ "$(CDPATH='' cd -- "$CF_ROOT" && pwd -P)" = "$CF_ROOT" ] && [ "$(CDPATH='' cd -- "$CF_BACKEND_DIR" && pwd -P)" = "$CF_BACKEND_DIR" ] || exit 2
     cf_ssh_target=$CF_BACKEND_DIR/cfctl
     [ -f "$cf_ssh_target" ] && [ ! -L "$cf_ssh_target" ] && [ -x "$cf_ssh_target" ] || exit 2
+    # Owned by the caller (uid 0 when root runs it): a private 700 root; backend, marker, target not group/other-writable.
+    cf_scope_uid=$(id -u) && [ "$(stat -c '%u:%a' "$CF_ROOT")" = "$cf_scope_uid:700" ] || exit 2
+    for cf_scope_path in "$CF_BACKEND_DIR" "$CF_BACKEND_DIR/.couvrefeu-test-backend" "$cf_ssh_target";do
+        case $(stat -c '%u:%A' "$cf_scope_path") in "$cf_scope_uid":?????-??-?) ;; *) exit 2;; esac
+    done
 fi
 unset ENV BASH_ENV CDPATH IFS
 # ASCII space is the only separator; ':' is admitted for the canonical MAC only.
@@ -32,6 +37,7 @@ IFS=' '
 set -- $cf_ssh_command
 [ "$#" -ge 3 ] && [ "$1" = cfctl ] || exit 2
 shift
+# Argv shape is checked again in cfctl's early block and cf_scope_main: defence in depth, do not simplify.
 case $2 in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) exit 2;; esac
 case $1 in
     scope-preview) [ "$#" = 2 ] || exit 2;;

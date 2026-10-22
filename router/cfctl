@@ -45,11 +45,19 @@ fi
 # Scope administration (M1d): the typed confirmation is read HERE, before platform admission, so
 # no platform or policy lock and no admission deadline is held while a human types. core.sh
 # repeats every check under cf_lock and refuses scope-add/scope-remove unless this step ran.
+# Exit status matches core.sh for the same refusal: 2 for invalid_command, 1 for every other one.
 cf_scope_confirmed=0
 case ${1-} in scope-preview|scope-add|scope-remove)
-    cf_scope_early() { printf '{"ok":false,"errors":["%s"]}\n' "$1"; exit 2; }
+    # PATH and LC_ALL are already pinned at the top of this file; re-pinned here so the block stands alone.
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;export PATH LC_ALL
+    # A stopped or flow-controlled terminal must never hold a lock: job-control stops are ignored from
+    # here to exit, XON/XOFF is switched off on an output TTY, and core.sh prints only after unlocking.
+    trap '' TSTP TTIN TTOU
+    [ ! -t 1 ] || stty -ixon <&1 2>/dev/null || :
+    cf_scope_early() { printf '{"ok":false,"errors":["%s"]}\n' "$1"; [ "$1" != invalid_command ] || exit 2; exit 1; }
     [ -z "${CF_SERVICE_FORCED_COMMAND+x}" ] || cf_scope_early scope_forced_command_refused
     if [ "$1" != scope-preview ]; then
+        # Argv shape is checked again in cfctl-scope and cf_scope_main: defence in depth, do not simplify.
         [ "$#" = 4 ] && [ "$3" = --base ] || cf_scope_early invalid_command
         case $2 in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) cf_scope_early scope_mac_not_canonical;; esac
         case $4 in *[!0-9a-f]*) cf_scope_early scope_base_invalid;; esac
@@ -57,9 +65,13 @@ case ${1-} in scope-preview|scope-add|scope-remove)
         [ -t 0 ] || cf_scope_early scope_tty_required
         printf '%s %s --base %s\nType the last 6 hex digits of the address (no colons) to confirm: ' "$1" "$2" "$4"
         IFS= read -r cf_scope_answer || cf_scope_answer=
-        cf_scope_hex=$(printf '%s' "$2" | tr -d :)
+        # Last three octets of the validated canonical MAC, without colons (no external command).
+        cf_scope_rest=${2#??:??:??:}
+        cf_scope_tail=${cf_scope_rest%%:*}
+        cf_scope_rest=${cf_scope_rest#??:}
+        cf_scope_tail=$cf_scope_tail${cf_scope_rest%:*}${cf_scope_rest#*:}
         printf '\n'
-        [ "$cf_scope_answer" = "${cf_scope_hex#??????}" ] || cf_scope_early scope_confirmation_mismatch
+        [ "$cf_scope_answer" = "$cf_scope_tail" ] || cf_scope_early scope_confirmation_mismatch
         cf_scope_confirmed=1
     fi;;
 esac
@@ -85,7 +97,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=cafd5e880355a70d3d5320dd2a4285b796f5b0920718f495d8863a9bcdac5c30
+CF_BOOTSTRAP_PIN=c5d5ae1911e7be5d56f3bff21da31cc8bf24145cfcb113d2394493f3e134bd2a
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || cf_bootstrap_refuse
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse

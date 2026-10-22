@@ -2,7 +2,18 @@
 """M1d: admin-only scope-preview / scope-add / scope-remove and the per-admin cfctl-scope wrapper.
 
 Isolated fixtures only (no SSH, Dropbear, router or packets). All MACs and admin names are fictional.
+
+Mutation checks (each applied to a COPY of the repository, re-frozen, and required to turn this suite red):
+  Plan M1d list (.omc/plans/tier1-build-plan-20261020.md): drop the protected check; drop the in-use check;
+    add scope-add to cfctl-ssh; drop the --base CAS; drop the floor refusal; invert cf_mac_local.
+  The original author's full list of 12 was not recorded in the repository; the six above are the recorded ones.
+  Security review: m1 last-4-digit confirmation compare; m2 empty --base accepted; m3 cf_unlock before the
+    write; m4 cfctl-scope admits a 3-token scope-preview.
+  Review fixes: logger failure not refused; early confirmation block moved after the entry tick; output
+    printed while cf_lock is held; cfctl-scope test-mode ownership guard removed; cf_file_has failing open
+    on a read error; router interface MAC not refused; job-control stop signals not ignored.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +22,7 @@ import pty
 import signal
 import subprocess
 import sys
+import termios
 import time
 import unittest
 
@@ -23,6 +35,8 @@ NEW2 = '02:00:00:00:00:04'
 GHOST = '02:00:00:00:00:05'
 ADMIN = 'alpha'
 SHA_ZERO = '0' * 64
+ROUTER_MAC = '02:00:00:00:00:fe'  # fixture router interface (sysfs double)
+BUSYBOX = Path.home() / '.local/bin/busybox'
 
 
 def scope_sha(macs):
@@ -51,6 +65,11 @@ class ScopeCommon:
         self.install()
         self.attach(NEW, '192.168.1.40', 'phone-a')
         self.attach(NEW2, '192.168.1.41', 'tablet-b')
+        # The router's own interfaces, read as $CF_BASE/sys/class/net/*/address.
+        for name, mac in (('lo', '00:00:00:00:00:00'), ('br-lan', ROUTER_MAC), ('eth0', ROUTER_MAC)):
+            interface = self.f.root / 'sys/class/net' / name
+            interface.mkdir(parents=True)
+            (interface / 'address').write_text(mac + '\n')
 
     def tearDown(self):
         self.f.close()
@@ -87,7 +106,12 @@ class ScopeCommon:
         return self.status()['scopeSha']
 
     def scope(self, *args, confirm=None, tty=True, env=None, timeout=120):
-        """Run cfctl with a pseudo-terminal as stdin; `confirm` is typed (with a newline) before the read."""
+        """Run cfctl with a pseudo-terminal as stdin; `confirm` is typed (with a newline) before the read.
+
+        The pty makes `[ -t 0 ]` true as under `ssh -t`. The answer is queued in the line discipline before
+        the child starts, so the read returns at once; stdout/stderr stay pipes so output is captured whole.
+        It is not the child's controlling terminal (no job control, no XOFF): those are tested separately.
+        """
         command = self.f.shell + [str(REPO / 'router/cfctl'), *args]
         if not tty:
             return subprocess.run(command, env=env or self.f.env, input=(confirm or '') + '\n',
@@ -106,6 +130,22 @@ class ScopeCommon:
 
     def remove(self, mac, base=None, **kwargs):
         return self.scope('scope-remove', mac, '--base', base or self.base(), confirm=kwargs.pop('confirm', tail6(mac)), **kwargs)
+
+    def core_shell(self, body, *args, env=None, tty=True):
+        """Source the real router modules over this fixture and run `body`, bypassing cfctl's early block."""
+        prelude = ('set -f;PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;umask 077;CF_LOCAL_TEST=1;CF_BASE=$CF_ROOT\n'
+                   'CF_LIB=' + str(REPO / 'router/lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
+                   'platform_entry_root_validate;platform_choose runtime "$CF_BASE"\n. "$CF_LIB/core.sh"\n'
+                   'platform_admit runtime "$CF_BASE" "$CF_LIB"\n. "$CF_LIB/rpc.sh";. "$CF_LIB/firewall.sh";. "$CF_LIB/activity.sh"\n')
+        command = self.f.shell + ['-c', prelude + body, 'core', *args]
+        if not tty:
+            return subprocess.run(command, env=env or self.f.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        master, slave = pty.openpty()
+        try:
+            return subprocess.run(command, env=env or self.f.env, stdin=slave, capture_output=True, text=True, timeout=120)
+        finally:
+            os.close(slave)
+            os.close(master)
 
     def ok(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -270,7 +310,7 @@ class ScopeRefusalTests(ScopeCommon, unittest.TestCase):
 
     def test_stale_and_malformed_base(self):
         self.assert_refused(self.add(NEW, SHA_ZERO), 'scope_base_conflict')
-        for base in ('abc', 'A' * 64, 'g' * 64, '0' * 65):
+        for base in ('', 'abc', 'A' * 64, 'g' * 64, '0' * 65):
             with self.subTest(base=base):
                 self.assert_refused(self.scope('scope-add', NEW, '--base', base, confirm=tail6(NEW)), 'scope_base_invalid')
 
@@ -286,7 +326,8 @@ class ScopeRefusalTests(ScopeCommon, unittest.TestCase):
         self.assert_refused(self.remove(NEW, tty=False), 'scope_tty_required')
 
     def test_wrong_confirmation(self):
-        for typed in ('', '000004', NEW, 'yes', '00000'):
+        # ff0003 and 0003 share only the last 4 digits: a shortened compare must not accept them.
+        for typed in ('', '000004', NEW, 'yes', '00000', 'ff0003', '0003'):
             with self.subTest(typed=typed):
                 self.assert_refused(self.add(NEW, confirm=typed), 'scope_confirmation_mismatch')
 
@@ -596,6 +637,21 @@ class AdminWrapperTests(FakeTargetMixin, unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(self.log.exists())
 
+    def test_test_mode_requires_caller_owned_unshared_root_backend_and_target(self):
+        target = self.f.bin / 'cfctl'
+        marker = self.f.bin / '.couvrefeu-test-backend'
+        for path, mode in ((self.f.root, 0o755), (self.f.bin, 0o775), (marker, 0o666), (target, 0o720)):
+            with self.subTest(path=path.name, mode=oct(mode)):
+                original = path.stat().st_mode & 0o7777
+                path.chmod(mode)
+                try:
+                    result = self.wrapper('cfctl-scope', self.accepted()[0], ADMIN)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertFalse(self.log.exists())
+                finally:
+                    path.chmod(original)
+        self.assertEqual(self.wrapper('cfctl-scope', self.accepted()[0], ADMIN).returncode, 0)
+
 
 class AdminWrapperEndToEndTests(ScopeCommon, unittest.TestCase):
     """cfctl-scope in front of the real cfctl: the admin name reaches the audit log."""
@@ -676,6 +732,321 @@ class InstallerTests(ScopeCommon, unittest.TestCase):
         self.assertEqual(len(names), 15)
         result = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--check'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+def proc_state(pid):
+    return Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()[0]
+
+
+def wait_for(predicate, seconds, step=.1):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(step)
+    return predicate()
+
+
+class ScopeReviewFixTests(ScopeCommon, unittest.TestCase):
+    """M1d review fixes: S-M1 terminal/lock hazard, S-M2/C-M2, S-L2..S-L4, C-M1, C-L."""
+
+    def setUp(self):
+        super().setUp()
+        self.before = self.f.durable_snapshot()
+
+    def cfctl(self, *args):
+        return self.f.shell + [str(REPO / 'router/cfctl'), *args]
+
+    def test_add_and_remove_are_refused_when_the_intent_cannot_be_logged(self):
+        self.ok(self.add(NEW))
+        self.before = self.f.durable_snapshot()
+        self.f.update_backend(failures=[{'command': 'logger', 'remaining': 99}])
+        self.refused(self.add(NEW2), 'scope_audit_unavailable', self.before, commits=1)
+        self.refused(self.remove(NEW), 'scope_audit_unavailable', self.before, commits=1)
+        self.f.update_backend(failures=[])
+        (self.f.bin / 'logger').unlink()
+        self.refused(self.add(NEW2), 'scope_audit_unavailable', self.before, commits=1)
+
+    def test_core_refuses_add_and_remove_without_the_early_confirmation(self):
+        for verb in ('scope-add', 'scope-remove'):
+            with self.subTest(verb=verb):
+                self.refused(self.core_shell('cf_main "$@"', verb, NEW, '--base', self.base()), 'scope_confirmation_required', self.before)
+        # Control: the same harness commits once the early step is marked done.
+        self.ok(self.core_shell('cf_scope_confirmed=1;cf_main "$@"', 'scope-add', NEW, '--base', self.base()))
+        self.assertEqual(self.status()['scope'], [KID, NEW])
+
+    def test_early_and_core_refusals_share_exit_codes(self):
+        cases = ((('scope-add', '02-00-00-00-00-03', '--base', SHA_ZERO), 'scope_mac_not_canonical', 1, None),
+                 (('scope-add', NEW, '--base', 'abc'), 'scope_base_invalid', 1, None),
+                 (('scope-preview',), 'invalid_command', 2, None),
+                 (('scope-remove', NEW, '--sha', SHA_ZERO), 'invalid_command', 2, None),
+                 (('scope-add', NEW, '--base', SHA_ZERO), 'scope_forced_command_refused', 1, dict(self.f.env, CF_SERVICE_FORCED_COMMAND='1')))
+        for args, code, status, env in cases:
+            with self.subTest(args=args, code=code):
+                for result in (self.scope(*args, confirm=tail6(NEW), env=env),
+                               self.core_shell('cf_scope_confirmed=1;cf_main "$@"', *args, env=env)):
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assertEqual(last_json(result.stdout)['errors'], [code])
+        for result in (self.add(NEW, tty=False), self.core_shell('cf_scope_confirmed=1;cf_main "$@"', 'scope-add', NEW, '--base', SHA_ZERO, tty=False)):
+            self.assertEqual((result.returncode, last_json(result.stdout)['errors']), (1, ['scope_tty_required']))
+
+    def test_output_is_printed_only_after_both_locks_are_released(self):
+        probe = ('CF_PLATFORM_LOCKED=1\nplatform_lock_release() { [ "$CF_PLATFORM_LOCKED" = 1 ] || return 0;'
+                 '[ ! -d "$CF_RUNTIME/lock" ] || printf "CF_LOCK_HELD\\n";printf "PLATFORM_RELEASED\\n";CF_PLATFORM_LOCKED=0; }\n'
+                 'trap "cf_unlock;platform_lock_release" 0\ncf_scope_confirmed=1\ncf_main "$@"\n')
+        for args in (('scope-preview', NEW), ('scope-add', NEW, '--base', SHA_ZERO), ('scope-add', NEW, '--base', self.base())):
+            with self.subTest(args=args):
+                result = self.core_shell(probe, *args)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[0], 'PLATFORM_RELEASED', result.stdout + result.stderr)
+                self.assertNotIn('CF_LOCK_HELD', lines)
+                self.assertTrue(lines[-1].startswith('{"ok":'), result.stdout)
+        self.assertEqual(self.status()['scope'], [KID, NEW])
+
+    def test_commit_output_blocked_on_a_full_pipe_holds_no_lock(self):
+        """A terminal that stops reading (XOFF, suspended client) blocks the final write; no lock may be held then."""
+        request = ScopeConcurrencyTests.sync_request(self)
+        base = self.base()
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master);self.addCleanup(os.close, slave)
+        os.write(master, (tail6(NEW) + '\n').encode())
+        marker = self.f.root / 'rpc-stopped'
+        marker.unlink(missing_ok=True)
+        with open(self.f.root / 'child.err', 'w') as err:
+            child = subprocess.Popen(self.cfctl('scope-add', NEW, '--base', base), env=dict(self.f.env, CF_TEST_RPC_STOP='scope_before_write'),
+                                     stdin=slave, stdout=write_end, stderr=err, start_new_session=True)
+        self.addCleanup(lambda: child.poll() is None and (os.killpg(child.pid, signal.SIGKILL), child.wait()))
+        filler = os.open('/proc/self/fd/%d' % write_end, os.O_WRONLY | os.O_NONBLOCK)  # own description: child stays blocking
+        os.close(write_end)
+        self.assertTrue(wait_for(lambda: marker.exists() and proc_state(child.pid) == 'T', 90), 'checkpoint not reached')
+        os.set_blocking(read_end, False)
+        try:
+            while os.read(read_end, 65536):
+                pass
+        except BlockingIOError:
+            pass
+        try:
+            while True:
+                os.write(filler, b'#' * 4096)
+        except BlockingIOError:
+            pass
+        os.close(filler)
+        os.killpg(child.pid, signal.SIGCONT)
+        self.assertTrue(wait_for(lambda: NEW in self.live.read_text(), 60), 'commit not reached')
+        self.assertTrue(wait_for(lambda: self.f.run('rpc-status', '--json').returncode == 0, 20, .3),
+                        'cf_lock is still held while the commit output is blocked')
+        self.assertIsNone(child.poll())
+        self.assertIn('pipe_write', Path('/proc/%d/wchan' % child.pid).read_text())
+        os.killpg(child.pid, signal.SIGSTOP)  # the admin's session is wedged; nothing else may be
+        for args in (('expire',), ('apply-fw',)):
+            result = self.f.run(*args, timeout=120)
+            self.assertEqual(result.returncode, 0, args + (result.stdout, result.stderr))
+        result = self.f.run('rpc-sync', raw=request, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        os.killpg(child.pid, signal.SIGCONT)
+        os.set_blocking(read_end, True)
+        chunks = []
+        while True:
+            data = os.read(read_end, 65536)
+            if not data:
+                break
+            chunks.append(data)
+        self.assertEqual(child.wait(timeout=60), 0)
+        reply = last_json(b''.join(chunks).decode().replace('#', ''))
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(self.status()['scope'], [KID, NEW])
+
+    def test_job_control_stop_signals_are_ignored_by_every_scope_verb(self):
+        for args in (('scope-preview', NEW), ('scope-add', NEW, '--base', SHA_ZERO)):
+            with self.subTest(args=args):
+                read_end, write_end = os.pipe()
+                master, slave = pty.openpty()
+                child = None
+                try:
+                    preview = args[0] == 'scope-preview'
+                    if preview:  # blocked on its output
+                        os.write(write_end, b'#' * fcntl.fcntl(write_end, fcntl.F_GETPIPE_SZ))
+                    # Own process group in this session: not orphaned, so a stop signal would really stop it.
+                    child = subprocess.Popen(self.cfctl(*args), env=self.f.env, stdin=slave, stdout=write_end,
+                                             stderr=subprocess.DEVNULL, process_group=0)
+                    os.close(write_end);write_end = None
+                    if preview:
+                        ready = wait_for(lambda: 'pipe_write' in Path('/proc/%d/wchan' % child.pid).read_text(), 60)
+                    else:  # blocked reading the confirmation after its prompt
+                        os.set_blocking(read_end, False)
+                        seen = []
+                        def prompted():
+                            try:
+                                seen.append(os.read(read_end, 4096))
+                            except BlockingIOError:
+                                pass
+                            return b'confirm: ' in b''.join(seen)
+                        ready = wait_for(prompted, 60)
+                    self.assertTrue(ready)
+                    for number in (signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU):
+                        os.kill(child.pid, number)
+                    time.sleep(.5)
+                    self.assertNotEqual(proc_state(child.pid), 'T')
+                finally:
+                    if child is not None and child.poll() is None:
+                        child.kill();child.wait()
+                    for fd in (read_end, write_end, master, slave):
+                        if fd is not None:
+                            os.close(fd)
+
+    def test_terminal_flow_control_is_disabled_before_admission(self):
+        master, slave = pty.openpty()
+        try:
+            self.assertTrue(termios.tcgetattr(slave)[0] & termios.IXON)
+            result = subprocess.run(self.cfctl('scope-preview', NEW), env=self.f.env, stdin=slave, stdout=slave,
+                                    stderr=subprocess.PIPE, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(termios.tcgetattr(slave)[0] & termios.IXON)
+        finally:
+            os.close(slave);os.close(master)
+
+    def test_slow_typed_confirmation_still_succeeds(self):
+        """Typing takes longer than the ~13 s admission budget: the read must precede the entry tick (see next test)."""
+        base = self.base()
+        master, slave = pty.openpty()
+        try:
+            child = subprocess.Popen(self.cfctl('scope-add', NEW, '--base', base), env=self.f.env, stdin=slave,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            prompt = b''
+            while b'confirm: ' not in prompt:
+                data = os.read(child.stdout.fileno(), 4096)
+                self.assertTrue(data, 'no prompt')
+                prompt += data
+            time.sleep(14)
+            os.write(master, (tail6(NEW) + '\n').encode())
+            stdout, stderr = child.communicate(timeout=120)
+        finally:
+            os.close(slave);os.close(master)
+        self.assertEqual(child.returncode, 0, (stdout + stderr).decode())
+        self.assertTrue(last_json(stdout.decode())['ok'])
+
+    def test_router_interface_mac_is_refused_and_preview_warns(self):
+        self.attach(ROUTER_MAC, '192.168.1.43', 'extender')
+        self.before = self.f.durable_snapshot()
+        self.refused(self.add(ROUTER_MAC), 'scope_mac_is_router_interface', self.before)
+        result = self.scope('scope-preview', ROUTER_MAC)
+        self.assertEqual(self.ok(result)['addRefusal'], 'scope_mac_is_router_interface')
+        self.assertIn("WARNING: this is one of the router's own interface addresses", result.stdout)
+        self.assertNotIn('own interface', self.scope('scope-preview', NEW).stdout)
+
+    def test_unreadable_router_interfaces_refuse(self):
+        address = self.f.root / 'sys/class/net/eth0/address'
+        address.chmod(0)
+        self.refused(self.add(NEW), 'scope_router_interfaces_unreadable', self.before)
+        address.chmod(0o644)
+        for name in ('lo', 'br-lan', 'eth0'):
+            (self.f.root / 'sys/class/net' / name / 'address').unlink()
+        self.refused(self.add(NEW), 'scope_router_interfaces_unreadable', self.before)
+
+    def test_file_membership_read_errors_fail_closed(self):
+        probe = self.f.root / 'probe'
+        probe.write_text(KID + '\n')
+        locked = self.f.root / 'probe-locked'
+        locked.write_text(KID + '\n');locked.chmod(0)
+        body = 'for f in probe probe probe-locked probe-missing;do cf_file_has "$1" "$CF_BASE/$f";printf "%s " "$?";shift;done'
+        for runtime in ('', 'awk() { "' + str(BUSYBOX) + '" awk "$@"; };'):
+            with self.subTest(busybox=bool(runtime)):
+                result = self.core_shell(runtime + body, KID, NEW, KID, KID)
+                codes = result.stdout.split()
+                self.assertEqual(codes[:2], ['0', '1'], result.stdout + result.stderr)
+                self.assertTrue(all(code not in ('0', '1') for code in codes[2:]), codes)
+        # The callers refuse on a read error. (End to end, cf_scope_load already refuses an unreadable floor
+        # or protected list first; this checks the second line of defence directly, after a good load.)
+        self.ok(self.add(NEW))
+        assess = ('CF_RPC_REQUIRE_RUNTIME=1;CF_SCOPE_ACTION=scope-$1;cf_scope_load || exit 9;chmod 0 "$2"\n'
+                  'cf_scope_assess "$1" "$3";printf "%s %s\\n" "$?" "$CF_ERROR";chmod 600 "$2"')
+        for verb, path, mac in (('remove', 'etc/couvrefeu/backup/etc_couvrefeu_rpc-allowed.staged', NEW),
+                                ('add', 'etc/couvrefeu/protected', NEW2)):
+            with self.subTest(verb=verb):
+                result = self.core_shell(assess, verb, str(self.f.root / path), mac)
+                self.assertEqual(result.stdout.split(), ['1', 'scope_state_unreadable'], result.stdout + result.stderr)
+
+    def test_preview_marks_stale_and_link_local_evidence_as_weak(self):
+        self.attach(GHOST, '192.168.1.60', lease=False, state='STALE')
+        link_local = '02:00:00:00:00:06'
+        self.attach(link_local, 'fe80::6', lease=False)
+        for mac in (GHOST, link_local):
+            with self.subTest(mac=mac):
+                result = self.scope('scope-preview', mac)
+                self.ok(result)
+                self.assertIn('(weak evidence', result.stdout)
+        self.assertNotIn('weak evidence', self.scope('scope-preview', NEW).stdout)
+
+    def test_scope_add_looks_up_the_ssh_client_once(self):
+        def neighbour_reads(mac, env):
+            start = len(self.f.calls())
+            self.ok(self.add(mac, env=env))
+            return sum(call['command'] == 'ip' and call['argv'][:2] == ['-4', 'neigh'] for call in self.f.calls()[start:])
+        ssh = dict(self.f.env, SSH_CONNECTION='192.168.1.10 40000 192.168.1.1 22', SSH_CLIENT='192.168.1.10 40000 22')
+        # The SSH client is looked up once per add (cf_scope_assess); cf_ssh_guard reuses that lookup.
+        self.assertEqual(neighbour_reads(NEW2, ssh) - neighbour_reads(NEW, None), 1)
+
+
+class ScopeStaticTests(unittest.TestCase):
+    def test_early_block_precedes_admission_clock_and_ignores_job_control(self):
+        text = (REPO / 'router/cfctl').read_text()
+        read = text.index('IFS= read -r cf_scope_answer')
+        self.assertLess(text.index("trap '' TSTP TTIN TTOU"), read)
+        self.assertLess(text.index('stty -ixon'), read)
+        for later in ('CF_PLATFORM_ENTRY_TICK=$(', '# BEGIN authenticated bootstrap boundary', 'platform_admit runtime'):
+            self.assertLess(read, text.index(later), later)
+
+    def test_awk_mac_copies_agree_with_cf_mac_valid(self):
+        """cf_scope_evidence/cf_addresses carry an awk copy of cf_mac_valid; all must agree."""
+        core = (REPO / 'router/lib/core.sh').read_text()
+        copies = [line.strip() for line in core.splitlines() if line.strip().startswith('function mac(')]
+        self.assertGreaterEqual(len(copies), 2)
+        samples = [NEW, KID, '0a:00:00:00:00:01', '03:00:00:00:00:03', '01:00:5e:00:00:01', '33:33:00:00:00:01',
+                   'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00', '02:00:00:00:00:0A', '02:00:00:00:00:003', '2:00:00:00:00:03',
+                   '02-00-00-00-00-03', '02:00:00:00:00', '02:00:00:00:00:03:', '', 'zz:00:00:00:00:00']
+        valid = subprocess.run(['sh', '-c', 'CF_BASE=;. "$0";for s;do if cf_mac_valid "$s";then echo 1;else echo 0;fi;done',
+                                str(REPO / 'router/lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
+        expected = valid.stdout.split()
+        self.assertEqual(len(expected), len(samples), valid.stderr)
+        self.assertEqual(expected[:3], ['1', '1', '1'])
+        for runtime in (['awk'], [str(BUSYBOX), 'awk']):
+            for copy in copies:
+                with self.subTest(runtime=runtime[0], copy=copy[:40]):
+                    result = subprocess.run(runtime + [copy + ' {print mac($0)?1:0}'], input=''.join(s + '\n' for s in samples),
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.stdout.split(), expected, result.stderr)
+
+
+class StrippedScopeWrapperTests(unittest.TestCase):
+    def setUp(self):
+        self.f = RouterFixture()
+        self.addCleanup(self.f.close)
+
+    def test_strip_tool_emits_the_scope_wrapper_without_its_test_block(self):
+        stripped = self.f.root / 'cfctl-scope-stripped'
+        tool = REPO / 'tools/strip-test-mode.py'
+        result = subprocess.run([sys.executable, '-I', str(tool), str(stripped), 'cfctl-scope'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), hashlib.sha256(stripped.read_bytes()).hexdigest())
+        original = (REPO / 'router/cfctl-scope').read_text().splitlines(keepends=True)
+        lines = stripped.read_text().splitlines(keepends=True)
+        index = original.index('# The grammar fixture may invoke only a marked private-root executable.\n')
+        removed = len(original) - len(lines)
+        self.assertEqual(original[index + removed - 1], 'fi\n')
+        self.assertEqual(original[:index] + original[index + removed:], lines)
+        self.assertNotIn('CF_TEST_MODE', stripped.read_text())
+        # In a fixture environment the stripped copy can only exec the production path, never the backend double.
+        log = self.f.root / 'ran'
+        fake = self.f.bin / 'cfctl'
+        fake.write_text('#!/bin/sh\n: > ' + str(log) + '\n');fake.chmod(0o700)
+        run = subprocess.run(self.f.shell + [str(stripped), ADMIN], env=dict(self.f.env, SSH_ORIGINAL_COMMAND='cfctl scope-preview ' + NEW),
+                             capture_output=True, text=True, timeout=10)
+        self.assertFalse(log.exists(), run.stdout + run.stderr)
+        for argv in (['cfctl-other'], ['cfctl-scope', 'extra']):
+            refused = subprocess.run([sys.executable, '-I', str(tool), str(self.f.root / 'x'), *argv], capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(refused.returncode, 0)
 
 
 if __name__ == '__main__':
