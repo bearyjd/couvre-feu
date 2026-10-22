@@ -294,6 +294,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(resumed["desiredRevision"], 3)
         self.assertEqual(self.paused(), [])
 
+    def test_nan_and_inf_person_ids_pause_only_themselves(self):
+        # Person ids are [a-z][a-z0-9_]*, so nan/inf are the awk-numeric ones (busybox awk: never equal themselves).
+        document = policy()
+        document["people"] = [{"id": "nan", "macs": [KID]}, {"id": "inf", "macs": [OTHER_KID]}]
+        self.sync(document)
+        for identifier, mac in (("nan", KID), ("inf", OTHER_KID)):
+            self.success(self.fixture.run("pause", identifier))
+            self.assertCountEqual(self.paused(), [mac])
+            self.success(self.fixture.run("resume", identifier))
+            self.assertEqual(self.paused(), [])
+
     def test_pause_flushes_every_known_ipv4_ipv6_source_and_destination(self):
         self.sync()
         for repeat in range(2):

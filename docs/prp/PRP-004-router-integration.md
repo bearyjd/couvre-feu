@@ -54,9 +54,12 @@ contains `operationId`, `requestDigest`, `baseRevision`, `baseDigest`,
 `acceptedRevision`, `acceptedDigest`, `outcome: "accepted"` and `current`.
 An exact replay returns that receipt with fresh status, without writing or retrying
 the apply. Reusing the ID for another request conflicts. History holds at most
-128 unique accepted operations; it never evicts. At capacity, new acceptance fails
-closed with `receipt_capacity`; existing exact receipt reads/replays still work.
-Compaction requires a separate design and authorization.
+128 unique accepted operations. At capacity, a new acceptance evicts the oldest
+receipt(s) first (insertion order, never the current one) in the same state
+replacement that commits the new policy. A replay of an evicted operation is
+indistinguishable from a new request on a stale base and gets `policy_conflict`
+(it is never re-applied); `rpc-status <id>` reports `receipt: null` for it, so a
+null receipt means "unknown", not "never applied". Retained receipts still replay.
 State commit uses sync/rename/sync; local crash fixtures do not prove power-loss
 durability on the router filesystem.
 
