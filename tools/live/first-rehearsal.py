@@ -239,7 +239,7 @@ def release_id(blobs):
 def payload_mode(rel):
     if rel == 'release.sha256':
         return '600'
-    if rel in ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh'):
+    if rel in ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'):
         return '755'
     return '644'
 

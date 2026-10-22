@@ -57,4 +57,5 @@ case $1 in
         [ "${#2}" -le 32 ] || exit 2;;
     *) exit 2;;
 esac
-exec env -i PATH="$PATH" LC_ALL=C SSH_CONNECTION="${SSH_CONNECTION-}" SSH_CLIENT="${SSH_CLIENT-}" "$cf_ssh_target" "$@"
+# The marker makes cfctl refuse scope administration from this forced command (defence in depth).
+exec env -i PATH="$PATH" LC_ALL=C SSH_CONNECTION="${SSH_CONNECTION-}" SSH_CLIENT="${SSH_CLIENT-}" CF_SERVICE_FORCED_COMMAND=1 "$cf_ssh_target" "$@"

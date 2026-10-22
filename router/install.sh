@@ -58,7 +58,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=90e8ce0682bdbee44e24ceb80da77aea595d70a5b6dba9f40c5eae2a09128f08
+CF_BOOTSTRAP_PIN=cafd5e880355a70d3d5320dd2a4285b796f5b0920718f495d8863a9bcdac5c30
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -86,7 +86,7 @@ fi
 if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
 fi
-for file in cfctl cfctl-ssh lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh; do
+for file in cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh; do
     if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
         fail "missing/unsafe source: $file"
     fi
@@ -167,7 +167,7 @@ journal_rollback() {
 }
 cleanup() {
     journal_rollback
-    for file in cfctl cfctl-ssh include protected state rpc-allowed rpc-allowed.live generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
+    for file in cfctl cfctl-ssh cfctl-scope include protected state rpc-allowed rpc-allowed.live generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
     for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
@@ -187,7 +187,8 @@ valid_protection "$STAGE/protected" || fail 'at least one unique canonical prote
 chmod 600 "$STAGE/protected"
 cp "$SOURCE/cfctl" "$STAGE/cfctl"
 cp "$SOURCE/cfctl-ssh" "$STAGE/cfctl-ssh"
-chmod 755 "$STAGE/cfctl" "$STAGE/cfctl-ssh"
+cp "$SOURCE/cfctl-scope" "$STAGE/cfctl-scope"
+chmod 755 "$STAGE/cfctl" "$STAGE/cfctl-ssh" "$STAGE/cfctl-scope"
 printf '%s\n' '#!/bin/sh' 'exec /usr/sbin/cfctl apply-fw' > "$STAGE/include"
 chmod 755 "$STAGE/include"
 if [ -e "$BASE/state" ]; then cp -p "$BASE/state" "$STAGE/state"
@@ -276,7 +277,7 @@ if [ -e "$BACKUP" ]; then
     if [ "$ACTIVATE" = 0 ]; then printf '%s\n' 'Recorded installation validated; no changes made.'; exit 0; fi
 else
     printf '\nconfig include '\''couvrefeu'\''\n\toption type '\''script'\''\n\toption path '\''/etc/firewall.couvrefeu'\''\n\toption reload '\''1'\''\n' >> "$STAGE/firewall"
-    printf '\n/etc/couvrefeu\n/usr/sbin/cfctl\n/usr/sbin/cfctl-ssh\n/usr/lib/couvrefeu\n/etc/firewall.couvrefeu\n/etc/crontabs/root\n' >> "$STAGE/sysupgrade"
+    printf '\n/etc/couvrefeu\n/usr/sbin/cfctl\n/usr/sbin/cfctl-ssh\n/usr/sbin/cfctl-scope\n/usr/lib/couvrefeu\n/etc/firewall.couvrefeu\n/etc/crontabs/root\n' >> "$STAGE/sysupgrade"
     printf '\n/etc/.couvrefeu-release-%s\n' "$CF_RELEASE_ID" >> "$STAGE/sysupgrade"
     printf '\n* * * * * /usr/sbin/cfctl expire\n' >> "$STAGE/cron"
     chmod 600 "$STAGE/cron"
@@ -380,7 +381,7 @@ if [ ! -e "$BACKUP" ]; then
             usr/lib/couvrefeu/rules.awk) staged=lib/rules.awk;;
             usr/lib/couvrefeu/activity.sh) staged=lib/activity.sh;;
             usr/lib/couvrefeu/install-common.sh) staged=lib/install-common.sh;;
-            usr/sbin/cfctl) staged=cfctl;; usr/sbin/cfctl-ssh) staged=cfctl-ssh;;
+            usr/sbin/cfctl) staged=cfctl;; usr/sbin/cfctl-ssh) staged=cfctl-ssh;; usr/sbin/cfctl-scope) staged=cfctl-scope;;
             etc/firewall.couvrefeu) staged=include;; etc/config/firewall) staged=firewall;;
             etc/sysupgrade.conf) staged=sysupgrade;; etc/crontabs/root) staged=cron;;
             etc/couvrefeu/protected) staged=protected;; etc/couvrefeu/state) staged=state;;

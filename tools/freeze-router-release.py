@@ -28,7 +28,7 @@ for name in ['install.sh', 'uninstall.sh', 'cfctl']:
     s = (router / name).read_text()
     s = re.sub(r'^CF_BOOTSTRAP_PIN=.*$', 'CF_BOOTSTRAP_PIN=' + pin, s, flags=re.M)
     expected[name] = s.encode()
-files = ['install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh'] + ['lib/' + name for name in names] + ['lib/platform-bootstrap.sh']
+files = ['install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'] + ['lib/' + name for name in names] + ['lib/platform-bootstrap.sh']
 expected['release.sha256'] = ''.join(
     hashlib.sha256(expected[name] if name in expected else (router / name).read_bytes()).hexdigest() + '  ' + name + '\n'
     for name in files).encode()

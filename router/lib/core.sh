@@ -24,6 +24,7 @@ cf_backend_available() {
         sync)cf_backend_paths='/bin/sync /usr/bin/sync';;
         uci|fw3)cf_backend_paths="/sbin/$cf_backend_name /usr/sbin/$cf_backend_name";;
         ip)cf_backend_paths='/sbin/ip /usr/sbin/ip /bin/ip';;
+        logger)cf_backend_paths='/usr/bin/logger /bin/logger';;
         *)return 1;;
     esac
     for cf_backend_path in $cf_backend_paths;do
@@ -360,7 +361,9 @@ cf_address_refresh() {
     cf_address_required=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v now="$CF_EXPIRY_NOW" '$1=="P"&&$3!="-"{m[$2]=m[$2] " " $3}$1=="S"||$1=="A"&&($3==0||$3>now){p[$2]=1}END{for(id in p){n=split(m[id],a," ");for(i=1;i<=n;i++)if(a[i]!="")print a[i]}}' | sort -u)
     if printf '%s\n' "$CF_ADDRESS_DATA" | awk -F '\t' -v required="$cf_address_required" 'BEGIN{n=split(required,a,"\n");for(i=1;i<=n;i++)if(a[i]!="")need[a[i]]=1}NF==2{have[$2]=1}$1=="UNCERTAIN"&&($3 in need){bad=1}END{for(m in need)if(!have[m])bad=1;exit bad}';then CF_ADDRESS_OK=true;fi
 }
-cf_ssh_guard() {
+# The SSH client's unique br-lan MAC in CF_SSH_CLIENT_MAC (empty without SSH). Read-only.
+cf_ssh_client_mac() {
+    CF_SSH_CLIENT_MAC=
     [ -n "${SSH_CONNECTION-}${SSH_CLIENT-}" ] || return 0
     cf_ip=$(printf '%s\n' "${SSH_CONNECTION:-${SSH_CLIENT-}}" | awk 'NF==4||NF==3{print $1}')
     [ -n "$cf_ip" ] || { cf_fail unknown_ssh_client; return 1; }
@@ -368,10 +371,173 @@ cf_ssh_guard() {
     cf_macs=$(printf '%s\n' "$cf_pairs" | awk -F '\t' -v ip="$cf_ip" '$1==ip{print $2}' | sort -u)
     [ "$(printf '%s\n' "$cf_macs" | awk 'NF{n++}END{print n+0}')" = 1 ] || { cf_fail ambiguous_ssh_client; return 1; }
     cf_mac_valid "$cf_macs" || { cf_fail unknown_ssh_client; return 1; }
+    CF_SSH_CLIENT_MAC=$cf_macs
+}
+cf_ssh_guard() {
+    cf_ssh_client_mac || return 1
+    [ -n "$CF_SSH_CLIENT_MAC" ] || return 0
+    cf_macs=$CF_SSH_CLIENT_MAC
     printf '%s\n' "$CF_POLICY" | awk -F '\t' -v mac="$cf_macs" '$1=="P"&&$3==mac{exit 1}' || { cf_fail ssh_client_overlap; return 1; }
     # The guard only reads: a refused request must never grow `protected`.
     awk -v mac="$cf_macs" -v scope="${CF_SCOPE-}" 'BEGIN{n=split(scope,s," ");for(i=1;i<=n;i++)if(s[i]==mac)exit 1}' || { cf_fail ssh_client_in_scope; return 1; }
     awk -v mac="$cf_macs" '$0==mac{yes=1}END{exit !yes}' "$CF_PROTECTED" || { cf_fail ssh_client_unprotected; return 1; }
+}
+# ---- Scope administration (M1d): root, interactive, never reachable through cfctl-ssh. ----
+# Locally administered (private/randomised-capable) address bit. A display hint only, never a gate.
+cf_mac_local() { case $1 in ?[2367abef]:*) return 0;; esac; return 1; }
+# Shared display sanitiser (docs/contracts/tier1-rpc.md 2.1): reject, never strip.
+cf_hostname_sanitise() { awk '{if($0!~/^[A-Za-z0-9][A-Za-z0-9._-]*$/||length($0)>63)print "(unnamed)";else print}'; }
+# CF_SCOPE_EVIDENCE rows: N<TAB>ip<TAB>mac<TAB>state (live br-lan neighbour) and
+# L<TAB>ip<TAB>mac<TAB>expiry<TAB>hostname (unexpired lease inside the br-lan IPv4 subnet).
+# Any LAN host can forge these: they are printed and required to exist, never trusted.
+cf_scope_evidence() {
+    cf_network || return 1
+    # cf_addr4 (br-lan addresses) is set by cf_network in firewall.sh.
+    # shellcheck disable=SC2154
+    cf_ev_prefix=$(printf '%s\n' "$cf_addr4" | awk -v ip="$CF_LAN_IP" '{for(i=1;i<NF;i++)if($i=="inet"){split($(i+1),a,"/");if(a[1]==ip&&a[2]~/^[0-9]+$/&&a[2]+0>=8&&a[2]+0<=32){print a[2]+0;exit}}}')
+    [ -n "$cf_ev_prefix" ] || { cf_fail lan_address_mismatch;return 1; }
+    cf_ev_n4=$(cf_backend ip -4 neigh show dev br-lan) && cf_ev_n6=$(cf_backend ip -6 neigh show dev br-lan) || { cf_fail neighbor_inspection_failed;return 1; }
+    cf_ev_leases=
+    if [ -e "$CF_BASE/tmp/dhcp.leases" ] || [ -L "$CF_BASE/tmp/dhcp.leases" ];then
+        [ -f "$CF_BASE/tmp/dhcp.leases" ] && [ ! -L "$CF_BASE/tmp/dhcp.leases" ] || { cf_fail unsafe_lease_file;return 1; }
+        cf_ev_leases=$(awk 'NF>=4{print "L",$3,tolower($2),$1,$4}' "$CF_BASE/tmp/dhcp.leases") || { cf_fail unsafe_lease_file;return 1; }
+    fi
+    CF_SCOPE_EVIDENCE=$(printf '%s\n%s\n%s\n' "$cf_ev_n4" "$cf_ev_n6" "$cf_ev_leases" | awk -v now="$CF_NOW_VALUE" -v lan="$CF_LAN_IP" -v prefix="$cf_ev_prefix" '
+    function ip4(s,a,n,i){n=split(s,a,".");if(n!=4)return 0;for(i=1;i<=4;i++)if(a[i]!~/^(0|[1-9][0-9]*)$/||length(a[i])>3||a[i]+0>255)return 0;return 1}
+    function ip6(s){return s~/^[0-9a-f:]+$/&&length(s)<=39&&index(s,":")>0}
+    function num(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
+    function mac(s,a,n,i){if(length(s)!=17)return 0;n=split(s,a,":");if(n!=6)return 0;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)return 0;return index("02468ace",substr(a[1],2,1))&&s!="00:00:00:00:00:00"}
+    BEGIN{span=2^(32-prefix);net=int(num(lan)/span)}
+    $1=="L"{if(NF!=5||!mac($3)||!ip4($2)||$4!~/^(0|[1-9][0-9]*)$/||length($4)>10)next;if($4!=0&&$4+0<=now+0)next;if(int(num($2)/span)!=net)next;print "L\t" $2 "\t" $3 "\t" $4 "\t" $5;next}
+    NF{ip=tolower($1);m="";st="";for(i=2;i<=NF;i++){if($i=="lladdr"&&i<NF)m=tolower($(i+1));else if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE)$/)st=$i}
+        if(st!=""&&mac(m)&&(ip4(ip)||ip6(ip)))print "N\t" ip "\t" m "\t" st}')
+}
+cf_scope_seen() { printf '%s\n' "$CF_SCOPE_EVIDENCE" | awk -F '\t' -v m="$1" '($3"")==(m""){yes=1}END{exit !yes}'; }
+cf_file_has() { awk -v m="$1" '($0"")==(m""){yes=1}END{exit !yes}' "$2"; }
+# Why adding ($1=add) or removing ($1=remove) MAC $2 is refused, against the loaded scope, policy
+# and protected list. Order keeps every refusal reachable on its own (and testable).
+cf_scope_assess() {
+    cf_mac_valid "$2" || { cf_fail scope_mac_invalid;return 1; }
+    cf_sa_in=0
+    awk -v m="$2" -v s="$CF_SCOPE" 'BEGIN{n=split(s,a," ");for(i=1;i<=n;i++)if((a[i]"")==(m""))exit 0;exit 1}' && cf_sa_in=1
+    if [ "$1" = add ];then
+        cf_ssh_client_mac || return 1
+        [ "$CF_SSH_CLIENT_MAC" != "$2" ] || { cf_fail scope_mac_is_ssh_client;return 1; }
+        ! cf_file_has "$2" "$CF_PROTECTED" || { cf_fail scope_mac_protected;return 1; }
+        cf_scope_evidence || return 1
+        cf_scope_seen "$2" || { cf_fail scope_no_evidence;return 1; }
+        [ "$cf_sa_in" = 0 ] || { cf_fail scope_mac_present;return 1; }
+        [ "$(printf '%s\n' "$CF_SCOPE" | awk '{print NF}')" -lt 256 ] || { cf_fail scope_full;return 1; }
+    else
+        [ "$cf_sa_in" = 1 ] || { cf_fail scope_mac_absent;return 1; }
+        ! cf_file_has "$2" "$CF_DIR/backup/etc_couvrefeu_rpc-allowed.staged" || { cf_fail scope_mac_in_floor;return 1; }
+        ! printf '%s\n' "$CF_POLICY" | awk -F '\t' -v m="$2" '$1=="P"&&($3"")==(m""){yes=1}END{exit !yes}' || { cf_fail scope_mac_in_use;return 1; }
+    fi
+}
+cf_scope_refuse() { printf '{"ok":false,"errors":["%s"]}\n' "${CF_ERROR:-scope_refused}";return 1; }
+# Install gate, ready+complete generation, single-read scope snapshot and policy safety (no lock).
+cf_scope_load() {
+    cf_install_gate "$CF_SCOPE_ACTION" && cf_control_dirs && cf_protected_valid && cf_state_load && cf_clock || return 1
+    [ -n "$CF_GENERATION" ] && [ -n "$CF_SCOPE" ] || { cf_fail scope_unscoped_install;return 1; }
+    cf_policy_safe
+}
+cf_scope_preview() {
+    cf_scope_evidence || return 1
+    cf_sp_rows=$(printf '%s\n' "$CF_SCOPE_EVIDENCE" | awk -F '\t' -v m="$CF_SCOPE_MAC" '($3"")==(m""){print}')
+    cf_sp_absent=$(printf '%s\n' "$CF_SCOPE_EVIDENCE" | awk -F '\t' 'NR==FNR{if(NF>=3)seen[$3]=1;next}!($0 in seen){print}' - "$CF_PROTECTED")
+    cf_sp_add=null;cf_sp_add_text=allowed;cf_sp_remove=null;cf_sp_remove_text=allowed
+    cf_scope_assess add "$CF_SCOPE_MAC" || { cf_sp_add="\"$CF_ERROR\"";cf_sp_add_text="refused ($CF_ERROR)";CF_ERROR=; }
+    cf_scope_assess remove "$CF_SCOPE_MAC" || { cf_sp_remove="\"$CF_ERROR\"";cf_sp_remove_text="refused ($CF_ERROR)";CF_ERROR=; }
+    cf_sp_local=false;cf_sp_type='globally unique (vendor-assigned)'
+    if cf_mac_local "$CF_SCOPE_MAC";then cf_sp_local=true;cf_sp_type='locally administered (private/randomised; the device must use a FIXED address)';fi
+    printf 'scope-preview %s\n  address: %s\n' "$CF_SCOPE_MAC" "$cf_sp_type"
+    if [ -z "$cf_sp_rows" ];then printf '  evidence: none\n';fi
+    printf '%s\n' "$cf_sp_rows" | while IFS="$(printf '\t')" read -r cf_sp_kind cf_sp_ip cf_sp_m cf_sp_x cf_sp_host;do
+        case $cf_sp_kind in
+            N)printf '  evidence: neighbour %s %s\n' "$cf_sp_ip" "$cf_sp_x";;
+            L)printf '  evidence: lease %s expires %s name %s\n' "$cf_sp_ip" "$cf_sp_x" "$(printf '%s\n' "$cf_sp_host" | cf_hostname_sanitise)";;
+        esac
+    done
+    cf_sp_count=$(printf '%s\n' "$CF_SCOPE" | awk '{print NF}')
+    printf '  current scopeSha: %s (%s entries)\n  scope-add: %s\n  scope-remove: %s\n' "$CF_SCOPE_SHA" "$cf_sp_count" "$cf_sp_add_text" "$cf_sp_remove_text"
+    cf_sp_absent_n=$(printf '%s\n' "$cf_sp_absent" | awk 'NF{n++}END{print n+0}');if [ "$cf_sp_absent_n" != 0 ];then
+        printf '  WARNING: %s protected device(s) not seen on the LAN now:%s\n' "$cf_sp_absent_n" "$(printf '%s\n' "$cf_sp_absent" | awk 'NF{printf " %s",$0}')"
+        printf '  An adult device whose private address rotated shows up as a NEW address: never scope-add it.\n'
+    fi
+    printf '  NOTE: LAN evidence can be forged. Read the address from the device'"'"'s own Wi-Fi settings.\n'
+    cf_sp_in=false;case " $CF_SCOPE " in *" $CF_SCOPE_MAC "*)cf_sp_in=true;;esac;cf_sp_seen=false;[ -z "$cf_sp_rows" ] || cf_sp_seen=true
+    printf '{"ok":true,"action":"scope-preview","mac":"%s","locallyAdministered":%s,"inScope":%s,"evidence":%s,"scopeSha":"%s","scopeCount":%s,"addRefusal":%s,"removeRefusal":%s,"protectedAbsent":%s,"errors":[]}\n' \
+        "$CF_SCOPE_MAC" "$cf_sp_local" "$cf_sp_in" "$cf_sp_seen" "$CF_SCOPE_SHA" "$cf_sp_count" "$cf_sp_add" "$cf_sp_remove" "$cf_sp_absent_n"
+}
+# Audit line at intent (the change is refused if it cannot be logged) and at commit.
+cf_scope_log() {
+    cf_sl_client=$(printf '%s\n' "${SSH_CLIENT-}" | awk 'NF==3&&$1~/^[0-9a-fA-F.:]+$/&&length($1)<=45&&$2~/^[0-9]+$/&&length($2)<=5{print $1 ":" $2;ok=1}END{if(!ok)print "-"}')
+    cf_sl_ppid=$PPID;case $cf_sl_ppid in ''|*[!0-9]*)cf_sl_ppid=-;;esac
+    cf_backend logger -t couvrefeu "$CF_SCOPE_ACTION phase=$1 admin=$CF_SCOPE_ADMIN_NAME client=$cf_sl_client ppid=$cf_sl_ppid mac=$CF_SCOPE_MAC old=$CF_SCOPE_OLD_SHA new=$CF_SCOPE_NEW_SHA"
+}
+# Replace the live scope under cf_lock: an exclusive same-directory candidate (.scope.<pid>) is
+# validated with the runtime validators, flushed, renamed over rpc-allowed and flushed again.
+# The floor (backup/*.staged, *.after) is never written. Any crash leaves the old or new file.
+cf_scope_write() {
+    platform_deadline_check
+    cf_sw_tmp=$CF_RUNTIME/.scope.$$
+    cf_sw_rd=$(stat -c %d "$CF_RUNTIME") && cf_sw_dd=$(stat -c %d "$CF_DIR") && [ "$cf_sw_rd" = "$cf_sw_dd" ] || { cf_fail cross_filesystem_state;return 1; }
+    cf_rpc_checkpoint scope_before_write
+    platform_initial_write
+    ( umask 077;set -C;printf '%s\n' "$CF_SCOPE_NEXT" > "$cf_sw_tmp" ) 2>/dev/null && chmod 600 "$cf_sw_tmp" || { cf_fail unsafe_temporary;return 1; }
+    cf_rpc_checkpoint scope_after_write
+    cf_scope_check "$cf_sw_tmp" && [ "$CF_SCOPE_SHA" = "$CF_SCOPE_NEW_SHA" ] || { rm -f "$cf_sw_tmp";cf_fail scope_candidate_invalid;return 1; }
+    cf_scope_safe || { rm -f "$cf_sw_tmp";return 1; }
+    cf_backend sync || { rm -f "$cf_sw_tmp";cf_fail scope_write_failed;return 1; }
+    cf_rpc_checkpoint scope_before_rename
+    mv -f "$cf_sw_tmp" "$CF_DIR/rpc-allowed" || { rm -f "$cf_sw_tmp";cf_fail scope_write_failed;return 1; }
+    cf_rpc_checkpoint scope_after_rename
+    cf_backend sync || { cf_fail scope_write_failed;return 1; }
+}
+cf_scope_main() {
+    CF_SCOPE_ACTION=$1
+    if [ "$1" = scope-preview ];then [ "$#" = 2 ] || { cf_fail invalid_command;cf_scope_refuse;return 2; }
+    else [ "$#" = 4 ] && [ "$3" = --base ] || { cf_fail invalid_command;cf_scope_refuse;return 2; };fi
+    case $2 in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *)cf_fail scope_mac_not_canonical;cf_scope_refuse;return 1;;esac
+    CF_SCOPE_MAC=$2
+    # Never through the service key's forced command (cfctl-ssh marks its child).
+    [ -z "${CF_SERVICE_FORCED_COMMAND+x}" ] || { cf_fail scope_forced_command_refused;cf_scope_refuse;return 1; }
+    if [ "$1" != scope-preview ];then
+        case $4 in *[!0-9a-f]*)cf_fail scope_base_invalid;cf_scope_refuse;return 1;;esac
+        [ "${#4}" = 64 ] || { cf_fail scope_base_invalid;cf_scope_refuse;return 1; }
+        [ -t 0 ] || { cf_fail scope_tty_required;cf_scope_refuse;return 1; }
+        # cfctl reads the typed confirmation before admission; nothing is confirmed while a lock is held.
+        [ "${cf_scope_confirmed:-0}" = 1 ] || { cf_fail scope_confirmation_required;cf_scope_refuse;return 1; }
+    fi
+    CF_SCOPE_ADMIN_NAME=-
+    if [ -n "${CF_SCOPE_ADMIN+x}" ];then
+        case $CF_SCOPE_ADMIN in ''|*[!a-z]*)cf_fail scope_admin_invalid;cf_scope_refuse;return 1;;esac
+        [ "${#CF_SCOPE_ADMIN}" -le 16 ] || { cf_fail scope_admin_invalid;cf_scope_refuse;return 1; }
+        CF_SCOPE_ADMIN_NAME=$CF_SCOPE_ADMIN
+    fi
+    CF_RPC_REQUIRE_RUNTIME=1
+    cf_scope_load || { cf_scope_refuse;return 1; }
+    if [ "$1" = scope-preview ];then cf_scope_preview || { cf_scope_refuse;return 1; };return 0;fi
+    cf_rpc_checkpoint scope_before_lock
+    trap '' TSTP
+    cf_lock || { cf_scope_refuse;return 1; }
+    # Everything is re-read and re-checked under the lock: the CAS base, then every refusal and the guard.
+    cf_scope_load || { cf_scope_refuse;return 1; }
+    [ "$4" = "$CF_SCOPE_SHA" ] || { cf_fail scope_base_conflict;cf_scope_refuse;return 1; }
+    cf_scope_assess "${1#scope-}" "$2" && cf_ssh_guard || { cf_scope_refuse;return 1; }
+    CF_SCOPE_OLD_SHA=$CF_SCOPE_SHA
+    # Deliberate splitting of the validated space-joined set.
+    # shellcheck disable=SC2086
+    if [ "$1" = scope-add ];then CF_SCOPE_NEXT=$(printf '%s\n' $CF_SCOPE "$2" | LC_ALL=C sort)
+    else CF_SCOPE_NEXT=$(printf '%s\n' $CF_SCOPE | awk -v m="$2" '($0"")!=(m"")');fi
+    CF_SCOPE_NEW_SHA=$(printf '%s\n' "$CF_SCOPE_NEXT" | sha256sum | awk '{print $1}')
+    cf_scope_log intent || { cf_fail scope_audit_unavailable;cf_scope_refuse;return 1; }
+    cf_scope_write || { cf_scope_refuse;return 1; }
+    cf_scope_log commit || printf '%s\n' 'couvre-feu: warning: scope change committed but the commit audit line was not logged' >&2
+    cf_sm_count=$(printf '%s\n' "$CF_SCOPE" | awk '{print NF}')
+    printf '%s committed: %s\n  old scopeSha: %s\n  new scopeSha: %s (%s entries)\n' "$1" "$2" "$CF_SCOPE_OLD_SHA" "$CF_SCOPE_SHA" "$cf_sm_count"
+    printf '{"ok":true,"action":"%s","mac":"%s","oldScopeSha":"%s","scopeSha":"%s","scopeCount":%s,"errors":[]}\n' "$1" "$2" "$CF_SCOPE_OLD_SHA" "$CF_SCOPE_SHA" "$cf_sm_count"
 }
 cf_write_policy() {
     platform_deadline_check
@@ -568,6 +734,7 @@ cf_main() {
     cf_action=${1-}
     case $cf_action in
         rpc-sync|rpc-status) cf_rpc_main "$@";return $?;;
+        scope-preview|scope-add|scope-remove) cf_scope_main "$@";return $?;;
         activity|rpc-activity) [ "$#" = 2 ] && [ "$2" = --json ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; }
             if [ "$cf_action" = activity ];then cf_activity;else cf_rpc_activity;fi;return $?;;
         check) [ "$#" = 1 ] || { printf '%s\n' '{"ok":false,"errors":["invalid_command"]}'; return 2; };cf_check;return $?;;

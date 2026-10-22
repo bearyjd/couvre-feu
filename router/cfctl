@@ -42,6 +42,27 @@ if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_AWK-}" ]; then
     esac
     awk() { "$CF_BUSYBOX" awk "$@"; }
 fi
+# Scope administration (M1d): the typed confirmation is read HERE, before platform admission, so
+# no platform or policy lock and no admission deadline is held while a human types. core.sh
+# repeats every check under cf_lock and refuses scope-add/scope-remove unless this step ran.
+cf_scope_confirmed=0
+case ${1-} in scope-preview|scope-add|scope-remove)
+    cf_scope_early() { printf '{"ok":false,"errors":["%s"]}\n' "$1"; exit 2; }
+    [ -z "${CF_SERVICE_FORCED_COMMAND+x}" ] || cf_scope_early scope_forced_command_refused
+    if [ "$1" != scope-preview ]; then
+        [ "$#" = 4 ] && [ "$3" = --base ] || cf_scope_early invalid_command
+        case $2 in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) cf_scope_early scope_mac_not_canonical;; esac
+        case $4 in *[!0-9a-f]*) cf_scope_early scope_base_invalid;; esac
+        [ "${#4}" = 64 ] || cf_scope_early scope_base_invalid
+        [ -t 0 ] || cf_scope_early scope_tty_required
+        printf '%s %s --base %s\nType the last 6 hex digits of the address (no colons) to confirm: ' "$1" "$2" "$4"
+        IFS= read -r cf_scope_answer || cf_scope_answer=
+        cf_scope_hex=$(printf '%s' "$2" | tr -d :)
+        printf '\n'
+        [ "$cf_scope_answer" = "${cf_scope_hex#??????}" ] || cf_scope_early scope_confirmation_mismatch
+        cf_scope_confirmed=1
+    fi;;
+esac
 # BEGIN authenticated bootstrap boundary
 cf_bootstrap_refuse() { printf '%s\n' '{"ok":false,"errors":["platform_admission_refused"]}'; exit 2; }
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -64,7 +85,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=90e8ce0682bdbee44e24ceb80da77aea595d70a5b6dba9f40c5eae2a09128f08
+CF_BOOTSTRAP_PIN=cafd5e880355a70d3d5320dd2a4285b796f5b0920718f495d8863a9bcdac5c30
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || cf_bootstrap_refuse
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse

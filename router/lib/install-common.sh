@@ -58,6 +58,11 @@ case "$0" in */install.sh) [ -z "${RPC_ALLOW:-}" ] || SCOPED_INSTALL=1;; esac
 if [ -e "$BACKUP/etc_couvrefeu_rpc-allowed.after" ] || [ "$SCOPED_INSTALL" = 1 ];then
     FILES="$FILES etc/couvrefeu/rpc-allowed"
 fi
+# The per-admin scope wrapper is journaled by fresh installations only; older journals keep
+# their own inventory (derived from the journal, never environment input).
+if { [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; } || [ -e "$BACKUP/usr_sbin_cfctl-scope.after" ];then
+    FILES="$FILES usr/sbin/cfctl-scope"
+fi
 # Legacy inventory comes solely from the validated original journal shape.
 PROFILE_INVENTORY=0
 if [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; then PROFILE_INVENTORY=1
@@ -280,12 +285,14 @@ journal_preflight() {
     allowed_entries='release-absent ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next firewall.pending etc_config_firewall.staged.couvrefeu-tmp'
     record_entries='release-absent ready activated complete kernel-cleaned kernel-cleaned.next no-kernel-mutations no-kernel-mutations.next restoring restoring.next restored restored.next firewall.transaction firewall.transaction.next etc_config_firewall.after.next'
     # DONE proves full exact restoration has already succeeded. Its authenticated
-    # cleanup-only whitelist survives deletion of the optional scope .after;
+    # cleanup-only whitelist survives deletion of an optional (scope, wrapper) .after;
     # restoration inventory and its full preflight remain journal-derived.
     if [ "${1:-}" = cleanup ]; then
         platform_valid_done "$DONE" || fail 'unsafe cleanup completion record'
-        allowed_entries="$allowed_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.original etc_couvrefeu_rpc-allowed.copy etc_couvrefeu_rpc-allowed.staged etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
-        record_entries="$record_entries etc_couvrefeu_rpc-allowed.before etc_couvrefeu_rpc-allowed.after etc_couvrefeu_rpc-allowed.mtime etc_couvrefeu_rpc-allowed.inode"
+        for optional_key in etc_couvrefeu_rpc-allowed usr_sbin_cfctl-scope;do
+            allowed_entries="$allowed_entries $optional_key.before $optional_key.after $optional_key.original $optional_key.copy $optional_key.staged $optional_key.mtime $optional_key.inode"
+            record_entries="$record_entries $optional_key.before $optional_key.after $optional_key.mtime $optional_key.inode"
+        done
     fi
     for rel in $FILES; do
         k=$(key "$rel")

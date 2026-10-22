@@ -1721,7 +1721,8 @@ class RestrictedCommandTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(self.wrapper_log.read_text())
                 self.assertEqual(record["argv"], expected)
-                self.assertEqual(record["cf"], {})
+                # Only the service forced-command marker (M1d: cfctl refuses scope-* when it is set) survives env -i.
+                self.assertEqual(record["cf"], {"CF_SERVICE_FORCED_COMMAND": "1"})
 
     def test_shell_syntax_extra_options_and_internal_commands_refused(self):
         for command in ("", "sh", "cfctl status", "cfctl status --json; id",

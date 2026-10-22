@@ -9,11 +9,11 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=becec4a9e52929257706a05e4922509907cdafe1759225073552c790c2f0aa3c
+CF_RELEASE_ID=a802214ea5a7e6335b8f78056b10734d1226e4735564555617df243ba19a2ab6
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-CF_RELEASE_MODULES='core.sh:fefe92ae44bcf4eca616d1239eed9bda2f91949dcc79ff57c9108e050552ff58 rpc.sh:d9a4897277865d1dff29f36167b830ac24c34c6d2b27f51ff39b6b64acbac74e firewall.sh:8dfe686a481a824a08395c3a60c362d5400b74f78c846c57d0204cd332fa78ad install-common.sh:fb0105b9a7224da3b1a7f29ddbd2c661c9ea75ace4069a3437ad70bda6845f52 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:22d78f6a78174dcfc7ca040cd1dc3cda5d516f5dbdbdbc15cad655773cbb6566'
+CF_RELEASE_MODULES='core.sh:c2aa5b03ddb3b57569291d72358dab358cf8978f8ed149ba464509f9d87c9f34 rpc.sh:d9a4897277865d1dff29f36167b830ac24c34c6d2b27f51ff39b6b64acbac74e firewall.sh:8dfe686a481a824a08395c3a60c362d5400b74f78c846c57d0204cd332fa78ad install-common.sh:273e17fde3342f342fe27d0709b16a02e7279b28104137236c0ea1f52bc24ee2 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:22d78f6a78174dcfc7ca040cd1dc3cda5d516f5dbdbdbc15cad655773cbb6566'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -204,7 +204,7 @@ platform_external_closure() {
     platform_verify_modules "$platform_release/lib"
     platform_private "$platform_release/release.sha256" 600
     # Outer reviewed manifest has exactly these direct files, no path escapes.
-    awk 'NF!=2||length($1)!=64||$1~/[^0-9a-f]/||$2!~/^(install.sh|uninstall.sh|cfctl|cfctl-ssh|lib\/(platform-bootstrap.sh|vendor-platform.sh|install-common.sh|core.sh|rpc.sh|firewall.sh|state.awk|rules.awk|json.awk|activity.sh))$/||seen[$2]++ {bad=1}END{exit bad||NR!=14}' "$platform_release/release.sha256" || platform_fail release_manifest
+    awk 'NF!=2||length($1)!=64||$1~/[^0-9a-f]/||$2!~/^(install.sh|uninstall.sh|cfctl|cfctl-ssh|cfctl-scope|lib\/(platform-bootstrap.sh|vendor-platform.sh|install-common.sh|core.sh|rpc.sh|firewall.sh|state.awk|rules.awk|json.awk|activity.sh))$/||seen[$2]++ {bad=1}END{exit bad||NR!=15}' "$platform_release/release.sha256" || platform_fail release_manifest
     while read -r platform_digest platform_file; do
         platform_hash "$platform_release/$platform_file" "$platform_digest"
         case "$platform_file" in lib/*) platform_mode=644;; *) platform_mode=755;; esac
