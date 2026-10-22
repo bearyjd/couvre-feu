@@ -34,8 +34,12 @@ test('moving a device to its own child is refused in the page before any passkey
   page.on('request', (r) => { if (r.method() === 'POST') calls.push(new URL(r.url()).pathname); });
   await signIn(page, f, 'operator');
   const panel = page.locator('#children-panel'), row = panel.locator('[data-entry="kid2"] [data-device="d_kid2"]');
-  await row.getByLabel('Move Device kid2 to').evaluate((select: HTMLSelectElement) => { select.append(new Option('Own child', 'kid2')); select.value = 'kid2'; select.dispatchEvent(new Event('change', { bubbles: true })); });
-  await row.getByRole('button', { name: 'Move device Device kid2', exact: true }).evaluate((b: HTMLButtonElement) => { b.disabled = false; b.click(); });
+  // One atomic DOM step: a periodic redraw between separate steps would drop the injected option.
+  await row.evaluate((r: HTMLElement) => {
+    const select = r.querySelector('select') as HTMLSelectElement, button = r.querySelector('button[aria-label^="Move device"]') as HTMLButtonElement;
+    select.append(new Option('Own child', 'kid2')); select.value = 'kid2'; select.dispatchEvent(new Event('change', { bubbles: true }));
+    button.disabled = false; button.click();
+  });
   await expect(panel.locator('.notice[role="status"]')).toContainText('already belongs');
   expect(calls.filter((c) => c === '/step-up/options' || c.includes('/move'))).toEqual([]);
 });
