@@ -1,5 +1,7 @@
 const mode = process.argv[2];
-if (mode === 'exit') process.exit(255);
+if (mode === 'exit' || mode === 'exit255') process.exit(255);
+if (mode === 'exit2') process.exit(2);
+if (mode === 'invalid-command') { process.stdout.write('{"ok":false,"errors":["invalid_command"]}\n'); process.exit(2); }
 if (mode === 'truncated') process.stdout.write('{"rpc_version":1');
 else if (mode === 'oversize') process.stdout.write('x'.repeat(131073));
 else if (mode === 'diagnostics') process.stderr.write('PRIVATE_DIAGNOSTIC'.repeat(2000));

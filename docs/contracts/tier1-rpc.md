@@ -250,3 +250,21 @@ M2a/M2c.
   `cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>`.
 - Protected cap is 128 in the service (`PROTECTED_MAC_LIMIT`), pinned to `router/lib/install-common.sh` `valid_protection` by a drift test.
 - Observed scope is not part of `targetDigest`; rebind validates stored devices against the NEW manifest floor only.
+
+## 8. M2c decisions (inventory, service side)
+
+- Parser: `shared/src/router-inventory.ts` uses `parseJSON(text, false, 131071)`, not router mode, because router mode rejects the contract's camelCase key `routerTime`. ASCII is enforced field by field
+  (hostname, address, code and generation patterns). `inventory_version` is checked before the strict key check; a missing or non-1 version is `unknown_inventory_version`. The reply is rejected as a whole for a
+  protected MAC (`protected_mac_listed`), any hostname outside `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`, an unsorted or duplicate address or MAC, or a size of 131072 bytes or more.
+- `ipv4` "sorted" means C-locale string order (what `sort -u` prints: `192.0.2.10` before `192.0.2.9`). M1e must emit exactly that. MACs are strictly ascending.
+- Error strings stored only in `inventory_state.last_error`: `inventory_unavailable:<code>` for old routers (`old_router` for an empty exit 2, `invalid_command` for the exact body), `unknown_inventory_version`,
+  `invalid_router_inventory`, `empty_reply`, `protected_mac_listed` and transport codes such as `ssh_timeout`; ssh exit 255 is stored as `inventory_transport_error:ssh_exit_255` so it is never shown as an unavailable inventory;
+  an incomplete (errors or truncated) reply is `inventory_incomplete:<code|truncated>`. `RouterTransportError.exitCode` carries the remote exit status.
+- integration-006: `dispatch_steps.kind` gains `inventory`, `parent_alerts.kind` gains `new_device` (ids and AUTOINCREMENT high-water kept), plus `inventory_devices` (with `alerted_at`), the 1024-row trigger and
+  `inventory_state` (with `generation`, `last_attempt_at`, `refresh_pending`). `automatic_read_summary` is not widened: an inventory poll records `automatic_read_polls` only, so its steps are pruned with the other automatic reads.
+- Execution: a poll is a generated permit under the automatic owner only (no operator form). It runs at the start of `cycle()` when no operation is active, every 60 s (`last_attempt_at`) or when `refresh_pending`.
+  The step is always settled `resolved`; the result is fenced by epoch and step ownership; `dispatch_stopped` is neither read nor written. Failures are caught inside `pollInventory`.
+- Incomplete polls (errors or truncated) refresh devices already known and store nothing new, so they can neither baseline nor produce "New" nor imply "gone". "New" rows carry `alerted_at`: a device whose alert was
+  coalesced away is alerted by a later complete poll. Alert limits (1 per poll, 1 per hour, 12 per 24 h from the first alert of the window) are global because all admins share one system `new_device` alert; its details are a count only.
+- "Unassigned" = the MAC is in neither the `devices` table nor the desired policy. Routes (admin only, 403 `admin_required` otherwise): `GET /admin/inventory`, `POST /admin/inventory/acknowledge {mac}`,
+  `POST /admin/inventory/refresh {}` (202; 409 `inventory_dispatch_disabled`; 429 `inventory_refresh_rate_limited`). Retention: `CF_INVENTORY_RETENTION_DAYS`, default 30, at most 90.

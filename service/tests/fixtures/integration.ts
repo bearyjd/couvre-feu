@@ -5,10 +5,11 @@ import type { IntegrationConfig } from '../../src/integration-config.ts';
 import { IntegrationStore } from '../../src/integration-db.ts';
 import { IntegrationPolicy } from '../../src/integration-policy.ts';
 import { IntegrationWorker } from '../../src/integration-worker.ts';
-import { SSHRouter } from '../../src/ssh-router.ts';
+import { SSHRouter, inventoryFromReply } from '../../src/ssh-router.ts';
 import { RouterTransportError } from '../../src/router-transport.ts';
 import { normalizeRouterActivity } from '../../../shared/src/router-activity.ts';
 import type { RouterActivity } from '../../../shared/src/router-activity.ts';
+import type { RouterInventory } from '../../../shared/src/router-inventory.ts';
 import type { AsyncRouter, FrozenInvocation, DispatchKind } from '../../src/router-transport.ts';
 import { normalizeEnvelope, policyDigest, requestDigest } from '../../../shared/src/router-rpc.ts';
 import type { RPCObservation, RPCEnvelope, RPCReceipt } from '../../../shared/src/router-rpc.ts';
@@ -46,6 +47,10 @@ export class TestRouter implements AsyncRouter {
     transform: ((o: RPCObservation) => RPCObservation) | null = null;
     defer: Promise<void> | null = null;
     activity: unknown = null;
+    /** Raw stdout of `cfctl rpc-inventory --json`, parsed by the real classifier; null behaves like an old router (exit 2, no output). */
+    inventoryText: string | null = null;
+    inventoryFailure: RouterTransportError | null = null;
+    inventoryDefer: Promise<void> | null = null;
     /** Like rpc.sh: an rpc-sync refused under the lock before any write (e.g. a managed device without an address). */
     reject: string | null = null;
     /** Like cf_error_record: a refused transition leaves runtime/error, so status stays not-ok until a later confirmation. */
@@ -60,6 +65,14 @@ export class TestRouter implements AsyncRouter {
         if (this.defer) await this.defer;
         if (this.failure) throw this.failure;
         return normalizeRouterActivity(this.activity);
+    }
+    async invokeInventory(i: FrozenInvocation): Promise<RouterInventory> {
+        if (this.store.db.isTransaction) throw new Error('test_network_transaction');
+        this.calls.push(i);
+        if (this.inventoryDefer) await this.inventoryDefer;
+        if (this.inventoryFailure) throw this.inventoryFailure;
+        if (this.inventoryText === null) throw new RouterTransportError('inventory_unavailable:old_router');
+        return inventoryFromReply(this.inventoryText, this.config);
     }
     async invoke(i: FrozenInvocation): Promise<RPCObservation> {
         if (this.store.db.isTransaction) throw new Error('test_network_transaction');

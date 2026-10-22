@@ -60,6 +60,8 @@ export class IntegrationStore extends Store {
         this.runMigration('integration-004.sql', 'operations', "'pause_all'");
         // integration-005: devices may be `moving` between children (M2b). Same marker pattern: the table's own SQL carries the new state.
         this.runMigration('integration-005.sql', 'devices', "'moving'");
+        // integration-006 (M2c): inventory tables, the `inventory` step kind and the `new_device` alert kind. The marker is the step-kind CHECK.
+        this.runMigration('integration-006.sql', 'dispatch_steps', "'inventory'");
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));
@@ -121,7 +123,7 @@ export class IntegrationStore extends Store {
         if (!this.db.isTransaction) throw new Error('read_retention_requires_transaction');
         const old = this.all<{batch_id: string}>(`SELECT p.batch_id FROM automatic_read_polls p
             JOIN dispatch_steps s ON s.batch_id=p.batch_id AND s.ordinal=1
-            WHERE s.kind IN ('observe','receipt') AND s.state<>'consumed'
+            WHERE s.kind IN ('observe','receipt','inventory') AND s.state<>'consumed'
             ORDER BY p.sequence DESC LIMIT -1 OFFSET ?`, AUTOMATIC_READ_RETENTION);
         for (const row of old) {
             // No consumed callback survives this selection; do not remove its fence witness.

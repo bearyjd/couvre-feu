@@ -11,6 +11,8 @@ import type { RouterActivity } from '../../shared/src/router-activity.ts';
 import { routerScopeOf } from './integration-config.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
+import { DEFAULT_INVENTORY_RETENTION_DAYS, InventoryStore, inventoryFailureLabel } from './inventory-store.ts';
+import type { RouterInventory } from '../../shared/src/router-inventory.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-children.ts';
 import { RouterTransportError } from './router-transport.ts';
@@ -34,11 +36,13 @@ export class IntegrationWorker {
     readonly policy: IntegrationPolicy;
     readonly activity: ActivityStore;
     readonly scope: ScopeTracker;
+    readonly inventory: InventoryStore;
     readonly now: () => number;
-    constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000)) {
+    constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000), inventoryRetentionDays = DEFAULT_INVENTORY_RETENTION_DAYS) {
         this.store = store; this.router = router; this.now = now; this.policy = new IntegrationPolicy(store, now);
         this.activity = new ActivityStore(store, {now, provenance: store.config.provenance});
         this.scope = new ScopeTracker(store, new ParentAlerts(store, null, now), now);
+        this.inventory = new InventoryStore(store, new ParentAlerts(store, null, now), now, inventoryRetentionDays);
     }
     /** Preparing a review artifact performs no network call and grants no authorization. */
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
@@ -75,9 +79,24 @@ export class IntegrationWorker {
         if (kind === 'activity') throw new AppError(403, 'activity_requires_operator_permit');
         await this.run(this.prepare(kind, operationId), owner);
     }
+    /**
+     * One inventory poll inside the dispatch loop. Whatever happens (refused claim, transport failure, bad reply, fence) is recorded in
+     * inventory_state only: it never throws into the cycle, never writes observation_error and never touches dispatch_stopped.
+     */
+    async pollInventory(owner: {token: string; epoch: number}): Promise<void> {
+        try {
+            this.inventory.recordAttempt(this.now());
+            await this.executeAutomatic('inventory', owner);
+        } catch (error) {
+            const code = error instanceof RouterTransportError || error instanceof AppError ? error.code : 'invalid_router_inventory';
+            try { this.inventory.recordFailure(inventoryFailureLabel(code)); } catch { /* the store itself is unavailable; the next cycle's own work reports it */ }
+        }
+    }
     private async run(plan: PreparedDispatch, owner: {token: string; epoch: number} | null): Promise<void> {
         const invocation = this.validate(plan);
-        const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now();
+        // Inventory has no operator-approved form: it is a generated, finite, read-only poll under a live owner session.
+        if (invocation.kind === 'inventory' && !owner) throw new AppError(403, 'inventory_requires_automatic_permit');
+        const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now(), lease = now + (invocation.kind === 'inventory' ? 10 : 17);
         const invocationDigest = owner ? sha256(plan.script + '\n' + batchId) : plan.scriptSha256;
         this.store.transaction(() => {
             this.store.assertIdentity();
@@ -116,16 +135,18 @@ export class IntegrationWorker {
                 this.store.run("UPDATE operations SET error='awaiting_exact_router_receipt',updated_at=? WHERE id=?", now, id);
             }
             this.store.run("INSERT INTO dispatch_batches(id,script_sha256,target_digest,generation,dispatch_epoch,approved_at,expires_at,state) VALUES(?,?,?,?,?,?,?,'running')", batchId, invocationDigest, plan.targetDigest, plan.generation, epoch, now, plan.expiresAt);
-            this.store.run("INSERT INTO dispatch_steps(batch_id,ordinal,operation_id,kind,request_digest,argv_json,stdin_text,deadline_ms,state,claim_token,lease_until) VALUES(?,1,?,?,?,?,?,?,'consumed',?,?)", batchId, invocation.operationId, invocation.kind, invocation.requestDigest, JSON.stringify(invocation.argv), invocation.stdin, invocation.deadlineMs, token, now + 17);
-            this.store.run('UPDATE integration_state SET dispatch_stopped=0 WHERE singleton=1');
+            this.store.run("INSERT INTO dispatch_steps(batch_id,ordinal,operation_id,kind,request_digest,argv_json,stdin_text,deadline_ms,state,claim_token,lease_until) VALUES(?,1,?,?,?,?,?,?,'consumed',?,?)", batchId, invocation.operationId, invocation.kind, invocation.requestDigest, JSON.stringify(invocation.argv), invocation.stdin, invocation.deadlineMs, token, lease);
+            // Inventory is a side read: it leaves the dispatch fence exactly as it found it.
+            if (invocation.kind !== 'inventory') this.store.run('UPDATE integration_state SET dispatch_stopped=0 WHERE singleton=1');
             if (owner && invocation.kind !== 'apply') {
                 this.store.run('INSERT INTO automatic_read_polls(batch_id) VALUES(?)', batchId);
-                this.store.run(`INSERT INTO automatic_read_summary(kind,dispatch_count,dispatched_at,outcome) VALUES(?,1,?,'claimed_once')
+                if (invocation.kind !== 'inventory') this.store.run(`INSERT INTO automatic_read_summary(kind,dispatch_count,dispatched_at,outcome) VALUES(?,1,?,'claimed_once')
                     ON CONFLICT(kind) DO UPDATE SET dispatch_count=dispatch_count+1,dispatched_at=excluded.dispatched_at,outcome=excluded.outcome`, invocation.kind, now);
             } else if (owner) this.store.run("INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES('operator',?,?,?,'claimed_once')", invocation.operationId, 'automatic_apply', now);
         });
         if (!this.store.get('SELECT id FROM dispatch_batches WHERE id=?', batchId)) return;
         if (invocation.kind === 'activity') { await this.runActivity(batchId, token, epoch, invocation); return; }
+        if (invocation.kind === 'inventory') { await this.runInventory(batchId, token, epoch, invocation); return; }
         // A crash here is deliberately possible delivery. Restart must not replay the operation.
         try {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
@@ -158,6 +179,30 @@ export class IntegrationWorker {
             this.store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
             this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', 'operator', 'activity_poll', this.now(), code ?? 'ingested');
             this.store.run('UPDATE integration_state SET dispatch_stopped=1 WHERE singleton=1');
+        });
+    }
+    /**
+     * Read-only listing. The step is ALWAYS settled (a lingering `consumed` step would make the next observe fail with dispatch_in_progress)
+     * and is `resolved` even on failure, since a read leaves no uncertain remote state (an `uncertain` step would also block a rebind). Fencing
+     * is by epoch and step ownership; dispatch_stopped is neither read nor written.
+     */
+    private async runInventory(batchId: string, token: string, epoch: number, invocation: FrozenInvocation): Promise<void> {
+        let reply: RouterInventory | null = null, failure: RouterTransportError | null = null;
+        try {
+            if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
+            reply = await this.router.invokeInventory(invocation);
+        } catch (error) { failure = error instanceof RouterTransportError ? error : new RouterTransportError('invalid_router_inventory'); }
+        this.store.transaction(() => {
+            const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
+            if (!step || step.claim_token !== token || step.state !== 'consumed' || s.dispatch_epoch !== epoch || s.generation !== this.store.config.router.generation || step.lease_until < this.now()) return;
+            this.store.run("UPDATE dispatch_steps SET state='resolved' WHERE batch_id=? AND ordinal=1 AND claim_token=?", batchId, token);
+            this.store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
+            let label = failure ? inventoryFailureLabel(failure.code) : null;
+            if (reply) {
+                try { this.inventory.ingest(reply, this.now()); } catch { label = inventoryFailureLabel('inventory_unavailable:ingest_failed'); }
+            }
+            if (label) this.inventory.recordFailure(label);
+            this.store.pruneAutomaticReads();
         });
     }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {

@@ -40,6 +40,12 @@ export class AutomaticDispatch {
         if (!this.authorized()) return;
         const {store, policy} = this.worker;
         let active = store.integrationState().active_operation_id;
+        // Inventory first, only while nothing is in flight and on its own cadence. It cannot fail the cycle: pollInventory records
+        // every outcome in inventory_state alone.
+        if (!active && this.worker.inventory.due(this.worker.now())) {
+            await this.worker.pollInventory(this.owner);
+            if (!this.authorized()) return;
+        }
         const rpc = active ? store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active) : null;
         await this.worker.executeAutomatic(rpc?.attempt_count ? 'receipt' : 'observe', this.owner, rpc?.attempt_count ? active! : undefined);
         if (!this.authorized() || !policy.fresh()) return;
