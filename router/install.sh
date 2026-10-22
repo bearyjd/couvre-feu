@@ -58,7 +58,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=f3d3e42eadb22855efaa25d9cf6002356b4a3f6d8530b8c42babcfe97206c52f
+CF_BOOTSTRAP_PIN=90e8ce0682bdbee44e24ceb80da77aea595d70a5b6dba9f40c5eae2a09128f08
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -224,6 +224,12 @@ if [ -n "$RPC_ALLOW" ];then
         printf 'X\t1\nG\t%s\nC\t-\n' "$GENERATION" >> "$STAGE/state"
         chmod 600 "$STAGE/state"
     fi
+    # A completed scoped install whose live scope vanished is not silently re-floored (that
+    # would shrink a grown scope unannounced): fail loud. Uninstall still restores the originals.
+    # Non-regular files and symlinks are already refused by safe_paths (install-common.sh).
+    if [ -f "$BACKUP/complete" ];then
+        [ -e "$BASE/rpc-allowed" ] || [ -L "$BASE/rpc-allowed" ] || fail 'live RPC scope missing'
+    fi
     # Every scoped admission, including initial activation, precedes managed writes.
     (
         # shellcheck disable=SC2034
@@ -235,12 +241,12 @@ if [ -n "$RPC_ALLOW" ];then
         stage_valid=$(printf '%s\n' "$stage_json" | awk -f "$SOURCE/lib/json.awk") || exit 1
         [ "$(printf '%s\n' "$stage_valid" | cf_canonical)" = "$(printf '%s\n' "$stage_records" | cf_canonical)" ] || exit 1
         # Resume of a completed scoped install: the live scope may have grown past the
-        # floor ($STAGE/rpc-allowed). One private copy serves every live-scope check.
+        # floor ($STAGE/rpc-allowed). One private, bounded copy serves every live-scope check.
         scope_file=$STAGE/rpc-allowed
-        if [ -f "$BACKUP/complete" ] && [ -e "$BASE/rpc-allowed" ];then
-            cp "$BASE/rpc-allowed" "$STAGE/rpc-allowed.live" && chmod 600 "$STAGE/rpc-allowed.live" || exit 1
+        if [ -f "$BACKUP/complete" ];then
+            head -c 4609 "$BASE/rpc-allowed" > "$STAGE/rpc-allowed.live" && chmod 600 "$STAGE/rpc-allowed.live" || exit 1
             cf_scope_file "$STAGE/rpc-allowed.live" >/dev/null || exit 1
-            scope_has_floor "$STAGE/rpc-allowed" "$STAGE/rpc-allowed.live" || exit 1
+            cf_scope_has_floor "$STAGE/rpc-allowed" "$STAGE/rpc-allowed.live" || exit 1
             awk 'NR==FNR{protected[$0]=1;next}$0 in protected{exit 1}' "$STAGE/protected" "$STAGE/rpc-allowed.live" || exit 1
             scope_file=$STAGE/rpc-allowed.live
         fi

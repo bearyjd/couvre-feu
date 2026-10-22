@@ -236,21 +236,11 @@ valid_protection() {
         END {if(NR < 1 || NR > 128) exit 1}
     ' "$1"
 }
-# Live RPC scope: 1..256 canonical unicast MACs, LF-terminated, unique, LC_ALL=C
-# ascending. Mirrors core.sh cf_scope_file (which preflight cannot source).
-valid_scope() {
-    awk '
-        length($0)!=17 {exit 1}
-        {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00")exit 1}
-        END {if(NR<1||NR>256)exit 1}
-    ' "$1" || return 1
-    [ "$(wc -c < "$1")" -eq $(( $(awk 'END {print NR}' "$1") * 18 )) ] || return 1
-    LC_ALL=C sort -u "$1" | cmp -s - "$1"
-}
-# Every floor MAC (first file) is a line of the live scope (second file); string keys.
-scope_has_floor() {
-    awk 'NR==FNR {if(!($0 in need)){need[$0]=1;n++};next} ($0 in need) {got[$0]=1} END {c=0;for(k in got)c++;exit c!=n}' "$1" "$2"
-}
+# Live RPC scope validation is the runtime's (core.sh cf_scope_file / cf_scope_has_floor),
+# sourced in a subshell so its globals stay out of the installer: one validator, no mirror.
+scope_core() ( CF_BASE=$ROOT CF_LIB=${SOURCE:-$HERE}/lib; . "$CF_LIB/core.sh"; "$@" )
+valid_scope() { scope_core cf_scope_file "$1" >/dev/null; }
+scope_has_floor() { scope_core cf_scope_has_floor "$1" "$2"; }
 metadata() { stat -c '%a:%u:%g' "$1"; }
 
 valid_signature_record() {

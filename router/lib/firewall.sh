@@ -1154,6 +1154,7 @@ $CF_SLOT" ] || return 1
                 printf '%s\n' "$cf_zr_file";;
             .scope.*)
                 # Scope snapshot of a killed reader (cf_scope_bind); owned, removed after proofs.
+                # Tolerated: zero-baseline enumeration would otherwise refuse uninstall on a stray snapshot.
                 cf_zr_pid=${cf_zr_file##*/};cf_zr_pid=${cf_zr_pid#.scope.}
                 case $cf_zr_pid in ''|*[!0-9]*)return 1;;esac
                 # A live reader may delete its copy between enumeration and this test.
