@@ -18,7 +18,7 @@ test('SSH invocation uses fixed public-key-only pinned argv, no forwarding, shel
 });
 test('every SSH invocation kind hardens argv and sends only the three RPC remote commands as the final arg', () => {
     const c = testConfig('/tmp/cf-argv-test'), router = new SSHRouter(c), policy = {...c.enrollment, revision: 1};
-    const envelope = {rpc_version: 1, generation: c.router.generation, operation_id: 'op_1', expected_revision: 0, expected_digest: policyDigest(c.enrollment), policy};
+    const envelope = {rpc_version: 1 as const, generation: c.router.generation, operation_id: 'op_1', expected_revision: 0, expected_digest: policyDigest(c.enrollment), policy};
     const cases = [router.invocation('observe'), router.invocation('activity'), router.invocation('receipt', undefined, 'op_1'), router.invocation('apply', envelope)];
     const remote = /^(cfctl rpc-sync|cfctl rpc-status --json( [a-z0-9_-]{1,64})?|cfctl rpc-activity --json)$/;
     for (const i of cases) {
