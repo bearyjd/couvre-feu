@@ -332,6 +332,7 @@ check) [ "${CF_TEST_CHECK_FAIL:-0}" != 1 ];;
 esac
 ''')
         (self.source / 'cfctl-ssh').write_text('#!/bin/sh\nexit 0\n')
+        (self.source / 'cfctl-scope').write_text('#!/bin/sh\nexit 2\n')
         for lib in ('core.sh', 'rpc.sh', 'firewall.sh', 'activity.sh'):
             (self.source / 'lib' / lib).write_text(':\n')
         for lib in ('json.awk', 'state.awk', 'rules.awk'):
@@ -1451,7 +1452,9 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         adapter_files = ('usr/lib/couvrefeu/platform-bootstrap.sh',
                          'usr/lib/couvrefeu/vendor-platform.sh',
                          'etc/couvrefeu/platform-profile',
-                         'usr/lib/couvrefeu/activity.sh')
+                         'usr/lib/couvrefeu/activity.sh',
+                         # A legacy journal also predates the M1d per-admin scope wrapper.
+                         'usr/sbin/cfctl-scope')
         for rel in FILES + adapter_files:
             key = rel.replace('/', '_')
             original = backup / (key + '.original')

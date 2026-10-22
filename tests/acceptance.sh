@@ -55,7 +55,7 @@ case "${1:---preflight}" in
         [ -f /etc/firewall.couvrefeu ] && [ ! -L /etc/firewall.couvrefeu ]
         awk '$0=="exec /usr/sbin/cfctl apply-fw"{n++}END{exit n!=1}' /etc/firewall.couvrefeu
         awk '$0=="* * * * * /usr/sbin/cfctl expire"{n++}END{exit n!=1}' /etc/crontabs/root
-        for PRESERVED in /etc/couvrefeu /usr/sbin/cfctl /usr/sbin/cfctl-ssh /etc/firewall.couvrefeu /usr/lib/couvrefeu; do
+        for PRESERVED in /etc/couvrefeu /usr/sbin/cfctl /usr/sbin/cfctl-ssh /usr/sbin/cfctl-scope /etc/firewall.couvrefeu /usr/lib/couvrefeu; do
             awk -v path="$PRESERVED" '$0==path{found=1}END{exit !found}' /etc/sysupgrade.conf || {
                 printf 'FAIL: missing preservation entry: %s\n' "$PRESERVED" >&2; exit 1;
             }

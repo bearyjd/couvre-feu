@@ -1721,7 +1721,8 @@ class RestrictedCommandTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(self.wrapper_log.read_text())
                 self.assertEqual(record["argv"], expected)
-                self.assertEqual(record["cf"], {})
+                # Only the service forced-command marker (M1d: cfctl refuses scope-* when it is set) survives env -i.
+                self.assertEqual(record["cf"], {"CF_SERVICE_FORCED_COMMAND": "1"})
 
     def test_shell_syntax_extra_options_and_internal_commands_refused(self):
         for command in ("", "sh", "cfctl status", "cfctl status --json; id",
@@ -2006,7 +2007,7 @@ class InstalledPackageTests(unittest.TestCase):
     def assert_restored(self, fixture, original):
         firewall = fixture.root / "etc/config/firewall"
         self.assertEqual((firewall.read_bytes(), firewall.stat().st_mode & 0o7777), original)
-        for relative in ("usr/sbin/cfctl", "usr/sbin/cfctl-ssh", "usr/lib/couvrefeu",
+        for relative in ("usr/sbin/cfctl", "usr/sbin/cfctl-ssh", "usr/sbin/cfctl-scope", "usr/lib/couvrefeu",
                          "etc/firewall.couvrefeu", "etc/crontabs/root", "etc/sysupgrade.conf", "etc/couvrefeu"):
             self.assertFalse((fixture.root / relative).exists(), relative)
 

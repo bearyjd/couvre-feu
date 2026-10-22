@@ -65,6 +65,9 @@ def main():
 
 
 def dispatch(command, args, state):
+    if command == "logger":
+        # Audit lines are recorded by the call log above; nothing reaches the host syslog.
+        return 0, ""
     if command == "sync":
         if args:
             # Per-file flush (GNU, or BusyBox FEATURE_SYNC_FANCY) before an

@@ -1,0 +1,50 @@
+#!/bin/sh
+# Per-admin Dropbear forced command for router scope administration: tokens only, no shell or eval.
+# authorized_keys: command="/usr/sbin/cfctl-scope <admin>" on that admin's OWN key, never the
+# service key. Admits exactly cfctl scope-preview / scope-add / scope-remove; the admin name is
+# exported for the audit line. Never routed through cfctl-ssh.
+set -f
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+[ "$#" = 1 ] || exit 2
+case $1 in ''|*[!a-z]*) exit 2;; esac
+[ "${#1}" -le 16 ] || exit 2
+cf_scope_admin=$1
+cf_ssh_command=${SSH_ORIGINAL_COMMAND-}
+cf_ssh_target=/usr/sbin/cfctl
+# The grammar fixture may invoke only a marked private-root executable.
+if [ "${CF_TEST_MODE-}" = 1 ];then
+    case ${CF_ROOT-} in /tmp/couvre-feu-*) ;; *) exit 2;; esac
+    case ${CF_BACKEND_DIR-} in "$CF_ROOT"/*) ;; *) exit 2;; esac
+    [ -d "$CF_ROOT" ] && [ ! -L "$CF_ROOT" ] && [ -d "$CF_BACKEND_DIR" ] && [ ! -L "$CF_BACKEND_DIR" ] && [ -f "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] && [ ! -L "$CF_BACKEND_DIR/.couvrefeu-test-backend" ] || exit 2
+    [ "$(CDPATH='' cd -- "$CF_ROOT" && pwd -P)" = "$CF_ROOT" ] && [ "$(CDPATH='' cd -- "$CF_BACKEND_DIR" && pwd -P)" = "$CF_BACKEND_DIR" ] || exit 2
+    cf_ssh_target=$CF_BACKEND_DIR/cfctl
+    [ -f "$cf_ssh_target" ] && [ ! -L "$cf_ssh_target" ] && [ -x "$cf_ssh_target" ] || exit 2
+    # Owned by the caller (uid 0 when root runs it): a private 700 root; backend, marker, target not group/other-writable.
+    cf_scope_uid=$(id -u) && [ "$(stat -c '%u:%a' "$CF_ROOT")" = "$cf_scope_uid:700" ] || exit 2
+    for cf_scope_path in "$CF_BACKEND_DIR" "$CF_BACKEND_DIR/.couvrefeu-test-backend" "$cf_ssh_target";do
+        case $(stat -c '%u:%A' "$cf_scope_path") in "$cf_scope_uid":?????-??-?) ;; *) exit 2;; esac
+    done
+fi
+unset ENV BASH_ENV CDPATH IFS
+# ASCII space is the only separator; ':' is admitted for the canonical MAC only.
+case $cf_ssh_command in ''|*[!a-z0-9:\ -]*) exit 2;; esac
+[ "${#cf_ssh_command}" -le 128 ] || exit 2
+IFS=' '
+# shellcheck disable=SC2086
+set -- $cf_ssh_command
+[ "$#" -ge 3 ] && [ "$1" = cfctl ] || exit 2
+shift
+# Argv shape is checked again in cfctl's early block and cf_scope_main: defence in depth, do not simplify.
+case $2 in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) exit 2;; esac
+case $1 in
+    scope-preview) [ "$#" = 2 ] || exit 2;;
+    scope-add|scope-remove)
+        [ "$#" = 4 ] && [ "$3" = --base ] || exit 2
+        case $4 in *[!0-9a-f]*) exit 2;; esac
+        [ "${#4}" = 64 ] || exit 2;;
+    *) exit 2;;
+esac
+exec env -i PATH="$PATH" LC_ALL=C SSH_CONNECTION="${SSH_CONNECTION-}" SSH_CLIENT="${SSH_CLIENT-}" CF_SCOPE_ADMIN="$cf_scope_admin" "$cf_ssh_target" "$@"

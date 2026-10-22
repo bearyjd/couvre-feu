@@ -24,7 +24,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=90e8ce0682bdbee44e24ceb80da77aea595d70a5b6dba9f40c5eae2a09128f08
+CF_BOOTSTRAP_PIN=21dce443d524b9ceabb34bcfb47bcb3f4629e7a2d6648c6e91f1c6ff94c69f45
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -78,7 +78,7 @@ finish_cleanup() {
         # Remove the journal only while each managed path still holds its
         # exact original (bytes, mode, owner and nanosecond mtime): a legacy
         # journal copy, or the remaining records of one renamed back.
-        for rel in $FILES etc/couvrefeu/rpc-allowed; do
+        for rel in $FILES etc/couvrefeu/rpc-allowed usr/sbin/cfctl-scope; do
             k=$(key "$rel")
             if [ -e "$BACKUP/$k.original" ]; then
                 if ! { [ -f "$ROOT/$rel" ] && [ ! -L "$ROOT/$rel" ] &&
