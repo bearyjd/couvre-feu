@@ -305,7 +305,9 @@ export class TimeRequestService {
     private async repause(row: RequestRow): Promise<void> {
         // A later confirmed or pending policy change for this child outranks the stale allowance. Our own operations are excluded by key.
         const own = this.store.get<{revision: number}>("SELECT revision FROM operations WHERE person_id=? AND idempotency_key LIKE ? ORDER BY revision LIMIT 1", row.person_id, `tr-${row.id}-r%`);
-        const later = own && this.store.get("SELECT id FROM operations WHERE person_id=? AND revision>? AND state IN ('pending','confirmed') AND idempotency_key NOT LIKE ? LIMIT 1", row.person_id, own.revision, `tr-${row.id}-%`);
+        // A bulk operation names this child through operation_people (integration databases only), not necessarily as its representative person_id.
+        const people = this.store.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_people'") ? ' OR id IN (SELECT operation_id FROM operation_people WHERE person_id=?)' : '';
+        const later = own && this.store.get(`SELECT id FROM operations WHERE (person_id=?${people}) AND revision>? AND state IN ('pending','confirmed') AND idempotency_key NOT LIKE ? LIMIT 1`, ...(people ? [row.person_id, row.person_id] : [row.person_id]), own.revision, `tr-${row.id}-%`);
         if (later) return this.setRepause(row, 'superseded', null);
         // The original timed pause would already have ended by itself: nothing to restore.
         if (row.original_pause_until !== 0 && row.original_pause_until! <= this.now()) return this.setRepause(row, 'not_needed', null);

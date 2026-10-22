@@ -95,8 +95,11 @@ export class IntegrationWorker {
                 if (owner) {
                     const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
                     const request = JSON.parse(op.request_json) as {permissionVersion?: string};
-                    const roleAllowed = ['enroll', 'unenroll'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
-                    if (!actor?.active || !roleAllowed || !JSON.parse(actor.person_ids).includes(op.person_id) || String(actor.permission_version) !== request.permissionVersion) {
+                    const roleAllowed = ['enroll', 'unenroll', 'move'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
+                    // The actor must (still) manage EVERY child the operation names, and every one must still exist; the representative alone proves nothing.
+                    const scope: string[] = actor ? JSON.parse(actor.person_ids) : [];
+                    const authorized = this.policy.affectedPeople(op).every(person => scope.includes(person) && this.store.get('SELECT id FROM people WHERE id=? AND active=1', person));
+                    if (!actor?.active || !roleAllowed || !authorized || String(actor.permission_version) !== request.permissionVersion) {
                         this.updateOperation(id, 'failed', 'actor_permission_changed_before_dispatch');
                         this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
                         this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
@@ -209,6 +212,22 @@ export class IntegrationWorker {
             }
         });
     }
+    /**
+     * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so
+     * the device stays with its source child; anything else is decided by the stored OBSERVATION, never by the receipt alone
+     * (a receipt can be accepted yet superseded). Held under the target => it moves; under the source => it stays; neither => the row goes.
+     */
+    private settleMoves(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): void {
+        if (state === 'unknown') return;
+        const o = state === 'failed' ? null : this.store.observation().value;
+        if (state !== 'failed' && !o) return;
+        for (const row of this.store.all<{id: string; person_id: string; identifier: string; move_to: string}>("SELECT id,person_id,identifier,move_to FROM devices WHERE operation_id=? AND state='moving'", op.id)) {
+            const heldBy = (child: string) => o!.acceptedPolicy.people.some(p => p.id === child && p.macs.includes(row.identifier));
+            if (state !== 'failed' && heldBy(row.move_to)) this.store.run("UPDATE devices SET person_id=move_to,move_to=NULL,state='active',operation_id=NULL WHERE id=?", row.id);
+            else if (state === 'failed' || heldBy(row.person_id)) this.store.run("UPDATE devices SET move_to=NULL,state='active',operation_id=NULL WHERE id=?", row.id);
+            else this.store.run('DELETE FROM devices WHERE id=?', row.id);
+        }
+    }
     private refusedBeforeWrite(o: RPCObservation, e: ReturnType<IntegrationPolicy['envelope']>): boolean {
         return o.receipt === null && o.currentOperationId !== e.operation_id && o.generation === e.generation && o.acceptedPolicy.revision === e.expected_revision &&
             o.policyDigest === e.expected_digest && o.errors.length > 0 && o.errors.every(code => PRE_WRITE_REJECTIONS.has(code));
@@ -225,6 +244,7 @@ export class IntegrationWorker {
      * may follow an accepted receipt that was later superseded, so it settles from the stored router observation instead.
      */
     private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): void {
+        if (op.action === 'move') return this.settleMoves(op, state);
         if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return;
         const pending = op.action === 'enroll' ? 'enrolling' : 'removing';
         let held: boolean;

@@ -77,6 +77,17 @@ export class IntegrationStore extends Store {
             } catch (error) { this.close(); throw error; }
             finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
         }
+        // integration-005: devices may be `moving` between children (M2b). Same marker pattern: the table's own SQL carries the new state.
+        if (!this.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'")!.sql.includes("'moving'")) {
+            this.db.exec('PRAGMA foreign_keys=OFF');
+            try {
+                this.transaction(() => {
+                    this.db.exec(readFileSync(new URL('../migrations/integration-005.sql', import.meta.url), 'utf8'));
+                    if (this.all('PRAGMA foreign_key_check').length) throw new Error('integration_migration_foreign_key_violation');
+                });
+            } catch (error) { this.close(); throw error; }
+            finally { if (this.db.isOpen) this.db.exec('PRAGMA foreign_keys=ON'); }
+        }
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));

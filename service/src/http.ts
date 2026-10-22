@@ -1,4 +1,5 @@
 import { ChildAdmin, childrenGet, childrenPost } from './admin-children.ts';
+import { BulkOps, bulkPost } from './integration-bulk.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
@@ -96,6 +97,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const accounts = new AccountAdmin(auth);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
+    const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
@@ -196,6 +198,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const child = await childrenPost(children, session, path, payload);
                 if (child) {
                     send(response, child.status, {...provenance, ...child.body as object});
+                    return;
+                }
+                const bulkRoute = await bulkPost(bulk, session, path, payload, typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined);
+                if (bulkRoute) {
+                    send(response, bulkRoute.status, {...provenance, ...bulkRoute.body as object});
                     return;
                 }
                 const account = await accountPost(accounts, session, path, payload);
