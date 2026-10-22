@@ -758,8 +758,10 @@ cfp_scope_clean() {
     awk 'END{exit NR!=1}' "$1" || return 1
     cfp_sc_line=$(cat "$1")
     case $cfp_sc_line in "{\"rpc_version\":1,\"generation\":\"$3\","*) ;; *) return 1;; esac
-    case $cfp_sc_line in *",\"errors\":[\"$CFP_SCOPE_ERROR\"]}") ;; *) return 1;; esac
     case $cfp_sc_line in *"$CFP_SCOPE_MAC"*) return 1;; esac
+    # Scoped installs append exactly ,"scope":[macs],"scopeSha":"<64 hex>" after errors.
+    cfp_sc_line=$(printf '%s\n' "$cfp_sc_line" | sed 's/\(,"errors":\["[a-z_]*"\]\),"scope":\["[0-9a-f:",]*"\],"scopeSha":"[0-9a-f]\{64\}"}$/\1}/')
+    case $cfp_sc_line in *",\"errors\":[\"$CFP_SCOPE_ERROR\"]}") ;; *) return 1;; esac
     for cfp_sc_want in '"acceptedPolicy":{"version":1,"revision":1,' \
         "\"policyDigest\":\"$4\",\"currentOperationId\":\"$CFP_OPERATION_ID\"," '"receipt":null,' \
         "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}"; do
