@@ -1,6 +1,6 @@
 # Tier-1 RPC and schema contracts (DRAFT)
 
-Status: DRAFT, nothing here is implemented. It lets router (R) and service (S) work proceed in parallel. Router-side
+Status: DRAFT. Sections 1 (router side), 3 and 9 are implemented on the router; the rest is a contract. It lets router (R) and service (S) work proceed in parallel. Router-side
 validation and service-side parsing must both reject anything outside these bounds. All MACs below are fictional.
 Line references are to this branch (`chore/m0-contracts`). A claim marked UNVERIFIED was not confirmed against code.
 
