@@ -9,6 +9,8 @@ import { IntegrationPolicy } from './integration-policy.ts';
 import { ActivityStore } from './activity-store.ts';
 import type { RouterActivity } from '../../shared/src/router-activity.ts';
 import { routerScopeOf } from './integration-config.ts';
+import { ScopeTracker } from './integration-scope.ts';
+import { ParentAlerts } from './parent-alerts.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-children.ts';
 import { RouterTransportError } from './router-transport.ts';
@@ -31,10 +33,12 @@ export class IntegrationWorker {
     readonly router: AsyncRouter;
     readonly policy: IntegrationPolicy;
     readonly activity: ActivityStore;
+    readonly scope: ScopeTracker;
     readonly now: () => number;
     constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000)) {
         this.store = store; this.router = router; this.now = now; this.policy = new IntegrationPolicy(store, now);
         this.activity = new ActivityStore(store, {now, provenance: store.config.provenance});
+        this.scope = new ScopeTracker(store, new ParentAlerts(store, null, now), now);
     }
     /** Preparing a review artifact performs no network call and grants no authorization. */
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
@@ -119,7 +123,7 @@ export class IntegrationWorker {
         // A crash here is deliberately possible delivery. Restart must not replay the operation.
         try {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
-            const o = normalizeObservation(await this.router.invoke(invocation));
+            const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
             try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
@@ -172,6 +176,7 @@ export class IntegrationWorker {
                 this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
                 this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
                 this.activity.purgeUnenrolled();
+                this.scope.observe(o!);
                 if (o!.errors.length === 0 && healthyConfirmation(o!.status, o!.acceptedPolicy, o!.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o!.routerTime);
                 if (!active) return;
                 const e = this.policy.envelope(active), accepted = exactReceipt(o!, e), healthy = accepted && exactHealthy(o!, e);

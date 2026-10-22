@@ -6,6 +6,7 @@ const TITLES = {
   possible_bypass: 'Possible bypass',
   repeated_blocked_attempts: 'Repeated blocked attempts',
   time_request_pending: 'Time request waiting',
+  router_scope_change: 'Router device list changed',
 };
 const SEVERITIES = ['info', 'warning', 'critical'];
 const STATES = ['open', 'acknowledged', 'resolved'];
@@ -21,6 +22,11 @@ export function alertSummary(alert) {
     case 'possible_bypass': return `${kb(d.totalBytes)} of traffic was counted while access was blocked. This can indicate a device that is not covered; it is not proof.`;
     case 'repeated_blocked_attempts': return `${count(d.blockedPackets).toLocaleString()} blocked connection attempts were counted in one window.`;
     case 'time_request_pending': return `${count(d.pendingRequests)} request for more time ${count(d.pendingRequests) === 1 ? 'is' : 'are'} waiting.`;
+    case 'router_scope_change': {
+      // Counts only: the server never puts device addresses in an alert.
+      const added = count(d.added), removed = count(d.removed);
+      return `${added} device${added === 1 ? '' : 's'} added and ${removed} removed from the router's allowed list. ${d.matched === true ? 'A request exists.' : 'No matching request — check with the router administrator.'}`;
+    }
     default: return '';
   }
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { normalizePolicy, policyJSON, effectiveAllowances, allowanceWithinHorizon, healthyConfirmation, effectivePauses, MAX_ALLOWANCE_SECONDS } from '../src/router-schema.ts';
 import type { RouterPolicy, RouterStatus } from '../src/router-schema.ts';
-import { canonicalPolicyRecords, policyDigest, normalizeObservation } from '../src/router-rpc.ts';
+import { canonicalPolicyRecords, policyDigest, normalizeObservation, FORMAT_ONLY } from '../src/router-rpc.ts';
 
 const NOW = 1791691200;
 const base = {version: 1, revision: 3, people: [{id: 'zed', macs: []}, {id: 'alex', macs: ['02:00:00:00:00:20']}], pauses: [{person: 'alex', until: 0}], schedules: [], doh: {ipv4: [], ipv6: []}};
@@ -78,11 +78,11 @@ test('healthy confirmation excludes overridden pauses and requires the router to
 test('RPC observation accepts reported allowances and rejects fabricated or out-of-policy ones', () => {
     const p = normalizePolicy({...base, allowances: [{person: 'alex', until: NOW + 60}]});
     const o = {rpc_version: 1, generation: 'a'.repeat(64), acceptedPolicy: p, policyDigest: policyDigest(p), currentOperationId: null, routerTime: NOW, receipt: null, errors: [], status: status(p, NOW)};
-    assert.deepEqual(normalizeObservation(o).status.effectiveAllowances, [{person: 'alex', until: NOW + 60, remaining: 60}]);
+    assert.deepEqual(normalizeObservation(o, FORMAT_ONLY).status.effectiveAllowances, [{person: 'alex', until: NOW + 60, remaining: 60}]);
     const legacy = normalizePolicy(base), {desiredAllowances: _d, effectiveAllowances: _e, ...legacyStatus} = status(legacy, NOW);
-    assert.equal(normalizeObservation({...o, acceptedPolicy: legacy, policyDigest: policyDigest(legacy), status: legacyStatus}).status.desiredAllowances, undefined);
-    assert.throws(() => normalizeObservation({...o, status: {...o.status, desiredAllowances: []}}));
-    assert.throws(() => normalizeObservation({...o, status: {...o.status, effectiveAllowances: [{person: 'zed', until: NOW + 60, remaining: 60}]}}));
-    assert.throws(() => normalizeObservation({...o, status: {...o.status, effectiveAllowances: [{person: 'alex', until: NOW + 60, remaining: MAX_ALLOWANCE_SECONDS + 1}]}}));
-    assert.throws(() => normalizeObservation({...o, status: {...o.status, effectiveAllowances: [{person: 'alex', until: NOW + 60}]}}));
+    assert.equal(normalizeObservation({...o, acceptedPolicy: legacy, policyDigest: policyDigest(legacy), status: legacyStatus}, FORMAT_ONLY).status.desiredAllowances, undefined);
+    assert.throws(() => normalizeObservation({...o, status: {...o.status, desiredAllowances: []}}, FORMAT_ONLY));
+    assert.throws(() => normalizeObservation({...o, status: {...o.status, effectiveAllowances: [{person: 'zed', until: NOW + 60, remaining: 60}]}}, FORMAT_ONLY));
+    assert.throws(() => normalizeObservation({...o, status: {...o.status, effectiveAllowances: [{person: 'alex', until: NOW + 60, remaining: MAX_ALLOWANCE_SECONDS + 1}]}}, FORMAT_ONLY));
+    assert.throws(() => normalizeObservation({...o, status: {...o.status, effectiveAllowances: [{person: 'alex', until: NOW + 60}]}}, FORMAT_ONLY));
 });

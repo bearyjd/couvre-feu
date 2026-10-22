@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { canonicalPolicyRecords, normalizeEnvelope, normalizeObservation, parseObservation, policyDigest, requestDigest, exactHealthy } from '../src/router-rpc.ts';
+import { canonicalPolicyRecords, normalizeEnvelope, normalizeObservation, parseObservation, policyDigest, requestDigest, exactHealthy, FORMAT_ONLY } from '../src/router-rpc.ts';
 import { normalizePolicy } from '../src/router-schema.ts';
 import { testConfig, observation } from '../../service/tests/fixtures/integration.ts';
 
@@ -28,14 +28,14 @@ test('RPC envelope rejects shell-like identities, unknown fields, missing next r
 });
 test('RPC observation rejects missing, contradicted, duplicate, truncated and fabricated witnesses', () => {
     const c = testConfig('/tmp/unused'), o = observation(c, c.enrollment, 1791691200);
-    assert.equal(parseObservation(JSON.stringify(o)).policyDigest, o.policyDigest);
-    assert.throws(() => normalizeObservation({...o, policyDigest: '0'.repeat(64)}));
-    assert.throws(() => normalizeObservation({...o, rpc_version: 2}));
-    assert.throws(() => normalizeObservation({...o, status: {...o.status, capabilities: {...o.status.capabilities, nativeKernelConfirmed: undefined}}}));
-    assert.throws(() => parseObservation(JSON.stringify(o).slice(0, -1)));
-    assert.throws(() => parseObservation(JSON.stringify(o) + '{}'));
-    assert.throws(() => parseObservation('{"rpc_version":1,"rpc_version":1}'));
-    assert.throws(() => parseObservation(' '.repeat(131073)));
+    assert.equal(parseObservation(JSON.stringify(o), FORMAT_ONLY).policyDigest, o.policyDigest);
+    assert.throws(() => normalizeObservation({...o, policyDigest: '0'.repeat(64)}, FORMAT_ONLY));
+    assert.throws(() => normalizeObservation({...o, rpc_version: 2}, FORMAT_ONLY));
+    assert.throws(() => normalizeObservation({...o, status: {...o.status, capabilities: {...o.status.capabilities, nativeKernelConfirmed: undefined}}}, FORMAT_ONLY));
+    assert.throws(() => parseObservation(JSON.stringify(o).slice(0, -1), FORMAT_ONLY));
+    assert.throws(() => parseObservation(JSON.stringify(o) + '{}', FORMAT_ONLY));
+    assert.throws(() => parseObservation('{"rpc_version":1,"rpc_version":1}', FORMAT_ONLY));
+    assert.throws(() => parseObservation(' '.repeat(131073), FORMAT_ONLY));
     const e = normalizeEnvelope({rpc_version: 1, generation: c.router.generation, operation_id: 'op', expected_revision: 0, expected_digest: o.policyDigest, policy: {...c.enrollment, revision: 1}});
     assert.equal(exactHealthy(o, e), false);
 });
