@@ -32,6 +32,10 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         const macs = store.all<{identifier: string}>("SELECT identifier FROM devices WHERE identifier_kind='mac'").map(d => d.identifier), scope = routerScopeOf(next);
         if (macs.some(m => next.protectedMacs.includes(m))) refuse('rebind_device_protected');
         if (macs.some(m => !scope.includes(m))) refuse('rebind_device_outside_scope');
+        // Scope observed under the old generation says nothing about the new router: forget it, so the next observation re-baselines on the new floor.
+        store.run('DELETE FROM router_scope_observed');
+        // A request made against the old router can never be observed by the new one.
+        store.run("UPDATE scope_requests SET state='cancelled',resolved_at=? WHERE state='pending'", now);
         store.run('UPDATE integration_state SET target_digest=?,manifest_digest=?,generation=?,dispatch_stopped=1,dispatch_epoch=dispatch_epoch+1,observation_error=NULL WHERE singleton=1', next.targetDigest, next.manifestDigest, next.router.generation);
         store.run('UPDATE automatic_dispatch SET enabled=0 WHERE singleton=1');
         store.run("UPDATE dispatch_batches SET state='revoked' WHERE state='running'");

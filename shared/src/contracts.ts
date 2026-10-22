@@ -20,7 +20,7 @@ export interface SessionDTO extends Provenance {
     csrfToken: string;
     expiresAt: number;
 }
-export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll';
+export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move';
 export interface ScheduleWindowDTO {
     id: string;
     weekdays: string[];
@@ -38,6 +38,11 @@ export interface OperationDTO extends Provenance {
     updatedAt: number;
     error: string | null;
     confirmedAt: number | null;
+    /**
+     * Bulk blocks only. What the household can rely on right now: a block is `blocking` only when healthy-confirmed; anything
+     * unconfirmed is `not_blocking`. A resume that is unconfirmed `may_still_be_blocked`; a refused one is `unchanged`.
+     */
+    effect?: 'blocking' | 'not_blocking' | 'unblocked' | 'may_still_be_blocked' | 'unchanged';
     currentHealthy?: boolean;
     accepted?: boolean;
     dispatch?: 'awaiting_operator_dispatch' | 'awaiting_automatic_dispatch' | 'consumed' | 'uncertain' | 'resolved';
@@ -55,7 +60,7 @@ export interface AssignedDeviceDTO {
     id: string;
     label: string;
     /** A queued router change for this device (integration only); absent once the router confirmed it. */
-    change?: 'adding' | 'removing';
+    change?: 'adding' | 'removing' | 'moving';
     /** Policy enrollment evidence only, never network presence or activity. */
     evidence?: DeviceEvidenceDTO;
 }

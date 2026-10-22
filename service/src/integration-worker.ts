@@ -9,6 +9,10 @@ import { IntegrationPolicy } from './integration-policy.ts';
 import { ActivityStore } from './activity-store.ts';
 import type { RouterActivity } from '../../shared/src/router-activity.ts';
 import { routerScopeOf } from './integration-config.ts';
+import { ScopeTracker } from './integration-scope.ts';
+import { ParentAlerts } from './parent-alerts.ts';
+import { DEFAULT_INVENTORY_RETENTION_DAYS, InventoryStore, inventoryFailureLabel } from './inventory-store.ts';
+import type { RouterInventory } from '../../shared/src/router-inventory.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-children.ts';
 import { RouterTransportError } from './router-transport.ts';
@@ -31,10 +35,15 @@ export class IntegrationWorker {
     readonly router: AsyncRouter;
     readonly policy: IntegrationPolicy;
     readonly activity: ActivityStore;
+    readonly scope: ScopeTracker;
+    readonly inventory: InventoryStore;
     readonly now: () => number;
-    constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000)) {
+    constructor(store: IntegrationStore, router: AsyncRouter, now = () => Math.floor(Date.now() / 1000), inventoryRetentionDays = DEFAULT_INVENTORY_RETENTION_DAYS) {
         this.store = store; this.router = router; this.now = now; this.policy = new IntegrationPolicy(store, now);
         this.activity = new ActivityStore(store, {now, provenance: store.config.provenance});
+        const alerts = new ParentAlerts(store, null, now);
+        this.scope = new ScopeTracker(store, alerts, now);
+        this.inventory = new InventoryStore(store, alerts, now, inventoryRetentionDays);
     }
     /** Preparing a review artifact performs no network call and grants no authorization. */
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
@@ -71,9 +80,26 @@ export class IntegrationWorker {
         if (kind === 'activity') throw new AppError(403, 'activity_requires_operator_permit');
         await this.run(this.prepare(kind, operationId), owner);
     }
+    /**
+     * One inventory poll inside the dispatch loop. Whatever happens (refused claim, transport failure, bad reply, fence) is recorded in
+     * inventory_state only: it never throws into the cycle, never writes observation_error and never touches dispatch_stopped.
+     */
+    async pollInventory(owner: {token: string; epoch: number}): Promise<void> {
+        try {
+            this.inventory.recordAttempt(this.now());
+            await this.executeAutomatic('inventory', owner);
+        } catch (error) {
+            // A transport failure is the router's; anything else (a refused claim, a fence, a local fault) says the poll did not run.
+            const label = error instanceof RouterTransportError ? inventoryFailureLabel(error.code)
+                : `inventory_not_run:${(error instanceof AppError ? error.code : 'internal_error').replace(/[^a-z0-9_]/g, '_').slice(0, 64)}`;
+            try { this.inventory.recordFailure(label); } catch { /* the store itself is unavailable; the next cycle's own work reports it */ }
+        }
+    }
     private async run(plan: PreparedDispatch, owner: {token: string; epoch: number} | null): Promise<void> {
         const invocation = this.validate(plan);
-        const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now();
+        // Inventory has no operator-approved form: it is a generated, finite, read-only poll under a live owner session.
+        if (invocation.kind === 'inventory' && !owner) throw new AppError(403, 'inventory_requires_automatic_permit');
+        const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now(), lease = now + (invocation.kind === 'inventory' ? 10 : 17);
         const invocationDigest = owner ? sha256(plan.script + '\n' + batchId) : plan.scriptSha256;
         this.store.transaction(() => {
             this.store.assertIdentity();
@@ -88,16 +114,22 @@ export class IntegrationWorker {
                 const id = invocation.operationId!, op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
                 const rpc = this.store.get<{phase: string; attempt_count: number}>('SELECT * FROM operation_rpc WHERE operation_id=?', id);
                 if (!op || !rpc || rpc.phase !== 'queued' || rpc.attempt_count !== 0 || op.state !== 'pending' || this.store.integrationState().active_operation_id !== id) throw new AppError(409, 'operation_dispatch_not_eligible');
+                const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
+                // The actor must (still) manage EVERY child the operation names, and every one must still exist; the representative alone proves nothing.
+                // This holds for an operator-approved dispatch as much as for an automatic one: the approval covers the script, not a narrowed scope.
+                const scope: string[] = actor ? JSON.parse(actor.person_ids) : [];
+                const authorized = this.policy.affectedPeople(op).every(person => scope.includes(person) && this.store.get('SELECT id FROM people WHERE id=? AND active=1', person));
+                let allowed = Boolean(authorized);
                 if (owner) {
-                    const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
                     const request = JSON.parse(op.request_json) as {permissionVersion?: string};
-                    const roleAllowed = ['enroll', 'unenroll'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
-                    if (!actor?.active || !roleAllowed || !JSON.parse(actor.person_ids).includes(op.person_id) || String(actor.permission_version) !== request.permissionVersion) {
-                        this.updateOperation(id, 'failed', 'actor_permission_changed_before_dispatch');
-                        this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
-                        this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
-                        return;
-                    }
+                    const roleAllowed = ['enroll', 'unenroll', 'move'].includes(op.action) ? actor?.role === 'admin' : ['admin', 'parent'].includes(actor?.role ?? '');
+                    allowed = allowed && Boolean(actor?.active) && roleAllowed && String(actor!.permission_version) === request.permissionVersion;
+                }
+                if (!allowed) {
+                    this.updateOperation(id, 'failed', 'actor_permission_changed_before_dispatch');
+                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
+                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+                    return;
                 }
                 if (!this.policy.fresh()) throw new AppError(503, 'approved_router_observation_required');
                 const o = this.store.observation().value!, e = this.policy.envelope(id);
@@ -106,20 +138,22 @@ export class IntegrationWorker {
                 this.store.run("UPDATE operations SET error='awaiting_exact_router_receipt',updated_at=? WHERE id=?", now, id);
             }
             this.store.run("INSERT INTO dispatch_batches(id,script_sha256,target_digest,generation,dispatch_epoch,approved_at,expires_at,state) VALUES(?,?,?,?,?,?,?,'running')", batchId, invocationDigest, plan.targetDigest, plan.generation, epoch, now, plan.expiresAt);
-            this.store.run("INSERT INTO dispatch_steps(batch_id,ordinal,operation_id,kind,request_digest,argv_json,stdin_text,deadline_ms,state,claim_token,lease_until) VALUES(?,1,?,?,?,?,?,?,'consumed',?,?)", batchId, invocation.operationId, invocation.kind, invocation.requestDigest, JSON.stringify(invocation.argv), invocation.stdin, invocation.deadlineMs, token, now + 17);
-            this.store.run('UPDATE integration_state SET dispatch_stopped=0 WHERE singleton=1');
+            this.store.run("INSERT INTO dispatch_steps(batch_id,ordinal,operation_id,kind,request_digest,argv_json,stdin_text,deadline_ms,state,claim_token,lease_until) VALUES(?,1,?,?,?,?,?,?,'consumed',?,?)", batchId, invocation.operationId, invocation.kind, invocation.requestDigest, JSON.stringify(invocation.argv), invocation.stdin, invocation.deadlineMs, token, lease);
+            // Inventory is a side read: it leaves the dispatch fence exactly as it found it.
+            if (invocation.kind !== 'inventory') this.store.run('UPDATE integration_state SET dispatch_stopped=0 WHERE singleton=1');
             if (owner && invocation.kind !== 'apply') {
                 this.store.run('INSERT INTO automatic_read_polls(batch_id) VALUES(?)', batchId);
-                this.store.run(`INSERT INTO automatic_read_summary(kind,dispatch_count,dispatched_at,outcome) VALUES(?,1,?,'claimed_once')
+                if (invocation.kind !== 'inventory') this.store.run(`INSERT INTO automatic_read_summary(kind,dispatch_count,dispatched_at,outcome) VALUES(?,1,?,'claimed_once')
                     ON CONFLICT(kind) DO UPDATE SET dispatch_count=dispatch_count+1,dispatched_at=excluded.dispatched_at,outcome=excluded.outcome`, invocation.kind, now);
             } else if (owner) this.store.run("INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES('operator',?,?,?,'claimed_once')", invocation.operationId, 'automatic_apply', now);
         });
         if (!this.store.get('SELECT id FROM dispatch_batches WHERE id=?', batchId)) return;
         if (invocation.kind === 'activity') { await this.runActivity(batchId, token, epoch, invocation); return; }
+        if (invocation.kind === 'inventory') { await this.runInventory(batchId, token, epoch, invocation); return; }
         // A crash here is deliberately possible delivery. Restart must not replay the operation.
         try {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
-            const o = normalizeObservation(await this.router.invoke(invocation));
+            const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
             try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
@@ -150,6 +184,47 @@ export class IntegrationWorker {
             this.store.run('UPDATE integration_state SET dispatch_stopped=1 WHERE singleton=1');
         });
     }
+    /**
+     * Read-only listing. The step is ALWAYS settled `resolved`, by claim token and dispatch epoch alone: a read has no lease semantics and leaves
+     * no uncertain remote state, and a lingering `consumed` or `uncertain` step would block a rebind and the next claim (dispatch_in_progress).
+     * A reply that arrives after the lease is not applied (`inventory_unavailable:lease_expired`). The bookkeeping runs in a savepoint: if it
+     * throws, only the bookkeeping is lost and the step is settled on its own. dispatch_stopped is neither read nor written.
+     */
+    private async runInventory(batchId: string, token: string, epoch: number, invocation: FrozenInvocation): Promise<void> {
+        let reply: RouterInventory | null = null, failure: RouterTransportError | null = null;
+        try {
+            if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
+            reply = await this.router.invokeInventory(invocation);
+        } catch (error) { failure = error instanceof RouterTransportError ? error : new RouterTransportError('invalid_router_inventory'); }
+        const settle = () => {
+            const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
+            if (!step || step.claim_token !== token || s.dispatch_epoch !== epoch || !['consumed', 'uncertain'].includes(step.state)) return null;
+            this.store.run("UPDATE dispatch_steps SET state='resolved' WHERE batch_id=? AND ordinal=1 AND claim_token=?", batchId, token);
+            this.store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
+            return {late: step.lease_until < this.now(), current: s.generation === this.store.config.router.generation};
+        };
+        const bookkeeping = (late: boolean) => {
+            let label = failure ? inventoryFailureLabel(failure.code) : null;
+            if (late) { label = inventoryFailureLabel('inventory_unavailable:lease_expired'); reply = null; }
+            if (reply) {
+                try { this.inventory.ingest(reply, this.now()); } catch { label = inventoryFailureLabel('inventory_unavailable:ingest_failed'); }
+            }
+            if (label) this.inventory.recordFailure(label);
+            this.store.pruneAutomaticReads();
+        };
+        try {
+            this.store.transaction(() => {
+                const settled = settle();
+                if (!settled || !settled.current) return;
+                this.store.db.exec('SAVEPOINT inventory_bookkeeping');
+                try { bookkeeping(settled.late); this.store.db.exec('RELEASE inventory_bookkeeping'); }
+                catch { this.store.db.exec('ROLLBACK TO inventory_bookkeeping'); this.store.db.exec('RELEASE inventory_bookkeeping'); }
+            });
+        } catch {
+            // The transaction itself failed (e.g. at commit): settle the step alone, which is what keeps the next claim and a rebind unblocked.
+            try { this.store.transaction(() => { settle(); }); } catch { /* the store is unavailable; recovery settles the step */ }
+        }
+    }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {
         this.store.transaction(() => {
             try {
@@ -172,6 +247,7 @@ export class IntegrationWorker {
                 this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
                 this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
                 this.activity.purgeUnenrolled();
+                this.scope.observe(o!);
                 if (o!.errors.length === 0 && healthyConfirmation(o!.status, o!.acceptedPolicy, o!.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o!.routerTime);
                 if (!active) return;
                 const e = this.policy.envelope(active), accepted = exactReceipt(o!, e), healthy = accepted && exactHealthy(o!, e);
@@ -204,6 +280,29 @@ export class IntegrationWorker {
             }
         });
     }
+    /**
+     * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so
+     * the device stays with its source child; anything else is decided by the stored OBSERVATION, never by the receipt alone
+     * (a receipt can be accepted yet superseded). Held under an active target => it moves; under the source => it stays. Anything
+     * else (held under neither, or under a target that is no longer active) is drift: the row is KEPT, active under the source
+     * (never deleted, so the label survives and the device is not silently unmanaged), and the code is returned for the operation.
+     */
+    private settleMoves(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): string | null {
+        if (state === 'unknown') return null;
+        const o = state === 'failed' ? null : this.store.observation().value;
+        if (state !== 'failed' && !o) return null;
+        let drift: string | null = null;
+        for (const row of this.store.all<{id: string; person_id: string; identifier: string; move_to: string}>("SELECT id,person_id,identifier,move_to FROM devices WHERE operation_id=? AND state='moving'", op.id)) {
+            const heldBy = (child: string) => o!.acceptedPolicy.people.some(p => p.id === child && p.macs.includes(row.identifier));
+            const targetActive = Boolean(this.store.get('SELECT id FROM people WHERE id=? AND active=1', row.move_to));
+            if (state !== 'failed' && heldBy(row.move_to) && targetActive) this.store.run("UPDATE devices SET person_id=move_to,move_to=NULL,state='active',operation_id=NULL WHERE id=?", row.id);
+            else {
+                this.store.run("UPDATE devices SET move_to=NULL,state='active',operation_id=NULL WHERE id=?", row.id);
+                if (state !== 'failed' && (heldBy(row.move_to) || !heldBy(row.person_id))) drift = 'device_move_drift';
+            }
+        }
+        return drift;
+    }
     private refusedBeforeWrite(o: RPCObservation, e: ReturnType<IntegrationPolicy['envelope']>): boolean {
         return o.receipt === null && o.currentOperationId !== e.operation_id && o.generation === e.generation && o.acceptedPolicy.revision === e.expected_revision &&
             o.policyDigest === e.expected_digest && o.errors.length > 0 && o.errors.every(code => PRE_WRITE_REJECTIONS.has(code));
@@ -211,28 +310,30 @@ export class IntegrationWorker {
     private updateOperation(id: string, state: 'confirmed' | 'unknown' | 'failed' | 'conflict', error: string | null, confirmedAt: number | null = null): void {
         const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id)!;
         if (op.state === state && op.error === error && (confirmedAt === null || op.confirmed_at === confirmedAt)) return;
-        this.settleDevices(op, state);
-        this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, error, confirmedAt, this.now(), id);
+        const drift = this.settleDevices(op, state);
+        this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, drift ?? error, confirmedAt, this.now(), id);
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, id, op.action, op.revision, this.now(), state);
     }
     /**
      * Device rows staged by an enroll/unenroll operation settle with it; an unknown outcome leaves them pending. A conflict
      * may follow an accepted receipt that was later superseded, so it settles from the stored router observation instead.
      */
-    private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): void {
-        if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return;
+    private settleDevices(op: IntegrationOperation, state: 'confirmed' | 'unknown' | 'failed' | 'conflict'): string | null {
+        if (op.action === 'move') return this.settleMoves(op, state);
+        if (state === 'unknown' || (op.action !== 'enroll' && op.action !== 'unenroll')) return null;
         const pending = op.action === 'enroll' ? 'enrolling' : 'removing';
         let held: boolean;
         if (state === 'conflict') {
             const o = this.store.observation().value;
-            if (!o) return;
+            if (!o) return null;
             for (const row of this.store.all<{id: string; identifier: string}>('SELECT id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
                 held = o.acceptedPolicy.people.some(p => p.id === op.person_id && p.macs.includes(row.identifier));
                 this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE id=?" : 'DELETE FROM devices WHERE id=?', row.id);
             }
-            return;
+            return null;
         }
         held = (state === 'confirmed') === (op.action === 'enroll');
         this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state=?" : 'DELETE FROM devices WHERE operation_id=? AND state=?', op.id, pending);
+        return null;
     }
 }

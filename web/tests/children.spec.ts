@@ -75,7 +75,7 @@ test('admin adds a device group and devices with passkey step-up through the rou
   await child.getByLabel('New device name for Explicit test person').fill('Unknown');
   await child.getByLabel('Wi-Fi address (MAC) for Explicit test person').fill('02:10:20:30:40:5e');
   await child.getByRole('button', { name: 'Add device' }).click();
-  await expect(panel.locator('.notice[role="status"]')).toContainText('--rpc-allow');
+  await expect(panel.locator('.notice[role="status"]')).toContainText('cfctl scope-add');
 
   // Removal goes through the router as well.
   await child.getByRole('button', { name: 'Remove device Tablet from Explicit test person' }).click();

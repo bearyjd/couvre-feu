@@ -8,6 +8,10 @@ import type { Store } from './db.ts';
 export const CHILD_LIMIT = 64;
 export const DEVICES_PER_CHILD = 32;
 export const DEVICE_LIMIT = 256;
+/** A router revision token ("s<state>-r<revision>-<digest>") as the If-Match / precondition value of every router change. */
+export const TOKEN = /^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/;
+/** Client idempotency keys. The `tr-` prefix belongs to the time-request service (its re-pause keys), so a client key can never mimic one. */
+export const CLIENT_KEY = /^(?!tr-)[A-Za-z0-9_-]{16,128}$/;
 /** Router replies to an rpc-sync that it refused under its lock before writing anything (router/lib/rpc.sh). */
 export const PRE_WRITE_REJECTIONS: ReadonlySet<string> = new Set(['incomplete_address_coverage', 'incomplete_transition_address_coverage', 'rpc_scope_overlap', 'protected_mac_overlap']);
 /** The router needs a DHCP lease or neighbour entry for these MACs; it does not say which one was missing. */
@@ -16,7 +20,7 @@ export const ADDRESS_COVERAGE_REJECTIONS: ReadonlySet<string> = new Set(['incomp
 export interface ChildRow { id: string; name: string; kind: 'child' | 'device_group'; active: number; created_at: number }
 export interface DeviceRow {
     id: string; person_id: string; label: string; identifier_kind: 'mac'; identifier: string;
-    state: 'enrolling' | 'active' | 'removing'; operation_id: string | null; created_at: number;
+    state: 'enrolling' | 'active' | 'removing' | 'moving'; operation_id: string | null; created_at: number; move_to: string | null;
 }
 
 /**
@@ -43,7 +47,9 @@ export const configuredMacs = (store: Store, person: string): string[] => device
 export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock'>, store: Store, allowEmpty = true): void {
     normalizePolicy(policy, config.protectedMacs);
     if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
-    const known = new Set(store.all<{person_id: string; identifier: string}>("SELECT person_id,identifier FROM devices WHERE identifier_kind='mac'").map(d => `${d.person_id}\n${d.identifier}`));
+    // A moving device is admitted under both its source and its target child, so a policy on either side of the change validates.
+    const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
+        .flatMap(d => [`${d.person_id}\n${d.identifier}`, ...(d.move_to ? [`${d.move_to}\n${d.identifier}`] : [])]));
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
     if (JSON.stringify(policy.schedules) !== JSON.stringify(ownerSchedules(policy, config))) throw new AppError(409, 'owner_schedule_configuration_changed');
     if (policy.schedules.length > 0 && !config.scheduleClock) throw new AppError(409, 'owner_schedule_clock_required');
@@ -67,4 +73,11 @@ export function withoutDevice(base: RouterPolicy, config: Pick<IntegrationManife
     return normalizePolicy({...base, revision: base.revision + 1, people, pauses: gone ? base.pauses.filter(p => p.person !== person) : base.pauses,
         ...(base.allowances ? {allowances: gone ? base.allowances.filter(a => a.person !== person) : base.allowances} : {}),
         schedules: ownerSchedules({people}, config)}, config.protectedMacs);
+}
+/** withoutDevice(A) then withDevice(B), as ONE revision: the router sees a single step, so there is never a state with the device nowhere. */
+export function movePolicy(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, from: string, to: string, mac: string): RouterPolicy {
+    if (from === to) throw new AppError(409, 'device_move_same_child');
+    if (!base.people.some(p => p.id === from && p.macs.includes(mac))) throw new AppError(409, 'device_not_on_router');
+    const next = withDevice(withoutDevice(base, config, from, mac), config, to, mac);
+    return normalizePolicy({...next, revision: base.revision + 1}, config.protectedMacs);
 }

@@ -6,7 +6,7 @@ import { integrationFixture, actor, testConfig, TestRouter } from './fixtures/in
 import { IntegrationStore } from '../src/integration-db.ts';
 import { IntegrationWorker } from '../src/integration-worker.ts';
 import { RouterTransportError } from '../src/router-transport.ts';
-import { policyDigest } from '../../shared/src/router-rpc.ts';
+import { policyDigest, sha256 } from '../../shared/src/router-rpc.ts';
 
 test('integration defaults make no calls; HTTP facade only queues an exact durable intent', async () => {
     const f = integrationFixture();
@@ -243,5 +243,23 @@ test('receipt poll returning null after eviction while policy moved on is unknow
         const op = f.policy.operation(actor, id);
         assert.equal(op.state, 'unknown'); assert.equal(op.accepted, false); assert.equal(op.confirmedAt, null);
         assert.equal(f.store.integrationState().active_operation_id, id);
+    } finally { f.cleanup(); }
+});
+
+test('S3: an observation whose scope holds a protected MAC, or misses a floor MAC, is invalid and changes nothing', async () => {
+    const f = integrationFixture();
+    try {
+        const SEED = '02:10:20:30:40:50', PROTECTED = f.config.protectedMacs[0], OTHER = '02:10:20:30:40:52';
+        (f.config as {routerScope?: string[]}).routerScope = [SEED];
+        const shaOf = (scope: string[]) => sha256(scope.join('\n') + '\n');
+        f.router.transform = o => ({...o, scope: [SEED], scopeSha: shaOf([SEED])}); await f.observe();
+        const observedScope = () => JSON.stringify(f.store.get('SELECT * FROM router_scope_observed'));
+        const before = observedScope();
+        for (const scope of [[SEED, PROTECTED], [OTHER]]) {
+            f.advance(1); f.router.transform = o => ({...o, scope, scopeSha: shaOf(scope)}); await f.observe();
+            assert.equal(f.store.integrationState().observation_error, 'router_observation_invalid', JSON.stringify(scope));
+            assert.equal(f.policy.fresh(), false);
+            assert.equal(observedScope(), before);
+        }
     } finally { f.cleanup(); }
 });

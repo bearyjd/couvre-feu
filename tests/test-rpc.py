@@ -732,7 +732,7 @@ class RpcTests(unittest.TestCase):
                                     ('cfctl status --json', False), ('cfctl pause alice', False),
                                     ('cfctl expire', False), ('cfctl apply-fw', False),
                                     ('cfctl rpc-status --json -', False), ('cfctl rpc-sync; id', False),
-                                    ('cfctl rpc-sync\n', False), ('cfctl rpc-status --json --rpc-only', True),
+                                    ('cfctl rpc-sync\n', False), ('cfctl rpc-status --json --rpc-only', False),
                                     ('cfctl rpc-activity --json', True), ('cfctl rpc-activity', False),
                                     ('cfctl rpc-activity --json op-1', False), ('cfctl activity --json', False),
                                     ('cfctl rpc-activity --json; id', False)):
