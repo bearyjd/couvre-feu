@@ -489,17 +489,6 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(self.f.mutation_calls(), [])
         self.reject(self.request())
 
-    def test_capacity_preserves_all_receipts_and_allows_exact_replay(self):
-        request = self.request()
-        accepted = self.accept(request)
-        path = self.f.root / 'etc/couvrefeu/state'
-        with path.open('a') as stream:
-            for index in range(127):
-                stream.write('O\tfiller_{}\t{}\t0\t{}\t1\t{}\n'.format(index, '0' * 64, self.base['policyDigest'], accepted['policyDigest']))
-        self.reject(self.request('full', accepted), error='receipt_capacity')
-        self.accept(request)
-        self.assertEqual(sum(line.startswith('O\t') for line in path.read_text().splitlines()), 128)
-
     def test_uninstall_reinstall_generations_and_scope_original_restoration(self):
         old = self.request()
         result = self.script('uninstall.sh')
@@ -759,6 +748,69 @@ THIRD_KID = '02:00:00:00:00:03'
 
 def scope_args(*macs):
     return [arg for mac in macs for arg in ('--rpc-allow', mac)]
+
+
+class ReceiptEvictionTests(unittest.TestCase):
+    """Receipt history is bounded at 128 by evicting the oldest, never the current."""
+    setUp = RpcTests.setUp
+    tearDown = RpcTests.tearDown
+    script = RpcTests.script
+    install = RpcTests.install
+    observe = RpcTests.observe
+    request = RpcTests.request
+    accept = RpcTests.accept
+    reject = RpcTests.reject
+
+    def state_lines(self):
+        return (self.f.root / 'etc/couvrefeu/state').read_text().splitlines()
+
+    def receipts(self):
+        return [line.split('\t')[1] for line in self.state_lines() if line.startswith('O\t')]
+
+    def fill_to_capacity(self):
+        """Accept one real operation, then seed 127 older-format receipts: 128 retained."""
+        requests, responses = {}, {}
+        requests['op_0'] = self.request('op_0')
+        responses['op_0'] = self.accept(requests['op_0'])
+        with (self.f.root / 'etc/couvrefeu/state').open('a') as stream:
+            for index in range(127):
+                stream.write('O\tfiller_{}\t{}\t0\t{}\t1\t{}\n'.format(
+                    index, '0' * 64, self.base['policyDigest'], responses['op_0']['policyDigest']))
+        self.assertEqual(len(self.receipts()), 128)
+        return requests, responses
+
+    def test_sync_at_capacity_evicts_oldest_in_the_same_write(self):
+        requests, responses = self.fill_to_capacity()
+        state = self.f.root / 'etc/couvrefeu/state'
+        newest = self.accept(self.request('full', responses['op_0']))
+        receipts = self.receipts()
+        self.assertEqual(len(receipts), 128)
+        self.assertNotIn('op_0', receipts)
+        self.assertEqual(receipts[0], 'filler_0')
+        self.assertEqual(receipts[-1], 'full')
+        self.assertIn('C\tfull', self.state_lines())
+        self.assertTrue(newest['receipt']['current'])
+        self.assertEqual(self.observe()['policyDigest'], newest['policyDigest'])
+        self.assertEqual([p.name for p in state.parent.iterdir() if p.name.startswith('state.')], [])
+
+    def test_consecutive_syncs_at_capacity_evict_in_insertion_order(self):
+        requests, responses = self.fill_to_capacity()
+        for index in range(1, 6):
+            name = 'op_{}'.format(index)
+            requests[name] = self.request(name, self.observe())
+            responses[name] = self.accept(requests[name])
+            receipts = self.receipts()
+            self.assertEqual(len(receipts), 128, name)
+            self.assertEqual(receipts[-1], name)
+            self.assertIn('C\t' + name, self.state_lines())
+        self.assertEqual(self.receipts()[:2], ['filler_4', 'filler_5'])
+        # Evicted: replay is a CAS conflict (never re-applied) and status reports unknown.
+        self.reject(requests['op_0'], error='policy_conflict')
+        self.assertIsNone(self.observe('op_0')['receipt'])
+        self.assertIsNone(self.observe('filler_0')['receipt'])
+        # Retained: replay returns the identical receipt without mutation.
+        self.assertEqual(self.accept(requests['op_5'])['receipt'], responses['op_5']['receipt'])
+        self.assertEqual(self.observe('filler_4')['receipt']['operationId'], 'filler_4')
 
 
 class MultiScopeRpcTests(unittest.TestCase):

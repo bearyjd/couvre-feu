@@ -106,7 +106,6 @@ cf_rpc_main() {
         cf_rpc_response;return $?
     fi
     [ "$CF_BASE_REVISION" = "$CF_REVISION" ] && [ "$CF_BASE_DIGEST" = "$CF_DIGEST" ] || { cf_fail policy_conflict;cf_rpc_response;return 1; }
-    [ "$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="O"{n++}END{print n+0}')" -lt 128 ] || { cf_fail receipt_capacity;cf_rpc_response;return 1; }
     cf_backend_available sync || { cf_fail missing_dependencies;cf_rpc_response;return 1; }
     CF_OLD_POLICY=$CF_POLICY
     CF_OLD_DIGEST=$CF_DIGEST
@@ -119,6 +118,8 @@ cf_rpc_main() {
     CF_METADATA=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_CURRENT" 'BEGIN{OFS="\t"}$1=="C"{$2=id}{print}')
     CF_METADATA="$CF_METADATA
 $(printf 'O\t%s\t%s\t%s\t%s\t%s\t%s' "$CF_REQUEST_ID" "$cf_request_digest" "$CF_BASE_REVISION" "$CF_BASE_DIGEST" "$CF_REVISION" "$CF_DIGEST")"
+    # Bounded history: drop the oldest receipts (insertion order), never the current one; persisted by cf_write_policy's single rename.
+    CF_METADATA=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v cur="$CF_CURRENT" '{l[NR]=$0;if($1=="O")n++}END{drop=n-128;for(i=1;i<=NR;i++){split(l[i],f,"\t");if(f[1]=="O"&&drop>0&&f[2]!=cur){drop--;continue}print l[i]}}')
     cf_write_policy || { cf_error_record;cf_rpc_reject;return 1; }
     if ! cf_apply;then CF_ERROR=${CF_ERROR:-apply_failed};cf_error_record;fi
     cf_rpc_checkpoint after_apply
