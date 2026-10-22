@@ -132,7 +132,7 @@ cf_gated_plan() {
     printf '%s\n' "$cf_gp_gates" | while IFS="$(printf '\t')" read -r cf_gp_person cf_gp_until cf_gp_date; do
         [ -n "$cf_gp_person" ] || continue
         # Pauses still in force at the gate, plus every schedule, for this person only.
-        cf_gp_policy=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_gp_person" -v g="$cf_gp_until" '$2!=p{next}$1=="P"||$1=="S"||($1=="A"&&($3==0||$3>g)){print}')
+        cf_gp_policy=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_gp_person" -v g="$cf_gp_until" '($2"")!=(p""){next}$1=="P"||$1=="S"||($1=="A"&&($3==0||$3>g)){print}')
         cf_gp_paused=$(printf '%s\n' "$cf_gp_policy" | awk -F '\t' '$1=="P"&&$3!="-"{m[++n]=$3}$1=="A"{a=1}END{if(a)for(i=1;i<=n;i++)print m[i]}')
         for cf_gp_mac in $cf_gp_paused;do
             printf '%s\tfilter\tcf_fwd\t-i br-lan -m mac --mac-source %s -m time --datestart %s -m comment --comment cf:v1 -j REJECT\n' "$cf_gp_family" "$cf_gp_mac" "$cf_gp_date"
@@ -190,7 +190,7 @@ cf_state_load() {
     CF_GENERATION=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="G"{print $2}')
     CF_CURRENT=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="C"{print $2}')
     if [ -n "$CF_CURRENT" ] && [ "$CF_CURRENT" != - ];then
-        printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_CURRENT" -v rev="$CF_REVISION" -v digest="$CF_DIGEST" '$1=="O"&&$2==id{if($6!=rev||$7!=digest)exit 1}' || { cf_fail invalid_receipt_pointer;return 1; }
+        printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_CURRENT" -v rev="$CF_REVISION" -v digest="$CF_DIGEST" '$1=="O"&&($2"")==(id""){if($6!=rev||$7!=digest)exit 1}' || { cf_fail invalid_receipt_pointer;return 1; }
     fi
     cf_rpc_binding
 }
@@ -389,7 +389,7 @@ cf_write_policy() {
     cf_backend sync || { cf_fail state_write_failed;return 1; }
     CF_DIGEST=$(printf '%s\n' "$CF_POLICY" | sha256sum | awk '{print $1}')
 }
-cf_person_exists() { printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$1" '$1=="P"&&$2==p{yes=1}END{exit !yes}'; }
+cf_person_exists() { printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$1" '$1=="P"&&($2"")==(p""){yes=1}END{exit !yes}'; }
 cf_pause_edit() {
     cf_person=$1; cf_until=$2
     cf_id_valid "$cf_person" && cf_person_exists "$cf_person" || { cf_fail unknown_person; return 1; }
@@ -398,14 +398,14 @@ cf_pause_edit() {
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
     # An explicit local pause is an emergency block: it also clears the person's allowance.
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&$2==p{next}{print}END{print "A",p,u}' | cf_canonical)
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&($2"")==(p""){next}{print}END{print "A",p,u}' | cf_canonical)
 }
 cf_resume_edit() {
     cf_person=$1
     cf_id_valid "$cf_person" && cf_person_exists "$cf_person" || { cf_fail unknown_person; return 1; }
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&$2==p{next}{print}' | cf_canonical)
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&($2"")==(p""){next}{print}' | cf_canonical)
 }
 cf_timeout_available() {
     if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_TIMEOUT-}" ];then

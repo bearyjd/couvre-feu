@@ -113,9 +113,9 @@ Execution model:
 
 A `null` receipt for the service's own attempted operation is "unknown" (`receipt_missing_remote_outcome_unknown`), not
 success and not failed, unless the router's own pre-write refusal is proven (`integration-worker.ts:207`
-`refusedBeforeWrite`). Today the router REFUSES new changes at 128 receipts (`router/lib/rpc.sh:109`
-`receipt_capacity`). Labelling eviction is a ROUTER-SIDE CHANGE: evict the oldest, never the current receipt, in the same
-metadata write. After it, absence can no longer imply "never applied". Tests: `service/tests/integration-worker.test.ts`.
+`refusedBeforeWrite`). The router now EVICTS the oldest receipt at 128 (`router/lib/rpc.sh:124`; never the current receipt, in the same
+state write as the policy change) instead of refusing with `receipt_capacity`. Absence can therefore no longer imply
+"never applied"; a replay of an evicted operation returns `policy_conflict` and `rpc-status` returns `receipt: null`. Tests: `service/tests/integration-worker.test.ts`.
 
 ## 4. integration-004 DDL (DRAFT)
 

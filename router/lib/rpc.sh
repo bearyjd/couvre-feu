@@ -49,7 +49,7 @@ cf_scope_safe() {
 cf_receipt_json() {
     cf_receipt_id=$1
     [ -n "$cf_receipt_id" ] && [ "$cf_receipt_id" != - ] || { printf 'null';return 0; }
-    printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$cf_receipt_id" -v current="$CF_CURRENT" '$1=="O"&&$2==id{printf "{\"operationId\":\"%s\",\"requestDigest\":\"%s\",\"baseRevision\":%s,\"baseDigest\":\"%s\",\"acceptedRevision\":%s,\"acceptedDigest\":\"%s\",\"outcome\":\"accepted\",\"current\":%s}",$2,$3,$4,$5,$6,$7,($2==current?"true":"false");found=1}END{if(!found)printf "null"}'
+    printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$cf_receipt_id" -v current="$CF_CURRENT" '$1=="O"&&($2"")==(id""){printf "{\"operationId\":\"%s\",\"requestDigest\":\"%s\",\"baseRevision\":%s,\"baseDigest\":\"%s\",\"acceptedRevision\":%s,\"acceptedDigest\":\"%s\",\"outcome\":\"accepted\",\"current\":%s}",$2,$3,$4,$5,$6,$7,(($2"")==(current"")?"true":"false");found=1}END{if(!found)printf "null"}'
 }
 cf_rpc_response() {
     cf_rpc_error=$CF_ERROR
@@ -100,13 +100,12 @@ cf_rpc_main() {
     [ "$CF_REQUEST_GENERATION" = "$CF_GENERATION" ] || { cf_fail generation_conflict;cf_rpc_response;return 1; }
     CF_RESPONSE_ID=$CF_REQUEST_ID
     cf_request_digest=$(printf 'rpc1\n%s\n%s\n%s\n%s\n%s\n' "$CF_REQUEST_GENERATION" "$CF_REQUEST_ID" "$CF_BASE_REVISION" "$CF_BASE_DIGEST" "$CF_NEXT_DIGEST" | sha256sum | awk '{print $1}')
-    cf_prior_request=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_REQUEST_ID" '$1=="O"&&$2==id{print $3}')
+    cf_prior_request=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_REQUEST_ID" '$1=="O"&&($2"")==(id""){print $3}')
     if [ -n "$cf_prior_request" ];then
         [ "$cf_prior_request" = "$cf_request_digest" ] || { cf_fail operation_conflict;cf_rpc_response;return 1; }
         cf_rpc_response;return $?
     fi
     [ "$CF_BASE_REVISION" = "$CF_REVISION" ] && [ "$CF_BASE_DIGEST" = "$CF_DIGEST" ] || { cf_fail policy_conflict;cf_rpc_response;return 1; }
-    [ "$(printf '%s\n' "$CF_METADATA" | awk -F '\t' '$1=="O"{n++}END{print n+0}')" -lt 128 ] || { cf_fail receipt_capacity;cf_rpc_response;return 1; }
     cf_backend_available sync || { cf_fail missing_dependencies;cf_rpc_response;return 1; }
     CF_OLD_POLICY=$CF_POLICY
     CF_OLD_DIGEST=$CF_DIGEST
@@ -119,6 +118,10 @@ cf_rpc_main() {
     CF_METADATA=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v id="$CF_CURRENT" 'BEGIN{OFS="\t"}$1=="C"{$2=id}{print}')
     CF_METADATA="$CF_METADATA
 $(printf 'O\t%s\t%s\t%s\t%s\t%s\t%s' "$CF_REQUEST_ID" "$cf_request_digest" "$CF_BASE_REVISION" "$CF_BASE_DIGEST" "$CF_REVISION" "$CF_DIGEST")"
+    # Bounded history: drop the oldest receipts (insertion order) so n-128 are removed, never the current one; persisted by cf_write_policy's single rename.
+    # The 128 literal must match the ++n>128 limit in state.awk:10. The f[2]!=cur guard is defense in depth (the newest receipt is last, so it is never reached by drop).
+    # Ids are compared as strings ("" concatenation): awk would otherwise treat nan/inf/1e2 as numbers.
+    CF_METADATA=$(printf '%s\n' "$CF_METADATA" | awk -F '\t' -v cur="$CF_CURRENT" '{l[NR]=$0;if($1=="O")n++}END{drop=n-128;for(i=1;i<=NR;i++){split(l[i],f,"\t");if(f[1]=="O"&&drop>0&&(f[2]"")!=(cur"")){drop--;continue}print l[i]}}')
     cf_write_policy || { cf_error_record;cf_rpc_reject;return 1; }
     if ! cf_apply;then CF_ERROR=${CF_ERROR:-apply_failed};cf_error_record;fi
     cf_rpc_checkpoint after_apply
