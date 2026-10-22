@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import shutil
 import signal
 import subprocess
 import sys
@@ -36,7 +37,7 @@ GHOST = '02:00:00:00:00:05'
 ADMIN = 'alpha'
 SHA_ZERO = '0' * 64
 ROUTER_MAC = '02:00:00:00:00:fe'  # fixture router interface (sysfs double)
-BUSYBOX = Path.home() / '.local/bin/busybox'
+BUSYBOX = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')  # CI installs it on PATH
 
 
 def scope_sha(macs):
