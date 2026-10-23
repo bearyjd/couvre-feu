@@ -125,7 +125,7 @@ cfr_run_sh() {
     # Deliberate split of the fixed shell selection ("busybox ash").
     # Child diagnostics go to the stage log, never to the marker stream.
     # shellcheck disable=SC2086
-    $CFR_SH "$@" </dev/null 2>>"$CFR_STAGE/child.log"
+    $CFR_SH "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
 }
 
 cfr_extract() {

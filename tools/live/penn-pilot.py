@@ -132,9 +132,21 @@ CFCTL_ALLOWANCE_SECONDS = 45
 KILL_GRACE_SECONDS = 15
 CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS
 INSTALL_ALLOWANCE_SECONDS = 240
-# Teardown: leg-2 cancel wait 20 + one safe-band wait 71 + uninstall TERM allowance 240 (not shorter than the install
-# allowance) + KILL grace 15 = 346 s, plus the restore snapshot, proof and connectivity reads.
-TEARDOWN_RESERVE_SECONDS = 420
+# The uninstall is never given a shorter deadline than the install.
+UNINSTALL_ALLOWANCE_SECONDS = INSTALL_ALLOWANCE_SECONDS
+# The leg-2 cancel wait (the driver's idle acknowledgement and the scope quiet check) must outlast a leg that is
+# still running when the stop comes (SCOPE_LEG_SECONDS), plus a margin for the acknowledgement itself.
+LEG2_CANCEL_MARGIN_SECONDS = 15
+LEG2_CANCEL_WAIT_SECONDS = SCOPE_LEG_SECONDS + LEG2_CANCEL_MARGIN_SECONDS
+TEARDOWN_SAFE_BAND_WAIT_SECONDS = 71
+# The KILL-bounded local reads after the uninstall (READ_TIMEOUT_SECONDS each): the restore snapshot (5 reads), the
+# connectivity neighbour read (success path) and cfp_kernel_state (3 reads, failure path).
+TEARDOWN_SNAPSHOT_READS_SECONDS = 5 * 8
+TEARDOWN_CONNECTIVITY_READS_SECONDS = 8
+TEARDOWN_KERNEL_STATE_READS_SECONDS = 3 * 8
+# Teardown: leg-2 cancel wait 75 + one safe-band wait 71 + uninstall TERM allowance 240 + KILL grace 15 = 401 s, then
+# 449 s on success (+ snapshot 40 + connectivity 8) or 465 s on failure (+ snapshot 40 + kernel state 24).
+TEARDOWN_RESERVE_SECONDS = 480
 # Router-side `timeout -s KILL` bound for each read-only iptables/ipset read.
 READ_TIMEOUT_SECONDS = 8
 # One counters snapshot: five chains, each read with -S and -nvxL.
@@ -275,7 +287,7 @@ def _schema_version(document):
 
 
 def _pilot_timeout(document, version):
-    """remoteTimeoutSeconds: v2 up to its own hard max; v1 up to V1_MAX (the TERM-then-KILL grace and the 420 s
+    """remoteTimeoutSeconds: v2 up to its own hard max; v1 up to V1_MAX (the TERM-then-KILL grace and the 480 s
     teardown reserve put the two-device-with-SCOPE worst case above the rehearsal tool's 3600 s cap)."""
     if version == 2:
         return V2.v2_timeout(document)
@@ -378,7 +390,8 @@ def build_payload(config, commit, blobs, timing):
               'CFP_REMOTE_TIMEOUT': config['remoteTimeoutSeconds'], 'CFP_TEARDOWN_RESERVE': TEARDOWN_RESERVE_SECONDS,
               'CFP_READ_TIMEOUT': READ_TIMEOUT_SECONDS, 'CFP_COUNTERS_WORST': COUNTERS_WORST_SECONDS,
               'CFP_ITERATION_WORST': iteration_worst_seconds(timing),
-              'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS}
+              'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS, 'CFP_KILL_GRACE': KILL_GRACE_SECONDS,
+              'CFP_UNINSTALL_ALLOWANCE': UNINSTALL_ALLOWANCE_SECONDS, 'CFP_LEG2_CANCEL_WAIT': LEG2_CANCEL_WAIT_SECONDS}
     budget = config_budget(config)
     # Only phases the template implements get a parameter (the v2 phase names are not shell identifiers).
     # Hyphens are not shell identifier characters: SCOPE-ADD-1 becomes CFP_WORST_SCOPE_ADD_1.

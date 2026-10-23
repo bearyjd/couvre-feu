@@ -5,7 +5,6 @@ Same harness as tests/test-penn-pilot-leg2.py (fake ssh, no router). Fictional M
 import json
 import os
 from pathlib import Path
-import re
 import shlex
 import shutil
 import signal
@@ -101,11 +100,12 @@ class AckCommandTests(L2.DriverBase):
 
     def test_the_scan_window_is_constant_and_fits_inside_the_cancel_wait_and_the_ssh_timeout(self):
         leg2 = self.tool.LEG2
-        shell = (REPO / 'tools/live/penn-pilot.sh').read_text()
-        wait = int(re.search(r'^CFP_LEG2_CANCEL_WAIT=(\d+)$', shell, re.M).group(1))
+        # The shell has no default for CFP_LEG2_CANCEL_WAIT since T3c: penn-pilot.py passes it as a digest-bound parameter.
+        wait = self.tool.LEG2_CANCEL_WAIT_SECONDS
         self.assertGreaterEqual(leg2.ACK_SCAN_SECONDS, 15)
         self.assertLess(leg2.ACK_SCAN_SECONDS, wait)
         self.assertGreater(leg2.ACK_SECONDS, leg2.ACK_SCAN_SECONDS)
+        self.assertLessEqual(leg2.ACK_SECONDS, wait)
         with mock.patch.object(leg2, 'ACK_SCAN_SECONDS', 3):
             self.process(51, '/bin/sh', '/usr/sbin/cfctl', 'expire')
             begun = time.monotonic()

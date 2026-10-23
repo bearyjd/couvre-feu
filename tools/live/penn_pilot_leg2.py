@@ -59,7 +59,8 @@ set -C; : > PATH_
 """
 # The router-side scan waits up to this many seconds for a live cfctl (cron `cfctl expire`, the wrapper's timeout
 # watcher) to go away, then reports busy (final, no retry). It, the ssh connect (5 s) and the ssh timeout below must
-# fit the shell's CFP_LEG2_CANCEL_WAIT (20 s, shared with the quiet check), so it stays a constant 15.
+# fit the shell's CFP_LEG2_CANCEL_WAIT (penn-pilot.py LEG2_CANCEL_WAIT_SECONDS, 75 s, shared with the quiet check),
+# so it stays a constant 15.
 ACK_SCAN_SECONDS = 15
 ACK_SECONDS = ACK_SCAN_SECONDS + 10
 ACK_BUSY = 3
