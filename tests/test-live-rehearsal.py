@@ -686,6 +686,201 @@ class LiveRehearsalTests(unittest.TestCase):
                 copy = self.committed_copy(**{'router/release.sha256': manifest + line})
                 self.assert_head_source_refused(copy, 'release.sha256')
 
+    def forged_copy(self, edits, repin=True):
+        """A committed copy whose edited router files keep release.sha256 (and pins) self-consistent.
+
+        Only the release id is left as the edit made it, so each case isolates one identity check."""
+        copy = SourceCopy()
+        self.addCleanup(copy.tmp.cleanup)
+        router = copy.root / 'router'
+        for rel, data in edits.items():
+            (router / rel).write_bytes(data)
+        if repin:
+            pin = hashlib.sha256((router / 'lib/platform-bootstrap.sh').read_bytes()).hexdigest().encode()
+            for rel in ('install.sh', 'uninstall.sh', 'cfctl'):
+                (router / rel).write_bytes(re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=' + pin, (router / rel).read_bytes()))
+        lines = []
+        for line in (router / 'release.sha256').read_text().splitlines():
+            digest, rel = line.split()
+            if rel in ('cfctl-ssh', 'cfctl-scope'):
+                lines.append(line)
+            else:
+                lines.append(hashlib.sha256((router / rel).read_bytes()).hexdigest() + '  ' + rel)
+        (router / 'release.sha256').write_text('\n'.join(lines) + '\n')
+        git = ['git', '-C', str(copy.root), '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid']
+        subprocess.run(git + ['add', '-A'], check=True, capture_output=True)
+        subprocess.run(git + ['commit', '-q', '--allow-empty', '-m', 'forged'], check=True, capture_output=True)
+        return copy
+
+    def test_fixture_copy_forging_is_consistent_when_unedited(self):
+        copy = self.forged_copy({})
+        self.assertEqual(copy.tool.head_source()[0], copy.tool.git('rev-parse', 'HEAD').strip())
+
+    def test_release_id_is_recomputed_from_shipped_bytes(self):
+        boot = (SOURCE.root / 'router/lib/platform-bootstrap.sh').read_text()
+        flipped = re.sub(r'(?m)^CF_RELEASE_ID=([0-9a-f]{64})$', lambda m: 'CF_RELEASE_ID=' + 'f' * 64, boot)
+        self.assert_head_source_refused(self.forged_copy({'lib/platform-bootstrap.sh': flipped.encode()}), 'release id')
+        # The id covers the boundary files: an edit to cfctl (pin kept self-consistent) changes it.
+        cfctl = (SOURCE.root / 'router/cfctl').read_bytes() + b'# boundary edit\n'
+        self.assert_head_source_refused(self.forged_copy({'cfctl': cfctl}), 'release id')
+        core = (SOURCE.root / 'router/lib/core.sh').read_bytes() + b'# module edit\n'
+        self.assert_head_source_refused(self.forged_copy({'lib/core.sh': core}), 'release id')
+
+    def test_release_modules_line_must_match_shipped_modules(self):
+        boot = (SOURCE.root / 'router/lib/platform-bootstrap.sh').read_text()
+        edited = re.sub(r"(?m)^CF_RELEASE_MODULES='core.sh:[0-9a-f]{64}", "CF_RELEASE_MODULES='core.sh:" + '0' * 64, boot)
+        self.assertNotEqual(edited, boot)
+        self.assert_head_source_refused(self.forged_copy({'lib/platform-bootstrap.sh': edited.encode()}), 'CF_RELEASE_MODULES')
+
+    def test_bootstrap_pins_must_equal_shipped_bootstrap_hash(self):
+        for rel in ('install.sh', 'uninstall.sh', 'cfctl'):
+            with self.subTest(rel):
+                data = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=' + b'1' * 64,
+                              (SOURCE.root / 'router' / rel).read_bytes())
+                self.assert_head_source_refused(self.forged_copy({rel: data}, repin=False), 'CF_BOOTSTRAP_PIN')
+
+    def test_unlisted_tracked_router_file_refused_but_known_unused_files_are_not_shipped(self):
+        self.assert_head_source_refused(self.forged_copy({'extra.sh': b'echo extra\n'}), 'not in release.sha256')
+        config = self.tool.load_config(self.write_config())
+        commit, blobs = self.tool.head_source()
+        self.assertIn('router/cron', blobs)
+        self.assertIn('router/firewall.include', blobs)
+        payload, _ = self.tool.build_payload(config, commit, blobs)
+        text = payload.decode()
+        self.assertNotIn('router/cron', text)
+        self.assertNotIn('router/firewall.include', text)
+        manifest = [line.split() for line in (SOURCE.root / 'router/release.sha256').read_text().splitlines()]
+        self.assertEqual(self.payload_manifest_paths(text), sorted(['router/' + rel for _, rel in manifest] + ['router/release.sha256']))
+        self.assertIn(f'CFR_PAYLOAD_COUNT={len(manifest) + 1}\n', text)
+
+    def test_manifest_entry_dropped_makes_a_shipped_file_unlisted(self):
+        manifest = (SOURCE.root / 'router/release.sha256').read_text()
+        kept = ''.join(line + '\n' for line in manifest.splitlines() if not line.endswith('lib/activity.sh'))
+        self.assertNotEqual(kept, manifest)
+        copy = self.committed_copy(**{'router/release.sha256': kept.encode()})
+        self.assert_head_source_refused(copy, 'not in release.sha256')
+
+    def test_payload_region_refuses_a_file_set_that_differs_from_the_manifest(self):
+        commit, blobs = self.tool.head_source()
+        extra = dict(blobs, **{'router/stray.sh': b'echo stray\n'})
+        with self.assertRaises(self.tool.Refusal) as caught:
+            self.tool.payload_region(extra)
+        self.assertIn('release.sha256', str(caught.exception))
+        missing = {path: data for path, data in blobs.items() if path != 'router/lib/json.awk'}
+        with self.assertRaises(self.tool.Refusal):
+            self.tool.payload_region(missing)
+
+    @staticmethod
+    def payload_manifest_paths(text):
+        body = text[text.index("cat > \"$CFR_STAGE/manifest\" <<'CF_FIRST_MANIFEST_EOF'"):]
+        body = body[body.index('\n') + 1:body.index('CF_FIRST_MANIFEST_EOF\n', 10)]
+        return sorted(line.split()[2] for line in body.splitlines())
+
+    @staticmethod
+    def tree_sha256(entries):
+        return hashlib.sha256(''.join(f'{mode} {rel} {digest}\n' for rel, (mode, digest) in sorted(entries.items())).encode()).hexdigest()
+
+    def test_emitted_tree_matches_freezer_emit_and_is_disclosed_and_bound(self):
+        out = Path(tempfile.mkdtemp(prefix='couvre-feu-emit-'))
+        self.addCleanup(shutil.rmtree, out, True)
+        emitted = out / 'tree'
+        freezer = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+                                 capture_output=True, text=True, check=True, cwd=out)
+        entries = {}
+        for path in sorted(emitted.rglob('*')):
+            if path.is_file():
+                entries[str(path.relative_to(emitted))] = ('%o' % (path.stat().st_mode & 0o777),
+                                                           hashlib.sha256(path.read_bytes()).hexdigest())
+        commit, blobs = self.tool.head_source()
+        tree = self.tool.emitted_tree(blobs)
+        self.assertEqual({rel: (mode, hashlib.sha256(data).hexdigest()) for rel, (mode, data) in tree.items()}, entries)
+        for rel, (mode, data) in tree.items():
+            self.assertEqual((emitted / rel).read_bytes(), data, rel)
+        self.assertEqual(self.tool.release_id(blobs), freezer.stdout.strip())
+        details = self.plan_details(self.write_config())
+        self.assertEqual(details['emittedTreeSha256'], self.tree_sha256(entries))
+        self.assertIn('emittedTreeSha256', self.tool.PLAN_DIGEST_FIELDS)
+
+    def test_emitted_tree_change_changes_the_plan_digest(self):
+        first = self.plan_details(self.write_config())
+        saved = self.tool.emitted_tree_sha256
+        try:
+            self.tool.emitted_tree_sha256 = lambda tree: 'e' * 64
+            second = self.plan_details(self.write_config())
+        finally:
+            self.tool.emitted_tree_sha256 = saved
+        self.assertNotEqual(first['planSha256'], second['planSha256'])
+
+    def verify_installed(self, tamper=None, drop=None, planned_id=None):
+        """Run only cfr_verify_installed from the template over a private copy of the emitted tree."""
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        match = re.search(r'(?ms)^cfr_verify_installed\(\) \{\n.*?^\}\n', template)
+        self.assertIsNotNone(match, 'cfr_verify_installed missing from the template')
+        commit, blobs = self.tool.head_source()
+        tree = self.tool.emitted_tree(blobs)
+        release_id = self.tool.release_id(blobs)
+        scratch = Path(tempfile.mkdtemp(prefix='verify-', dir=self.work))
+        root, stage = scratch / 'root', scratch / 'stage'
+        release = root / f'etc/.couvrefeu-release-{release_id}'
+        stage.mkdir()
+        manifest = ''
+        for rel, (mode, data) in tree.items():
+            manifest += f'{hashlib.sha256(data).hexdigest()} {mode} router/{rel}\n'
+            targets = [release / rel]
+            if rel in ('cfctl', 'cfctl-ssh', 'cfctl-scope'):
+                targets.append(root / 'usr/sbin' / rel)
+            elif rel.startswith('lib/'):
+                targets.append(root / 'usr/lib/couvrefeu' / rel[4:])
+            for target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        (stage / 'manifest').write_text(manifest)
+        if tamper:
+            (root / tamper).write_bytes((root / tamper).read_bytes() + b'x')
+        if drop:
+            (root / drop).unlink()
+        script = ('cfr_info() { echo "INFO $*"; }\ncfr_fail() { echo "PHASE $1 FAIL $2"; }\n' + match.group(0)
+                  + f'CFR_ROOT={shlex.quote(str(root))} CFR_STAGE={shlex.quote(str(stage))} '
+                  f'CFR_RELEASE_DIR={shlex.quote(str(release))} CFR_RELEASE_ID={planned_id or release_id}\n'
+                  'cfr_verify_installed; echo "rc=$?"\n')
+        result = subprocess.run(['sh', '-c', script], capture_output=True, text=True)
+        return result.stdout + result.stderr, release_id
+
+    def test_verify_installed_accepts_the_emitted_tree(self):
+        out, release_id = self.verify_installed()
+        self.assertIn('INFO installed_tree ok', out)
+        self.assertIn(release_id, out)
+        self.assertTrue(out.rstrip().endswith('rc=0'), out)
+
+    def test_verify_installed_detects_tampering_or_absence(self):
+        rid = self.tool.release_id(self.tool.head_source()[1])
+        cases = {'release dir file': f'etc/.couvrefeu-release-{rid}/lib/core.sh',
+                 'installed lib': 'usr/lib/couvrefeu/rpc.sh',
+                 'installed cfctl': 'usr/sbin/cfctl',
+                 'installed bootstrap (id carrier)': 'usr/lib/couvrefeu/platform-bootstrap.sh'}
+        for label, path in cases.items():
+            with self.subTest(label):
+                out, _ = self.verify_installed(tamper=path)
+                self.assertIn('PHASE VERIFY FAIL installed_tree_mismatch', out)
+                self.assertTrue(out.rstrip().endswith('rc=1'), out)
+        out, _ = self.verify_installed(drop='usr/sbin/cfctl-scope')
+        self.assertIn('PHASE VERIFY FAIL installed_tree_mismatch', out)
+        # Installed files carry another release id than the planned one.
+        out, _ = self.verify_installed(planned_id='a' * 64)
+        self.assertIn('installed_release_id', out)
+
+    def test_rehearsal_reports_installed_tree_check(self):
+        code, out, err = self.execute()
+        self.assertEqual(code, 0, out + err)
+        stdout = (self.evidence() / 'stdout.log').read_text()
+        self.assertIn(f'INFO installed_tree ok release={self.tool.release_id(self.tool.head_source()[1])}', stdout)
+        self.assertLess(stdout.index('INFO installed_tree ok'), stdout.index('PHASE VERIFY OK'))
+
+    def test_release_module_list_matches_freezer(self):
+        freezer = (REPO / 'tools/freeze-router-release.py').read_text()
+        names = re.search(r"^names = \[(.*)\]$", freezer, re.M).group(1)
+        self.assertEqual(tuple(re.findall(r"'([^']+)'", names)), self.tool.RELEASE_MODULES)
+
     def test_evidence_directory_collision_refused(self):
         (self.evidence_root / 'evidence/20261012T180000Z-first-rehearsal').mkdir(mode=0o700)
         config = self.write_config()

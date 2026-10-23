@@ -280,6 +280,28 @@ class PilotPlanTests(PilotBase):
         other = dict(self.config['roles'], penn_child={'ip': PENN['ip'], 'mac': '02:00:00:00:00:31'})
         self.assertNotEqual(self.plan_details(self.write_config(roles=other))['planSha256'], first['planSha256'])
 
+    def test_plan_discloses_and_binds_emitted_tree_sha256(self):
+        details = self.plan_details(self.write_config())
+        commit, blobs = self.tool.FR.head_source()
+        expected = self.tool.FR.emitted_tree_sha256(self.tool.FR.emitted_tree(blobs))
+        self.assertEqual(details['emittedTreeSha256'], expected)
+        self.assertIn('emittedTreeSha256', self.tool.PLAN_DIGEST_FIELDS)
+        original = self.tool.FR.emitted_tree_sha256
+        try:
+            self.tool.FR.emitted_tree_sha256 = lambda tree: 'e' * 64
+            changed = self.plan_details(self.write_config())
+        finally:
+            self.tool.FR.emitted_tree_sha256 = original
+        self.assertNotEqual(changed['planSha256'], details['planSha256'])
+
+    def test_pilot_has_no_release_identity_logic_of_its_own(self):
+        text = (REPO / 'tools/live/penn-pilot.py').read_text()
+        for token in ('CF_RELEASE_ID', 'CF_BOOTSTRAP_PIN', 'CF_RELEASE_MODULES', 'BLOCK_LINES', 'strip-test-mode',
+                      'release.sha256', 'hashlib.sha256(blobs'):
+            self.assertNotIn(token, text, token)
+        for name in ('head_source', 'build_payload', 'release_id', 'emitted_tree', 'emitted_tree_sha256'):
+            self.assertIn('FR.' + name, text, name)
+
     def test_payload_appends_pilot_after_rehearsal_helpers(self):
         config = self.tool.FR.load_config(self.write_config())
         commit, blobs = self.tool.FR.head_source()

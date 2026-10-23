@@ -31,6 +31,12 @@ TEMPLATE_PATH = 'tools/live/first-rehearsal.sh'
 SOURCE_DIRS = ('router', 'tools/live')
 STRIPPER_PATH = 'tools/strip-test-mode.py'
 SOURCE_PATHS = SOURCE_DIRS + (STRIPPER_PATH,)
+# Same module order as tools/freeze-router-release.py (a test compares the two).
+RELEASE_MODULES = ('core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'state.awk', 'rules.awk', 'json.awk',
+                   'vendor-platform.sh', 'activity.sh')
+BOUNDARY_PIN_FILES = ('install.sh', 'uninstall.sh', 'cfctl')
+# Tracked under router/ but neither in release.sha256 nor used by install.sh: never shipped.
+UNSHIPPED_ROUTER_FILES = ('router/cron', 'router/firewall.include')
 PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
 DEFAULT_PROFILE = 'gl-xe3000-4.8.3-os-trust-v1'
 ROLES = ('management', 'jd_adult', 'penn_child')
@@ -253,14 +259,70 @@ def ship_stripped_wrappers(blobs):
             shipped['router/' + name] = strip(wrapper.decode('utf-8'), lines).encode('utf-8')
         except ValueError as error:
             raise Refusal(f'router/{name}: {error}') from None
-    for line in blobs['router/release.sha256'].decode('utf-8').splitlines():
-        fields = line.split()
-        if len(fields) != 2 or 'router/' + fields[1] not in shipped:
-            raise Refusal(f'router/release.sha256: unknown or malformed entry {line[:80]!r}')
-        digest, rel = fields
+    manifest = manifest_entries(shipped)
+    for digest, rel in manifest:
         if hashlib.sha256(shipped['router/' + rel]).hexdigest() != digest:
             raise Refusal(f'router/{rel}: shipped bytes do not match release.sha256')
+    emitted_tree(shipped)
+    verify_release_identity(shipped)
     return shipped
+
+
+def manifest_entries(blobs):
+    """Parsed release.sha256 as (digest, rel) pairs; unknown, malformed, duplicate or self entries refuse."""
+    entries, seen = [], set()
+    for line in blobs['router/release.sha256'].decode('utf-8').splitlines():
+        fields = line.split()
+        if (len(fields) != 2 or fields[1] == 'release.sha256' or fields[1] in seen
+                or not re.fullmatch(r'[0-9a-f]{64}', fields[0]) or 'router/' + fields[1] not in blobs):
+            raise Refusal(f'router/release.sha256: unknown or malformed entry {line[:80]!r}')
+        seen.add(fields[1])
+        entries.append((fields[0], fields[1]))
+    return entries
+
+
+def emitted_tree(blobs):
+    """The tree that is shipped: exactly the release.sha256 entries plus release.sha256 itself, as rel -> (mode, bytes).
+
+    Two-way: a tracked router/ file outside the manifest (other than the known unused ones) refuses."""
+    tree = {rel: (payload_mode(rel), blobs['router/' + rel]) for _, rel in manifest_entries(blobs)}
+    tree['release.sha256'] = (payload_mode('release.sha256'), blobs['router/release.sha256'])
+    stray = sorted(path for path in blobs if path.startswith('router/') and path[len('router/'):] not in tree
+                   and path not in UNSHIPPED_ROUTER_FILES)
+    if stray:
+        raise Refusal(f'{stray[0]}: tracked under router/ but not in release.sha256 (shipped set must equal the manifest)')
+    return tree
+
+
+def emitted_tree_sha256(tree):
+    """sha256 over sorted "mode path sha256" lines of the emitted tree."""
+    return hashlib.sha256(''.join(f'{mode} {rel} {hashlib.sha256(data).hexdigest()}\n'
+                                  for rel, (mode, data) in sorted(tree.items())).encode()).hexdigest()
+
+
+def verify_release_identity(shipped):
+    """Recompute CF_RELEASE_ID from the shipped bytes (same formula as tools/freeze-router-release.py) and the pins."""
+    try:
+        pairs = [name + ':' + hashlib.sha256(shipped['router/lib/' + name]).hexdigest() for name in RELEASE_MODULES]
+        bootstrap = shipped['router/lib/platform-bootstrap.sh']
+        cfctl = shipped['router/cfctl']
+        wrappers = [name + ':' + hashlib.sha256(shipped['router/' + name]).hexdigest() for name in ('cfctl-ssh', 'cfctl-scope')]
+    except KeyError as error:
+        raise Refusal(f'release identity input missing: {error.args[0]}') from None
+    if len(re.findall(rb'^CF_BOOTSTRAP_PIN=[0-9a-f]{64}$', cfctl, flags=re.M)) != 1 or cfctl.count(b'CF_BOOTSTRAP_PIN=') != 1:
+        raise Refusal('router/cfctl: exactly one well-formed CF_BOOTSTRAP_PIN line required')
+    blanked = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', cfctl, flags=re.M)
+    identity = hashlib.sha256(('\n'.join(pairs + ['cfctl:' + hashlib.sha256(blanked).hexdigest()] + wrappers)
+                               + '\n').encode()).hexdigest()
+    if identity != release_id(shipped):
+        raise Refusal('release id: CF_RELEASE_ID does not equal the id recomputed from the shipped bytes')
+    modules = re.findall(r"^CF_RELEASE_MODULES='([^']*)'$", bootstrap.decode('utf-8'), flags=re.M)
+    if modules != [' '.join(pairs)]:
+        raise Refusal('platform-bootstrap.sh: CF_RELEASE_MODULES does not match the shipped modules')
+    pin = hashlib.sha256(bootstrap).hexdigest().encode()
+    for name in BOUNDARY_PIN_FILES:
+        if re.findall(rb'^CF_BOOTSTRAP_PIN=([0-9a-f]{64})$', shipped['router/' + name], flags=re.M) != [pin]:
+            raise Refusal(f'router/{name}: CF_BOOTSTRAP_PIN does not equal the shipped platform-bootstrap.sh hash')
 
 
 def release_id(blobs):
@@ -281,7 +343,8 @@ def payload_mode(rel):
 
 def payload_region(blobs):
     """Read-ahead-safe self-extraction: one quoted here-document per HEAD blob."""
-    files = sorted(path for path in blobs if path.startswith('router/'))
+    tree = emitted_tree(blobs)
+    files = sorted('router/' + rel for rel in tree)
     dirs = {'router'}
     for path in files:
         parts = path.split('/')[:-1]
@@ -290,7 +353,7 @@ def payload_region(blobs):
     cleanup_order = sorted(dirs, key=lambda d: (-d.count('/'), d))
     manifest, bodies = [], []
     for path in files:
-        data = blobs[path]
+        data = tree[path[len('router/'):]][1]
         rel = path[len('router/'):]
         if b'\0' in data or not data.endswith(b'\n') or not re.fullmatch(r'[A-Za-z0-9._/-]+', rel):
             raise Refusal(f'{path} cannot be embedded safely')
@@ -376,7 +439,7 @@ def public_key_fingerprint(path):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
 
 
-PLAN_DIGEST_FIELDS = ('payloadSha256', 'sshArgv', 'localTimeoutSeconds', 'remoteTimeoutSeconds', 'deadlineUtc',
+PLAN_DIGEST_FIELDS = ('payloadSha256', 'emittedTreeSha256', 'sshArgv', 'localTimeoutSeconds', 'remoteTimeoutSeconds', 'deadlineUtc',
                       'authorizationPath', 'evidenceDir', 'knownHostsSha256', 'adminPublicKeySha256')
 
 
@@ -390,6 +453,7 @@ def plan(config, env):
     payload, script_sha = build_payload(config, commit, blobs)
     argv = ssh_argv(config, env)
     details = {'tool': 'tools/live/first-rehearsal.py', 'sourceCommit': commit, 'releaseId': release_id(blobs),
+               'emittedTreeSha256': emitted_tree_sha256(emitted_tree(blobs)),
                'stripperBlobSha1': blob_id(blobs[STRIPPER_PATH]),
                'platformProfile': config['platformProfile'], 'payloadSha256': hashlib.sha256(payload).hexdigest(),
                'payloadBytes': len(payload), 'remoteScriptSha256': script_sha, 'sshArgv': argv,

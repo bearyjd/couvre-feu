@@ -323,7 +323,32 @@ cfr_snapshot() {
     printf 'G %s/%s* %s\n' "$CFR_STAGE_PARENT" "$CFR_STAGE_PREFIX" "$(cfr_glob_count "$CFR_STAGE_PARENT" "$CFR_STAGE_PREFIX")" >> "$cfr_snap"
 }
 
+# The installed tree must equal the emitted tree: every manifest file in the release
+# directory (named by the release id), and every file the installer places under
+# usr/sbin or usr/lib/couvrefeu, hashes to its shipped digest. Hash only; modes are not compared.
+cfr_verify_installed() {
+    cfr_bad=
+    cfr_checked=0
+    while read -r cfr_sum cfr_mode cfr_path; do
+        cfr_rel=${cfr_path#router/}
+        cfr_dests="$CFR_RELEASE_DIR/$cfr_rel"
+        case "$cfr_rel" in
+            cfctl|cfctl-ssh|cfctl-scope) cfr_dests="$cfr_dests $CFR_ROOT/usr/sbin/$cfr_rel";;
+            lib/*) cfr_dests="$cfr_dests $CFR_ROOT/usr/lib/couvrefeu/${cfr_rel#lib/}";;
+        esac
+        for cfr_dest in $cfr_dests; do
+            cfr_actual=$(sha256sum < "$cfr_dest" 2>/dev/null) || cfr_actual=unreadable
+            cfr_checked=$((cfr_checked + 1))
+            [ "${cfr_actual%% *}" = "$cfr_sum" ] || cfr_bad="$cfr_bad ${cfr_dest#"$CFR_ROOT"/}"
+        done
+    done < "$CFR_STAGE/manifest"
+    grep -qx "CF_RELEASE_ID=$CFR_RELEASE_ID" "$CFR_ROOT/usr/lib/couvrefeu/platform-bootstrap.sh" 2>/dev/null || cfr_bad="$cfr_bad installed_release_id"
+    if [ -n "$cfr_bad" ] || [ "$cfr_checked" -lt 1 ]; then cfr_fail VERIFY "installed_tree_mismatch$cfr_bad"; return 1; fi
+    cfr_info "installed_tree ok release=$CFR_RELEASE_ID files=$cfr_checked"
+}
+
 cfr_verify() {
+    cfr_verify_installed || return 0
     # status exits nonzero when unhealthy; the JSON body is the gate.
     cfr_run_sh "$CFR_CFCTL" status --json > "$CFR_STAGE/status.json" || :
     cfr_status=$(awk 'NR==1{print}END{exit NR!=1}' "$CFR_STAGE/status.json") || { cfr_fail VERIFY status_output_shape; return 0; }
