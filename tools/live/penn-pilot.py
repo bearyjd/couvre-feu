@@ -21,8 +21,9 @@ Chromebook (`roles.penn_child`) only, `roles.scope_target` {ip, mac} is the phon
 add and remove, and `roles.ct107` {ip, mac} (its MAC also in protectedHistoricalMacs) is the protected
 infrastructure container. v2 replaces `penn_child_2` (a v2 config that sets it is refused) and caps
 `remoteTimeoutSeconds` at min(10800, minimumRemoteTimeoutSeconds + 900). schemaVersion 1 configs are kept as
-the legacy shape: no `scope_target`, the old phases, the old 3600 s cap. A v2 plan can be produced and
-disclosed, but `execute` refuses it until the pilot template implements every planned phase.
+the legacy shape: no `scope_target`, the old phases, a 4200 s cap (the rehearsal tool's 3600 s no longer covers two devices). The template implements every v2 phase;
+the SCOPE commit legs need a TTY and are started by the leg-2 pty driver (T4), so `execute` still refuses a v2
+plan (`LEG2_DRIVER_IMPLEMENTED`). v2 also makes the remote script begin its teardown at 70% of remoteTimeoutSeconds.
 
 Exit codes: 0 PASS, 1 REFUSED before any router mutation, 2 STOPPED/FAIL/UNKNOWN
 after mutation possibly began.
@@ -88,9 +89,13 @@ PASS_LINE = 'PENN_PILOT_PASS'
 STOPPED_LINE = 'PENN_PILOT_STOPPED_RESTORED'
 STOPPED_NO_CONNECTIVITY_LINE = 'PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED'
 PHASES_V2, NEW_PHASES = V2.PHASES_V2, V2.NEW_PHASES
-# What penn-pilot.sh runs today; execute refuses any plan with another phase (the MOVE/BULK/INVENTORY/SCOPE
-# phases land with the template).
-IMPLEMENTED_PHASES = PHASES + ('SCOPE',)
+# What penn-pilot.sh runs; execute refuses any plan with another phase.
+IMPLEMENTED_PHASES = PHASES + ('SCOPE',) + NEW_PHASES
+# The SCOPE-ADD/SCOPE-REMOVE phases print `CFP_LEG2_READY <leg> <base>` and then wait for a commit leg that needs a
+# TTY (cfctl reads a typed confirmation). The local pty driver that starts those legs is T4; until it exists a v2
+# run could only wait 60 s and stop, so execute refuses v2 plans. T4 removes this guard (the legs are already
+# digest-bound in the plan).
+LEG2_DRIVER_IMPLEMENTED = False
 ALL_PHASES = PHASES_V2 + ('SCOPE',)
 PERSON, PILOT_B, SCOPE_TARGET_ROLE, SECOND_ROLE = V2.PERSON, V2.PILOT_B, V2.SCOPE_TARGET_ROLE, V2.SECOND_ROLE
 V2_MAX_REMOTE_TIMEOUT_SECONDS, V2_TIMEOUT_SLACK_SECONDS = V2.V2_MAX_REMOTE_TIMEOUT_SECONDS, V2.V2_TIMEOUT_SLACK_SECONDS
@@ -120,9 +125,16 @@ HOST_PROBE = {'intervalSeconds': 15, 'samples': 3, 'timeoutSeconds': 2, 'dnsMarg
 # The remote script re-checks each phase's worst case (and every observe/expiry
 # iteration) against the teardown reserve before starting it.
 SAFE_BAND_WAIT_SECONDS = 72
+V1_MAX_REMOTE_TIMEOUT_SECONDS = 4200
+# Each cfctl, wrapper and uninstall child gets TERM at its allowance (it releases its locks) and KILL only
+# KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), so one call's worst case is allowance + grace.
 CFCTL_ALLOWANCE_SECONDS = 45
+KILL_GRACE_SECONDS = 15
+CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS
 INSTALL_ALLOWANCE_SECONDS = 240
-TEARDOWN_RESERVE_SECONDS = 300
+# Teardown: leg-2 cancel wait 20 + one safe-band wait 71 + uninstall TERM allowance 240 (not shorter than the install
+# allowance) + KILL grace 15 = 346 s, plus the restore snapshot, proof and connectivity reads.
+TEARDOWN_RESERVE_SECONDS = 420
 # Router-side `timeout -s KILL` bound for each read-only iptables/ipset read.
 READ_TIMEOUT_SECONDS = 8
 # One counters snapshot: five chains, each read with -S and -nvxL.
@@ -168,12 +180,12 @@ def status_settle_worst_seconds(timing):
     before the window closes (that second absorbs 1 s clock granularity and the neighbor-hash forks): a
     full cfctl call (safe-band wait + allowance) and its neighbor read."""
     return (READ_TIMEOUT_SECONDS + timing['statusSettleSeconds'] + READ_TIMEOUT_SECONDS
-            + SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS)
+            + SAFE_BAND_WAIT_SECONDS + CFCTL_CALL_SECONDS)
 
 
 def phase_worst_seconds(timing, devices=1, scope=False, scope_target=False):
     """Worst case of each post-install phase, as the remote script budgets it."""
-    call = SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS
+    call = SAFE_BAND_WAIT_SECONDS + CFCTL_CALL_SECONDS
     snap, read, iteration = COUNTERS_WORST_SECONDS, READ_TIMEOUT_SECONDS, iteration_worst_seconds(timing)
     settle = status_settle_worst_seconds(timing)
     phases = {
@@ -200,8 +212,9 @@ def phase_worst_seconds(timing, devices=1, scope=False, scope_target=False):
 
 def new_phase_worst_seconds(timing):
     """Worst case of the v2 phases (every cfctl call keeps the safe-band wait)."""
-    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS, COUNTERS_WORST_SECONDS,
-                                      READ_TIMEOUT_SECONDS, status_settle_worst_seconds(timing))
+    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_CALL_SECONDS, READ_TIMEOUT_SECONDS,
+                                      status_settle_worst_seconds(timing), iteration_worst_seconds(timing),
+                                      timing['resumeObserveSeconds'], SAFE_BAND_WAIT_SECONDS)
 
 
 def worst_case_seconds(timing, devices=1, scope=False, scope_target=False):
@@ -261,6 +274,17 @@ def _schema_version(document):
     return version
 
 
+def _pilot_timeout(document, version):
+    """remoteTimeoutSeconds: v2 up to its own hard max; v1 up to V1_MAX (the TERM-then-KILL grace and the 420 s
+    teardown reserve put the two-device-with-SCOPE worst case above the rehearsal tool's 3600 s cap)."""
+    if version == 2:
+        return V2.v2_timeout(document)
+    timeout = document.get('remoteTimeoutSeconds', 1800)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 600 <= timeout <= V1_MAX_REMOTE_TIMEOUT_SECONDS:
+        raise Refusal(f'remoteTimeoutSeconds must be an integer from 600 to {V1_MAX_REMOTE_TIMEOUT_SECONDS}')
+    return timeout
+
+
 def load_config(path):
     """The rehearsal schema plus the pilot-only keys; refused before any SSH.
 
@@ -277,13 +301,10 @@ def load_config(path):
     base['schemaVersion'] = 1
     if extra:
         base['roles'] = {role: entry for role, entry in roles.items() if role not in V2.PILOT_ROLES}
-    timeout = None
-    if version == 2:
-        timeout = V2.v2_timeout(document)
-        base['remoteTimeoutSeconds'] = 1800
+    timeout = _pilot_timeout(document, version)
+    base['remoteTimeoutSeconds'] = 1800
     config = FR.validate_config(base)
-    if timeout is not None:
-        config['remoteTimeoutSeconds'] = timeout
+    config['remoteTimeoutSeconds'] = timeout
     scope = document.get('scopeNegativeTest', False)
     if not isinstance(scope, bool):
         raise Refusal('scopeNegativeTest must be true or false')
@@ -360,8 +381,9 @@ def build_payload(config, commit, blobs, timing):
               'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS}
     budget = config_budget(config)
     # Only phases the template implements get a parameter (the v2 phase names are not shell identifiers).
-    values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing, **budget).items()
-                   if phase in IMPLEMENTED_PHASES})
+    # Hyphens are not shell identifier characters: SCOPE-ADD-1 becomes CFP_WORST_SCOPE_ADD_1.
+    values.update({f"CFP_WORST_{phase.replace('-', '_')}": seconds
+                   for phase, seconds in phase_worst_seconds(timing, **budget).items() if phase in IMPLEMENTED_PHASES})
     # Single-device configurations emit no further parameters (the shell defaults apply).
     if SECOND_ROLE in config['roles']:
         macs = penn_macs(config)
@@ -371,9 +393,11 @@ def build_payload(config, commit, blobs, timing):
         values.update({'CFP_SCOPE_TEST': 1, 'CFP_SCOPE_MAC': SCOPE_TEST_MAC, 'CFP_SCOPE_OPERATION_ID': SCOPE_OPERATION_ID,
                        'CFP_SCOPE_ERROR': SCOPE_ERROR,
                        'CFP_SCOPE_POLICY': json.dumps(scope_policy(config), separators=(',', ':'), sort_keys=False)})
+    if budget['scope_target']:
+        values.update(V2.template_parameters(config, pilot_policies(config)))
     values = {key: str(value) for key, value in values.items()}
-    for value in values.values():
-        if not PARAM_VALUE.fullmatch(value):
+    for key, value in values.items():
+        if not re.fullmatch(r'CFP_[A-Z0-9_]+', key) or not PARAM_VALUE.fullmatch(value):
             raise Refusal('generated pilot parameter has unexpected characters')
     params = ''.join(f"{key}='{value}'\n" for key, value in values.items())
     template = blobs[PILOT_TEMPLATE]
@@ -421,7 +445,7 @@ def plan(config, env):
                'roles': config['roles'], 'protectedHistoricalMacs': config['protectedHistoricalMacs'],
                'knownHostsSha256': FR.regular_file_sha256(config['knownHostsPath'], 'knownHostsPath'),
                'adminPublicKeySha256': FR.regular_file_sha256(config['adminPublicKeyPath'], 'adminPublicKeyPath'),
-               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS), 'hostProbe': dict(HOST_PROBE),
+               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS, killGraceSeconds=KILL_GRACE_SECONDS), 'hostProbe': dict(HOST_PROBE),
                'dnsProbeName': DNS_PROBE_NAME, 'person': PERSON, 'operationId': OPERATION_ID,
                'policyJson': policy_json, 'policySha256': hashlib.sha256(policy_json.encode()).hexdigest(),
                'pauseRulesKernelTimeBound': False,
@@ -439,6 +463,10 @@ def plan(config, env):
                   for name, policy in pilot_policies(config)]
         for stage in stages:
             stage['policySha256'] = hashlib.sha256(stage['policyJson'].encode()).hexdigest()
+        details.update({'selfAbortPercent': V2.SELF_ABORT_PERCENT,
+                        'selfAbortSeconds': V2.self_abort_seconds(config['remoteTimeoutSeconds']),
+                        'operationIds': dict(V2.OPERATION_IDS),
+                        'derivedSyncs': V2.derived_syncs(config, pilot_policies(config))})
         details.update({'legs': scope_legs(config), 'pilotPolicies': stages,
                         'failedBlockAllWording': FAILED_BLOCK_ALL_WORDING,
                         'failedBlockAllWordingDecidedBy': FAILED_BLOCK_ALL_DECIDED_BY})
@@ -608,6 +636,9 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
     missing = [phase for phase in pilot_phases(config) if phase not in IMPLEMENTED_PHASES]
     if missing:
         raise Refusal('phases not implemented by the pilot template yet: ' + ', '.join(missing))
+    if scope_target_enabled(config) and not LEG2_DRIVER_IMPLEMENTED:
+        raise Refusal('leg-2 pty driver absent (T4): the SCOPE commit legs would never start; the legs are '
+                      'digest-bound in the plan, only the driver is missing')
     details, payload = plan(config, env)
     if not hmac.compare_digest(details['planSha256'], expected_plan_sha):
         raise Refusal(f'plan sha256 {details["planSha256"]} differs from the disclosed value')
