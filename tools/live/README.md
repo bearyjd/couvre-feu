@@ -126,6 +126,14 @@ The remote script is the filled `first-rehearsal.sh` with its final call removed
 
 After `MUTATION_BEGIN`, every outcome ends in that one teardown. This includes an adult-probe STOP, a failed gate, an exhausted time budget and an installer failure, provided the installed recovery `uninstall.sh` exists. The teardown is part of the approved procedure, not a retry. If it ends with exact restoration, the last line is `PENN_PILOT_STOPPED_RESTORED`, or `PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED` (outcome `STOPPED_CONNECTIVITY_FAILED`) when the management or JD neighbor check failed afterwards; if the teardown itself fails, it is `FAIL_AFTER_MUTATION`. Only `PENN_PILOT_PASS` means that every phase passed and the snapshot matched exactly. Even then, packet blocking is claimed only when counters rose.
 
+### Accepted installer residual; M4b blocks live use
+
+The pilot's INSTALL step is deliberately unbounded: a hung installer can outlive the remote timeout, leaving an empty-policy installation and a stale `/tmp/couvrefeu-install.lock`; nothing has been enrolled or paused at that stage. Do not add a KILL watchdog: SIGKILL skips lock cleanup, and a kill before the journal is ready makes uninstall refuse (`router/lib/install-common.sh`, lock acquisition/cleanup and `preflight`). The single automatic uninstall cannot recover that state.
+
+Manual recovery uses password login to the router, which is never disabled. Confirm that no installer or recovery process remains before removing a stale install lock, then run the installed uninstall as described in the [rehearsal recovery instructions](../../docs/runbooks/live-first-rehearsal.md#stale-install-lock-recovery). A missing/incomplete journal still requires manual recovery; removing the lock does not repair it.
+
+Accepted on 2026-10-23 as a documented residual for M5 code merges. **M4b blocks the first live rehearsal and permanent install:** router dead-owner recovery for the install lock, uninstall tolerating a pre-journal kill, a new release id and a full adversarial review/test cycle are required first.
+
 ### If the single uninstall is absent or refuses
 
 The last lines are then `PHASE UNINSTALL FAIL ...`, `PENN_KERNEL_STATE paused|clear|unknown` and `FAIL_AFTER_MUTATION UNINSTALL`, with `DIFF` lines showing what is left. Couvre-feu stays installed with its journal; do not retry and do not rerun install or uninstall to "clean up".
