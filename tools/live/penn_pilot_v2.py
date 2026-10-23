@@ -267,8 +267,8 @@ def new_phase_worst_seconds(call, read, settle, iteration, observe, band):
         # status, firewall shape
         'MOVE': 2 * shape + 2 * sync + 2 * settled + 2 * call + 4 * read + iteration,
         # firewall shape, pause_all (sync + settled status), set read + four chain reads, observation, resume_all
-        # (sync + settled status), set read + four chain reads
-        'BULK': shape + 2 * sync + 2 * settled + 10 * read + observe + iteration,
+        # (sync + settled status), set read + four chain reads, and one rpc-status receipt read per bulk operation id
+        'BULK': shape + 2 * sync + 2 * settled + 10 * read + observe + iteration + 2 * call,
         # three rpc-inventory reads and one wrapper read, each behind a safe-band wait; the checks are local
         'INVENTORY': 4 * call + local,
         # unenrol (sync + settled status), status for the base, leg 2d; the logread count is a KILL-wrapped read

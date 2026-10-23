@@ -130,7 +130,13 @@ for line in child.stdout:
         threading.Thread(target=run_leg, args=leg_match.groups(), daemon=True).start()
     for prefix, path in spec.get('touch_on', {}).items():
         if text.startswith(prefix):
-            open(path, 'w').close()
+            if isinstance(path, list):
+                # [file, content]: replace atomically so the script never reads a half-written clock.
+                with open(path[0] + '.tmp', 'w') as handle:
+                    handle.write(path[1])
+                os.replace(path[0] + '.tmp', path[0])
+            else:
+                open(path, 'w').close()
     match = re.match(r'INFO expiry_wait_begin until=([0-9]+) ', text)
     if match and spec.get('cron'):
         threading.Thread(target=cron, args=(int(match.group(1)),), daemon=True).start()
@@ -485,7 +491,8 @@ class PilotPlanTests(PilotBase):
         self.assertEqual(out.split(), [want for _, want in pairs])
 
     def test_phase_budget_refuses_when_worst_case_reaches_into_reserve(self):
-        base = 'cfp_now() { echo 1100; }\nCFR_START=1000\nCFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\n'
+        base = ('cfp_now() { echo 1100; }\ncfp_cs() { echo 110000; }\nCFP_START_CS=100000\n'
+                'CFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\n')
         self.assertEqual(self.pilot_shell(base + 'cfp_budget EXPIRY 600 && echo started\n'), (0, 'started\n'))
         self.assertEqual(self.pilot_shell(base + 'cfp_budget EXPIRY 601 && echo started\n'),
                          (20, 'STOP EXPIRY remote_budget_reserved_for_teardown\n'))
@@ -512,7 +519,7 @@ class PilotPlanTests(PilotBase):
         clock = self.work / 'fake-clock'
         body = (f'CLK={shlex.quote(str(clock))}\necho 1000 > "$CLK"\n'
                 'cfp_now() { cat "$CLK"; }\ncfp_safe_band() { return 0; }\n'
-                f'cfr_run_sh() {{ echo $(($(cat "$CLK") + {prior_call_s})) > "$CLK"; }}\n'
+                f'cfp_run() {{ echo $(($(cat "$CLK") + {prior_call_s})) > "$CLK"; }}\n'
                 f'CFR_CFCTL=cfctl\nCFP_PERSON=penn\nCFP_DIR={shlex.quote(str(self.work))}\nCFP_CFCTL_ALLOWANCE={allowance}\n'
                 f'{"cfp_cfctl status --json > /dev/null\n" if prior_call_s else ""}'
                 'cfp_before=$(cfp_now)\ncfp_pause ' + str(pause_s) + '\nprintf "%s\\n" "$((CFP_UNTIL - cfp_before))"\n')
@@ -547,6 +554,7 @@ class PilotPlanTests(PilotBase):
         q = shlex.quote
         body = (f'W={q(str(work))}\necho 1000 > "$W/clock"\necho 0 > "$W/n"\n: > "$W/calls"\n'
                 'cfp_now() { cat "$W/clock"; }\n'
+                'cfp_cs() { echo $(($(cat "$W/clock") * 100)); }\n'
                 'sleep() { echo $(($(cat "$W/clock") + $1)) > "$W/clock"; }\n'
                 'cfr_info() { printf "INFO %s\\n" "$*"; }\n'
                 'cfp_adult_probe() { echo probe >> "$W/calls"; }\n'
@@ -558,8 +566,9 @@ class PilotPlanTests(PilotBase):
                 'cfp_cfctl() { echo "cfctl $*" >> "$W/calls"; n=$(($(cat "$W/n") + 1)); echo "$n" > "$W/n"; '
                 f'echo $(($(cat "$W/clock") + {call_s})) > "$W/clock"; cat "$W/reply.$n"; }}\n'
                 f'CFP_DIR="$W"\nCFP_POLL=10\nCFP_STATUS_SETTLE={settle}\nCFP_ITERATION_WORST=40\nCFP_READ_TIMEOUT=8\n'
-                'CFP_CFCTL_ALLOWANCE=45\nCFR_START=1000\nCFP_REMOTE_TIMEOUT=100000\nCFP_TEARDOWN_RESERVE=300\n'
+                'CFP_CFCTL_ALLOWANCE=45\nCFP_START_CS=100000\nCFP_REMOTE_TIMEOUT=100000\nCFP_TEARDOWN_RESERVE=300\n'
                 f'CFR_MGMT_MAC={MGMT["mac"]}\nCFR_JD_MAC={JD["mac"]}\nCFR_PENN_MAC={PENN["mac"]}\n'
+                f'CFR_MGMT_IP={MGMT["ip"]}\nCFR_JD_IP={JD["ip"]}\nCFR_PENN_IP={PENN["ip"]}\n'
                 f'CFR_HISTORICAL_MACS={q(" ".join(HISTORICAL))}\nCFP_KIDS_JSON={q(json.dumps([PENN["mac"]]))}\n'
                 + extra +
                 'cfp_status_settle ENROLL penn_not_observed 1 "\\"observed\\":{\\"kids\\":$CFP_KIDS_JSON,\\"paused\\":[]}" '
@@ -581,11 +590,11 @@ class PilotPlanTests(PilotBase):
         # Neighbour evidence on every attempt: role MACs named, other MACs and IPv6 addresses hashed.
         neigh = [line for line in out.splitlines() if line.startswith('INFO status_settle_neigh ENROLL ')]
         self.assertEqual(len(neigh), 2, out)
-        self.assertIn(f'{PENN["ip"]}=penn_child/STALE', neigh[0])
-        self.assertIn(f'{MGMT["ip"]}=management/REACHABLE', neigh[0])
+        self.assertIn('penn_child=penn_child/STALE', neigh[0])
+        self.assertIn('management=management/REACHABLE', neigh[0])
         self.assertRegex(neigh[0], r' ip6-[0-9a-f]{12}=mac-[0-9a-f]{12}/REACHABLE')
-        self.assertIn('192.0.2.99=-/FAILED', neigh[0])
-        for secret in ('02:00:00:00:00:77', 'fe80::77', PENN['mac'], MGMT['mac']):
+        self.assertRegex(neigh[0], r' ip4-[0-9a-f]{12}=-/FAILED')
+        for secret in ('02:00:00:00:00:77', 'fe80::77', PENN['mac'], MGMT['mac'], '192.0.2.99', PENN['ip'], MGMT['ip']):
             self.assertNotIn(secret, '\n'.join(neigh))
         # Hashes are salted per run (sha256 of the salt hex + token), the salt is never logged, and one
         # token keeps one label across attempts.
@@ -775,8 +784,8 @@ class PilotPlanTests(PilotBase):
                           '1900000000 02:00:00:00:00:99 192.0.2.99 PRIVATE_OTHER *\n')
         body = (f'CFP_DIR={shlex.quote(str(self.work))}\nCFR_LEASES={shlex.quote(str(leases))}\n'
                 f'CFP_RPC_ALLOW={PENN["mac"]}\nCFR_PENN_IP={PENN["ip"]}\n'
-                'CFP_READ_TIMEOUT=8\nCFR_START=0\nCFP_REMOTE_TIMEOUT=2000\nCFP_TEARDOWN_RESERVE=300\n'
-                'cfp_now() { echo 1000; }\ncfr_info() { echo "INFO $1"; }\n'
+                'CFP_READ_TIMEOUT=8\nCFP_START_CS=0\nCFP_REMOTE_TIMEOUT=2000\nCFP_TEARDOWN_RESERVE=300\n'
+                'cfp_now() { echo 1000; }\ncfp_cs() { echo 100000; }\ncfr_info() { echo "INFO $1"; }\n'
                 'ip() { case "$*" in\n'
                 f' *neigh*) printf "%s\\n" "2001:db8::30 lladdr {PENN["mac"]} STALE" '
                 f'"{PENN["ip"]} lladdr 02:00:00:00:00:88 REACHABLE" '
@@ -841,7 +850,7 @@ class PilotPlanTests(PilotBase):
         self.assertEqual((code, out), (0, '0 0\n'))
 
     def test_empty_clock_stops_safely_instead_of_arithmetic_error(self):
-        empty = 'cfp_now() { :; }\nCFR_START=1000\nCFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\n'
+        empty = 'cfp_now() { :; }\ncfp_cs() { return 1; }\nCFP_START_CS=100000\nCFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\n'
         self.assertEqual(self.pilot_shell(empty + 'cfp_elapsed_ok 0 || echo not_ok\n'), (0, 'not_ok\n'))
         self.assertEqual(self.pilot_shell(empty + 'cfp_observe 5 paused PAUSE\n'),
                          (20, 'STOP PAUSE clock_unavailable\n'))
@@ -1546,11 +1555,11 @@ class PilotConfigV2Tests(PilotBase):
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         v2 = self.tool.phase_worst_seconds(shipped, scope=True, scope_target=True)
         self.assertEqual(v2, {'ENROLL': 609, 'PAUSE': 465, 'RESUME': 345, 'EXPIRY': 847, 'DNS': 80, 'SCOPE': 165,
-                              'SCOPE-ADD-1': 746, 'SCOPE-ADD-2': 1024, 'MOVE': 1412, 'BULK': 1222, 'INVENTORY': 478,
+                              'SCOPE-ADD-1': 746, 'SCOPE-ADD-2': 1024, 'MOVE': 1412, 'BULK': 1456, 'INVENTORY': 478,
                               'SCOPE-REMOVE': 907})
         self.assertEqual(self.tool.worst_case_seconds(shipped), 3318)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 9107)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 9272)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 9341)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 9506)
 
     def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
         details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
@@ -2004,6 +2013,7 @@ CFR_SH=sh
 CFR_FIXTURE=1
 CFR_ROOT=$H/root
 CFR_START=$(date +%%s)
+CFP_START_CS=$(cfp_cs)
 CFR_CFCTL=$CFR_ROOT/usr/sbin/cfctl
 cfp_safe_band() { return 0; }
 %(stop)s
@@ -2018,8 +2028,14 @@ D=0000000000000000000000000000000000000000000000000000000000000002
 cfp_cfctl() {
     case "$1" in
         rpc-status)
-            printf '{"rpc_version":1,"generation":"%s","acceptedPolicy":{"version":1,"revision":%s,"people":[],"pauses":[]},"policyDigest":"%s","currentOperationId":null,"routerTime":1,"receipt":null,"status":{},"errors":[],"scope":[%s],"scopeSha":"%s"}\n' \
-                "$G" "$(cat "$H/rev")" "$D" "$(cat "$H/scopejson")" "$(cat "$H/scopesha")";;
+            # `rpc-status --json <op>` answers with that operation's receipt(s): RECEIPTS copies (default one).
+            r=null
+            if [ -n "$3" ]; then
+                r=$(n=${RECEIPTS:-1}; while [ "$n" -gt 0 ]; do printf '{"operationId":"%s","requestDigest":"aa","baseRevision":1,"baseDigest":"bb","acceptedRevision":2,"acceptedDigest":"cc","outcome":"accepted","current":true}' "$3"; n=$((n - 1)); done)
+                [ -n "$r" ] || r=null
+            fi
+            printf '{"rpc_version":1,"generation":"%s","acceptedPolicy":{"version":1,"revision":%s,"people":[],"pauses":[]},"policyDigest":"%s","currentOperationId":null,"routerTime":1,"receipt":%s,"status":{},"errors":[],"scope":[%s],"scopeSha":"%s"}\n' \
+                "$G" "$(cat "$H/rev")" "$D" "$r" "$(cat "$H/scopejson")" "$(cat "$H/scopesha")";;
         *) return 1;;
     esac
 }
@@ -2054,6 +2070,7 @@ def inventory_reply(macs, hosts=None, truncated='false', errors=''):
 
 SENTINEL_HOST = 'sentinel-host-9f3c'
 SENTINEL_MAC = '02:00:00:00:00:77'
+SENTINEL_IP = '192.0.2.77'
 
 
 class PilotShellBase(PilotBase):
@@ -2066,6 +2083,9 @@ class PilotShellBase(PilotBase):
         changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
         # The v2 local timeout is far longer than v1's: the authorization deadline must outlast it.
         changes.setdefault('deadlineUtc', (self.now + datetime.timedelta(hours=5)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+        # The harness hardcodes remoteTimeoutSeconds=8900 unless a test overrides it: a fixed test value that sits
+        # inside the v2 range but does NOT come from the plan's minimumRemoteTimeoutSeconds (min + 900), so it
+        # bypasses the plan's own sizing/validation of the timeout. Production configs get no such default.
         return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8900))
 
     STUB_STOP = 'cfp_stop() { printf \'STOP %s %s\\n\' "$1" "$2"; exit 77; }'
@@ -2105,7 +2125,7 @@ class PilotShellInventoryTests(PilotShellBase):
     """INVENTORY: counts, shape and hashes only; the raw reply (hostnames, non-Penn MACs) is never printed."""
 
     DRIVER = r'''
-cfr_run_sh() { cat "$H/reply"; return "${REPLY_RC:-0}"; }
+cfp_run() { cat "$H/reply"; return "${REPLY_RC:-0}"; }
 cfp_wrapper_run() { cat "$H/reply"; return "${WRAPPER_RC:-0}"; }
 cfp_inventory_phase
 echo "LEFT:$(ls "$CFP_DIR" | tr '\n' ' ')"
@@ -2144,7 +2164,7 @@ echo "LEFT:$(ls "$CFP_DIR" | tr '\n' ' ')"
     def test_device_count_may_vary_between_samples_but_the_shape_may_not(self):
         # A guest joins between samples: counts are recorded per sample, only the shape is compared.
         more = inventory_reply([PENN['mac'], PHONE['mac'], SENTINEL_MAC, '02:00:00:00:00:78'])
-        driver = ('cfr_run_sh() { n=$(cat "$H/n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$H/n"; '
+        driver = ('cfp_run() { n=$(cat "$H/n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$H/n"; '
                   'if [ "$n" = 2 ]; then cat "$H/reply2"; else cat "$H/reply"; fi; }\n'
                   'cfp_wrapper_run() { cat "$H/reply"; }\ncfp_inventory_phase\n')
         done = self.run_driver(driver, files={'reply': self.good_reply() + '\n', 'reply2': more + '\n'})
@@ -2324,7 +2344,7 @@ class PilotShellMoveScopeTests(PilotShellBase):
                 self.assertIn('REFUSED', done.stdout, done.stderr)
 
     PREVIEW_DRIVER = r'''
-cfr_run_sh() {
+cfp_run() {
     case "$*" in
         *scope-preview*) cat "$H/preview";;
         *scope-add*) cat "$H/refusal"; return "${REFUSAL_RC:-1}";;
@@ -2472,7 +2492,7 @@ cfp_scope_add_1_phase
     SELF_ABORT = r'''
 CFP_SELF_ABORT_PCT=%(pct)s
 CFP_REMOTE_TIMEOUT=1000
-CFR_START=$(( $(date +%%s) - %(elapsed)s ))
+CFP_START_CS=$(( $(cfp_cs) - %(elapsed)s * 100 ))
 cfp_budget TESTPHASE 10
 echo SURVIVED
 '''
@@ -2490,7 +2510,7 @@ echo SURVIVED
         self.assertIn('STOP TESTPHASE remote_budget_reserved_for_teardown', done.stdout)
 
     def test_self_abort_fires_inside_the_leg_poll_loop(self):
-        driver = (RPC_STUBS + 'CFP_SELF_ABORT_PCT=70\nCFP_REMOTE_TIMEOUT=1000\nCFR_START=$(( $(date +%s) - 800 ))\n'
+        driver = (RPC_STUBS + 'CFP_SELF_ABORT_PCT=70\nCFP_REMOTE_TIMEOUT=1000\nCFP_START_CS=$(( $(cfp_cs) - 80000 ))\n'
                   'cfp_leg2 SCOPE-ADD-1 2a ' + 'c' * 64 + ' ' + 'd' * 64 + ' add\n')
         done = self.run_driver(driver, files=self.rpc_files())
         self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 remote_self_abort'])
@@ -2534,8 +2554,10 @@ echo SURVIVED
 
     def test_teardown_proof_runs_after_restore_and_before_connectivity(self):
         body = self.function_text('cfp_teardown')
-        self.assertLess(body.index('cfr_restore'), body.index('cfp_teardown_proof'))
-        self.assertLess(body.index('cfp_teardown_proof'), body.index('cfr_connectivity'))
+        self.assertLess(body.index('cfp_restore'), body.index('cfr_connectivity'))
+        restore = self.function_text('cfp_restore')
+        self.assertLess(restore.index('cfr_snapshot after'), restore.index('cfp_teardown_proof'))
+        self.assertLess(restore.index('cfp_teardown_proof'), restore.index('cfr_ok RESTORE'))
         self.assertIn('"$CFP_PROOF_FAILED" = 0', body)
 
     def test_self_abort_check_guards_every_wait_loop(self):
@@ -2607,6 +2629,289 @@ class PilotShellMoveFlowTests(PilotShellBase):
                 self.assertNotIn('PHASE MOVE OK', done.stdout)
 
 
+class PilotReviewFixTests(PilotShellBase):
+    """Review fixes: bounded children, leg-2 cancel, no raw LAN IPv4, the uptime clock, a real BULK receipt check,
+    a non-vacuous teardown proof and the fixture-only wrapper directory."""
+
+    HANG = '#!/bin/sh\nexec sleep 30\n'
+
+    def hang_driver(self, call, seconds=1):
+        return (f'CFR_CFCTL=$H/hang.sh\nCFP_CFCTL_ALLOWANCE={seconds}\nmkdir -p "$CFR_ROOT/usr/sbin"\n'
+                'cp "$H/hang.sh" "$CFR_ROOT/usr/sbin/cfctl-ssh"\nt0=$(date +%s)\n' + call
+                + '\necho "ELAPSED:$(( $(date +%s) - t0 ))"\n')
+
+    def elapsed(self, done):
+        return int(re.search(r'ELAPSED:([0-9]+)', done.stdout).group(1))
+
+    def test_a_hung_cfctl_or_wrapper_call_is_killed_at_the_allowance(self):
+        calls = {'cfctl': 'cfp_cfctl status --json > /dev/null; echo "RC:$?"',
+                 'cfctl with input': 'echo x > "$H/in"; cfp_cfctl_input "$H/in" rpc-sync > /dev/null; echo "RC:$?"',
+                 'wrapper': "cfp_wrapper_run cfctl-ssh 'cfctl rpc-inventory --json' --rpc-only > /dev/null; echo \"RC:$?\"",
+                 'pause': 'CFP_UNTIL=1; cfp_pause 30; echo "RC:$?"'}
+        for name, call in calls.items():
+            with self.subTest(call=name):
+                done = self.run_driver(self.hang_driver(call), files={'hang.sh': self.HANG}, timeout=60)
+                self.assertLess(self.elapsed(done), 10, done.stdout + done.stderr)
+                if name != 'pause':
+                    self.assertIn('RC:137', done.stdout)
+                else:
+                    self.assertIn('INFO pause exit 137', done.stdout)
+
+    @unittest.skipUnless(shutil.which('busybox'), 'busybox absent')
+    def test_the_kill_also_works_with_busybox_timeout(self):
+        driver = ('mkdir -p "$H/bb"; ln -sf "$(command -v busybox)" "$H/bb/timeout"; PATH=$H/bb:$PATH\n'
+                  + self.hang_driver('cfp_cfctl status --json > /dev/null; echo "RC:$?"'))
+        done = self.run_driver(driver, files={'hang.sh': self.HANG}, timeout=60)
+        self.assertLess(self.elapsed(done), 10, done.stdout + done.stderr)
+        self.assertIn('RC:137', done.stdout)
+
+    def test_a_phase_whose_call_hangs_stops_instead_of_waiting(self):
+        done = self.run_driver(self.hang_driver('cfp_status_read PHASE'), files={'hang.sh': self.HANG}, timeout=60)
+        self.assertEqual(self.stop_of(done), ['STOP PHASE rpc_status_failed'])
+        done = self.run_driver(self.hang_driver('CFP_PHONE_MAC=02:00:00:00:00:34; cfp_preview PHASE direct add_1'),
+                               files={'hang.sh': self.HANG}, timeout=60)
+        self.assertEqual(self.stop_of(done), ['STOP PHASE scope_preview_failed'])
+        done = self.run_driver(self.hang_driver('cfp_inventory_phase'), files={'hang.sh': self.HANG}, timeout=60)
+        self.assertEqual(len(self.stop_of(done)), 1, done.stdout)
+
+    def test_no_child_is_started_outside_the_bounded_helper(self):
+        text = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        loose = [line for line in text.splitlines()
+                 if not line.lstrip().startswith('#') and ('cfr_run_sh' in line or '$CFR_SH' in line)
+                 and 'timeout -s KILL' not in line]
+        self.assertEqual(loose, [])
+
+    UNINSTALL_DRIVER = r'''
+CFR_RELEASE_DIR=$H/rel
+mkdir -p "$CFR_RELEASE_DIR"
+cp "$H/uninstall.sh" "$CFR_RELEASE_DIR/uninstall.sh"
+cfr_snapshot() { return 1; }
+cfp_kernel_state() { echo stub; }
+cfp_crond_count() { :; }
+cfp_teardown
+'''
+
+    def test_a_hung_uninstall_is_killed_and_reported_as_uninstall_timeout(self):
+        done = self.run_driver(self.UNINSTALL_DRIVER, files={'uninstall.sh': self.HANG},
+                               params={'CFP_UNINSTALL_ALLOWANCE': 1}, timeout=60)
+        self.assertEqual(done.returncode, 20, done.stdout + done.stderr)
+        self.assertIn('PHASE UNINSTALL FAIL uninstall_timeout', done.stdout)
+        self.assertEqual(done.stdout.splitlines()[-1], 'FAIL_AFTER_MUTATION UNINSTALL')
+        self.assertNotIn('PHASE UNINSTALL OK', done.stdout)
+
+    def test_a_refused_uninstall_keeps_its_own_reason(self):
+        done = self.run_driver(self.UNINSTALL_DRIVER, files={'uninstall.sh': 'exit 1\n'}, timeout=60)
+        self.assertIn('PHASE UNINSTALL FAIL uninstall_refused_or_failed', done.stdout)
+        self.assertNotIn('uninstall_timeout', done.stdout)
+
+    LEG_DRIVER = r'''
+CFR_RELEASE_DIR=$H/rel
+mkdir -p "$CFR_RELEASE_DIR" "$CFR_ROOT/etc/couvrefeu/runtime"
+cat > "$CFR_RELEASE_DIR/uninstall.sh" <<'EOS'
+if [ -e "$LOCK" ]; then echo LOCK_PRESENT > "$H/seen"; else echo LOCK_ABSENT > "$H/seen"; fi
+cat "$H/filesha" >> "$H/seen"
+exit 1
+EOS
+LOCK=$CFR_ROOT/etc/couvrefeu/runtime/lock
+export LOCK H
+cfp_scope_file_sha() { cat "$H/filesha"; }
+cfr_snapshot() { return 1; }
+cfp_kernel_state() { echo stub; }
+cfp_crond_count() { :; }
+%s
+cfp_teardown
+'''
+
+    def leg_teardown(self, setup, params=None):
+        return self.run_driver(self.LEG_DRIVER % setup, files={'filesha': 'aaa\n'}, params=params, timeout=60)
+
+    def test_a_stop_during_a_leg_cancels_it_and_waits_for_quiet_before_uninstall(self):
+        # The lock is held and the scope file changes after the stop: uninstall must see neither.
+        setup = ('CFP_LEG2_ACTIVE=2c\nmkdir "$LOCK"\n'
+                 '( sleep 2; echo bbb > "$H/filesha"; sleep 1; rmdir "$LOCK" ) &\n')
+        done = self.leg_teardown(setup)
+        lines = done.stdout.splitlines()
+        self.assertIn('CFP_LEG2_CANCEL 2c', lines, done.stdout)
+        self.assertLess(lines.index('CFP_LEG2_CANCEL 2c'), next(i for i, l in enumerate(lines) if 'run uninstall.sh once' in l))
+        self.assertEqual((done.home / 'seen').read_text().split(), ['LOCK_ABSENT', 'bbb'])
+
+    def test_quiet_means_the_scope_file_is_unchanged_across_two_reads(self):
+        # No lock, but the scope file keeps changing for ~3 s after the stop: uninstall must wait for it to settle.
+        setup = ('CFP_LEG2_ACTIVE=2b\n( sleep 0.5; echo b > "$H/filesha"; sleep 1; echo c > "$H/filesha"; '
+                 'sleep 1; echo d > "$H/filesha" ) &\n')
+        done = self.leg_teardown(setup)
+        self.assertEqual((done.home / 'seen').read_text().split(), ['LOCK_ABSENT', 'd'], done.stdout)
+
+    def test_the_cancel_wait_is_bounded_and_uninstall_still_runs(self):
+        done = self.leg_teardown('CFP_LEG2_ACTIVE=2a\nmkdir "$LOCK"\n', params={'CFP_LEG2_CANCEL_WAIT': 2})
+        self.assertIn('CFP_LEG2_CANCEL 2a', done.stdout)
+        self.assertIn('INFO leg2_quiesce_timeout', done.stdout)
+        self.assertEqual((done.home / 'seen').read_text().split()[0], 'LOCK_PRESENT')
+        self.assertIn('PHASE UNINSTALL FAIL', done.stdout)
+
+    def test_no_cancel_marker_without_an_outstanding_leg(self):
+        done = self.leg_teardown(':')
+        self.assertNotIn('CFP_LEG2_CANCEL', done.stdout)
+
+    def test_the_leg_flag_is_set_before_the_marker_and_cleared_after_the_confirming_read(self):
+        body = self.function_text('cfp_leg2')
+        self.assertLess(body.index('CFP_LEG2_ACTIVE=$cfp_l_leg'), body.index('CFP_LEG2_READY'))
+        self.assertLess(body.index('scope_sha_inconsistent'), body.rindex('CFP_LEG2_ACTIVE='))
+        self.assertTrue(body.rstrip().splitlines()[-1].strip().startswith('CFP_LEG2_ACTIVE='), body[-200:])
+
+    NEIGH_STUBS = (
+        'timeout() { shift 3; "$@"; }\n'
+        'dd() { printf "fixed-test-entropy"; }\n'
+        'ip() { printf "%s\\n" "192.0.2.88 lladdr 02:00:00:00:00:88 STALE" "192.0.2.99 FAILED" '
+        f'"{MGMT["ip"]} lladdr {MGMT["mac"]} REACHABLE" "{PENN["ip"]} lladdr {PENN["mac"]} DELAY" '
+        f'"{PHONE["ip"]} lladdr {PHONE["mac"]} STALE"; }}\n')
+
+    def test_non_role_ipv4_addresses_are_hashed_and_role_addresses_named(self):
+        done = self.run_driver(self.NEIGH_STUBS + 'cfp_neigh_evidence ENROLL\n')
+        phase_log = (done.home / 'stage/phase.log').read_text()
+        for text in (done.stdout, phase_log):
+            for raw in ('192.0.2.88', '192.0.2.99', '02:00:00:00:00:88'):
+                self.assertNotIn(raw, text)
+        line = next(l for l in done.stdout.splitlines() if l.startswith('INFO status_settle_neigh ENROLL '))
+        self.assertRegex(line, r' ip4-[0-9a-f]{12}=mac-[0-9a-f]{12}/STALE')
+        self.assertRegex(line, r' ip4-[0-9a-f]{12}=-/FAILED')
+        self.assertIn('management=management/REACHABLE', line)
+        self.assertIn('penn_child=penn_child/DELAY', line)
+        self.assertIn('scope_target=scope_target/STALE', line)
+
+    CLOCK = ('CFP_REMOTE_TIMEOUT=1000\nCFP_TEARDOWN_RESERVE=300\nCFP_START_CS=100000\n'
+             'cfp_now() { echo 5; }\ncfp_cs() { echo $((100000 + %(elapsed)s * 100)); }\n')
+
+    def test_elapsed_budget_and_abort_use_the_uptime_clock_not_the_wall_clock(self):
+        for elapsed, ok in ((690, True), (701, False)):
+            with self.subTest(elapsed=elapsed):
+                done = self.run_driver(self.CLOCK % {'elapsed': elapsed} + 'cfp_elapsed_ok 10 && echo ok || echo not_ok\n')
+                self.assertEqual(done.stdout.split(), ['ok' if ok else 'not_ok'], done.stdout + done.stderr)
+        done = self.run_driver(self.CLOCK % {'elapsed': 701} + 'CFP_SELF_ABORT_PCT=70\ncfp_abort_check T\necho SURVIVED\n')
+        self.assertEqual(self.stop_of(done), ['STOP T remote_self_abort'])
+        done = self.run_driver(self.CLOCK % {'elapsed': 100} + 'CFP_SELF_ABORT_PCT=70\ncfp_abort_check T\necho SURVIVED\n')
+        self.assertIn('SURVIVED', done.stdout)
+        done = self.run_driver(self.CLOCK % {'elapsed': 100} + 'cfp_cs() { return 1; }\ncfp_elapsed_ok 0 || echo not_ok\n')
+        self.assertEqual(done.stdout.split()[-1], 'not_ok')
+
+    def test_a_phase_whose_worst_case_crosses_the_abort_mark_is_not_started(self):
+        # Mark: 70% of 2000 = 1400 s; the 100% budget (2000 - 300 reserve) is further out.
+        base = self.CLOCK % {'elapsed': 600} + 'CFP_REMOTE_TIMEOUT=2000\nCFP_SELF_ABORT_PCT=70\n'
+        done = self.run_driver(base + 'cfp_budget P 800\necho STARTED\n')
+        self.assertIn('STARTED', done.stdout)
+        done = self.run_driver(base + 'cfp_budget P 801\necho STARTED\n')
+        self.assertEqual(self.stop_of(done), ['STOP P remote_self_abort_worst_case'])
+        # v1 (no percent) keeps its legacy shape.
+        done = self.run_driver(base + "CFP_SELF_ABORT_PCT=''\ncfp_budget P 801\necho STARTED\n")
+        self.assertIn('STARTED', done.stdout)
+
+    def test_the_inventory_salt_needs_a_real_read(self):
+        # A failed urandom read hashes nothing: the empty-input digest is no salt.
+        done = self.run_driver('dd() { :; }\ncfp_inventory_phase\n')
+        self.assertEqual(self.stop_of(done), ['STOP INVENTORY salt_unavailable'])
+
+    def test_router_supplied_lists_are_never_glob_expanded(self):
+        done = self.run_driver('cd "$H"\ntouch aaa bbb\ncfp_scope_sha "*"\n')
+        self.assertEqual(done.stdout.strip(), hashlib.sha256(b'*\n').hexdigest())
+        done = self.run_driver(f'cd "$H"\ntouch aaa bbb\ncfp_scope_with "*" {PHONE["mac"]}\necho\necho "SET:$-"\n')
+        words = done.stdout.split('\n')
+        self.assertEqual(words[0], f'* {PHONE["mac"]}', done.stdout + done.stderr)
+        self.assertNotIn('f', words[1])
+
+    def test_raw_reply_files_are_removed_even_when_stdout_is_lost(self):
+        raw = ('preview.out', 'wrapper.out', 'inventory.json', 'inventory.w.json', 'settle.neigh', 'settle.tokens', 'settle.map')
+        driver = ''.join(f'echo secret > "$CFP_DIR/{name}"\n' for name in raw) + \
+                 'echo keep > "$CFP_DIR/status.json"\nCFR_STDOUT_LOST=1\ncfp_cleanup\nls "$CFP_DIR" | tr "\\n" " "\n'
+        done = self.run_driver(driver)
+        self.assertEqual(done.stdout.strip(), 'status.json', done.stdout + done.stderr)
+
+    def test_the_raw_scope_preview_is_removed_as_soon_as_it_is_parsed(self):
+        driver = f'cfp_run() {{ cat "$H/preview"; }}\nCFP_PHONE_MAC={PHONE["mac"]}\ncfp_preview P direct add_1\necho "LEFT:$(ls "$CFP_DIR")"\n'
+        done = self.run_driver(driver, files={'preview': PilotShellMoveScopeTests.preview(self)})
+        self.assertIn('MEASURE scope_preview_add_1 measured', done.stdout)
+        self.assertIn('LEFT:', done.stdout)
+        self.assertNotIn('preview.out', done.stdout)
+        self.assertNotIn(SENTINEL_HOST, done.stdout)
+
+    def test_an_empty_scope_is_unparsable_because_it_cannot_exist(self):
+        # router/lib/core.sh: cf_scope_file requires 1-256 MACs, install refuses an empty --rpc-allow, scope-remove
+        # refuses a floor MAC (scope_mac_in_floor) and cf_scope_load refuses an unscoped install.
+        files = dict(self.rpc_files(), scopejson='\n')
+        done = self.run_driver(RPC_STUBS + 'cfp_status_read P\necho PARSED\n', files=files)
+        self.assertEqual(self.stop_of(done), ['STOP P rpc_status_unparsed'])
+
+    def bulk_receipts(self, receipts):
+        both = ' '.join(sorted([PENN['mac'], PHONE['mac']]))
+        kids = '[' + ','.join(f'"{m}"' for m in both.split()) + ']'
+        driver = (RPC_STUBS + f'CFP_RPC_ALLOW="{both}"\nCFP_KIDS_JSON=\'{kids}\'\nCFP_REV=8\nCFP_LAT_MAX=0\nRECEIPTS={receipts}\n'
+                  + PilotShellBulkTests.SEQ + 'cfp_bulk_phase\n')
+        files = dict(self.rpc_files(rev=8), penn_state='paused\n', chain4='paused 0\n', chain6='paused 0\n', calls='')
+        return self.run_driver(driver, files=files)
+
+    def test_bulk_requires_exactly_one_receipt_per_operation_id(self):
+        done = self.bulk_receipts(1)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('PHASE BULK OK', done.stdout)
+        for count in (0, 2):
+            with self.subTest(count=count):
+                done = self.bulk_receipts(count)
+                stops = self.stop_of(done)
+                self.assertEqual(len(stops), 1, done.stdout)
+                self.assertTrue(stops[0].startswith('STOP BULK bulk_receipt_count_unexpected'), stops)
+                self.assertNotIn('PHASE BULK OK', done.stdout)
+
+    def test_bulk_has_no_dead_revision_difference_guard(self):
+        self.assertNotIn('cfp_bk_rev1 - cfp_bk_rev0', self.function_text('cfp_bulk_phase'))
+
+    def test_the_wrapper_directory_override_is_honoured_only_in_fixture_mode(self):
+        driver = ('unset CF_TEST_MODE CF_ROOT CF_BACKEND_DIR\nCFP_WRAPPER_DIR=/evil/dir\ncfr_setup_paths\n'
+                  'echo "FIXTURE:$CFR_FIXTURE"\ncfp_wrapper_dir\n')
+        done = self.run_driver(driver)
+        self.assertEqual(done.stdout.split(), ['FIXTURE:0', '/usr/sbin'], done.stdout + done.stderr)
+        done = self.run_driver('CFR_FIXTURE=1\nCFP_WRAPPER_DIR=/fixture/dir\ncfp_wrapper_dir\n')
+        self.assertEqual(done.stdout.strip(), '/fixture/dir')
+
+    def function_text(self, name):
+        script = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        start = script.index(f'\n{name}() {{') + 1
+        return script[start:script.index('\n}\n', start)]
+
+    def test_teardown_proof_needs_its_evidence_files(self):
+        setup = (
+            'CFR_STAGE=$H/stage; CFR_ROOT=$H/root; CFR_RELEASE_DIR=$CFR_ROOT/etc/.couvrefeu-release-x\n'
+            'for k in ipset ipsetsave iptables ip6tables; do : > "$CFR_STAGE/text.before.$k"; : > "$CFR_STAGE/text.after.$k"; done\n'
+            'CFP_CROND_UNINSTALL=2 CFP_CROND_BASELINE=2\n%s\ncfp_teardown_proof\necho "FAILED:$CFP_PROOF_FAILED"\n')
+        for kind in ('ipset', 'ipsetsave', 'iptables', 'ip6tables'):
+            with self.subTest(missing=kind):
+                done = self.run_driver(setup % f'rm -f "$CFR_STAGE/text.after.{kind}"')
+                self.assertIn('PHASE RESTORE FAIL teardown_evidence_missing', done.stdout)
+                self.assertIn('FAILED:1', done.stdout)
+        done = self.run_driver(setup % 'rm -f "$CFR_STAGE/text.before.iptables"')
+        self.assertIn('PHASE RESTORE FAIL teardown_evidence_missing', done.stdout)
+        # Present but not a regular file: awk would skip a directory with a zero count, so it must count as missing.
+        done = self.run_driver(setup % 'rm -f "$CFR_STAGE/text.after.ip6tables"; mkdir "$CFR_STAGE/text.after.ip6tables"')
+        self.assertIn('PHASE RESTORE FAIL teardown_evidence_missing', done.stdout)
+
+    RESTORE_DRIVER = (
+        'CFR_ROOT=$H/root; CFR_RELEASE_DIR=$CFR_ROOT/etc/.couvrefeu-release-x\n'
+        'for k in ipset ipsetsave iptables ip6tables; do : > "$CFR_STAGE/text.before.$k"; : > "$CFR_STAGE/text.after.$k"; done\n'
+        'CFP_CROND_UNINSTALL=2 CFP_CROND_BASELINE=2\n'
+        'cfr_snapshot() { echo same > "$CFR_STAGE/snapshot.$1"; }\ncfr_snapshot before\n%s\ncfp_restore\n')
+
+    def test_one_restore_verdict_only_after_the_teardown_proof(self):
+        done = self.run_driver(self.RESTORE_DRIVER % ':')
+        self.assertEqual(done.stdout.count('PHASE RESTORE OK'), 1, done.stdout)
+        self.assertNotIn('RESTORE FAIL', done.stdout)
+        done = self.run_driver(self.RESTORE_DRIVER % 'mkdir -p "$CFR_RELEASE_DIR"')
+        self.assertIn('PHASE RESTORE FAIL teardown_release_dir_left', done.stdout)
+        self.assertNotIn('PHASE RESTORE OK', done.stdout)
+        done = self.run_driver(self.RESTORE_DRIVER % 'rm -f "$CFR_STAGE/text.after.iptables"')
+        self.assertNotIn('PHASE RESTORE OK', done.stdout)
+        done = self.run_driver(self.RESTORE_DRIVER % 'cfr_snapshot() { return 1; }')
+        self.assertIn('PHASE RESTORE FAIL snapshot_failed', done.stdout)
+        self.assertNotIn('PHASE RESTORE OK', done.stdout)
+
+
 class PilotV2FixtureTests(PilotShellBase):
     """End to end against the fixture router, schema v2. The fake ssh stands in for the T4 pty driver: it runs each
     commit leg under a pty when it sees a valid marker. Slow (every phase installs, syncs and uninstalls)."""
@@ -2658,7 +2963,7 @@ class PilotV2FixtureTests(PilotShellBase):
     def assert_no_leaks(self):
         for path in self.evidence().iterdir():
             text = path.read_text(errors='replace')
-            for leaked in (SENTINEL_HOST, SENTINEL_MAC):
+            for leaked in (SENTINEL_HOST, SENTINEL_MAC, SENTINEL_IP):
                 self.assertNotIn(leaked, text, path.name)
 
     def test_v2_happy_path_passes_in_order_and_restores_exactly(self):
@@ -2674,6 +2979,7 @@ class PilotV2FixtureTests(PilotShellBase):
         legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
         self.assertEqual(sorted(leg['leg'] for leg in legs), ['2a', '2b', '2c', '2d'])
         self.assertTrue(all(leg['exit'] == 0 and '"ok":true' in leg['last'] for leg in legs), legs)
+        self.assertFalse([line for line in stdout if line.startswith('CFP_LEG2_CANCEL')])
         markers = [line for line in stdout if line.startswith('CFP_LEG2_READY')]
         self.assertEqual([m.split()[1] for m in markers], ['2a', '2b', '2c', '2d'])
         self.assertTrue(all(re.fullmatch(r'CFP_LEG2_READY 2[a-d] [0-9a-f]{64}', m) for m in markers))
@@ -2701,6 +3007,8 @@ class PilotV2FixtureTests(PilotShellBase):
         stdout = self.stdout_lines()
         self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
         self.assertIn('STOP SCOPE-ADD-2 scope_leg_timeout', stdout)
+        # The outstanding leg is cancelled before the single uninstall.
+        self.assertLess(stdout.index('CFP_LEG2_CANCEL 2c'), next(i for i, l in enumerate(stdout) if l.startswith('INFO run uninstall.sh once')))
         self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
         self.assertEqual(stdout.count('PHASE UNINSTALL OK'), 1)
         self.assertIn('PHASE RESTORE OK', stdout)
@@ -2724,12 +3032,12 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assertEqual(self.router_snapshot(), before)
 
     def test_v2_self_abort_at_seventy_percent_ends_stopped_and_restored(self):
-        # The router clock jumps past 70% of remoteTimeoutSeconds once ENROLL is done.
-        offset = self.work / 'clock-offset'
-        real_date = shutil.which('date')
-        self.router_double('date', f'if [ -e {shlex.quote(str(offset))} ] && [ "$1" = +%s ]; then echo $(( $({shlex.quote(real_date)} +%s) + 7000 )); exit 0; fi\n'
-                           f'exec {shlex.quote(real_date)} "$@"\n')
-        self.spec['touch_on']['PHASE ENROLL OK'] = str(offset)
+        # The router's uptime clock (the elapsed/abort clock; CFP_UPTIME_FILE is honoured in fixture mode only)
+        # jumps past 70% of remoteTimeoutSeconds once ENROLL is done. The wall clock `date` is untouched.
+        uptime = self.work / 'uptime'
+        uptime.write_text('1000000.00 0.00\n')
+        self.spec['env']['CFP_UPTIME_FILE'] = str(uptime)
+        self.spec['touch_on']['PHASE ENROLL OK'] = [str(uptime), '1007000.00 0.00\n']
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()
