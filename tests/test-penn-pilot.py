@@ -2203,12 +2203,12 @@ echo "LEFT:$(ls "$CFP_DIR" | tr '\n' ' ')"
 class PilotShellBulkTests(PilotShellBase):
     """BULK: pause_all and resume_all are ONE rpc-sync each; IPv4 and IPv6 chain state is recorded."""
 
-    def bulk(self, penn_state='paused', chain4='paused 0\n', chain6='paused 0\n', extra=''):
+    def bulk(self, penn_state='paused', chain4='paused 0\n', chain6='paused 0\n', extra='', rev=8):
         both = ' '.join(sorted([PENN['mac'], PHONE['mac']]))
         kids = '[' + ','.join(f'"{m}"' for m in both.split()) + ']'
-        driver = (RPC_STUBS + f'CFP_RPC_ALLOW="{both}"\nCFP_KIDS_JSON=\'{kids}\'\nCFP_REV=8\nCFP_LAT_MAX=0\n' + extra
+        driver = (RPC_STUBS + f'CFP_RPC_ALLOW="{both}"\nCFP_KIDS_JSON=\'{kids}\'\nCFP_REV={rev}\nCFP_LAT_MAX=0\n' + extra
                   + 'cfp_bulk_phase\necho "REV:$CFP_REV"\n')
-        files = dict(self.rpc_files(rev=8), penn_state=penn_state + '\n', chain4=chain4, chain6=chain6, calls='')
+        files = dict(self.rpc_files(rev=rev), penn_state=penn_state + '\n', chain4=chain4, chain6=chain6, calls='')
         return self.run_driver(driver, files=files)
 
     def calls(self, done):
@@ -2254,6 +2254,13 @@ class PilotShellBulkTests(PilotShellBase):
         self.assertIn('MEASURE bulk_ipv6 unmeasured partial_or_unconfirmed paused_rules=0 not_retried', done.stdout)
         self.assertIn('MEASURE bulk_ipv4 measured paused_rules=1 set_members=2', done.stdout)
         self.assertEqual(self.calls(done).count('chain'), 4)  # (v4, v6) while paused, (v4, v6) after resume: no retry
+
+    def test_the_sync_revision_must_be_the_planned_one(self):
+        # BULK is planned at revisions 9 and 10 (digest-bound derivedSyncs): a run that is one revision off stops
+        # before sending anything, even though its own CAS read agrees with its own count.
+        done = self.bulk(rev=9)
+        self.assertEqual(self.stop_of(done), ['STOP BULK policy_revision_mismatch'])
+        self.assertEqual(self.calls(done).count('sync'), 0)
 
     def test_a_revision_the_pilot_did_not_set_stops_before_any_sync(self):
         done = self.bulk(extra='echo 9 > "$H/rev"\n')
