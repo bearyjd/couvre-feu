@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "host": "192.0.2.1",
+  "adminPublicKeyPath": "/home/operator/private/couvre-feu/admin_ed25519.pub",
+  "adminKeyFingerprint": "SHA256:FictionalExampleFingerprintNotARealKey00000",
+  "knownHostsPath": "/home/operator/private/couvre-feu/known_hosts",
+  "evidenceDir": "/home/operator/private/couvre-feu/evidence",
+  "authorizationPath": "/home/operator/private/couvre-feu/authorization-penn-pilot.txt",
+  "deadlineUtc": "2026-01-01T12:00:00Z",
+  "platformProfile": "gl-xe3000-4.8.3-os-trust-v1",
+  "remoteTimeoutSeconds": 9000,
+  "roles": {
+    "management": {"ip": "192.0.2.10", "mac": "02:00:00:00:00:10"},
+    "jd_adult": {"ip": "192.0.2.20", "mac": "02:00:00:00:00:20"},
+    "penn_child": {"ip": "192.0.2.30", "mac": "02:00:00:00:00:30"},
+    "scope_target": {"ip": "192.0.2.34", "mac": "02:00:00:00:00:34"}
+  },
+  "protectedHistoricalMacs": ["02:00:00:00:00:40"]
+}
