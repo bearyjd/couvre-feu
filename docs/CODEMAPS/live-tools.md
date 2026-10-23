@@ -7,4 +7,4 @@
   Result lines: PENN_PILOT_PASS / PENN_PILOT_STOPPED_RESTORED[_CONNECTIVITY_FAILED]; PENN_KERNEL_STATE paused|clear|unknown.
 - Config: host, admin key fingerprint pinned, knownHosts, evidenceDir (not tmpfs), authorizationPath, deadlineUtc, platformProfile, roles{management,jd_adult,penn_child}, protectedHistoricalMacs.
 - `tools/freeze-router-release.py`: module pins + router/release.sha256; `--emit DIR` writes the shippable tree with cfctl-ssh/cfctl-scope stripped via strip-test-mode.py; refuses unless router/ is frozen. tools/live/first-rehearsal.py ships the same stripped wrappers and now depends on tools/strip-test-mode.py as a HEAD-bound source: the committed blob must match disk and index, is compiled and run from memory (never from disk), and its blob SHA is printed in the plan as `stripperBlobSha1`.
-- Tests: tests/test-live-rehearsal.py, tests/test-penn-pilot.py. Runbook: docs/runbooks/live-first-rehearsal.md.
+- Tests: tests/test-live-rehearsal.py, tests/test-penn-pilot.py, tests/test-penn-pilot-leg2.py and tests/test-penn-pilot-leg2-guards.py (leg-2 driver against tests/fake-leg-ssh.py). Runbook: docs/runbooks/live-first-rehearsal.md.

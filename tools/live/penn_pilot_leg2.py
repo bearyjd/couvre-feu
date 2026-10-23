@@ -8,7 +8,8 @@ Leg 1 is the single `ssh ... /bin/sh -s` payload session. Its stdout file is tai
 digest. The typed confirmation (last six hex digits of the scope target MAC) is sent only when everything the leg has
 printed equals the one expected text. Each leg gets its planned seconds, no retry, and is killed when leg 1 prints
 STOP or CFP_LEG2_CANCEL, ends, or times out. Nothing the leg prints is kept except counts and the reply's reason codes.
-This module never changes how the router is logged in to: it only reuses the pinned leg-1 ssh options."""
+This module never changes how the router is logged in to: it only reuses the pinned leg-1 ssh options. The known-hosts
+and identity files are re-hashed before every leg and every ack; SIGTERM, SIGHUP and SIGINT end a run like Ctrl-C."""
 import hmac
 import json
 import os
@@ -39,20 +40,39 @@ MARKER = re.compile(r'CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})')
 CANCEL = re.compile(r'CFP_LEG2_CANCEL 2[a-d]')
 # Leg 1's teardown names the router-side acknowledgement file; the only path the driver will ever write.
 ACK_FILE = re.compile(r'CFP_LEG2_ACK_FILE (/tmp/couvre-feu-first\.[A-Za-z0-9]{6}/leg2-idle)')
-ACK_SECONDS = 8
+# Created only once no cfctl or cfctl-scope process is alive on the router (checked as exact NUL-separated fields of
+# /proc/*/cmdline, so this script's own command line never matches), never through an existing file or symlink.
+ACK_SCRIPT = r"""n=0
+while :; do b=0
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    if tr '\000' '\n' <"$p/cmdline" 2>/dev/null | awk '$0=="/usr/sbin/cfctl"||$0=="/usr/sbin/cfctl-scope"{f=1}END{exit !f}'; then b=1; break; fi
+  done
+  if [ "$b" = 0 ]; then break; fi
+  n=$((n+1)); if [ "$n" -ge 4 ]; then exit 3; fi
+  sleep 1
+done
+if [ -e PATH_ ] || [ -L PATH_ ]; then exit 4; fi
+set -C; : > PATH_
+"""
+ACK_SECONDS = 12
+ACK_BUSY = 3
+SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 PROMPT = 'Type the last 6 hex digits of the address (no colons) to confirm: '
 # (leg, form, op) in the only order the plan may list them.
 LEG_TABLE = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
              ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove'))
-TEMPLATES = {'cfctl': r'/usr/sbin/cfctl (scope-add|scope-remove) \{MAC\} --base \{BASE\}',
-             'cfctl-scope': r"env SSH_ORIGINAL_COMMAND='cfctl (scope-add|scope-remove) \{MAC\} --base \{BASE\}' "
-                            r'/usr/sbin/cfctl-scope pilot'}
+# The remote bound `timeout -s KILL <seconds>` is the leg's own digest-bound timeoutSeconds, written without leading zeros.
+TEMPLATES = {'cfctl': r'timeout -s KILL ([1-9][0-9]{0,2}) /usr/sbin/cfctl (scope-add|scope-remove) \{MAC\} --base \{BASE\}',
+             'cfctl-scope': r"timeout -s KILL ([1-9][0-9]{0,2}) env SSH_ORIGINAL_COMMAND='cfctl (scope-add|scope-remove) "
+                            r"\{MAC\} --base \{BASE\}' /usr/sbin/cfctl-scope pilot"}
 # The only ssh options a leg may carry besides the pinned known-hosts file (the leg-1 option set).
 FIXED_OPTIONS = {'IdentitiesOnly=yes', 'BatchMode=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null',
                  'ConnectTimeout=5', 'ConnectionAttempts=1', 'ForwardAgent=no', 'ClearAllForwardings=yes'}
 REQUIRED_OPTIONS = {'IdentitiesOnly=yes', 'BatchMode=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null'}
 CAPTURE_BYTES = 4096
 LINE_BYTES = 65536
+READ_BYTES = 65536  # most one step takes from a leg's pty or stderr: a flood cannot starve the deadline, STOP or cancel
 POLL_SECONDS = 0.05
 REASON = re.compile(r'[a-z0-9_]{1,64}')
 
@@ -63,11 +83,11 @@ def confirmation_digits(mac):
 
 
 def check_pinned(argv):
-    """A leg argv is the leg-1 option set with `-tt` for `-T`; host-key checking and known hosts cannot be weakened."""
-    if (len(argv) < 9 or argv[1:3] != ['-F', '/dev/null'] or argv[3] != '-i' or argv[-3] != '-tt'
+    """A leg argv is the leg-1 option set with `-e none -tt` for `-T`; host-key checking and known hosts cannot be weakened."""
+    if (len(argv) < 11 or argv[1:3] != ['-F', '/dev/null'] or argv[3] != '-i' or argv[-5:-2] != ['-e', 'none', '-tt']
             or not re.fullmatch(r'root@[0-9a-z.:-]+', argv[-2])):
         raise Refusal('leg ssh argv is not the pinned leg-1 shape')
-    rest = argv[5:-3]
+    rest = argv[5:-5]
     if len(rest) % 2 or any(rest[index] != '-o' for index in range(0, len(rest), 2)):
         raise Refusal('leg ssh argv carries something other than -o options')
     options = rest[1::2]
@@ -91,9 +111,10 @@ def check_leg(entry, expected, details, base):
     template = entry.get('commandTemplate')
     match = isinstance(template, str) and re.fullmatch(TEMPLATES[form], template)
     argv = entry.get('sshArgv')
-    if not match or match.group(1) != op or not isinstance(argv, list) or argv[-1:] != [template]:
+    if (not match or match.group(2) != op or int(match.group(1)) != seconds or not isinstance(argv, list)
+            or argv[-1:] != [template]):
         raise Refusal(f'leg {leg} command is not the fixed text')
-    if argv[:-1] != base[:-3] + ['-tt', base[-2]]:
+    if argv[:-1] != base[:-3] + ['-e', 'none', '-tt', base[-2]]:
         raise Refusal(f'leg {leg} ssh argv differs from the leg-1 argv')
     check_pinned(argv)
 
@@ -124,21 +145,26 @@ class Leg:
             os.close(slave)
 
     def drain_stderr(self):
-        while self.process is not None and self.process.stderr is not None and select.select([self.process.stderr], [], [], 0)[0]:
+        taken = 0
+        while (taken < READ_BYTES and self.process is not None and self.process.stderr is not None
+               and select.select([self.process.stderr], [], [], 0)[0]):
             chunk = os.read(self.process.stderr.fileno(), 4096)
             if not chunk:
                 return
+            taken += len(chunk)
             self.stderr_bytes += len(chunk)
 
     def read(self):
         self.drain_stderr()
-        while self.master is not None and select.select([self.master], [], [], 0)[0]:
+        taken = 0
+        while taken < READ_BYTES and self.master is not None and select.select([self.master], [], [], 0)[0]:
             try:
                 chunk = os.read(self.master, 4096)
             except OSError:
                 return
             if not chunk:
                 return
+            taken += len(chunk)
             self.total += len(chunk)
             if self.sent:
                 self.after = (self.after + chunk)[-CAPTURE_BYTES:]
@@ -158,23 +184,36 @@ class Leg:
         if self.result:
             return
         self.read()
-        code = self.process.poll()
-        if code is not None:
+        if self.exited():
             self.read()
-            self.finish('exited', code, now)
+            self.finish('exited', self.process.wait(), now)
         elif not self.sent and self.buffer and not self.check_prompt():
             self.kill('prompt_mismatch', now)
         elif now >= self.deadline:
             self.kill('timeout', now)
 
+    def killpg(self):
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def exited(self):
+        """True once the leg's ssh has exited; its whole process group is killed BEFORE the leader is reaped, while
+        the group id is still ours, so nothing it left behind outlives it."""
+        try:
+            done = os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return self.process.poll() is not None
+        if done is not None:
+            self.killpg()
+        return done is not None
+
     def kill(self, outcome, now):
         if self.result:
             return
         if self.process is not None:
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self.killpg()
             self.process.wait()
         self.finish(outcome, None, now)
 
@@ -205,14 +244,16 @@ class Leg:
 
 
 def send_ack(argv, path, env):
-    """Create the acknowledgement file on the router with ONE short ssh (the leg-1 argv, the command replaced).
-    Returns 'sent' or 'failed'. Only called once no leg is in flight and none can start."""
+    """Create the acknowledgement file on the router with ONE short ssh (the leg-1 argv, ACK_SCRIPT as the command).
+    Returns 'sent', 'busy' (a cfctl process was still alive on the router: nothing written) or 'failed'. Only called
+    once no leg is in flight and none can start."""
     try:
-        done = subprocess.run(argv[:-1] + [f': > {path}'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, env=env, start_new_session=True, timeout=ACK_SECONDS)
+        done = subprocess.run(argv[:-1] + [ACK_SCRIPT.replace('PATH_', path)], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True,
+                              timeout=ACK_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         return 'failed'
-    return 'sent' if done.returncode == 0 else 'failed'
+    return {0: 'sent', ACK_BUSY: 'busy'}.get(done.returncode, 'failed')
 
 
 class Tail:
@@ -248,6 +289,12 @@ def feed(stream, payload):
             pass
 
 
+def stop_now(number, frame):
+    """SIGTERM, SIGHUP and SIGINT end a run like Ctrl-C; a second signal waits until the cleanup has finished."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    raise KeyboardInterrupt
+
+
 class Driver:
     """Leg 1 plus the leg-2 watcher. Built only from a plan whose digest is exactly the approved one."""
 
@@ -263,48 +310,50 @@ class Driver:
             raise Refusal('plan legs or leg-1 argv are not the fixed shape')
         for entry, expected in zip(legs, LEG_TABLE):
             check_leg(entry, expected, details, base)
-        self.argv, self.legs = list(base), legs
+        known = [option[len('UserKnownHostsFile='):] for option in base if option.startswith('UserKnownHostsFile=')]
+        self.pinned = ((known[0], details['knownHostsSha256']), (base[4], details['adminPublicKeySha256']))
+        # Copies: nothing edited in `details` after the checks above can reach a leg.
+        self.argv, self.legs = list(base), json.loads(json.dumps(legs))
+
+    def files_unchanged(self):
+        """Known hosts and the identity file still hash to the approved, digest-bound values."""
+        try:
+            return all(hmac.compare_digest(FR.regular_file_sha256(path, 'pinned file'), approved)
+                       for path, approved in self.pinned)
+        except (Refusal, OSError):
+            return False
 
     def run(self, payload, env, stdout_fd, stderr_fd, stdout_path, timeout):
-        """Returns (leg-1 exit code, timed_out, {'legs': [...], 'ignoredMarkers': n}). Always reaps everything."""
-        tail = Tail(stdout_path)
-        process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=stdout_fd, stderr=stderr_fd, env=env,
-                                   start_new_session=True)
-        feeder = threading.Thread(target=feed, args=(process.stdin, payload), daemon=True)
-        feeder.start()
-        results, ignored, active, pending, locked, ack = [], 0, None, None, False, 'none'
+        """Returns (leg-1 exit code, timed_out, {'legs': [...], 'ignoredMarkers': n, 'ack': ..., 'pinned': ...}).
+        Always reaps everything, also on SIGTERM, SIGHUP and SIGINT."""
+        if not self.files_unchanged():
+            raise Refusal('known hosts or identity file differs from the approved plan: nothing was sent')
+        self.results, self.ignored, self.active, self.pending, self.env = [], 0, None, None, env
+        self.locked = self.cancelled = False
+        self.ack, self.pinned_state = 'none', 'ok'
+        try:
+            saved = {number: signal.signal(number, stop_now) for number in SIGNALS}
+        except ValueError:  # not the main thread: the caller owns signal handling
+            saved = {}
+        try:
+            return self.supervise(payload, stdout_fd, stderr_fd, stdout_path, timeout)
+        finally:
+            for number, handler in saved.items():
+                signal.signal(number, handler)
+
+    def supervise(self, payload, stdout_fd, stderr_fd, stdout_path, timeout):
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        tail = process = feeder = None
         timed_out, aborted, begun = False, True, time.monotonic()
         try:
+            tail = Tail(stdout_path)
+            process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=stdout_fd, stderr=stderr_fd, env=self.env,
+                                       start_new_session=True)
+            feeder = threading.Thread(target=feed, args=(process.stdin, payload), daemon=True)
+            feeder.start()
             while True:
                 now = time.monotonic()
-                lines = tail.lines()
-                halts = [CANCEL.fullmatch(line) is not None for line in lines if line.startswith('STOP ') or CANCEL.fullmatch(line)]
-                markers = [m.groups() for m in map(MARKER.fullmatch, lines) if m]
-                if halts:
-                    locked, pending = True, None
-                    if active:
-                        active.kill('killed_on_cancel' if halts[0] else 'killed_on_stop', now)
-                if active:
-                    active.step(now)
-                    if active.result:
-                        results.append(active.result)
-                        active = None
-                for found in map(ACK_FILE.fullmatch, lines):
-                    # Honoured only after a cancel (locked), with every leg already ended above, once.
-                    if found and locked and not active and ack == 'none':
-                        ack = send_ack(self.argv, found.group(1), env)
-                    elif found:
-                        ignored += 1
-                for leg, base in markers:
-                    index = len(results) + (1 if active else 0)
-                    if locked or pending or index >= len(self.legs) or self.legs[index]['leg'] != leg:
-                        ignored += 1
-                    elif active:
-                        pending = (index, base)  # leg 1 was quicker than this leg's ssh closing: start it right after
-                    else:
-                        active = Leg(self.legs[index], base, env, now)
-                if pending and not active and not locked:
-                    active, pending = Leg(self.legs[pending[0]], pending[1], env, now), None
+                self.handle(tail.lines(), now)
                 if process.poll() is not None:
                     break
                 if now - begun > timeout:
@@ -312,15 +361,76 @@ class Driver:
                     break
                 time.sleep(POLL_SECONDS)
             aborted = False
+            signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
         finally:
-            if active:
-                active.kill('aborted' if aborted else 'killed_leg1_ended', time.monotonic())
-                results.append(active.result)
+            signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+            self.cleanup(process, feeder, tail, aborted)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)  # a signal that waited is delivered here
+        return process.returncode, timed_out, {'legs': self.results, 'ignoredMarkers': self.ignored, 'ack': self.ack,
+                                               'pinned': self.pinned_state}
+
+    def cleanup(self, process, feeder, tail, aborted):
+        if self.active:
+            self.active.kill('aborted' if aborted else 'killed_leg1_ended', time.monotonic())
+            self.results.append(self.active.result)
+        if process is not None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.wait()
+        if feeder is not None:
             feeder.join(5)
+        if tail is not None:
             tail.close()
-        return process.returncode, timed_out, {'legs': results, 'ignoredMarkers': ignored, 'ack': ack}
+
+    def handle(self, lines, now):
+        """One poll: halts first (a marker in the same read never starts a leg), then the lines in order, then the leg."""
+        if any(line.startswith('STOP ') or CANCEL.fullmatch(line) for line in lines):
+            self.locked, self.pending = True, None
+        for line in lines:
+            if CANCEL.fullmatch(line) or line.startswith('STOP '):
+                self.cancelled = self.cancelled or CANCEL.fullmatch(line) is not None
+                if self.active:
+                    self.active.kill('killed_on_cancel' if CANCEL.fullmatch(line) else 'killed_on_stop', now)
+                    self.reap()
+            elif ACK_FILE.fullmatch(line):
+                self.acknowledge(ACK_FILE.fullmatch(line).group(1))
+            elif MARKER.fullmatch(line):
+                self.marker(*MARKER.fullmatch(line).groups(), now)
+        if self.active:
+            self.active.step(now)
+            self.reap()
+        if self.pending and not self.active and not self.locked:
+            index, base = self.pending
+            self.pending = None
+            self.start(index, base, now)
+
+    def reap(self):
+        if self.active and self.active.result:
+            self.results.append(self.active.result)
+            self.active = None
+
+    def acknowledge(self, path):
+        """Only the first path, only after a CANCEL (not a bare STOP), only once every leg has ended."""
+        if not (self.cancelled and not self.active and self.ack == 'none'):
+            self.ignored += 1
+        elif not self.files_unchanged():
+            self.locked, self.ack, self.pinned_state = True, 'refused', 'changed'
+        else:
+            self.ack = send_ack(self.argv, path, self.env)
+
+    def marker(self, leg, base, now):
+        index = len(self.results) + (1 if self.active else 0)
+        if self.locked or self.pending or index >= len(self.legs) or self.legs[index]['leg'] != leg:
+            self.ignored += 1
+        elif self.active:
+            self.pending = (index, base)  # leg 1 was quicker than this leg's ssh closing: start it right after
+        else:
+            self.start(index, base, now)
+
+    def start(self, index, base, now):
+        if self.files_unchanged():
+            self.active = Leg(self.legs[index], base, self.env, now)
+        else:
+            self.locked, self.pending, self.pinned_state = True, None, 'changed'

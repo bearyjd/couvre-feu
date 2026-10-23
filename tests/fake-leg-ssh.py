@@ -7,7 +7,12 @@ Leg 2 (`-tt`): refuses unless the pinned host-key options are present and stdin 
   mode 'fixture': runs the translated remote command under its own pty (like a remote sshd would),
   bridging the tty both ways, so the repository's cfctl and cfctl-scope read a real typed confirmation.
 Every call appends its argv (and, in scripted mode, what it received) to spec['log']; that is test data only.
+With spec['leg2']['events'] a leg also appends timestamped events (launch, start, prompt, read, reply, exit) there, and
+leg 1 understands handshake lines instead of sleeps: `@wait <event> <n>` (n events recorded), `@wait dead` (the leg's
+child pid is gone) and `@append <path> <text>` (test-only file change). The ack call (anything without -T/-tt that is
+not leg 1) runs the real command with /proc and /tmp/couvre-feu-first. pointed at spec['ack'] directories.
 """
+import atexit
 import json
 import os
 import pty
@@ -18,6 +23,7 @@ import signal
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 
@@ -33,10 +39,56 @@ def record(**entry):
         handle.write(json.dumps(entry) + '\n')
 
 
+def event(name):
+    if spec.get('leg2', {}).get('events'):
+        with open(spec['leg2']['events'], 'a') as handle:
+            handle.write(json.dumps({'event': name, 't': time.monotonic()}) + '\n')
+
+
+def count(name):
+    try:
+        lines = open(spec['leg2']['events']).read().splitlines()
+    except OSError:
+        return 0
+    return sum(json.loads(line)['event'] == name for line in lines)
+
+
+def gone(pid):
+    try:
+        os.kill(pid, 0)
+        return open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1][0] == 'Z'
+    except (ProcessLookupError, OSError):
+        return True
+
+
+def handshake(line):
+    """Block (at most 60 s) until the event or the leg's child pid says the driver did its part."""
+    words = line.split()
+    limit = time.monotonic() + 60
+    while time.monotonic() < limit:
+        if words[1] == 'dead':
+            child = spec['leg2'].get('child')
+            if child and os.path.exists(child) and open(child).read().strip() and gone(int(open(child).read())):
+                return
+        elif count(words[1]) >= int(words[2]):
+            return
+        time.sleep(0.02)
+
+
 def leg_one():
+    if spec.get('leg1_pid'):
+        open(spec['leg1_pid'], 'w').write(str(os.getpid()))
     sys.stdin.buffer.read()
     for delay, line, *newline in spec['leg1']:
         time.sleep(delay)
+        if line.startswith('@wait '):
+            handshake(line)
+            continue
+        if line.startswith('@append '):
+            _, path, text = line.split(' ', 2)
+            with open(path, 'a') as handle:
+                handle.write(text + '\n')
+            continue
         sys.stdout.write(line + ('\n' if not newline or newline[0] else ''))
         sys.stdout.flush()
     sys.exit(spec.get('leg1_exit', 0))
@@ -55,8 +107,10 @@ def scripted(cfg, command):
         sys.exit(2)
     op, mac, base = match.groups()
     if cfg.get('child'):
-        child = subprocess.Popen(['sleep', '300'])
+        # Ignores SIGHUP (closing the pty must not be what ends it): only the driver's killpg can.
+        child = subprocess.Popen(['sleep', '300'], preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
         open(cfg['child'], 'w').write(str(child.pid))
+    event('start')
     if cfg.get('ignore_term'):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if cfg.get('raw'):
@@ -74,21 +128,31 @@ def scripted(cfg, command):
     text = cfg.get('prompt_text') or '%s %s --base %s\n%s' % (op, mac, base, PROMPT)
     sys.stdout.write(text)
     sys.stdout.flush()
+    event('prompt')
     if cfg.get('hang_before_read'):
         time.sleep(300)
     answer = sys.stdin.readline().rstrip('\r\n')
     record(received=answer, op=op, base=base)
+    event('read')
     if cfg.get('hang_after_read'):
         time.sleep(300)
     print()
     ok = answer == mac.replace(':', '')[-6:]
     print(json.dumps({'ok': True, 'mac': mac} if ok else {'ok': False, 'errors': ['scope_confirmation_mismatch']}),
           flush=True)
+    event('reply')
+    if cfg.get('flood'):
+        # Blocking multi-MiB writes on both channels until the driver kills this group (see the driver's read bound).
+        threading.Thread(target=lambda: [os.write(2, b'y' * (1 << 20)) for _ in iter(int, 1)], daemon=True).start()
+        while True:
+            os.write(1, b'x' * (1 << 20))
     time.sleep(cfg.get('linger', 0))  # the ssh client is slow to close the channel after the remote is done
     sys.exit(0 if ok else 1)
 
 
 def translate(command):
+    timeout = shlex.join(shlex.split(spec['env'].get('CF_TEST_TIMEOUT', 'timeout')))
+    command = re.sub(r'^timeout ', timeout + ' ', command)
     cfctl = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['cfctl']])
     wrapper = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['leg2']['wrapper_scope']])
     return command.replace('/usr/sbin/cfctl-scope', wrapper).replace('/usr/sbin/cfctl', cfctl)
@@ -125,6 +189,8 @@ def bridge(cfg, command):  # noqa: C901
 
 def leg_two():
     cfg = spec['leg2']
+    event('launch')
+    atexit.register(event, 'exit')
     if not pinned() or not os.isatty(0):
         sys.exit(255)
     command = argv[-1]
@@ -136,14 +202,19 @@ def leg_two():
 
 
 def ack():
-    """The driver's acknowledgement write (`: > <path>` as the remote command): recorded, optionally failing/hanging."""
+    """The driver's acknowledgement command: optionally failing/hanging, or run for real against a fake /proc."""
     cfg = spec.get('ack', {})
     if cfg.get('hang'):
         time.sleep(300)
-    sys.exit(255 if cfg.get('fail') else 0)
+    if cfg.get('fail'):
+        sys.exit(255)
+    if cfg.get('proc'):
+        command = argv[-1].replace('/proc/', cfg['proc'] + '/').replace('/tmp/couvre-feu-first.', cfg['tmp'] + '/couvre-feu-first.')
+        sys.exit(subprocess.run(['/bin/sh', '-c', command], check=False).returncode)
+    sys.exit(0)
 
 
-if '-tt' not in argv and argv[-1].startswith(': > '):
+if '-tt' not in argv and '-T' in argv and 'leg2-idle' in argv[-1]:
     ack()
 if '-tt' in argv:
     leg_two()

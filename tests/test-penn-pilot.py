@@ -1286,12 +1286,16 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual([(leg['leg'], leg['form'], leg['op']) for leg in legs],
                          [('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
                           ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove')])
-        self.assertEqual(legs[0]['commandTemplate'], '/usr/sbin/cfctl scope-add {MAC} --base {BASE}')
-        self.assertEqual(legs[1]['commandTemplate'], '/usr/sbin/cfctl scope-remove {MAC} --base {BASE}')
+        bound = 'timeout -s KILL 60 '
+        self.assertEqual(legs[0]['commandTemplate'], bound + '/usr/sbin/cfctl scope-add {MAC} --base {BASE}')
+        self.assertEqual(legs[1]['commandTemplate'], bound + '/usr/sbin/cfctl scope-remove {MAC} --base {BASE}')
         self.assertEqual(legs[2]['commandTemplate'],
-                         "env SSH_ORIGINAL_COMMAND='cfctl scope-add {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
+                         bound + "env SSH_ORIGINAL_COMMAND='cfctl scope-add {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
         self.assertEqual(legs[3]['commandTemplate'],
-                         "env SSH_ORIGINAL_COMMAND='cfctl scope-remove {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
+                         bound + "env SSH_ORIGINAL_COMMAND='cfctl scope-remove {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
+        base = details['sshArgv']
+        for leg in legs:  # the leg-1 argv with `-e none -tt` for `-T`: no ssh escape character on the pty
+            self.assertEqual(leg['sshArgv'], base[:-3] + ['-e', 'none', '-tt', base[-2], leg['commandTemplate']])
         for leg in legs:
             self.assertEqual((leg['pty'], leg['timeoutSeconds'], leg['retry'], leg['confirmation']),
                              (True, 60, False, 'last6hex'))
@@ -1573,6 +1577,8 @@ class PilotFixtureTests(PilotBase):
         self.assertTrue(any(f'"observed":{{"kids":["{PENN["mac"]}"],"paused":[]}}' in line for line in stdout))
         summary = json.loads((self.evidence() / 'summary.json').read_text())
         self.assertEqual(summary['outcome'], 'PASS')
+        self.assertNotIn('legs', summary)  # v1 has no leg-2 driver: its summary keeps the v1 key set
+        self.assertFalse((self.evidence() / 'legs.json').exists())
         measured = summary['measurements']
         self.assertEqual(measured['packet_blocking']['label'], 'measured')
         self.assertRegex(measured['packet_blocking']['detail'], r'reject_delta=14 ')  # +7 per family
@@ -2992,7 +2998,7 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assert_no_leaks()
 
     def test_v2_wrong_confirmation_is_a_refused_leg_and_leg_one_does_not_believe_anything(self):
-        self.spec['leg2']['wrong_digits_match'] = '^/usr/sbin/cfctl scope-add'
+        self.spec['leg2']['wrong_digits_match'] = '^timeout -s KILL [0-9]+ /usr/sbin/cfctl scope-add'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()

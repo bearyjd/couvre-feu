@@ -230,17 +230,20 @@ def pilot_policies(config, base, candidates=candidate_policies):
 
 
 def scope_legs(config, ssh_argv):
-    """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values. Each leg also
-    binds its whole ssh argv: the leg-1 argv with `-tt` for `-T` and the command template last."""
+    """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values. The command is
+    bounded on the router by `timeout -s KILL <leg seconds>` (busybox timeout has no -k, and a leg's cfctl children
+    are short), so a leg whose local ssh died cannot run on past its deadline. Each leg also binds its whole ssh
+    argv: the leg-1 argv with `-e none -tt` for `-T` (no ssh escape character on the pty) and the template last."""
     if len(ssh_argv) < 4 or ssh_argv[-3] != '-T':
         raise Refusal('leg-1 ssh argv has no -T to turn into -tt')
     legs = []
     for leg, form, op in SCOPE_LEGS:
         inner = f'{op} {{MAC}} --base {{BASE}}'
-        template = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
-                    else f"env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
+        bound = f'timeout -s KILL {SCOPE_LEG_SECONDS} '
+        template = (f'{bound}/usr/sbin/cfctl {inner}' if form == 'cfctl'
+                    else f"{bound}env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
         legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template,
-                     'sshArgv': ssh_argv[:-3] + ['-tt', ssh_argv[-2], template], 'pty': True,
+                     'sshArgv': ssh_argv[:-3] + ['-e', 'none', '-tt', ssh_argv[-2], template], 'pty': True,
                      'timeoutSeconds': SCOPE_LEG_SECONDS, 'retry': False, 'confirmation': 'last6hex',
                      'scopeTargetMac': config['roles'][SCOPE_TARGET_ROLE]['mac']})
     return legs

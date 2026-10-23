@@ -690,10 +690,12 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
             FR.write_evidence(directory, 'legs.json', json.dumps(leg_report, indent=2, sort_keys=True) + '\n')
         summary = {'outcome': outcome, 'exitCode': code, 'remoteExit': remote_exit, 'timedOut': timed_out,
                    'reasons': reasons, 'phases': phases, 'measurements': measured, 'hostProbes': host,
-                   'legs': leg_report, 'pauseRulesKernelTimeBound': False, 'payloadSha256': details['payloadSha256'],
+                   'pauseRulesKernelTimeBound': False, 'payloadSha256': details['payloadSha256'],
                    'planSha256': details['planSha256'], 'sourceCommit': details['sourceCommit'],
                    'startedUtc': started.strftime('%Y-%m-%dT%H:%M:%SZ'),
                    'finishedUtc': now_fn().strftime('%Y-%m-%dT%H:%M:%SZ')}
+        if leg_report is not None:
+            summary['legs'] = leg_report  # a v1 run has no legs: its summary keeps the v1 key set
         FR.write_evidence(directory, 'summary.json', json.dumps(summary, indent=2, sort_keys=True) + '\n')
         for line in FR.console_lines(directory, stdout_text, PRINTED):
             print(line)
