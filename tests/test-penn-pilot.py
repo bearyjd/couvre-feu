@@ -67,6 +67,9 @@ FAST_TIMING = {'pauseSeconds': 90, 'pauseObserveSeconds': 2, 'resumeObserveSecon
 FAKE_SSH = r'''
 import json, os, pty, re, select, shlex, signal, subprocess, sys, threading, time
 spec = json.load(open(os.environ['FAKE_SSH_SPEC']))
+if '-tt' in sys.argv:
+    # A commit leg started by the T4 driver: tests/fake-leg-ssh.py plays ssh -tt (it logs its own argv).
+    os.execv(sys.executable, [sys.executable, '-B', spec['leg_helper']] + sys.argv[1:])
 with open(spec['log'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\n')
 payload = sys.stdin.buffer.read()
@@ -81,53 +84,10 @@ def cron(until):
         time.sleep(0.2)
     subprocess.run(shell + [spec['cfctl'], 'expire'], env=env, stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-MARKER = re.compile(r'^CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})$')
-def run_leg(leg, base):
-    # Test stand-in for the T4 pty driver: one leg under a pty, the confirmation typed only after the exact prompt.
-    cfg = spec['leg2']
-    if leg in cfg.get('skip', []):
-        return
-    mac = cfg['phone']
-    digits = '000000' if leg in cfg.get('wrong_digits', []) else mac.replace(':', '')[-6:]
-    op = 'scope-add' if leg in ('2a', '2c') else 'scope-remove'
-    leg_env = dict(env)
-    leg_env.pop('SSH_ORIGINAL_COMMAND', None)
-    if leg in ('2a', '2b'):
-        argv = shell + [spec['cfctl'], op, mac, '--base', base]
-    else:
-        leg_env['SSH_ORIGINAL_COMMAND'] = 'cfctl %s %s --base %s' % (op, mac, base)
-        argv = shell + [cfg['wrapper_scope'], 'pilot']
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.execvpe(argv[0], argv, leg_env)
-    out, sent, deadline = b'', False, time.time() + 60
-    while time.time() < deadline:
-        ready, _, _ = select.select([fd], [], [], 1)
-        if ready:
-            try:
-                chunk = os.read(fd, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            out += chunk
-            if not sent and b'to confirm: ' in out:
-                os.write(fd, (digits + '\n').encode())
-                sent = True
-    try:
-        _, status = os.waitpid(pid, 0)
-    except ChildProcessError:
-        status = 0
-    result = out.decode(errors='replace').replace(mac, '<mac>').strip().splitlines()
-    with open(cfg['log'], 'a') as handle:
-        handle.write(json.dumps({'leg': leg, 'exit': os.waitstatus_to_exitcode(status), 'last': result[-1] if result else ''}) + '\n')
 for line in child.stdout:
     sys.stdout.buffer.write(line)
     sys.stdout.flush()
     text = line.decode().rstrip('\n')
-    leg_match = MARKER.match(text)
-    if leg_match and spec.get('leg2'):
-        threading.Thread(target=run_leg, args=leg_match.groups(), daemon=True).start()
     for prefix, path in spec.get('touch_on', {}).items():
         if text.startswith(prefix):
             if isinstance(path, list):
@@ -1402,17 +1362,17 @@ class PilotConfigV2Tests(PilotBase):
         v1, _ = self.parameters(self.write_config())
         self.assertEqual(list(v1), SINGLE_PARAMETER_KEYS)
 
-    def test_execute_refuses_v2_until_the_leg2_driver_exists_and_never_for_a_missing_phase(self):
+    def test_execute_runs_v2_through_the_leg2_driver_and_never_for_a_missing_phase(self):
         config = self.write_config(**self.v2())
         sha = self.plan_details(config)['planSha256']
         # The template implements every v2 phase ...
         self.assertEqual(self.tool.IMPLEMENTED_PHASES, self.tool.PHASES + ('SCOPE',) + self.tool.NEW_PHASES)
         self.assertEqual(set(self.tool.pilot_phases(self.tool.load_config(config))) - set(self.tool.IMPLEMENTED_PHASES), set())
-        # ... but the TTY commit legs have no driver yet (T4): a v2 run could only wait and stop.
-        self.assertIs(self.tool.LEG2_DRIVER_IMPLEMENTED, False)
-        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
+        # ... and the TTY commit legs have their driver (T4): a plan whose digest is not the approved one starts nothing.
+        self.assertIs(self.tool.LEG2_DRIVER_IMPLEMENTED, True)
+        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', '0' * 64)
         self.assertEqual(code, 1)
-        self.assertIn('leg-2 pty driver absent (T4)', err)
+        self.assertIn('differs from the disclosed value', err)
         self.assertNotIn('not implemented', err)
         self.assertFalse(self.ssh_log.exists())
         # A phase the template lacks is still refused first.
@@ -1539,7 +1499,7 @@ class PilotConfigV2Tests(PilotBase):
         self.assertIn('ct107', example.read_text())
         readme = (REPO / 'tools/live/README.md').read_text()
         for needle in ('schemaVersion` 2', 'scope_target', 'config.pilot.example.json', 'minimumRemoteTimeoutSeconds + 900',
-                       'break-glass', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'leg-2 pty driver absent (T4)', 'CFP_LEG2_READY',
+                       'break-glass', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'penn_pilot_leg2.py', 'CFP_LEG2_READY',
                        'remote_self_abort', 'teardown_proof', 'block_all_unchanged', 'CFP_WRAPPER_DIR'):
             with self.subTest(needle):
                 self.assertIn(needle, readme)
@@ -2913,14 +2873,12 @@ cfp_teardown
 
 
 class PilotV2FixtureTests(PilotShellBase):
-    """End to end against the fixture router, schema v2. The fake ssh stands in for the T4 pty driver: it runs each
-    commit leg under a pty when it sees a valid marker. Slow (every phase installs, syncs and uninstalls)."""
+    """End to end against the fixture router, schema v2. The real T4 driver starts each commit leg when it sees a valid
+    marker; tests/fake-leg-ssh.py plays `ssh -tt` (own pty, the repository's cfctl). Slow (every phase installs, syncs
+    and uninstalls)."""
 
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.object(self.tool, 'LEG2_DRIVER_IMPLEMENTED', True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         leg_patch = mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 15)
         leg_patch.start()
         self.addCleanup(leg_patch.stop)
@@ -2944,7 +2902,8 @@ class PilotV2FixtureTests(PilotShellBase):
         target.chmod(0o700)
         self.leg_log = self.work / 'legs.jsonl'
         self.spec['env'].update(CFP_WRAPPER_DIR=str(REPO / 'router'))
-        self.spec['leg2'] = {'phone': PHONE['mac'], 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['leg2'] = {'mode': 'fixture', 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['leg_helper'] = str(REPO / 'tests/fake-leg-ssh.py')
         self.spec['cfctl'] = str(self.root / 'usr/sbin/cfctl')
 
     def run_v2(self, **changes):
@@ -2976,9 +2935,12 @@ class PilotV2FixtureTests(PilotShellBase):
         phases = [line.split()[1] for line in stdout if line.startswith('PHASE ') and line.endswith(' OK')]
         self.assertEqual(phases, V2_PHASES)
         # Four commit legs ran under a pty, none refused; each marker is a strict line printed once.
-        legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
-        self.assertEqual(sorted(leg['leg'] for leg in legs), ['2a', '2b', '2c', '2d'])
-        self.assertTrue(all(leg['exit'] == 0 and '"ok":true' in leg['last'] for leg in legs), legs)
+        legs = json.loads((self.evidence() / 'legs.json').read_text())['legs']
+        self.assertEqual([leg['leg'] for leg in legs], ['2a', '2b', '2c', '2d'])
+        self.assertTrue(all((leg['outcome'], leg['exit'], leg['ok'], leg['confirmationSent']) == ('exited', 0, True, True)
+                            for leg in legs), legs)
+        ssh_calls = [json.loads(line) for line in self.ssh_log.read_text().splitlines()]
+        self.assertEqual([('-T' in call, '-tt' in call) for call in ssh_calls], [(True, False)] + [(False, True)] * 4)
         self.assertFalse([line for line in stdout if line.startswith('CFP_LEG2_CANCEL')])
         markers = [line for line in stdout if line.startswith('CFP_LEG2_READY')]
         self.assertEqual([m.split()[1] for m in markers], ['2a', '2b', '2c', '2d'])
@@ -2998,15 +2960,17 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assertIn('scope_candidates=0', measured['teardown_proof']['detail'])
         self.assertEqual(self.stage_leftovers, [])
         self.assert_no_leaks()
-        self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
+        self.assertEqual(summary['legs']['legs'], legs)
 
     def test_v2_leg_that_never_runs_stops_and_tears_down_once_with_exact_restore(self):
-        self.spec['leg2']['skip'] = ['2c']
+        # The 2c leg's ssh dies before it reaches cfctl: leg 1 sees no change, stops, and nothing is retried.
+        self.spec['leg2']['exit255_match'] = 'scope-add.*cfctl-scope'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()
         self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
         self.assertIn('STOP SCOPE-ADD-2 scope_leg_timeout', stdout)
+        self.assertEqual(sum('-tt' in json.loads(line) for line in self.ssh_log.read_text().splitlines()), 3)
         # The outstanding leg is cancelled before the single uninstall.
         self.assertLess(stdout.index('CFP_LEG2_CANCEL 2c'), next(i for i, l in enumerate(stdout) if l.startswith('INFO run uninstall.sh once')))
         self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
@@ -3020,14 +2984,15 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assert_no_leaks()
 
     def test_v2_wrong_confirmation_is_a_refused_leg_and_leg_one_does_not_believe_anything(self):
-        self.spec['leg2']['wrong_digits'] = ['2a']
+        self.spec['leg2']['wrong_digits_match'] = '^/usr/sbin/cfctl scope-add'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()
         self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
         self.assertIn('STOP SCOPE-ADD-1 scope_leg_timeout', stdout)
-        legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
-        self.assertIn('scope_confirmation_mismatch', legs[0]['last'])
+        legs = json.loads((self.evidence() / 'legs.json').read_text())['legs']
+        self.assertEqual((legs[0]['ok'], legs[0]['errors']), (False, ['scope_confirmation_mismatch']))
+        self.assertEqual(len(legs), 1)
         self.assertEqual(stdout[-1], 'PENN_PILOT_STOPPED_RESTORED')
         self.assertEqual(self.router_snapshot(), before)
 

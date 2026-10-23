@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py, test-penn-pilot.py, test-scope-admin.py, test-inventory.py]
+        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py, test-penn-pilot.py, test-penn-pilot-leg2.py, test-scope-admin.py, test-inventory.py]
         partition: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4

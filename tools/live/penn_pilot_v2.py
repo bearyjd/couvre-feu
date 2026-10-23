@@ -7,6 +7,7 @@ Everything here is pure: configuration validation, the v2 policy validator and i
 expectation, the Leg-2 commit command table, the v2 phase worst cases and the digest/disclosure rules."""
 import json
 import re
+import shlex
 from typing import Any
 
 
@@ -228,14 +229,18 @@ def pilot_policies(config, base, candidates=candidate_policies):
             for name, policy in candidates(config, base)]
 
 
-def scope_legs(config):
-    """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values."""
+def scope_legs(config, ssh_argv):
+    """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values. Each leg also
+    binds its whole ssh argv: the leg-1 argv with `-tt` for `-T` and the command template last."""
+    if len(ssh_argv) < 4 or ssh_argv[-3] != '-T':
+        raise Refusal('leg-1 ssh argv has no -T to turn into -tt')
     legs = []
     for leg, form, op in SCOPE_LEGS:
         inner = f'{op} {{MAC}} --base {{BASE}}'
         template = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
                     else f"env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
-        legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template, 'pty': True,
+        legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template,
+                     'sshArgv': ssh_argv[:-3] + ['-tt', ssh_argv[-2], template], 'pty': True,
                      'timeoutSeconds': SCOPE_LEG_SECONDS, 'retry': False, 'confirmation': 'last6hex',
                      'scopeTargetMac': config['roles'][SCOPE_TARGET_ROLE]['mac']})
     return legs
@@ -330,7 +335,10 @@ def digest_fields(details):
 def disclosure_lines(details):
     """Operator-facing lines printed after a v2 plan: owner confirmation, timeout bounds, break-glass recovery."""
     target = details['roles'][SCOPE_TARGET_ROLE]
-    return [
+    legs = [f'LEG {leg["leg"]} (pty, {leg["timeoutSeconds"]} s, no retry, confirmation = last 6 hex digits of the scope '
+            f'target MAC): {shlex.join(leg["sshArgv"]).replace("{MAC}", "<MAC>").replace("{BASE}", "<BASE>")}'
+            for leg in details['legs']]
+    return legs + [
         f'OWNER CONFIRMATION: scope_target {target["ip"]} {target["mac"]} is the only device added to and removed from '
         "Penn's scope. Confirm Penn owns it; it must not be an adult, management, CT107 or admin device.",
         f'minimumRemoteTimeoutSeconds {details["minimumRemoteTimeoutSeconds"]}; '
