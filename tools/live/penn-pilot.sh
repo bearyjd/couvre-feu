@@ -47,6 +47,9 @@ CFP_READ_TIMEOUT=
 CFP_COUNTERS_WORST=
 CFP_ITERATION_WORST=
 CFP_CFCTL_ALLOWANCE=
+CFP_KILL_GRACE=
+CFP_UNINSTALL_ALLOWANCE=
+CFP_LEG2_CANCEL_WAIT=
 CFP_WORST_ENROLL=
 CFP_WORST_PAUSE=
 CFP_WORST_RESUME=
@@ -100,17 +103,27 @@ CFP_REV=0
 CFP_MUTATED=0
 CFP_PROOF_FAILED=0
 CFP_TEARDOWN=0
-# Teardown arithmetic, all inside CFP_TEARDOWN_RESERVE (420 s): the leg-2 cancel wait (CFP_LEG2_CANCEL_WAIT: the
-# driver's idle acknowledgement and the quiet check share it) + one safe-band wait (at most 71 s) + the uninstall
-# allowance (CFP_UNINSTALL_ALLOWANCE, TERM) + the KILL grace + the restore snapshot, proof and connectivity reads
-# (local, each KILL-bounded): 20 + 71 + 240 + 15 = 346 s, leaving 74 s. The uninstall allowance is at least the 240 s
-# install allowance: a restoration is never given an arbitrary shorter deadline.
-CFP_UNINSTALL_ALLOWANCE=240
-CFP_LEG2_CANCEL_WAIT=20
-# Seconds between the TERM (the allowance) and the KILL backstop of every cfctl, wrapper and uninstall child.
-CFP_KILL_GRACE=15
+# Teardown arithmetic (the sums are pinned in penn-pilot.py, which also supplies CFP_UNINSTALL_ALLOWANCE,
+# CFP_KILL_GRACE and CFP_LEG2_CANCEL_WAIT as parameters): the leg-2 cancel wait (the driver's idle acknowledgement and
+# the quiet check share it; longer than a running leg) + one safe-band wait (at most 71 s) + the uninstall allowance
+# (TERM; never shorter than the install allowance) + the KILL grace = 401 s, then the KILL-bounded reads: restore
+# snapshot (5 x 8 s) and connectivity (8 s) on success = 449 s, snapshot and cfp_kernel_state (3 x 8 s) on failure
+# = 465 s, inside CFP_TEARDOWN_RESERVE (480 s).
+# CFP_KILL_GRACE: seconds between the TERM (the allowance) and the KILL backstop of every cfctl, wrapper and uninstall
+# child.
 # Set when a KILLed child left the platform lock behind; cfp_stop then names it.
 CFP_STALE_LOCK=0
+# The pid of the cfp_run child being waited for ("starting" until it is known); empty when none is in flight.
+CFP_RUN_LIVE=
+# 1 once cfp_main has saved the session's stdout as fd 5 (children never inherit it).
+CFP_FD5=0
+# Signals taken so far, and whether one arrived while a child was in flight (cfp_on_signal).
+CFP_SIG_COUNT=0
+CFP_SIG_PENDING=0
+# Saved SSH_ORIGINAL_COMMAND while cfp_wrapper_run has replaced it.
+CFP_WR_ENV=0
+CFP_WR_OLD=
+CFP_WR_OLD_SET=
 # The leg (2a..2d) whose CFP_LEG2_READY marker was printed and whose confirming rpc-status read has not happened.
 CFP_LEG2_ACTIVE=
 CFP_START_CS=
@@ -204,39 +217,80 @@ cfp_elapsed_ok() {
 }
 
 # The one place a cfctl, wrapper or uninstall child is started. $1 stdin file, $2 allowance in seconds, then the
-# script and its arguments (run by the fixed shell). At the allowance the child gets TERM (exit 143): cfctl and the
-# installers trap it and release their runtime and platform locks (router/lib/platform-bootstrap.sh
-# platform_lock_acquire, install-common.sh, core.sh); only if it is still alive CFP_KILL_GRACE seconds later is it
-# KILLed (exit 137), which skips those traps and can leave /tmp/couvrefeu-platform.lock behind (cfp_stale_lock_note).
-# Busybox timeout signals only its direct child and has no -k, so a small watchdog signals the child's own pid (the
-# shell that runs the script, exec'ed below, so TERM reaches it and not an intermediate sh). The subshell resets TERM
-# because the teardown ignores it and an ignored signal would otherwise be inherited by the child. A hung child can
-# never stall the session until the router-side last-resort timeout. Callers must not run it inside $(...): a
-# surviving grandchild could hold the pipe open, so output goes to a file.
+# script and its arguments (run by the fixed shell). At the allowance the child's whole process group gets TERM (exit
+# 143): cfctl and the installers trap it and release their runtime and platform locks (router/lib/platform-bootstrap.sh
+# platform_lock_acquire, install-common.sh, core.sh); signalling the group also ends a foreground grandchild
+# (iptables -w, ipset, uci) that would otherwise defer the child's trap. Only if the child is still alive
+# CFP_KILL_GRACE seconds later is the group KILLed (exit 137), which skips those traps and can leave
+# /tmp/couvrefeu-platform.lock behind (cfp_stale_lock_check). Busybox timeout signals only its direct child and has no
+# -k, so a small watchdog does it. The child is started by `exec setsid`: in a non-interactive shell the background
+# subshell is not a process-group leader, so setsid execs in place instead of forking (checked with util-linux and
+# busybox 1.33 setsid), the child keeps the pid $! reports and the pid cfctl records in the lock ($$), and the pid is
+# also the new group id. A setsid that did fork would only make the group signal miss; the watchdog then falls back to
+# the child's own pid and the pid-match stale check reports nothing. The subshell resets TERM because the teardown
+# ignores it and an ignored signal would otherwise be inherited by the child. A hung child can never stall the session
+# until the router-side last-resort timeout. A signal that the stop trap takes while the child is alive does not start
+# the teardown on top of it: cfp_on_signal only notes it, this function reaps the child (it ends at its own end or at
+# the watchdog), runs the stale-lock check, and only then stops. Callers must not run it inside $(...): a surviving
+# grandchild could hold the pipe open, so output goes to a file.
 cfp_run() {
     cfp_run_in=$1 cfp_run_t=$2; shift 2
+    cfp_run_mark=$CFR_STAGE/run.signalled
+    rm -f "$cfp_run_mark"
+    CFP_RUN_LIVE=starting
     # shellcheck disable=SC2086
-    ( trap - TERM; exec $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" &
+    ( trap - TERM; exec setsid $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
     cfp_run_pid=$!
+    CFP_RUN_LIVE=$cfp_run_pid
     ( cfp_w=0
       while kill -0 "$cfp_run_pid" 2>/dev/null; do
           sleep 1; cfp_w=$((cfp_w + 1))
-          [ "$cfp_w" -ne "$cfp_run_t" ] || kill -TERM "$cfp_run_pid" 2>/dev/null
-          [ "$cfp_w" -lt "$((cfp_run_t + CFP_KILL_GRACE))" ] || { kill -KILL "$cfp_run_pid" 2>/dev/null; break; }
+          if [ "$cfp_w" -eq "$cfp_run_t" ]; then
+              : > "$cfp_run_mark"
+              kill -TERM -- "-$cfp_run_pid" 2>/dev/null || kill -TERM "$cfp_run_pid" 2>/dev/null
+          fi
+          if [ "$cfp_w" -ge "$((cfp_run_t + CFP_KILL_GRACE))" ]; then
+              kill -KILL -- "-$cfp_run_pid" 2>/dev/null || kill -KILL "$cfp_run_pid" 2>/dev/null
+              break
+          fi
       done ) >/dev/null 2>&1 </dev/null &
     cfp_run_wd=$!
+    cfp_run_seen=$CFP_SIG_COUNT
     wait "$cfp_run_pid"
     cfp_run_rc=$?
+    # A trapped signal ends `wait` at once with 128+n while the child still runs: wait again for its real status. 127
+    # means it was already reaped by the interrupted wait, so the earlier status stands.
+    while [ "$CFP_SIG_COUNT" != "$cfp_run_seen" ]; do
+        cfp_run_seen=$CFP_SIG_COUNT
+        wait "$cfp_run_pid"
+        cfp_run_rc2=$?
+        [ "$cfp_run_rc2" = 127 ] || cfp_run_rc=$cfp_run_rc2
+    done
     kill "$cfp_run_wd" 2>/dev/null
     wait "$cfp_run_wd" 2>/dev/null
-    [ "$cfp_run_rc" != 137 ] || cfp_stale_lock_check
+    if [ -e "$cfp_run_mark" ]; then
+        # The child was signalled: anything of its group that outlived it is KILLed, then the lock is checked.
+        kill -KILL -- "-$cfp_run_pid" 2>/dev/null
+        [ "$cfp_run_rc" = 0 ] || cfp_stale_lock_check "$cfp_run_pid"
+    fi
+    CFP_RUN_LIVE=
+    if [ "$CFP_SIG_PENDING" = 1 ]; then CFP_SIG_PENDING=0; cfp_stop SIGNAL interrupted; fi
     return "$cfp_run_rc"
 }
-# After a KILL: the platform lock a KILLed cfctl held is never auto-cleared (only `cfctl recover-platform-lock`), so
-# the per-minute cron `cfctl expire` fails and pauses have no kernel time bound. Record it here (the caller owns this
-# call's stdout, so nothing is printed) and say so in cfp_stop / the teardown instead of waiting on it.
+# The INT/TERM trap of the mutating part. With a cfp_run child in flight the stop waits for it (see cfp_run);
+# otherwise it is the stop at once.
+cfp_on_signal() {
+    CFP_SIG_COUNT=$((CFP_SIG_COUNT + 1))
+    if [ -n "$CFP_RUN_LIVE" ]; then CFP_SIG_PENDING=1; return 0; fi
+    cfp_stop SIGNAL interrupted
+}
+# After a signalled child ($1 its pid) ended non-zero: the platform lock a killed cfctl held is never auto-cleared
+# (only `cfctl recover-platform-lock`), so the per-minute cron `cfctl expire` fails and pauses have no kernel time
+# bound. The lock is the child's only if its pid file holds exactly that pid: a lock that cron `cfctl expire` (or
+# anything else) holds legitimately is not ours. Record it here (the caller owns this call's stdout, so nothing is
+# printed) and say so in cfp_stop / the teardown instead of waiting on it.
 cfp_stale_lock_check() {
-    if [ -e "$CFR_PLATFORM_LOCK" ] || [ -L "$CFR_PLATFORM_LOCK" ]; then CFP_STALE_LOCK=1; fi
+    if printf '%s\n' "$1" | cmp -s - "$CFR_PLATFORM_LOCK/pid" 2>/dev/null; then CFP_STALE_LOCK=1; fi
 }
 cfp_stale_lock_report() {
     [ "$CFP_STALE_LOCK" = 1 ] || return 0
@@ -259,7 +313,7 @@ cfp_dns() {
     printf '%s %s\n' "$cfp_r" "$((cfp_t1 - cfp_t0))"
 }
 cfp_baseline() {
-    for cfp_tool in ping nslookup timeout date; do
+    for cfp_tool in ping nslookup timeout date setsid; do
         command -v "$cfp_tool" >/dev/null 2>&1 || cfr_refuse BASELINE "missing_tool $cfp_tool"
     done
     cfp_cs >/dev/null || cfr_refuse BASELINE uptime_unreadable
@@ -765,6 +819,8 @@ cfp_observe() {
 
 # --- Post-mutation flow -------------------------------------------------------
 cfp_stop() {
+    # A stop taken inside cfp_run runs under its caller's stdout redirection: the evidence goes to the session again.
+    [ "$CFP_FD5" != 1 ] || exec 1>&5
     # A KILLed child left the platform lock: that, not the generic failure, is what the operator must act on.
     if [ "$CFP_STALE_LOCK" != 0 ]; then set -- "$1" platform_lock_stale_after_kill; cfp_stale_lock_report; fi
     cfr_fail "$1" "$2"
@@ -818,6 +874,7 @@ cfp_teardown() {
     trap '' INT TERM
     [ "$CFP_TEARDOWN" = 0 ] || exit 20
     CFP_TEARDOWN=1
+    cfp_wrapper_env_restore
     [ -z "$CFP_LEG2_ACTIVE" ] || cfp_leg2_quiesce
     cfr_uninstall=$CFR_RELEASE_DIR/uninstall.sh
     if [ ! -f "$cfr_uninstall" ]; then
@@ -893,22 +950,44 @@ cfp_coverage_read() {
         return 1
     fi
 }
-# stdin: diagnostic rows whose raw LAN addresses are written @address[/len]; each is replaced by cfp_addr_label's
-# role or salted hash, so no raw IPv4/IPv6 address reaches the evidence.
+# $1 a raw MAC: the pilot's own device role, else mac- plus 12 hex of a salted hash, never the MAC ("-" stays "-").
+cfp_mac_label() {
+    case $1 in
+        -|'') printf -- '-\n'; return 0;;
+        "$CFR_MGMT_MAC") printf 'management\n'; return 0;;
+        "$CFR_JD_MAC") printf 'jd_adult\n'; return 0;;
+        "$CFR_PENN_MAC") printf 'penn_child\n'; return 0;;
+        "$CFP_PENN2_MAC") printf 'penn_child_2\n'; return 0;;
+        "$CFP_PHONE_MAC") printf 'scope_target\n'; return 0;;
+    esac
+    for cfp_ml_old in $CFR_HISTORICAL_MACS; do
+        [ "$1" != "$cfp_ml_old" ] || { printf 'protected\n'; return 0; }
+    done
+    cfp_salt_init
+    if [ -z "$CFP_NE_SALT" ]; then printf 'mac-unhashed\n'; return 0; fi
+    printf 'mac-%s\n' "$(printf '%s%s' "$CFP_NE_SALT" "$(printf '%s' "$1" | tr 'A-F' 'a-f')" | sha256sum | awk '{print substr($1,1,12)}')"
+}
+# stdin: diagnostic rows whose raw LAN addresses are written @address[/len] and whose raw MACs are written mac=#<mac>;
+# each is replaced by its role or salted hash (cfp_addr_label, cfp_mac_label), so no raw IPv4/IPv6 address or MAC reaches
+# the evidence. Words are split with globbing off (a row may carry `*`), and an empty address is dropped, never labelled.
 cfp_cd_emit() {
+    set -f
     while IFS= read -r cfp_cd_line; do
         cfp_cd_out=
         for cfp_cd_w in $cfp_cd_line; do
             case $cfp_cd_w in
+                mac=#*) cfp_cd_w=mac=$(cfp_mac_label "${cfp_cd_w#mac=#}");;
                 *@*)
                     cfp_cd_pre=${cfp_cd_w%%@*} cfp_cd_rest=${cfp_cd_w#*@} cfp_cd_len=
                     case $cfp_cd_rest in */*) cfp_cd_len=/${cfp_cd_rest#*/}; cfp_cd_rest=${cfp_cd_rest%%/*};; esac
+                    [ -n "$cfp_cd_rest" ] || continue
                     cfp_cd_w=$cfp_cd_pre$(cfp_addr_label "$cfp_cd_rest")$cfp_cd_len;;
             esac
             cfp_cd_out="$cfp_cd_out $cfp_cd_w"
         done
         cfr_out "${cfp_cd_out# }"
     done
+    set +f
 }
 cfp_coverage_diag() {
     # Six reads plus bounded formatting; failure diagnostics never reduce the
@@ -929,7 +1008,7 @@ cfp_coverage_diag() {
                     if($i=="lladdr"&&i<NF)mac=tolower($(i+1))
                     if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE|UNCERTAIN)$/)state=$i}
                 if(index(macs," " mac " ")||index(ips," " $1 " ")){
-                    if(++n<=16)print "INFO coverage_diag neighbor","@" $1,"mac=" mac,"state=" state
+                    if(++n<=16)print "INFO coverage_diag neighbor","@" $1,"mac=" (mac=="-"?"-":"#" mac),"state=" state
                     else {print "INFO coverage_diag neighbor truncated";exit}}}
             ' "$CFP_DIR/coverage.neigh$cfp_cd_family" | cfp_cd_emit
         fi
@@ -937,7 +1016,7 @@ cfp_coverage_diag() {
     if cfp_coverage_read leases cat "$CFR_LEASES"; then
         awk -v macs=" $CFP_RPC_ALLOW " -v ips=" $CFR_PENN_IP ${CFP_PENN2_IP:-} " '
             index(macs," " tolower($2) " ")||index(ips," " $3 " "){
-                if(++n<=16)print "INFO coverage_diag lease expiry=" $1,"mac=" tolower($2),"ip=@" $3
+                if(++n<=16)print "INFO coverage_diag lease expiry=" $1,"mac=#" tolower($2),"ip=@" $3
                 else {print "INFO coverage_diag lease truncated";exit}}
         ' "$CFP_DIR/coverage.leases" | cfp_cd_emit
     fi
@@ -1263,11 +1342,19 @@ cfp_wrapper_dir() {
 # $1 wrapper name, $2 SSH_ORIGINAL_COMMAND, rest: wrapper argv. stdin is /dev/null; child diagnostics go to the stage log.
 cfp_wrapper_run() {
     cfp_wr_name=$1 cfp_wr_cmd=$2; shift 2
+    CFP_WR_OLD=${SSH_ORIGINAL_COMMAND-} CFP_WR_OLD_SET=${SSH_ORIGINAL_COMMAND+1} CFP_WR_ENV=1
     SSH_ORIGINAL_COMMAND=$cfp_wr_cmd; export SSH_ORIGINAL_COMMAND
     cfp_run /dev/null "$CFP_CFCTL_ALLOWANCE" "$(cfp_wrapper_dir)/$cfp_wr_name" "$@"
     cfp_wr_rc=$?
-    unset SSH_ORIGINAL_COMMAND
+    cfp_wrapper_env_restore
     return "$cfp_wr_rc"
+}
+# The caller's SSH_ORIGINAL_COMMAND (or its absence) back after a wrapper call; also the first step of the teardown, so a
+# stop that interrupts cfp_wrapper_run never hands the wrapper's command to the uninstall child.
+cfp_wrapper_env_restore() {
+    [ "$CFP_WR_ENV" = 1 ] || return 0
+    CFP_WR_ENV=0
+    if [ -n "$CFP_WR_OLD_SET" ]; then SSH_ORIGINAL_COMMAND=$CFP_WR_OLD; export SSH_ORIGINAL_COMMAND; else unset SSH_ORIGINAL_COMMAND; fi
 }
 # $1 phase, $2 direct|wrapper. Raw output is in preview.out only until parsed; sets cfp_pv_sha, cfp_pv_count, cfp_pv_absent.
 cfp_preview() {
@@ -1616,12 +1703,14 @@ cfp_phase_list() {
 
 cfp_main() {
     umask 077
+    exec 5>&1
+    CFP_FD5=1
     CFR_START=$(date +%s)
     CFR_PREMUTATION_BUDGET=$CFP_PREMUTATION_BUDGET
     printf 'BEGIN penn-pilot commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS" \
         "$CFP_ROUTER_IP" "$CFP_PERSON" "$CFP_OPERATION_ID" "$CFP_POLICY" "$CFP_DNS_NAME" "$CFP_SAFE_BAND" "$CFP_STATUS_SETTLE" "$CFP_REMOTE_TIMEOUT" \
-        "$CFP_TEARDOWN_RESERVE" "$CFP_READ_TIMEOUT" "$CFP_COUNTERS_WORST" "$CFP_ITERATION_WORST" "$CFP_CFCTL_ALLOWANCE" "$CFP_WORST_ENROLL" "$CFP_WORST_PAUSE" \
+        "$CFP_TEARDOWN_RESERVE" "$CFP_READ_TIMEOUT" "$CFP_COUNTERS_WORST" "$CFP_ITERATION_WORST" "$CFP_CFCTL_ALLOWANCE" "$CFP_KILL_GRACE" "$CFP_UNINSTALL_ALLOWANCE" "$CFP_LEG2_CANCEL_WAIT" "$CFP_WORST_ENROLL" "$CFP_WORST_PAUSE" \
         "$CFP_WORST_RESUME" "$CFP_WORST_EXPIRY" "$CFP_WORST_DNS"; do
         [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
     done
@@ -1669,7 +1758,7 @@ cfp_main() {
     cfp_pm_el=$(cfp_elapsed) || cfr_refuse BASELINE uptime_unreadable
     [ "$cfp_pm_el" -le "$CFR_PREMUTATION_BUDGET" ] || cfr_refuse BASELINE premutation_budget_exceeded
     trap '' HUP PIPE
-    trap 'cfp_stop SIGNAL interrupted' INT TERM
+    trap cfp_on_signal INT TERM
     cfr_out MUTATION_BEGIN
     CFP_MUTATED=1
     cfp_safe_band || cfr_info 'install proceeding outside safe band'
