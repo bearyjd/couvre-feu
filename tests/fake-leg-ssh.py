@@ -152,6 +152,10 @@ def scripted(cfg, command):
 
 def translate(command):
     timeout = shlex.join(shlex.split(spec['env'].get('CF_TEST_TIMEOUT', 'timeout')))
+    # GNU timeout puts itself in a new process group unless --foreground, and then an inner one would be a background
+    # reader of the pty (busybox timeout does not): the nested remote bound is only safe with the flag.
+    if 'busybox' not in timeout:
+        timeout += ' --foreground'
     command = re.sub(r'(^| )timeout (?=-s )', lambda m: m.group(1) + timeout + ' ', command)
     cfctl = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['cfctl']])
     wrapper = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['leg2']['wrapper_scope']])
