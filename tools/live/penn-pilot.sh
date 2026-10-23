@@ -1245,8 +1245,8 @@ cfp_sync_send() {
     }
     cfp_sy_base=$(sed -n "s/.*\"receipt\":{\"operationId\":\"$cfp_sy_op\",\"requestDigest\":\"[0-9a-f]*\",\"baseRevision\":\([0-9][0-9]*\),.*/\1/p" "$CFP_DIR/rpc-sync.json")
     cfp_sy_acc=$(sed -n "s/.*\"receipt\":{\"operationId\":\"$cfp_sy_op\",.*\"acceptedRevision\":\([0-9][0-9]*\),\"acceptedDigest\".*/\1/p" "$CFP_DIR/rpc-sync.json")
-    [ -n "$cfp_sy_base" ] && [ -n "$cfp_sy_acc" ] || cfp_stop "$cfp_sy_phase" receipt_missing
-    [ "$cfp_sy_base" = "$CFP_REV" ] && [ "$cfp_sy_acc" = "$((CFP_REV + 1))" ] || cfp_stop "$cfp_sy_phase" "receipt_revision_unexpected base=$cfp_sy_base accepted=$cfp_sy_acc"
+    if [ -z "$cfp_sy_base" ] || [ -z "$cfp_sy_acc" ]; then cfp_stop "$cfp_sy_phase" receipt_missing; fi
+    if [ "$cfp_sy_base" != "$CFP_REV" ] || [ "$cfp_sy_acc" != "$((CFP_REV + 1))" ]; then cfp_stop "$cfp_sy_phase" "receipt_revision_unexpected base=$cfp_sy_base accepted=$cfp_sy_acc"; fi
     CFP_REV=$cfp_sy_acc
 }
 cfp_sync() { cfp_sync_prepare "$1"; cfp_sync_send "$@"; }
@@ -1291,7 +1291,7 @@ cfp_preview() {
     cfp_pv_sha=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*,"scopeSha":"\([0-9a-f]\{64\}\)",.*/\1/p')
     cfp_pv_count=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*,"scopeCount":\([0-9][0-9]*\),.*/\1/p')
     cfp_pv_absent=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*,"protectedAbsent":\([0-9][0-9]*\),.*/\1/p')
-    [ "${#cfp_pv_sha}" = 64 ] && [ -n "$cfp_pv_count" ] && [ -n "$cfp_pv_absent" ] || cfp_stop "$1" scope_preview_unparsed
+    if [ "${#cfp_pv_sha}" != 64 ] || [ -z "$cfp_pv_count" ] || [ -z "$cfp_pv_absent" ]; then cfp_stop "$1" scope_preview_unparsed; fi
     cfr_out "MEASURE scope_preview_$3 measured in_scope=false evidence=true add_refusal=none scope_entries=$cfp_pv_count protected_absent=$cfp_pv_absent"
 }
 # The live scope file is read lock-free: the commit leg takes the runtime and platform locks and refuses when they
