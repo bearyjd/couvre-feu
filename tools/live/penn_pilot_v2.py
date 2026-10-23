@@ -63,6 +63,8 @@ V2_MAX_REMOTE_TIMEOUT_SECONDS = 10800
 V2_TIMEOUT_SLACK_SECONDS = 900
 # Leg 2 (local pty driver): hard timeout of each commit leg, no retry.
 SCOPE_LEG_SECONDS = 60
+# Router-side: TERM (cfctl's traps release the platform lock) at the leg's seconds, KILL backstop this much later.
+SCOPE_LEG_KILL_GRACE_SECONDS = 15
 SCOPE_LEGS = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
               ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove'))
 POLICY_KEYS = {'version', 'revision', 'people', 'pauses', 'schedules', 'doh'}
@@ -231,15 +233,16 @@ def pilot_policies(config, base, candidates=candidate_policies):
 
 def scope_legs(config, ssh_argv):
     """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values. The command is
-    bounded on the router by `timeout -s KILL <leg seconds>` (busybox timeout has no -k, and a leg's cfctl children
-    are short), so a leg whose local ssh died cannot run on past its deadline. Each leg also binds its whole ssh
+    bounded on the router by nested timeouts, `timeout -s KILL <seconds + grace> timeout -s TERM <seconds>` (busybox
+    timeout has no -k; TERM first lets cfctl's traps release the platform lock, KILL skips them), so a leg whose local
+    ssh died cannot run on past its deadline. Each leg also binds its whole ssh
     argv: the leg-1 argv with `-e none -tt` for `-T` (no ssh escape character on the pty) and the template last."""
     if len(ssh_argv) < 4 or ssh_argv[-3] != '-T':
         raise Refusal('leg-1 ssh argv has no -T to turn into -tt')
     legs = []
     for leg, form, op in SCOPE_LEGS:
         inner = f'{op} {{MAC}} --base {{BASE}}'
-        bound = f'timeout -s KILL {SCOPE_LEG_SECONDS} '
+        bound = f'timeout -s KILL {SCOPE_LEG_SECONDS + SCOPE_LEG_KILL_GRACE_SECONDS} timeout -s TERM {SCOPE_LEG_SECONDS} '
         template = (f'{bound}/usr/sbin/cfctl {inner}' if form == 'cfctl'
                     else f"{bound}env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
         legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template,

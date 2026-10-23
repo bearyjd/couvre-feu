@@ -10,6 +10,7 @@ printed equals the one expected text. Each leg gets its planned seconds, no retr
 STOP or CFP_LEG2_CANCEL, ends, or times out. Nothing the leg prints is kept except counts and the reply's reason codes.
 This module never changes how the router is logged in to: it only reuses the pinned leg-1 ssh options. The known-hosts
 and identity files are re-hashed before every leg and every ack; SIGTERM, SIGHUP and SIGINT end a run like Ctrl-C."""
+import contextlib
 import hmac
 import json
 import os
@@ -40,7 +41,8 @@ MARKER = re.compile(r'CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})')
 CANCEL = re.compile(r'CFP_LEG2_CANCEL 2[a-d]')
 # Leg 1's teardown names the router-side acknowledgement file; the only path the driver will ever write.
 ACK_FILE = re.compile(r'CFP_LEG2_ACK_FILE (/tmp/couvre-feu-first\.[A-Za-z0-9]{6}/leg2-idle)')
-# Created only once no cfctl or cfctl-scope process is alive on the router (checked as exact NUL-separated fields of
+# Created only once no cfctl or cfctl-scope process is alive on the router (a leg's `timeout` parents carry the same
+# field, so a live leg is seen through its argv chain; checked as exact NUL-separated fields of
 # /proc/*/cmdline, so this script's own command line never matches), never through an existing file or symlink.
 ACK_SCRIPT = r"""n=0
 while :; do b=0
@@ -49,22 +51,30 @@ while :; do b=0
     if tr '\000' '\n' <"$p/cmdline" 2>/dev/null | awk '$0=="/usr/sbin/cfctl"||$0=="/usr/sbin/cfctl-scope"{f=1}END{exit !f}'; then b=1; break; fi
   done
   if [ "$b" = 0 ]; then break; fi
-  n=$((n+1)); if [ "$n" -ge 4 ]; then exit 3; fi
+  n=$((n+1)); if [ "$n" -gt SCAN_ ]; then exit 3; fi
   sleep 1
 done
 if [ -e PATH_ ] || [ -L PATH_ ]; then exit 4; fi
 set -C; : > PATH_
 """
-ACK_SECONDS = 12
+# The router-side scan waits up to this many seconds for a live cfctl (cron `cfctl expire`, the wrapper's timeout
+# watcher) to go away, then reports busy (final, no retry). It, the ssh connect (5 s) and the ssh timeout below must
+# fit the shell's CFP_LEG2_CANCEL_WAIT (20 s, shared with the quiet check), so it stays a constant 15.
+ACK_SCAN_SECONDS = 15
+ACK_SECONDS = ACK_SCAN_SECONDS + 10
 ACK_BUSY = 3
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 PROMPT = 'Type the last 6 hex digits of the address (no colons) to confirm: '
 # (leg, form, op) in the only order the plan may list them.
 LEG_TABLE = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
              ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove'))
-# The remote bound `timeout -s KILL <seconds>` is the leg's own digest-bound timeoutSeconds, written without leading zeros.
-TEMPLATES = {'cfctl': r'timeout -s KILL ([1-9][0-9]{0,2}) /usr/sbin/cfctl (scope-add|scope-remove) \{MAC\} --base \{BASE\}',
-             'cfctl-scope': r"timeout -s KILL ([1-9][0-9]{0,2}) env SSH_ORIGINAL_COMMAND='cfctl (scope-add|scope-remove) "
+# The remote bound is `timeout -s KILL <seconds + grace> timeout -s TERM <seconds>`: TERM (the leg's own digest-bound
+# timeoutSeconds) lets cfctl's traps release the platform lock, KILL (no -k in busybox 1.33) is the backstop. Both
+# numbers are written without leading zeros.
+LEG_KILL_GRACE_SECONDS = 15
+BOUND_RE = r'timeout -s KILL ([1-9][0-9]{0,2}) timeout -s TERM ([1-9][0-9]{0,2}) '
+TEMPLATES = {'cfctl': BOUND_RE + r'/usr/sbin/cfctl (scope-add|scope-remove) \{MAC\} --base \{BASE\}',
+             'cfctl-scope': BOUND_RE + r"env SSH_ORIGINAL_COMMAND='cfctl (scope-add|scope-remove) "
                             r"\{MAC\} --base \{BASE\}' /usr/sbin/cfctl-scope pilot"}
 # The only ssh options a leg may carry besides the pinned known-hosts file (the leg-1 option set).
 FIXED_OPTIONS = {'IdentitiesOnly=yes', 'BatchMode=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null',
@@ -111,7 +121,8 @@ def check_leg(entry, expected, details, base):
     template = entry.get('commandTemplate')
     match = isinstance(template, str) and re.fullmatch(TEMPLATES[form], template)
     argv = entry.get('sshArgv')
-    if (not match or match.group(2) != op or int(match.group(1)) != seconds or not isinstance(argv, list)
+    if (not match or match.group(3) != op or int(match.group(2)) != seconds
+            or int(match.group(1)) != seconds + LEG_KILL_GRACE_SECONDS or not isinstance(argv, list)
             or argv[-1:] != [template]):
         raise Refusal(f'leg {leg} command is not the fixed text')
     if argv[:-1] != base[:-3] + ['-e', 'none', '-tt', base[-2]]:
@@ -248,7 +259,8 @@ def send_ack(argv, path, env):
     Returns 'sent', 'busy' (a cfctl process was still alive on the router: nothing written) or 'failed'. Only called
     once no leg is in flight and none can start."""
     try:
-        done = subprocess.run(argv[:-1] + [ACK_SCRIPT.replace('PATH_', path)], stdin=subprocess.DEVNULL,
+        script = ACK_SCRIPT.replace('PATH_', path).replace('SCAN_', str(ACK_SCAN_SECONDS))
+        done = subprocess.run(argv[:-1] + [script], stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True,
                               timeout=ACK_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
@@ -277,7 +289,14 @@ class Tail:
         os.close(self.fd)
 
 
+def block_signals():
+    """Every helper thread calls this first: a process-wide signal goes to any thread that does not block it, and
+    CPython then runs the Python handler in the main thread, so one unblocked helper defeats the main thread's mask."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+
+
 def feed(stream, payload):
+    block_signals()
     try:
         stream.write(payload)
     except OSError:
@@ -289,10 +308,36 @@ def feed(stream, payload):
             pass
 
 
+_DEFER = {'on': False, 'pending': False, 'stopped': False}
+
+
 def stop_now(number, frame):
-    """SIGTERM, SIGHUP and SIGINT end a run like Ctrl-C; a second signal waits until the cleanup has finished."""
+    """SIGTERM, SIGHUP and SIGINT end a run like Ctrl-C. Only the first one raises: signals are blocked from then on, and
+    one that was already waiting (CPython runs several tripped handlers back to back) or arrives later is ignored, so
+    nothing can interrupt the cleanup, and the restore of handlers and mask after it, half way."""
     signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    if _DEFER['stopped']:
+        return
+    if _DEFER['on']:
+        _DEFER['pending'] = True
+        return
+    _DEFER['stopped'] = True
     raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def uninterruptible():
+    """A stop that arrives inside is raised as KeyboardInterrupt only when the block ends, so a child started inside
+    is always assigned (and so reaped by the cleanup) before the run can be interrupted. Main thread only. Residual:
+    the block is as long as the fork and exec it covers; SIGKILL and a power loss are not stoppable at all."""
+    _DEFER['on'] = True
+    try:
+        yield
+    finally:
+        _DEFER['on'] = False
+        if _DEFER['pending']:
+            _DEFER['pending'], _DEFER['stopped'] = False, True
+            raise KeyboardInterrupt
 
 
 class Driver:
@@ -331,26 +376,34 @@ class Driver:
         self.results, self.ignored, self.active, self.pending, self.env = [], 0, None, None, env
         self.locked = self.cancelled = False
         self.ack, self.pinned_state = 'none', 'ok'
+        # The mask is captured, and the signals blocked, BEFORE any handler is installed: a signal that arrives while the
+        # handlers go in waits until supervise unblocks, inside its try, and the finally below restores mask and handlers.
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        _DEFER.update(on=False, pending=False, stopped=False)
+        saved = {}
         try:
-            saved = {number: signal.signal(number, stop_now) for number in SIGNALS}
-        except ValueError:  # not the main thread: the caller owns signal handling
-            saved = {}
-        try:
-            return self.supervise(payload, stdout_fd, stderr_fd, stdout_path, timeout)
+            try:
+                for number in SIGNALS:
+                    saved[number] = signal.signal(number, stop_now)
+            except ValueError:  # not the main thread: the caller owns signal handling
+                pass
+            return self.supervise(payload, stdout_fd, stderr_fd, stdout_path, timeout, mask)
         finally:
             for number, handler in saved.items():
                 signal.signal(number, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
-    def supervise(self, payload, stdout_fd, stderr_fd, stdout_path, timeout):
-        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    def supervise(self, payload, stdout_fd, stderr_fd, stdout_path, timeout, mask):
         tail = process = feeder = None
         timed_out, aborted, begun = False, True, time.monotonic()
         try:
-            tail = Tail(stdout_path)
-            process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=stdout_fd, stderr=stderr_fd, env=self.env,
-                                       start_new_session=True)
-            feeder = threading.Thread(target=feed, args=(process.stdin, payload), daemon=True)
-            feeder.start()
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)  # a signal that waited for the handlers is delivered here
+            with uninterruptible():
+                tail = Tail(stdout_path)
+                process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=stdout_fd, stderr=stderr_fd,
+                                           env=self.env, start_new_session=True)
+                feeder = threading.Thread(target=feed, args=(process.stdin, payload), daemon=True)
+                feeder.start()
             while True:
                 now = time.monotonic()
                 self.handle(tail.lines(), now)
@@ -431,6 +484,7 @@ class Driver:
 
     def start(self, index, base, now):
         if self.files_unchanged():
-            self.active = Leg(self.legs[index], base, self.env, now)
+            with uninterruptible():
+                self.active = Leg(self.legs[index], base, self.env, now)
         else:
             self.locked, self.pending, self.pinned_state = True, None, 'changed'

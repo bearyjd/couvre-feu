@@ -38,7 +38,7 @@ PROMPT = 'Type the last 6 hex digits of the address (no colons) to confirm: '
 LEG_KEYS = {'leg', 'form', 'op', 'outcome', 'exit', 'ok', 'errors', 'confirmationSent', 'bytes', 'stderrBytes', 'seconds'}
 LEG_SECONDS = 5
 AFTER = 2.0
-BOUND = 'timeout -s KILL %d ' % LEG_SECONDS
+BOUND = 'timeout -s KILL %d timeout -s TERM %d ' % (LEG_SECONDS + 15, LEG_SECONDS)
 ACK_PATH = '/tmp/couvre-feu-first.Ab3dEf/leg2-idle'
 # One blocking write of 8 MiB keeps the channel full until the consumer has taken all of it: a read loop that has no
 # per-step bound cannot catch up with such a producer and never returns.
@@ -384,6 +384,15 @@ class DriverTests(DriverBase):
         self.assertEqual((leg['outcome'], leg['exit'], leg['ok']), ('exited', 255, False))
         self.assertEqual(len(self.leg_calls()), 1)
 
+    def test_a_failed_leg_is_not_retried_when_leg_one_repeats_its_marker(self):
+        # Only the next planned leg may ever start: a failed 2a is over, whatever leg 1 prints afterwards.
+        self.drive([marker(), [0, '@wait exit 1'], [0.3, f'CFP_LEG2_READY 2a {BASE}'], [0.3, f'CFP_LEG2_READY 2a {BASE2}']]
+                   + settled(), exit255=True)
+        (leg,) = self.legs()
+        self.assertEqual((leg['leg'], leg['outcome'], leg['exit'], leg['ok']), ('2a', 'exited', 255, False))
+        self.assertEqual(len(self.leg_calls()), 1)
+        self.assertGreaterEqual(self.outcome[2]['ignoredMarkers'], 2)
+
     def test_a_refused_leg_is_never_retried(self):
         with mock.patch.object(self.tool.LEG2, 'confirmation_digits', lambda mac: '999999'):
             self.drive([marker()] + settled())
@@ -587,14 +596,14 @@ class StaticTests(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout.strip()), (0, 'True True'), done.stderr)
         text = path.read_text()
         self.assertNotIn('noqa: F821', text)
-        self.assertLessEqual(len(text.splitlines()), 450)  # leg + ack + pinning + signals; the project cap is 800
+        self.assertLessEqual(len(text.splitlines()), 520)  # leg + ack + pinning + signals + deferral; the project cap is 800
         self.assertIsNone(re.search(r'authorized_keys|dropbear|passwd|shadow|password|PasswordAuth|sshd', text, re.I))
         for source in ((REPO / 'tools/live/penn-pilot.py').read_text(), (REPO / 'tools/live/penn_pilot_v2.py').read_text()):
             self.assertIsNone(re.search(r'StrictHostKeyChecking=(no|accept-new|off)|UserKnownHostsFile=/dev/null|CheckHostIP', source))
         self.assertIsNone(re.search(r'StrictHostKeyChecking=(no|accept-new|off)|CheckHostIP', text))
         self.assertLessEqual(len((REPO / 'tools/live/penn-pilot.py').read_text().splitlines()), 800)
         imports = set(re.findall(r'(?m)^(?:import|from) ([a-z_]+)', text))
-        self.assertLessEqual(imports, {'hmac', 'json', 'os', 'pty', 're', 'select', 'signal', 'subprocess', 'threading', 'time',
+        self.assertLessEqual(imports, {'contextlib', 'hmac', 'json', 'os', 'pty', 're', 'select', 'signal', 'subprocess', 'threading', 'time',
                                        'typing', 'hashlib', 'shlex', 'termios'})
 
     def test_every_function_in_the_driver_is_at_most_fifty_lines(self):

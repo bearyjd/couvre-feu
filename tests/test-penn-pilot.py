@@ -1286,7 +1286,7 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual([(leg['leg'], leg['form'], leg['op']) for leg in legs],
                          [('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
                           ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove')])
-        bound = 'timeout -s KILL 60 '
+        bound = 'timeout -s KILL 75 timeout -s TERM 60 '
         self.assertEqual(legs[0]['commandTemplate'], bound + '/usr/sbin/cfctl scope-add {MAC} --base {BASE}')
         self.assertEqual(legs[1]['commandTemplate'], bound + '/usr/sbin/cfctl scope-remove {MAC} --base {BASE}')
         self.assertEqual(legs[2]['commandTemplate'],
@@ -2998,7 +2998,7 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assert_no_leaks()
 
     def test_v2_wrong_confirmation_is_a_refused_leg_and_leg_one_does_not_believe_anything(self):
-        self.spec['leg2']['wrong_digits_match'] = '^timeout -s KILL [0-9]+ /usr/sbin/cfctl scope-add'
+        self.spec['leg2']['wrong_digits_match'] = '^timeout -s KILL [0-9]+ timeout -s TERM [0-9]+ /usr/sbin/cfctl scope-add'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()

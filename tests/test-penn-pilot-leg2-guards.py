@@ -5,6 +5,9 @@ Same harness as tests/test-penn-pilot-leg2.py (fake ssh, no router). Fictional M
 import json
 import os
 from pathlib import Path
+import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,6 +25,7 @@ PP, PHONE = L2.PP, L2.PHONE
 BASE, BASE2, ACK_PATH, BOUND, LEG_SECONDS, AFTER = L2.BASE, L2.BASE2, L2.ACK_PATH, L2.BOUND, L2.LEG_SECONDS, L2.AFTER
 marker, settled, gone, wait_dead = L2.marker, L2.settled, L2.gone, L2.wait_dead
 import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
 
 
 def setUpModule():
@@ -62,7 +66,7 @@ class AckCommandTests(L2.DriverBase):
     def test_a_live_cfctl_or_wrapper_process_blocks_the_ack_and_nothing_is_written(self):
         for fields in (('/bin/sh', '/usr/sbin/cfctl', 'scope-add', PHONE['mac']), ('/bin/sh', '/usr/sbin/cfctl-scope', 'pilot'),
                        ('timeout', '-s', 'KILL', '5', '/usr/sbin/cfctl', 'scope-add')):
-            with self.subTest(fields):
+            with self.subTest(fields), mock.patch.object(self.tool.LEG2, 'ACK_SCAN_SECONDS', 2):
                 self.process(21, *fields)
                 self.assertEqual(self.ack(), 'busy')
                 self.assertFalse(self.target.exists())
@@ -81,6 +85,34 @@ class AckCommandTests(L2.DriverBase):
         thread.join()
         self.assertTrue(self.target.is_file())
 
+    def test_a_cfctl_process_alive_for_several_seconds_is_waited_for_inside_the_cancel_wait(self):
+        # cron `cfctl expire` or the wrapper's timeout watcher shows /usr/sbin/cfctl for a few seconds: the old ~3 s scan
+        # gave up on it, and 'busy' is final.
+        self.process(41, 'timeout', '-s', 'KILL', '75', 'timeout', '-s', 'TERM', '60', '/usr/sbin/cfctl', 'expire')
+
+        def vanish():
+            time.sleep(6)
+            (self.proc / '41' / 'cmdline').unlink()
+        thread = threading.Thread(target=vanish)
+        thread.start()
+        self.assertEqual(self.ack(), 'sent')
+        thread.join()
+        self.assertTrue(self.target.is_file())
+
+    def test_the_scan_window_is_constant_and_fits_inside_the_cancel_wait_and_the_ssh_timeout(self):
+        leg2 = self.tool.LEG2
+        shell = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        wait = int(re.search(r'^CFP_LEG2_CANCEL_WAIT=(\d+)$', shell, re.M).group(1))
+        self.assertGreaterEqual(leg2.ACK_SCAN_SECONDS, 15)
+        self.assertLess(leg2.ACK_SCAN_SECONDS, wait)
+        self.assertGreater(leg2.ACK_SECONDS, leg2.ACK_SCAN_SECONDS)
+        with mock.patch.object(leg2, 'ACK_SCAN_SECONDS', 3):
+            self.process(51, '/bin/sh', '/usr/sbin/cfctl', 'expire')
+            begun = time.monotonic()
+            self.assertEqual(self.ack(), 'busy')
+            self.assertGreaterEqual(time.monotonic() - begun, 3)
+            self.assertLess(time.monotonic() - begun, 3 + 4)
+
     def test_an_existing_file_or_a_symlink_is_never_written_through(self):
         victim = self.work / 'victim'
         victim.write_text('keep\n')
@@ -94,9 +126,39 @@ class AckCommandTests(L2.DriverBase):
                 self.assertFalse((self.work / 'nowhere').exists())
 
 
+def local_busybox():
+    """The busybox CF_TEST_SHELL names, else one on PATH or in ~/.local/bin; None when there is none."""
+    named = shlex.split(os.environ.get('CF_TEST_SHELL', ''))
+    for candidate in (named[0] if named else None, shutil.which('busybox'), str(Path.home() / '.local/bin/busybox')):
+        if candidate and shutil.which(candidate):
+            return shutil.which(candidate)
+    return None
+
+
+@unittest.skipUnless(local_busybox(), 'no busybox available locally: the ack script was only run under the host /bin/sh')
+class BusyboxAckCommandTests(AckCommandTests):
+    """The same ack tests under busybox ash with busybox tr, awk and sleep only: the router's semantics (tr '\\000'
+    octal escape, awk exact-field match, noclobber O_EXCL refusing dangling symlinks), not the host's."""
+
+    def setUp(self):
+        super().setUp()
+        busybox, bindir = local_busybox(), self.work / 'busybox-bin'
+        bindir.mkdir()
+        for applet in ('tr', 'awk', 'sleep'):
+            (bindir / applet).symlink_to(busybox)
+        self.spec['ack'].update(busybox=busybox, bindir=str(bindir))
+        self.spec_path.write_text(json.dumps(self.spec))
+
+    def test_the_busybox_applets_are_what_ran(self):
+        for applet in ('tr', 'awk', 'sleep'):
+            shown = subprocess.run([str(self.work / 'busybox-bin' / applet), '--help'], capture_output=True, text=True,
+                                   check=False)
+            self.assertIn('BusyBox', shown.stdout + shown.stderr, applet)
+
+
 class SignalTests(L2.DriverBase):
     SCRIPT = '''
-import importlib.util, json, os, sys, time
+import importlib.util, json, os, signal, subprocess, sys, time
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('penn_pilot', sys.argv[1])
 tool = importlib.util.module_from_spec(spec)
@@ -106,14 +168,41 @@ if os.environ.get('SLOW_KILL'):
     original = tool.LEG2.Leg.kill
     tool.LEG2.Leg.kill = lambda *args: (time.sleep(float(os.environ['SLOW_KILL'])), original(*args))[1]
 driver = tool.LEG2.Driver(details, details['planSha256'], tool.plan_digest)
+if os.environ.get('PROBE_THREAD'):  # the pilot's own host-probe thread, started before driver.run
+    probes = tool.HostProbes(lambda host: {}, 'host.invalid')
+    probes.start()
+inject = os.environ.get('INJECT', '')
+if inject == 'mask':  # a stop that lands right after the last handler is installed
+    real_signal = signal.signal
+    def installing(number, handler):
+        old = real_signal(number, handler)
+        if number == signal.SIGINT and handler is tool.LEG2.stop_now:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return old
+    signal.signal = installing
+if inject.startswith('popen:'):  # a stop that lands right after the Nth child was started, before it is assigned
+    real_popen, started = subprocess.Popen, []
+    def popen(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        started.append(child)
+        if len(started) == int(inject[6:]):
+            open(sys.argv[4] + '.pid', 'w').write(str(child.pid))
+            os.kill(os.getpid(), signal.SIGTERM)
+        return child
+    subprocess.Popen = popen
+originals = {number: signal.getsignal(number) for number in tool.LEG2.SIGNALS}
 fd = os.open(sys.argv[4], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 try:
-    driver.run(b'payload\\n', env, fd, fd, sys.argv[4], 60)
+    driver.run(b'payload\\n' * (30000 if os.environ.get('PROBE_THREAD') else 1), env, fd, fd, sys.argv[4], 60)
 except KeyboardInterrupt:
-    sys.exit(7)
+    signal.signal = real_signal if inject == 'mask' else signal.signal
+    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, []) & set(tool.LEG2.SIGNALS)
+    restored = all(signal.getsignal(number) == handler for number, handler in originals.items())
+    sys.exit(7 if not blocked and restored else 9)
 '''
 
-    def run_signalled(self, signals, slow='0'):
+    def run_signalled(self, signals, slow='0', threads=None, inject=None):
+        threads = dict(threads or {}, INJECT=inject or '')
         self.spec_for([marker(), [0, '@wait read 1'], [60, 'END']], hang_after_read=True, child=str(self.pidfile))
         script = self.work / 'driver-child.py'
         script.write_text(self.SCRIPT)
@@ -121,12 +210,12 @@ except KeyboardInterrupt:
             (self.work / f'{name}.json').write_text(json.dumps(value))
         child = subprocess.Popen([sys.executable, '-B', str(script), str(PP.SOURCE.tool_path), str(self.work / 'details.json'),
                                   str(self.work / 'env.json'), str(self.work / 'out.log')], start_new_session=True,
-                                 env={'PATH': os.environ['PATH'], 'HOME': str(self.work), 'SLOW_KILL': slow})
+                                 env={'PATH': os.environ['PATH'], 'HOME': str(self.work), 'SLOW_KILL': slow, **threads})
         self.addCleanup(lambda: child.poll() is None and child.kill())
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not (self.events_log.exists() and 'read' in self.events_log.read_text()):
+        while not inject and time.monotonic() < deadline and not (self.events_log.exists() and 'read' in self.events_log.read_text()):
             time.sleep(0.05)
-        self.assertTrue(self.events_log.exists() and 'read' in self.events_log.read_text(), 'leg never read the answer')
+        self.assertTrue(inject or (self.events_log.exists() and 'read' in self.events_log.read_text()), 'leg never read the answer')
         for index, number in enumerate(signals):
             if index:
                 time.sleep(0.4)
@@ -142,6 +231,53 @@ except KeyboardInterrupt:
 
     def test_a_second_signal_during_the_cleanup_cannot_skip_the_kill_of_leg_one(self):
         self.run_signalled([signal.SIGTERM, signal.SIGTERM], slow='2')
+        self.child_dead()
+        self.assertTrue(wait_dead(int(self.leg1_pid.read_text())))
+
+    def test_a_stop_right_after_the_handlers_go_in_leaves_the_mask_and_the_handlers_as_they_were(self):
+        self.run_signalled([], inject='mask')  # exit 9 when SIGNALS stay blocked or a handler is not restored
+
+    def test_a_stop_right_after_a_child_started_cannot_orphan_it(self):
+        for nth in (1, 2):
+            with self.subTest(child=nth):
+                self.run_signalled([], inject=f'popen:{nth}')
+                started = int((self.work / 'out.log.pid').read_text())
+                self.assertTrue(wait_dead(started), f'child {nth} (pid {started}) was left running')
+                self.assertTrue(wait_dead(int(self.leg1_pid.read_text())) if self.leg1_pid.exists() else True)
+
+    @staticmethod
+    def blocked_signals(thread):
+        """The stop signals a thread blocks (its kernel mask), after giving it a moment to run its first action."""
+        wanted = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+        deadline = time.monotonic() + 3
+        while True:
+            line = next(row for row in Path(f'/proc/self/task/{thread.native_id}/status').read_text().splitlines()
+                        if row.startswith('SigBlk:'))
+            mask = int(line.split()[1], 16)
+            found = {number for number in wanted if mask >> (number - 1) & 1}
+            if found == wanted or time.monotonic() > deadline:
+                return found
+            time.sleep(0.05)
+
+    def test_every_helper_thread_blocks_the_stop_signals_as_its_first_action(self):
+        wanted = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+        probes = self.tool.HostProbes(lambda host: {}, 'host.invalid')
+        probes.start()
+        self.addCleanup(probes.stop)
+        self.assertEqual(self.blocked_signals(probes.thread), wanted, 'host-probe thread')
+        read_end, write_end = os.pipe()  # nobody reads: the 1 MiB payload keeps the feeder blocked in its write
+        stream = os.fdopen(write_end, 'wb')
+        feeder = threading.Thread(target=self.tool.LEG2.feed, args=(stream, b'x' * (1 << 20)), daemon=True)
+        feeder.start()
+        self.assertEqual(self.blocked_signals(feeder), wanted, 'payload feeder thread')
+        os.close(read_end)
+        feeder.join(10)
+
+    def test_a_second_signal_cannot_reach_the_cleanup_through_a_helper_thread(self):
+        # A process-wide signal goes to any thread that does not block it, and CPython then runs the handler in the
+        # main thread: with a host-probe thread and a payload (240 KB) bigger than the pipe, the payload feeder is
+        # still writing. Neither may leave a signal for the main thread between the leg kill and the leg-1 kill.
+        self.run_signalled([signal.SIGTERM, signal.SIGTERM, signal.SIGHUP], slow='2', threads={'PROBE_THREAD': '1'})
         self.child_dead()
         self.assertTrue(wait_dead(int(self.leg1_pid.read_text())))
 
@@ -239,9 +375,16 @@ class BindingTests(L2.DriverBase):
                                 (2, f'{BOUND}{scope} root'),
                                 (0, BOUND + '/usr/sbin/cfctl scope-add {MAC}'),
                                 (0, '/usr/sbin/cfctl scope-add {MAC} --base {BASE}'),
-                                (0, 'timeout -s KILL 999 /usr/sbin/cfctl scope-add {MAC} --base {BASE}'),
+                                (0, 'timeout -s KILL 999 timeout -s TERM 984 /usr/sbin/cfctl scope-add {MAC} --base {BASE}'),
                                 (0, 'timeout -s TERM %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % LEG_SECONDS),
-                                (0, 'timeout -s KILL 0%d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % LEG_SECONDS)):
+                                # the pre-fix shape: a bare KILL skips cfctl's EXIT/HUP/TERM traps
+                                (0, 'timeout -s KILL %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % LEG_SECONDS),
+                                (0, 'timeout -s KILL %d timeout -s TERM %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % (LEG_SECONDS + 14, LEG_SECONDS)),
+                                (0, 'timeout -s KILL %d timeout -s TERM %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % (LEG_SECONDS + 16, LEG_SECONDS)),
+                                (0, 'timeout -s KILL %d timeout -s TERM %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % (LEG_SECONDS, LEG_SECONDS)),
+                                (0, 'timeout -s TERM %d timeout -s KILL %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % (LEG_SECONDS + 15, LEG_SECONDS)),
+                                (0, 'timeout -s KILL %d timeout -s KILL %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % (LEG_SECONDS + 15, LEG_SECONDS)),
+                                (0, 'timeout -s KILL 0%d timeout -s TERM %d /usr/sbin/cfctl scope-add {MAC} --base {BASE}' % (LEG_SECONDS + 15, LEG_SECONDS))):
             with self.subTest(template):
                 details = self.fresh()
                 details['legs'][index]['commandTemplate'] = template
@@ -253,6 +396,11 @@ class BindingTests(L2.DriverBase):
         details = self.fresh()
         details['legs'][0]['retry'] = True
         self.refused(self.resign(details), resigned=True)
+
+    def test_the_kill_grace_of_the_nested_timeouts_is_the_same_in_the_plan_and_the_driver(self):
+        self.assertEqual(self.tool.V2.SCOPE_LEG_KILL_GRACE_SECONDS, self.tool.LEG2.LEG_KILL_GRACE_SECONDS)
+        for leg in self.details['legs']:
+            self.assertTrue(leg['commandTemplate'].startswith(BOUND), leg['commandTemplate'])
 
     def test_the_legs_are_copied_at_construction_so_later_edits_change_nothing(self):
         details = self.fresh()

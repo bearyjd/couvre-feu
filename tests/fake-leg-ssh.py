@@ -10,7 +10,7 @@ Every call appends its argv (and, in scripted mode, what it received) to spec['l
 With spec['leg2']['events'] a leg also appends timestamped events (launch, start, prompt, read, reply, exit) there, and
 leg 1 understands handshake lines instead of sleeps: `@wait <event> <n>` (n events recorded), `@wait dead` (the leg's
 child pid is gone) and `@append <path> <text>` (test-only file change). The ack call (anything without -T/-tt that is
-not leg 1) runs the real command with /proc and /tmp/couvre-feu-first. pointed at spec['ack'] directories.
+not leg 1) runs the real command (optionally under busybox ash with busybox applets only) with /proc and /tmp/couvre-feu-first. pointed at spec['ack'] directories.
 """
 import atexit
 import json
@@ -152,7 +152,7 @@ def scripted(cfg, command):
 
 def translate(command):
     timeout = shlex.join(shlex.split(spec['env'].get('CF_TEST_TIMEOUT', 'timeout')))
-    command = re.sub(r'^timeout ', timeout + ' ', command)
+    command = re.sub(r'(^| )timeout (?=-s )', lambda m: m.group(1) + timeout + ' ', command)
     cfctl = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['cfctl']])
     wrapper = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['leg2']['wrapper_scope']])
     return command.replace('/usr/sbin/cfctl-scope', wrapper).replace('/usr/sbin/cfctl', cfctl)
@@ -210,6 +210,9 @@ def ack():
         sys.exit(255)
     if cfg.get('proc'):
         command = argv[-1].replace('/proc/', cfg['proc'] + '/').replace('/tmp/couvre-feu-first.', cfg['tmp'] + '/couvre-feu-first.')
+        if cfg.get('busybox'):  # the router's shell and only busybox applets (tr, awk, sleep) on PATH
+            run = [cfg['busybox'], 'ash', '-c', command]
+            sys.exit(subprocess.run(run, check=False, env={'PATH': cfg['bindir']}).returncode)
         sys.exit(subprocess.run(['/bin/sh', '-c', command], check=False).returncode)
     sys.exit(0)
 

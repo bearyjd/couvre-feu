@@ -535,6 +535,7 @@ class HostProbes:
 
     def start(self):
         def loop():
+            LEG2.block_signals()  # the run's SIGTERM/SIGHUP/SIGINT handling belongs to the main thread alone
             while not self.stop_event.wait(HOST_PROBE['intervalSeconds']):
                 self.sample('during')
         self.thread = threading.Thread(target=loop, daemon=True)
