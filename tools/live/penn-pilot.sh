@@ -100,11 +100,17 @@ CFP_REV=0
 CFP_MUTATED=0
 CFP_PROOF_FAILED=0
 CFP_TEARDOWN=0
-# Teardown arithmetic, all inside CFP_TEARDOWN_RESERVE (300 s): the leg-2 cancel wait (CFP_LEG2_CANCEL_WAIT) + one
-# safe-band wait (at most 71 s) + the uninstall allowance (CFP_UNINSTALL_ALLOWANCE) + the restore snapshot, proof and
-# connectivity reads (local, a few seconds): 20 + 71 + 120 = 211 s, leaving 89 s.
-CFP_UNINSTALL_ALLOWANCE=120
+# Teardown arithmetic, all inside CFP_TEARDOWN_RESERVE (420 s): the leg-2 cancel wait (CFP_LEG2_CANCEL_WAIT: the
+# driver's idle acknowledgement and the quiet check share it) + one safe-band wait (at most 71 s) + the uninstall
+# allowance (CFP_UNINSTALL_ALLOWANCE, TERM) + the KILL grace + the restore snapshot, proof and connectivity reads
+# (local, each KILL-bounded): 20 + 71 + 240 + 15 = 346 s, leaving 74 s. The uninstall allowance is at least the 240 s
+# install allowance: a restoration is never given an arbitrary shorter deadline.
+CFP_UNINSTALL_ALLOWANCE=240
 CFP_LEG2_CANCEL_WAIT=20
+# Seconds between the TERM (the allowance) and the KILL backstop of every cfctl, wrapper and uninstall child.
+CFP_KILL_GRACE=15
+# Set when a KILLed child left the platform lock behind; cfp_stop then names it.
+CFP_STALE_LOCK=0
 # The leg (2a..2d) whose CFP_LEG2_READY marker was printed and whose confirming rpc-status read has not happened.
 CFP_LEG2_ACTIVE=
 CFP_START_CS=
@@ -116,8 +122,11 @@ cfp_cleanup() {
     # Raw replies (hostnames, LAN addresses) go even when stdout is lost and the stage is retained for inspection:
     # their summaries are in phase.log. Plain rm: the stage is on tmpfs.
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ]; then
-        for cfp_name in preview.out wrapper.out inventory.json inventory.w.json settle.neigh settle.tokens settle.map; do rm -f "$CFP_DIR/$cfp_name"; done
+        for cfp_name in preview.out wrapper.out inventory.json inventory.w.json settle.neigh settle.tokens settle.map \
+            identity.neigh coverage.leases coverage.neigh4 coverage.neigh6 coverage.addr4 coverage.addr6 \
+            members members.list members.all fw.ipset dns.out; do rm -f "$CFP_DIR/$cfp_name"; done
     fi
+    [ -z "$CFR_STAGE" ] || rm -f "$CFR_STAGE/connectivity.neigh"
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ] && [ "$CFR_STDOUT_LOST" != 1 ]; then
         # The rpc-sync reply is evidence: copy it to stderr (stderr.log) before
         # removal; stdout must keep the outcome line last.
@@ -136,6 +145,37 @@ cfr_install_args() {
     for cfr_allow in $CFP_RPC_ALLOW; do printf '%s\n' --rpc-allow "$cfr_allow"; done
     printf '%s\n' --protect "$CFR_MGMT_MAC" --protect "$CFR_JD_MAC"
     for cfr_old in $CFR_HISTORICAL_MACS; do printf '%s\n' --protect "$cfr_old"; done
+}
+
+# Snapshot text and connectivity reads, bounded and fail-closed: first-rehearsal.sh's cfr_text and cfr_connectivity
+# read the router with unbounded commands (and an empty `ipset` listing is a valid snapshot, so a killed read must
+# fail the snapshot, not look like "no sets"). Read-only tools, so KILL at CFP_READ_TIMEOUT like every other read.
+# $1 file, then the command: output goes straight to the file; a failure or timeout returns non-zero.
+cfp_text_read() {
+    cfp_tr_f=$1; shift
+    timeout -s KILL "$CFP_READ_TIMEOUT" "$@" > "$cfp_tr_f" 2>/dev/null </dev/null
+}
+# $1 file, then a stdin filter command applied to the file in place.
+cfp_text_filter() {
+    cfp_tf_f=$1; shift
+    "$@" < "$cfp_tf_f" > "$cfp_tf_f.t" && mv "$cfp_tf_f.t" "$cfp_tf_f"
+}
+cfr_text() {
+    cfr_text_file=$CFR_STAGE/text.$1.$2
+    case "$2" in
+        iptables) cfp_text_read "$cfr_text_file" iptables-save && cfp_text_filter "$cfr_text_file" sed -e '/^#/d' -e 's/\[[0-9][0-9]*:[0-9][0-9]*\]/[0:0]/g';;
+        ip6tables) cfp_text_read "$cfr_text_file" ip6tables-save && cfp_text_filter "$cfr_text_file" sed -e '/^#/d' -e 's/\[[0-9][0-9]*:[0-9][0-9]*\]/[0:0]/g';;
+        ipset) cfp_text_read "$cfr_text_file" ipset list -n && cfp_text_filter "$cfr_text_file" env LC_ALL=C sort;;
+        ipsetsave) cfp_text_read "$cfr_text_file" ipset save && cfp_text_filter "$cfr_text_file" env LC_ALL=C sort;;
+        uci) cfp_text_read "$cfr_text_file" uci export firewall;;
+        cron) if [ -f "$CFR_ROOT/etc/crontabs/root" ]; then cat "$CFR_ROOT/etc/crontabs/root" > "$cfr_text_file"; else printf 'absent\n' > "$cfr_text_file"; fi;;
+    esac
+}
+cfr_connectivity() {
+    timeout -s KILL "$CFP_READ_TIMEOUT" ip -4 neigh show dev br-lan > "$CFR_STAGE/connectivity.neigh" 2>/dev/null </dev/null || { cfr_fail CONNECTIVITY neighbor_read_failed; return 0; }
+    cfr_neighbor "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_PRESENT_STATES" "$CFR_STAGE/connectivity.neigh" || { cfr_fail CONNECTIVITY management_neighbor_lost; return 0; }
+    cfr_neighbor "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PRESENT_STATES" "$CFR_STAGE/connectivity.neigh" || { cfr_fail CONNECTIVITY jd_adult_neighbor_lost; return 0; }
+    cfr_ok CONNECTIVITY
 }
 
 # Centiseconds since boot (/proc/uptime has two decimals).
@@ -164,15 +204,44 @@ cfp_elapsed_ok() {
 }
 
 # The one place a cfctl, wrapper or uninstall child is started. $1 stdin file, $2 allowance in seconds, then the
-# script and its arguments (run by the fixed shell). The child is KILLed at the allowance (exit 137): a hung child can
-# never stall the session until the router-side last-resort timeout. A killed cfctl may leave its runtime or platform
-# lock behind; the single uninstall then refuses and the run ends FAIL_AFTER_MUTATION, which is the reported outcome.
-# Callers must not run it inside $(...): a surviving grandchild could hold the pipe open (busybox timeout kills only
-# its direct child), so output goes to a file.
+# script and its arguments (run by the fixed shell). At the allowance the child gets TERM (exit 143): cfctl and the
+# installers trap it and release their runtime and platform locks (router/lib/platform-bootstrap.sh
+# platform_lock_acquire, install-common.sh, core.sh); only if it is still alive CFP_KILL_GRACE seconds later is it
+# KILLed (exit 137), which skips those traps and can leave /tmp/couvrefeu-platform.lock behind (cfp_stale_lock_note).
+# Busybox timeout signals only its direct child and has no -k, so a small watchdog signals the child's own pid (the
+# shell that runs the script, exec'ed below, so TERM reaches it and not an intermediate sh). The subshell resets TERM
+# because the teardown ignores it and an ignored signal would otherwise be inherited by the child. A hung child can
+# never stall the session until the router-side last-resort timeout. Callers must not run it inside $(...): a
+# surviving grandchild could hold the pipe open, so output goes to a file.
 cfp_run() {
     cfp_run_in=$1 cfp_run_t=$2; shift 2
     # shellcheck disable=SC2086
-    timeout -s KILL "$cfp_run_t" $CFR_SH "$@" <"$cfp_run_in" 2>>"$CFR_STAGE/child.log"
+    ( trap - TERM; exec $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" &
+    cfp_run_pid=$!
+    ( cfp_w=0
+      while kill -0 "$cfp_run_pid" 2>/dev/null; do
+          sleep 1; cfp_w=$((cfp_w + 1))
+          [ "$cfp_w" -ne "$cfp_run_t" ] || kill -TERM "$cfp_run_pid" 2>/dev/null
+          [ "$cfp_w" -lt "$((cfp_run_t + CFP_KILL_GRACE))" ] || { kill -KILL "$cfp_run_pid" 2>/dev/null; break; }
+      done ) >/dev/null 2>&1 </dev/null &
+    cfp_run_wd=$!
+    wait "$cfp_run_pid"
+    cfp_run_rc=$?
+    kill "$cfp_run_wd" 2>/dev/null
+    wait "$cfp_run_wd" 2>/dev/null
+    [ "$cfp_run_rc" != 137 ] || cfp_stale_lock_check
+    return "$cfp_run_rc"
+}
+# After a KILL: the platform lock a KILLed cfctl held is never auto-cleared (only `cfctl recover-platform-lock`), so
+# the per-minute cron `cfctl expire` fails and pauses have no kernel time bound. Record it here (the caller owns this
+# call's stdout, so nothing is printed) and say so in cfp_stop / the teardown instead of waiting on it.
+cfp_stale_lock_check() {
+    if [ -e "$CFR_PLATFORM_LOCK" ] || [ -L "$CFR_PLATFORM_LOCK" ]; then CFP_STALE_LOCK=1; fi
+}
+cfp_stale_lock_report() {
+    [ "$CFP_STALE_LOCK" = 1 ] || return 0
+    CFP_STALE_LOCK=2
+    cfr_info "stale_platform_lock $CFR_PLATFORM_LOCK left by a killed child; manual recovery: cfctl recover-platform-lock; password login is the recovery path"
 }
 
 # --- Read-only adult probes -------------------------------------------------
@@ -463,13 +532,31 @@ cfp_status_transient() {
 # with one per-run salt that is never logged or written. IPv4 addresses are
 # treated the same way: role addresses by role, every other one hashed. Without a
 # salt nothing is hashed or logged. The raw neighbor files are removed on return.
-cfp_neigh_evidence() {
+# The per-run salt of every address hash in the evidence (empty when urandom is unreadable: nothing is hashed then).
+cfp_salt_init() {
     if [ -z "$CFP_NE_SALT" ]; then
         CFP_NE_SALT=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')
         # A failed read hashes nothing: the empty-input digest is no salt.
         case $CFP_NE_SALT in *[!0-9a-f]*|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) CFP_NE_SALT=;; esac
         [ "${#CFP_NE_SALT}" = 64 ] || CFP_NE_SALT=
     fi
+}
+# $1 a raw LAN address: the pilot's own device role, else ip4-/ip6- plus 12 hex of a salted hash, never the address.
+cfp_addr_label() {
+    case $1 in
+        "$CFR_MGMT_IP") printf 'management\n'; return 0;;
+        "$CFR_JD_IP") printf 'jd_adult\n'; return 0;;
+        "$CFR_PENN_IP") printf 'penn_child\n'; return 0;;
+        "$CFP_PENN2_IP") printf 'penn_child_2\n'; return 0;;
+        "$CFP_PHONE_IP") printf 'scope_target\n'; return 0;;
+    esac
+    case $1 in *:*) cfp_al_kind=ip6;; *) cfp_al_kind=ip4;; esac
+    cfp_salt_init
+    if [ -z "$CFP_NE_SALT" ]; then printf '%s-unhashed\n' "$cfp_al_kind"; return 0; fi
+    printf '%s-%s\n' "$cfp_al_kind" "$(printf '%s%s' "$CFP_NE_SALT" "$(printf '%s' "$1" | tr 'A-F' 'a-f')" | sha256sum | awk '{print substr($1,1,12)}')"
+}
+cfp_neigh_evidence() {
+    cfp_salt_init
     [ -n "$CFP_NE_SALT" ] || { cfr_info "status_settle_neigh $1 salt_unavailable"; return 0; }
     if ! timeout -s KILL "$CFP_READ_TIMEOUT" ip neigh show dev br-lan > "$CFP_DIR/settle.neigh" 2>/dev/null </dev/null; then
         cfr_info "status_settle_neigh $1 unreadable"; return 0
@@ -539,7 +626,7 @@ cfp_status_settle() {
         cfp_status_transient "$CFP_DIR/status.json" "$cfp_ss_rev" "$@" || { cfr_info "$cfp_ss_log not_transient"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
         [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$((CFP_STATUS_SETTLE - 1))" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
         cfp_abort_check "$cfp_ss_phase"
-        cfp_elapsed_ok "$((CFP_ITERATION_WORST + CFP_READ_TIMEOUT + 72 + CFP_CFCTL_ALLOWANCE))" ||
+        cfp_elapsed_ok "$((CFP_ITERATION_WORST + CFP_READ_TIMEOUT + 72 + CFP_CFCTL_ALLOWANCE + CFP_KILL_GRACE))" ||
             cfp_stop "$cfp_ss_phase" remote_budget_reserved_for_teardown
         cfp_adult_probe "$cfp_ss_phase" || cfp_stop "$cfp_ss_phase" "adult_disruption $CFP_ADULT_REASON"
         sleep "$CFP_POLL"
@@ -678,29 +765,37 @@ cfp_observe() {
 
 # --- Post-mutation flow -------------------------------------------------------
 cfp_stop() {
+    # A KILLed child left the platform lock: that, not the generic failure, is what the operator must act on.
+    if [ "$CFP_STALE_LOCK" != 0 ]; then set -- "$1" platform_lock_stale_after_kill; cfp_stale_lock_report; fi
     cfr_fail "$1" "$2"
     [ -n "$CFP_STOPPED" ] || CFP_STOPPED=$1
     cfr_out "STOP $1 $2"
     cfp_teardown
 }
-# A stop while a commit leg is outstanding: tell the driver to end it, then wait (bounded by
-# CFP_LEG2_CANCEL_WAIT) until the runtime lock is absent and the live scope file's sha256 is the same on two reads
-# one second apart, so uninstall cannot race a leg that is still writing. Timing out is reported, never fatal:
-# the uninstall is the safety path. The router cannot stop a driver from starting a leg after this marker.
+# A stop while a commit leg is outstanding: tell the driver to end it, then wait (bounded by CFP_LEG2_CANCEL_WAIT)
+# for ALL of: the driver's acknowledgement file (it creates it once no leg is in flight and none will start), the
+# runtime and platform locks absent, and the live scope file's sha256 the same on two reads one second apart, so
+# uninstall cannot race a leg that is still writing. A quiet scope proves nothing on its own: a leg that has not
+# started yet is also quiet. Without the acknowledgement the wait ends as leg2_quiesce_timeout (reported, never
+# fatal: the uninstall is the safety path). The router cannot stop a driver from starting a leg after the marker.
 cfp_leg2_quiesce() {
+    cfp_q_ack=$CFR_STAGE/leg2-idle
+    rm -f "$cfp_q_ack"
     cfr_out "CFP_LEG2_CANCEL $CFP_LEG2_ACTIVE"
+    cfr_out "CFP_LEG2_ACK_FILE $cfp_q_ack"
     cfp_q_t0=$(cfp_cs) || cfp_q_t0=0
     cfp_q_prev=
     while :; do
         cfp_q_sha=$(cfp_scope_file_sha)
-        if [ ! -e "$CFR_ROOT/etc/couvrefeu/runtime/lock" ] && [ ! -e "$CFR_PLATFORM_LOCK" ] && [ -n "$cfp_q_sha" ] && [ "$cfp_q_sha" = "$cfp_q_prev" ]; then
+        if [ -e "$cfp_q_ack" ] && [ ! -e "$CFR_ROOT/etc/couvrefeu/runtime/lock" ] && [ ! -e "$CFR_PLATFORM_LOCK" ] && [ -n "$cfp_q_sha" ] && [ "$cfp_q_sha" = "$cfp_q_prev" ]; then
             cfr_info "leg2_quiesced $CFP_LEG2_ACTIVE"
             return 0
         fi
         cfp_q_prev=$cfp_q_sha
         cfp_q_now=$(cfp_cs) || cfp_q_now=$((cfp_q_t0 + CFP_LEG2_CANCEL_WAIT * 100))
         if [ "$((cfp_q_now - cfp_q_t0))" -ge "$((CFP_LEG2_CANCEL_WAIT * 100))" ]; then
-            cfr_info "leg2_quiesce_timeout $CFP_LEG2_ACTIVE"
+            if [ -e "$cfp_q_ack" ]; then cfp_q_ackstate=acknowledged; else cfp_q_ackstate=no_acknowledgement; fi
+            cfr_info "leg2_quiesce_timeout $CFP_LEG2_ACTIVE $cfp_q_ackstate"
             return 0
         fi
         sleep 1
@@ -735,10 +830,11 @@ cfp_teardown() {
     cfr_info "run uninstall.sh once: $cfr_uninstall"
     cfp_run /dev/null "$CFP_UNINSTALL_ALLOWANCE" "$cfr_uninstall" >>"$CFR_STAGE/child.log"
     cfp_un_rc=$?
+    cfp_stale_lock_report
     if [ "$cfp_un_rc" != 0 ]; then
-        # 137: killed at the allowance (124: a timeout that reports expiry itself).
+        # 143: TERMed at the allowance (it released its locks); 137: still alive after the grace and KILLed.
         case $cfp_un_rc in
-            137|124) cfr_fail UNINSTALL 'uninstall_timeout; journal preserved; resolve explicitly';;
+            143|137|124) cfr_fail UNINSTALL 'uninstall_timeout; journal preserved; resolve explicitly';;
             *) cfr_fail UNINSTALL 'uninstall_refused_or_failed; journal preserved; resolve explicitly';;
         esac
         if cfr_snapshot after; then cfr_diff; fi
@@ -797,6 +893,23 @@ cfp_coverage_read() {
         return 1
     fi
 }
+# stdin: diagnostic rows whose raw LAN addresses are written @address[/len]; each is replaced by cfp_addr_label's
+# role or salted hash, so no raw IPv4/IPv6 address reaches the evidence.
+cfp_cd_emit() {
+    while IFS= read -r cfp_cd_line; do
+        cfp_cd_out=
+        for cfp_cd_w in $cfp_cd_line; do
+            case $cfp_cd_w in
+                *@*)
+                    cfp_cd_pre=${cfp_cd_w%%@*} cfp_cd_rest=${cfp_cd_w#*@} cfp_cd_len=
+                    case $cfp_cd_rest in */*) cfp_cd_len=/${cfp_cd_rest#*/}; cfp_cd_rest=${cfp_cd_rest%%/*};; esac
+                    cfp_cd_w=$cfp_cd_pre$(cfp_addr_label "$cfp_cd_rest")$cfp_cd_len;;
+            esac
+            cfp_cd_out="$cfp_cd_out $cfp_cd_w"
+        done
+        cfr_out "${cfp_cd_out# }"
+    done
+}
 cfp_coverage_diag() {
     # Six reads plus bounded formatting; failure diagnostics never reduce the
     # disclosed reserve, and add nothing to successful-run timing/minimums.
@@ -805,6 +918,7 @@ cfp_coverage_diag() {
         return 0
     fi
     cfr_info 'coverage_diag non_atomic_failure_snapshot row_limit=16 expected_revision=0 no_retry'
+    cfp_salt_init
     if cfp_coverage_read clock date -u '+%Y-%m-%dT%H:%M:%SZ epoch=%s'; then
         cfr_info "coverage_diag clock $(cat "$CFP_DIR/coverage.clock")"
     fi
@@ -815,24 +929,24 @@ cfp_coverage_diag() {
                     if($i=="lladdr"&&i<NF)mac=tolower($(i+1))
                     if($i~/^(REACHABLE|PERMANENT|STALE|DELAY|PROBE|FAILED|INCOMPLETE|NOARP|NONE|UNCERTAIN)$/)state=$i}
                 if(index(macs," " mac " ")||index(ips," " $1 " ")){
-                    if(++n<=16)print "INFO coverage_diag neighbor",$1,"mac=" mac,"state=" state
+                    if(++n<=16)print "INFO coverage_diag neighbor","@" $1,"mac=" mac,"state=" state
                     else {print "INFO coverage_diag neighbor truncated";exit}}}
-            ' "$CFP_DIR/coverage.neigh$cfp_cd_family" | while IFS= read -r cfp_cd_line; do cfr_out "$cfp_cd_line"; done
+            ' "$CFP_DIR/coverage.neigh$cfp_cd_family" | cfp_cd_emit
         fi
     done
     if cfp_coverage_read leases cat "$CFR_LEASES"; then
         awk -v macs=" $CFP_RPC_ALLOW " -v ips=" $CFR_PENN_IP ${CFP_PENN2_IP:-} " '
             index(macs," " tolower($2) " ")||index(ips," " $3 " "){
-                if(++n<=16)print "INFO coverage_diag lease expiry=" $1,"mac=" tolower($2),"ip=" $3
+                if(++n<=16)print "INFO coverage_diag lease expiry=" $1,"mac=" tolower($2),"ip=@" $3
                 else {print "INFO coverage_diag lease truncated";exit}}
-        ' "$CFP_DIR/coverage.leases" | while IFS= read -r cfp_cd_line; do cfr_out "$cfp_cd_line"; done
+        ' "$CFP_DIR/coverage.leases" | cfp_cd_emit
     fi
     for cfp_cd_family in 4 6; do
         if cfp_coverage_read "addr$cfp_cd_family" ip "-$cfp_cd_family" addr show dev br-lan; then
             awk '{for(i=1;i<NF;i++)if($i=="inet"||$i=="inet6"){
-                if(++n<=16)print "INFO coverage_diag lan",$i,$(i+1)
+                if(++n<=16)print "INFO coverage_diag lan",$i,"@" $(i+1)
                 else {print "INFO coverage_diag lan truncated";exit}}}' "$CFP_DIR/coverage.addr$cfp_cd_family" |
-                while IFS= read -r cfp_cd_line; do cfr_out "$cfp_cd_line"; done
+                cfp_cd_emit
         fi
     done
 }
@@ -1149,8 +1263,11 @@ cfp_wrapper_dir() {
 # $1 wrapper name, $2 SSH_ORIGINAL_COMMAND, rest: wrapper argv. stdin is /dev/null; child diagnostics go to the stage log.
 cfp_wrapper_run() {
     cfp_wr_name=$1 cfp_wr_cmd=$2; shift 2
-    # shellcheck disable=SC2086
-    env SSH_ORIGINAL_COMMAND="$cfp_wr_cmd" timeout -s KILL "$CFP_CFCTL_ALLOWANCE" $CFR_SH "$(cfp_wrapper_dir)/$cfp_wr_name" "$@" </dev/null 2>>"$CFR_STAGE/child.log"
+    SSH_ORIGINAL_COMMAND=$cfp_wr_cmd; export SSH_ORIGINAL_COMMAND
+    cfp_run /dev/null "$CFP_CFCTL_ALLOWANCE" "$(cfp_wrapper_dir)/$cfp_wr_name" "$@"
+    cfp_wr_rc=$?
+    unset SSH_ORIGINAL_COMMAND
+    return "$cfp_wr_rc"
 }
 # $1 phase, $2 direct|wrapper. Raw output is in preview.out only until parsed; sets cfp_pv_sha, cfp_pv_count, cfp_pv_absent.
 cfp_preview() {
@@ -1194,7 +1311,7 @@ cfp_leg2() {
     [ -n "$cfp_l_t0" ] || cfp_stop "$cfp_l_phase" clock_unavailable
     while :; do
         cfp_abort_check "$cfp_l_phase"
-        cfp_elapsed_ok "$((CFP_CFCTL_ALLOWANCE + 72 + 2))" || cfp_stop "$cfp_l_phase" remote_budget_reserved_for_teardown
+        cfp_elapsed_ok "$((CFP_CFCTL_ALLOWANCE + CFP_KILL_GRACE + 72 + 2))" || cfp_stop "$cfp_l_phase" remote_budget_reserved_for_teardown
         cfp_l_sha=$(cfp_scope_file_sha)
         if [ "$cfp_l_sha" = "$cfp_l_want" ]; then break; fi
         if [ -n "$cfp_l_sha" ] && [ "$cfp_l_sha" != "$cfp_l_base" ]; then cfp_stop "$cfp_l_phase" scope_sha_unexpected; fi
@@ -1324,7 +1441,8 @@ cfp_block_all_failed() {
     cfp_stop BULK "block_all_$CFP_FAILED_BLOCK_ALL $1"
 }
 # $1 BULK operation id. The router's receipt for that id is read by id (`rpc-status --json <id>`) and must appear
-# exactly once: a replayed or duplicated operation would show none or several.
+# exactly once. That is a lookup, so the count is 0 or 1 by construction: this verifies the router recorded a receipt
+# under exactly this id. A replay is caught by the receipt's revisions at the sync (receipt_revision_unexpected).
 cfp_bulk_receipt_check() {
     cfp_cfctl rpc-status --json "$1" > "$CFP_DIR/rpc-status.json" || cfp_stop BULK rpc_status_failed
     cfp_br_n=$(grep -o "\"operationId\":\"$1\"" "$CFP_DIR/rpc-status.json" | wc -l | tr -d ' ')

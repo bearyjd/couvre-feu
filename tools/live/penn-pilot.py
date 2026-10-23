@@ -21,7 +21,7 @@ Chromebook (`roles.penn_child`) only, `roles.scope_target` {ip, mac} is the phon
 add and remove, and `roles.ct107` {ip, mac} (its MAC also in protectedHistoricalMacs) is the protected
 infrastructure container. v2 replaces `penn_child_2` (a v2 config that sets it is refused) and caps
 `remoteTimeoutSeconds` at min(10800, minimumRemoteTimeoutSeconds + 900). schemaVersion 1 configs are kept as
-the legacy shape: no `scope_target`, the old phases, the old 3600 s cap. The template implements every v2 phase;
+the legacy shape: no `scope_target`, the old phases, a 4200 s cap (the rehearsal tool's 3600 s no longer covers two devices). The template implements every v2 phase;
 the SCOPE commit legs need a TTY and are started by the leg-2 pty driver (T4), so `execute` still refuses a v2
 plan (`LEG2_DRIVER_IMPLEMENTED`). v2 also makes the remote script begin its teardown at 70% of remoteTimeoutSeconds.
 
@@ -125,9 +125,16 @@ HOST_PROBE = {'intervalSeconds': 15, 'samples': 3, 'timeoutSeconds': 2, 'dnsMarg
 # The remote script re-checks each phase's worst case (and every observe/expiry
 # iteration) against the teardown reserve before starting it.
 SAFE_BAND_WAIT_SECONDS = 72
+V1_MAX_REMOTE_TIMEOUT_SECONDS = 4200
+# Each cfctl, wrapper and uninstall child gets TERM at its allowance (it releases its locks) and KILL only
+# KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), so one call's worst case is allowance + grace.
 CFCTL_ALLOWANCE_SECONDS = 45
+KILL_GRACE_SECONDS = 15
+CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS
 INSTALL_ALLOWANCE_SECONDS = 240
-TEARDOWN_RESERVE_SECONDS = 300
+# Teardown: leg-2 cancel wait 20 + one safe-band wait 71 + uninstall TERM allowance 240 (not shorter than the install
+# allowance) + KILL grace 15 = 346 s, plus the restore snapshot, proof and connectivity reads.
+TEARDOWN_RESERVE_SECONDS = 420
 # Router-side `timeout -s KILL` bound for each read-only iptables/ipset read.
 READ_TIMEOUT_SECONDS = 8
 # One counters snapshot: five chains, each read with -S and -nvxL.
@@ -173,12 +180,12 @@ def status_settle_worst_seconds(timing):
     before the window closes (that second absorbs 1 s clock granularity and the neighbor-hash forks): a
     full cfctl call (safe-band wait + allowance) and its neighbor read."""
     return (READ_TIMEOUT_SECONDS + timing['statusSettleSeconds'] + READ_TIMEOUT_SECONDS
-            + SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS)
+            + SAFE_BAND_WAIT_SECONDS + CFCTL_CALL_SECONDS)
 
 
 def phase_worst_seconds(timing, devices=1, scope=False, scope_target=False):
     """Worst case of each post-install phase, as the remote script budgets it."""
-    call = SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS
+    call = SAFE_BAND_WAIT_SECONDS + CFCTL_CALL_SECONDS
     snap, read, iteration = COUNTERS_WORST_SECONDS, READ_TIMEOUT_SECONDS, iteration_worst_seconds(timing)
     settle = status_settle_worst_seconds(timing)
     phases = {
@@ -205,7 +212,7 @@ def phase_worst_seconds(timing, devices=1, scope=False, scope_target=False):
 
 def new_phase_worst_seconds(timing):
     """Worst case of the v2 phases (every cfctl call keeps the safe-band wait)."""
-    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS, READ_TIMEOUT_SECONDS,
+    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_CALL_SECONDS, READ_TIMEOUT_SECONDS,
                                       status_settle_worst_seconds(timing), iteration_worst_seconds(timing),
                                       timing['resumeObserveSeconds'], SAFE_BAND_WAIT_SECONDS)
 
@@ -267,6 +274,17 @@ def _schema_version(document):
     return version
 
 
+def _pilot_timeout(document, version):
+    """remoteTimeoutSeconds: v2 up to its own hard max; v1 up to V1_MAX (the TERM-then-KILL grace and the 420 s
+    teardown reserve put the two-device-with-SCOPE worst case above the rehearsal tool's 3600 s cap)."""
+    if version == 2:
+        return V2.v2_timeout(document)
+    timeout = document.get('remoteTimeoutSeconds', 1800)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 600 <= timeout <= V1_MAX_REMOTE_TIMEOUT_SECONDS:
+        raise Refusal(f'remoteTimeoutSeconds must be an integer from 600 to {V1_MAX_REMOTE_TIMEOUT_SECONDS}')
+    return timeout
+
+
 def load_config(path):
     """The rehearsal schema plus the pilot-only keys; refused before any SSH.
 
@@ -283,13 +301,10 @@ def load_config(path):
     base['schemaVersion'] = 1
     if extra:
         base['roles'] = {role: entry for role, entry in roles.items() if role not in V2.PILOT_ROLES}
-    timeout = None
-    if version == 2:
-        timeout = V2.v2_timeout(document)
-        base['remoteTimeoutSeconds'] = 1800
+    timeout = _pilot_timeout(document, version)
+    base['remoteTimeoutSeconds'] = 1800
     config = FR.validate_config(base)
-    if timeout is not None:
-        config['remoteTimeoutSeconds'] = timeout
+    config['remoteTimeoutSeconds'] = timeout
     scope = document.get('scopeNegativeTest', False)
     if not isinstance(scope, bool):
         raise Refusal('scopeNegativeTest must be true or false')
@@ -430,7 +445,7 @@ def plan(config, env):
                'roles': config['roles'], 'protectedHistoricalMacs': config['protectedHistoricalMacs'],
                'knownHostsSha256': FR.regular_file_sha256(config['knownHostsPath'], 'knownHostsPath'),
                'adminPublicKeySha256': FR.regular_file_sha256(config['adminPublicKeyPath'], 'adminPublicKeyPath'),
-               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS), 'hostProbe': dict(HOST_PROBE),
+               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS, killGraceSeconds=KILL_GRACE_SECONDS), 'hostProbe': dict(HOST_PROBE),
                'dnsProbeName': DNS_PROBE_NAME, 'person': PERSON, 'operationId': OPERATION_ID,
                'policyJson': policy_json, 'policySha256': hashlib.sha256(policy_json.encode()).hexdigest(),
                'pauseRulesKernelTimeBound': False,
