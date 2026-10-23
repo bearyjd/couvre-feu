@@ -1113,7 +1113,7 @@ class PilotConfigV2Tests(PilotBase):
     def v2(self, roles=None, **changes):
         roles = dict(self.config['roles'], ct107=CT107, scope_target=PHONE) if roles is None else roles
         changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
-        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8500))
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 9000))
 
     def v2_config(self, **changes):
         return self.tool.load_config(self.write_config(**self.v2(**changes)))
@@ -1129,6 +1129,30 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual(details['roles']['scope_target'], PHONE)
         self.assertNotIn(PHONE['mac'], details['policyJson'])
         self.assertNotIn(PHONE['mac'], self.parameters(self.write_config(**self.v2()))[0]['CFP_POLICY'])
+
+    def test_derived_syncs_are_disclosed_digest_bound_and_planned_revisions_reach_the_template(self):
+        details = self.plan_details(self.write_config(**self.v2()))
+        syncs = {sync['stage']: sync for sync in details['derivedSyncs']}
+        self.assertEqual({name: sync['revision'] for name, sync in syncs.items()},
+                         {'bulk_pause': 9, 'bulk_resume': 10, 'unenrol': 12})
+        self.assertEqual([pause['person'] for pause in syncs['bulk_pause']['pauses']], ['penn', 'pilot_b'])
+        self.assertEqual(syncs['bulk_resume']['pauses'], [])
+        shape = lambda name: [(p['id'], p['macs']) for p in json.loads(syncs[name]['policyJson'])['people']]  # noqa: E731
+        self.assertEqual(shape('bulk_pause'), [('penn', [PHONE['mac']]), ('pilot_b', [PENN['mac']])])
+        self.assertEqual(shape('bulk_resume'), [('penn', sorted([PENN['mac'], PHONE['mac']]))])
+        self.assertEqual(shape('unenrol'), [('penn', [PENN['mac']])])
+        self.assertEqual(details['operationIds']['bulk_pause'], 'penn-pilot-bulk-1')
+        params, _ = self.parameters(self.write_config(**self.v2()))
+        self.assertEqual((params['CFP_REV_BULK_PAUSE'], params['CFP_REV_BULK_RESUME'], params['CFP_REV_UNENROL']), ('9', '10', '12'))
+        for field in ('derivedSyncs', 'operationIds', 'selfAbortPercent'):
+            mutated = copy.deepcopy(details)
+            mutated[field] = [] if field == 'derivedSyncs' else {'x': 1} if field == 'operationIds' else 99
+            self.assertNotEqual(self.tool.plan_digest(mutated), details['planSha256'], field)
+            missing = copy.deepcopy(details)
+            del missing[field]
+            with self.assertRaises(self.tool.Refusal):
+                self.tool.plan_digest(missing)
+        self.assertEqual(details['selfAbortSeconds'], 9000 * 70 // 100)
 
     def test_v1_behaviour_is_explicit(self):
         v1 = self.plan_details(self.write_config())
@@ -1508,11 +1532,11 @@ class PilotConfigV2Tests(PilotBase):
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         v2 = self.tool.phase_worst_seconds(shipped, scope=True, scope_target=True)
         self.assertEqual(v2, {'ENROLL': 609, 'PAUSE': 465, 'RESUME': 345, 'EXPIRY': 847, 'DNS': 80, 'SCOPE': 165,
-                              'SCOPE-ADD-1': 598, 'SCOPE-ADD-2': 950, 'MOVE': 1412, 'BULK': 1198, 'INVENTORY': 478,
-                              'SCOPE-REMOVE': 833})
+                              'SCOPE-ADD-1': 746, 'SCOPE-ADD-2': 1024, 'MOVE': 1412, 'BULK': 1222, 'INVENTORY': 478,
+                              'SCOPE-REMOVE': 907})
         self.assertEqual(self.tool.worst_case_seconds(shipped), 3318)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 8787)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 8952)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 9107)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 9272)
 
     def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
         details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
@@ -2028,7 +2052,7 @@ class PilotShellBase(PilotBase):
         changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
         # The v2 local timeout is far longer than v1's: the authorization deadline must outlast it.
         changes.setdefault('deadlineUtc', (self.now + datetime.timedelta(hours=5)).strftime('%Y-%m-%dT%H:%M:%SZ'))
-        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8500))
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8900))
 
     STUB_STOP = 'cfp_stop() { printf \'STOP %s %s\\n\' "$1" "$2"; exit 77; }'
 
@@ -2086,7 +2110,7 @@ echo "LEFT:$(ls "$CFP_DIR" | tr '\n' ' ')"
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn('PHASE INVENTORY OK', done.stdout)
         line = next(line for line in done.stdout.splitlines() if line.startswith('MEASURE inventory measured '))
-        self.assertRegex(line, r'devices=3 protected_listed=0 penn_devices_listed=2 truncated=false bytes=[0-9]+ '
+        self.assertRegex(line, r'device_counts=3,3,3 protected_listed=0 penn_devices_listed=2 truncated=false bytes=[0-9]+ '
                                r'shape=[0-9a-f]{12} reply_salted_sha256=[0-9a-f]{12} elapsed_ms=[0-9]+,[0-9]+,[0-9]+ '
                                r'wrapper_rpc_only=same_shape$')
         for leaked in (SENTINEL_HOST, SENTINEL_MAC, 'chromebook-x'):
@@ -2102,6 +2126,19 @@ echo "LEFT:$(ls "$CFP_DIR" | tr '\n' ' ')"
         pick = lambda done, key: re.search(key + r'=([0-9a-f]{12})', done.stdout).group(1)  # noqa: E731
         self.assertEqual(pick(first, 'shape'), pick(second, 'shape'))
         self.assertNotEqual(pick(first, 'reply_salted_sha256'), pick(second, 'reply_salted_sha256'))
+
+    def test_device_count_may_vary_between_samples_but_the_shape_may_not(self):
+        # A guest joins between samples: counts are recorded per sample, only the shape is compared.
+        more = inventory_reply([PENN['mac'], PHONE['mac'], SENTINEL_MAC, '02:00:00:00:00:78'])
+        driver = ('cfr_run_sh() { n=$(cat "$H/n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$H/n"; '
+                  'if [ "$n" = 2 ]; then cat "$H/reply2"; else cat "$H/reply"; fi; }\n'
+                  'cfp_wrapper_run() { cat "$H/reply"; }\ncfp_inventory_phase\n')
+        done = self.run_driver(driver, files={'reply': self.good_reply() + '\n', 'reply2': more + '\n'})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('device_counts=3,4,3 ', done.stdout)
+        reshaped = self.good_reply().replace('"truncated"', '"extra":1,"truncated"')
+        done = self.run_driver(driver, files={'reply': self.good_reply() + '\n', 'reply2': reshaped + '\n'})
+        self.assertEqual(self.stop_of(done), ['STOP INVENTORY inventory_shape_changed'])
 
     def test_truncated_flag_is_recorded(self):
         done = self.inventory(self.good_reply(truncated='true'))
@@ -2403,12 +2440,12 @@ cfp_scope_add_1_phase
         self.assertEqual((done.home / 'order').read_text().split('\n')[:-1], ['sync penn-pilot-unenrol-1', 'status', 'leg 2d'])
         self.assertIn('PHASE SCOPE-REMOVE OK', done.stdout)
         # The unenrol policy is the floor policy (Chromebook only) at the next revision.
-        driver2 = (RPC_STUBS + f'CFP_SHA_ADDED={"c" * 64}\nCFP_BASE0={"b" * 64}\nCFP_REV=12\n'
+        driver2 = (RPC_STUBS + f'CFP_SHA_ADDED={"c" * 64}\nCFP_BASE0={"b" * 64}\nCFP_REV=11\n'
                    'cfp_leg2() { :; }\ncfp_audit_count() { :; }\n'
                    'cfp_scope_remove_phase\n')
-        done = self.run_driver(driver2, files=self.rpc_files(rev=12))
+        done = self.run_driver(driver2, files=self.rpc_files(rev=11))
         request = (done.home / 'request.penn-pilot-unenrol-1.json').read_text()
-        self.assertIn(f'"policy":{{"version":1,"revision":13,"people":[{{"id":"penn","macs":["{PENN["mac"]}"]}}],"pauses":[]', request)
+        self.assertIn(f'"policy":{{"version":1,"revision":12,"people":[{{"id":"penn","macs":["{PENN["mac"]}"]}}],"pauses":[]', request)
         self.assertNotIn(PHONE['mac'], request)
 
     SELF_ABORT = r'''
@@ -2561,6 +2598,10 @@ class PilotV2FixtureTests(PilotShellBase):
         leg_patch = mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 15)
         leg_patch.start()
         self.addCleanup(leg_patch.stop)
+        # The router's own interfaces (scope-add refuses a router address and needs to read them).
+        for name, mac in (('lo', '00:00:00:00:00:00'), ('br-lan', '02:00:00:00:00:01')):
+            (self.root / 'sys/class/net' / name).mkdir(parents=True)
+            (self.root / 'sys/class/net' / name / 'address').write_text(mac + '\n')
         leases = self.root / 'tmp/dhcp.leases'
         leases.write_text(leases.read_text() + f'1800000000 {PHONE["mac"]} {PHONE["ip"]} phone *\n'
                           f'1800000000 {SENTINEL_MAC} 192.0.2.77 {SENTINEL_HOST} *\n')
@@ -2625,7 +2666,7 @@ class PilotV2FixtureTests(PilotShellBase):
                      'inventory', 'teardown_proof'):
             self.assertIn(name, measured)
         self.assertEqual(measured['inventory']['label'], 'measured')
-        self.assertRegex(measured['inventory']['detail'], r'devices=[0-9]+ protected_listed=0 penn_devices_listed=2')
+        self.assertRegex(measured['inventory']['detail'], r'device_counts=[0-9]+,[0-9]+,[0-9]+ protected_listed=0 penn_devices_listed=2')
         self.assertIn('revisions=8,9,10', measured['bulk_receipts']['detail'])
         self.assertIn('scope_candidates=0', measured['teardown_proof']['detail'])
         self.assertEqual(self.stage_leftovers, [])

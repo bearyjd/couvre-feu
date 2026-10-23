@@ -43,6 +43,11 @@ STAGES = ('enroll', 'enroll_phone', 'move', 'move_back')
 # `cfctl pause`/`resume` each add one, so the real sequence is: 1 enroll, 2 phone, 3 pause, 4 resume, 5 move A,
 # 6 pause pilot_b, 7 resume pilot_b, 8 move back. The BULK syncs derive their revisions at run time (9 and 10).
 STAGE_REVISIONS = {'enroll': 1, 'enroll_phone': 2, 'move': 5, 'move_back': 8}
+# Syncs whose policy is the revision-shifted shape of a stage (BULK pauses/resumes both persons; the final unenrol
+# returns to the floor). Revisions: 8 move back, 9 pause_all, 10 resume_all, 11 the EXPIRY pause (cron expire keeps
+# it), 12 unenrol. The router compares each against its own count before sending.
+DERIVED_REVISIONS = {'bulk_pause': 9, 'bulk_resume': 10, 'unenrol': 12}
+DERIVED_BASE_STAGE = {'bulk_pause': 'move', 'bulk_resume': 'move_back', 'unenrol': 'enroll'}
 # Tool-chosen operation ids (the router keeps one receipt per id), never read from the config.
 OPERATION_IDS = {'enroll_phone': 'penn-pilot-phone-1', 'move': 'penn-pilot-move-1', 'move_back': 'penn-pilot-move-2',
                  'bulk_pause': 'penn-pilot-bulk-1', 'bulk_resume': 'penn-pilot-bulk-2', 'unenrol': 'penn-pilot-unenrol-1'}
@@ -62,7 +67,7 @@ SCOPE_LEGS = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
 POLICY_KEYS = {'version', 'revision', 'people', 'pauses', 'schedules', 'doh'}
 # Bound into the plan digest of every v2 plan; a missing one is a refusal, never a silent drop.
 V2_ONLY_DIGEST_FIELDS = ('configSchemaVersion', 'legs', 'pilotPolicies', 'failedBlockAllWording',
-                         'failedBlockAllWordingDecidedBy', 'selfAbortPercent', 'operationIds')
+                         'failedBlockAllWordingDecidedBy', 'selfAbortPercent', 'operationIds', 'derivedSyncs')
 V2_DIGEST_FIELDS = V2_ONLY_DIGEST_FIELDS + ('roles', 'protectedHistoricalMacs', 'platformProfile', 'sourceCommit')
 
 
@@ -238,28 +243,54 @@ def scope_legs(config):
 
 # A local exec that never reaches cfctl's lock (wrapper argv negatives, the no-TTY refusal, a logread count).
 LOCAL_EXEC_SECONDS = 10
+# cfp_leg2 sleeps 2 s between scope-file reads, and the timeout is tested after the read.
+LEG_POLL_SLACK_SECONDS = 2
 
 
-def new_phase_worst_seconds(call, snap, read, settle, iteration=0, observe=0):
-    """Worst case of the v2 phases, counted from the calls penn-pilot.sh makes. `call` is one cfctl call (safe-band
-    wait + allowance), `snap` one counters snapshot, `read` one read-only firewall read, `settle` the extra worst case
-    of one status settle beyond its first status call, `iteration` one adult-probe iteration and `observe` the
-    BULK observation window. A leg poll loop ends within SCOPE_LEG_SECONDS plus the one call it started inside it."""
-    leg, local = SCOPE_LEG_SECONDS, LOCAL_EXEC_SECONDS
+def new_phase_worst_seconds(call, read, settle, iteration, observe, band):
+    """Worst case of the v2 phases, counted from the waits penn-pilot.sh makes (every `cfp_safe_band`, `cfp_cfctl`,
+    KILL-wrapped read and sleep in each phase function). `call` is one cfctl call (safe-band wait `band` + the cfctl
+    allowance), `read` one KILL-wrapped read, `settle` the extra worst case of one status settle beyond its first
+    status call, `iteration` one adult-probe iteration and `observe` the BULK observation window."""
+    local = LOCAL_EXEC_SECONDS
+    # a leg: the safe-band wait before the marker, the poll window and its sleep, then the one confirming rpc-status
+    leg = band + SCOPE_LEG_SECONDS + LEG_POLL_SLACK_SECONDS + call
+    sync = 2 * call  # status read (CAS) + rpc-sync
+    shape = 3 * read  # ipset save + iptables + ip6tables
+    settled = call + settle  # a settled status gate: its first status call + the settle window
     return {
-        # preview, status, two leg polls; the no-TTY refusal is local
-        'SCOPE-ADD-1': 4 * call + 2 * leg + local,
-        # wrapper preview, status after the argv negatives, poll, status + rpc-sync, settle's first status; negatives local
-        'SCOPE-ADD-2': 6 * call + leg + local + settle,
-        # sync A and B (status + sync), pause, resume, two settles; firewall shape x2 and kernel reads; one probe
-        'MOVE': 8 * call + 2 * settle + 10 * read + iteration,
-        # pause_all and resume_all (status + sync + settle's first status each); kernel and chain reads per state
-        'BULK': 6 * call + 2 * settle + 10 * read + observe + iteration,
-        # three rpc-inventory reads and one wrapper read
+        # preview, status; the no-TTY refusal is local; legs 2a and 2b
+        'SCOPE-ADD-1': call + local + call + 2 * leg,
+        # wrapper preview, status after the argv negatives (local), leg 2c, enrol the phone, settled status
+        'SCOPE-ADD-2': call + local + call + leg + sync + settled,
+        # firewall shape, sync A, settled status, pause, kernel reads, probe, resume, kernel reads, sync B, settled
+        # status, firewall shape
+        'MOVE': 2 * shape + 2 * sync + 2 * settled + 2 * call + 4 * read + iteration,
+        # firewall shape, pause_all (sync + settled status), set read + four chain reads, observation, resume_all
+        # (sync + settled status), set read + four chain reads
+        'BULK': shape + 2 * sync + 2 * settled + 10 * read + observe + iteration,
+        # three rpc-inventory reads and one wrapper read, each behind a safe-band wait; the checks are local
         'INVENTORY': 4 * call + local,
-        # unenrol (status + sync + settle), status for the base, poll; the logread count is local
-        'SCOPE-REMOVE': 5 * call + settle + leg + local,
+        # unenrol (sync + settled status), status for the base, leg 2d; the logread count is a KILL-wrapped read
+        'SCOPE-REMOVE': sync + settled + call + leg + local,
     }
+
+
+def derived_syncs(config, policies):
+    """The three syncs the router derives from a stage (so the plan can disclose every router mutation): the policy
+    shape at its planned revision, validated like a stage, plus the pauses BULK adds (their `until` is router time
+    plus the pause length plus the cfctl latency margin, known only at run time)."""
+    by_stage = dict(policies)
+    pauses = [{'person': who, 'until': 'router_now+pauseSeconds+latency_margin'} for who in (PERSON, PILOT_B)]
+    result = []
+    for name, revision in DERIVED_REVISIONS.items():
+        base = DERIVED_BASE_STAGE[name]
+        policy = assert_policy_pilot(dict(by_stage[base], revision=revision), config,
+                                     dict(expected_stage_policy(base, config), revision=revision))
+        result.append({'stage': name, 'operationId': OPERATION_IDS[name], 'revision': revision, 'baseStage': base,
+                       'policyJson': json.dumps(policy, separators=(',', ':'), sort_keys=False),
+                       'pauses': pauses if name == 'bulk_pause' else []})
+    return result
 
 
 def template_parameters(config, policies):
@@ -273,6 +304,8 @@ def template_parameters(config, policies):
             'CFP_OP_PHONE': OPERATION_IDS['enroll_phone'], 'CFP_OP_MOVE': OPERATION_IDS['move'],
             'CFP_OP_MOVE_BACK': OPERATION_IDS['move_back'], 'CFP_OP_BULK_PAUSE': OPERATION_IDS['bulk_pause'],
             'CFP_OP_BULK_RESUME': OPERATION_IDS['bulk_resume'], 'CFP_OP_UNENROL': OPERATION_IDS['unenrol'],
+            'CFP_REV_BULK_PAUSE': DERIVED_REVISIONS['bulk_pause'], 'CFP_REV_BULK_RESUME': DERIVED_REVISIONS['bulk_resume'],
+            'CFP_REV_UNENROL': DERIVED_REVISIONS['unenrol'],
             'CFP_SCOPE_LEG_SECONDS': SCOPE_LEG_SECONDS, 'CFP_FAILED_BLOCK_ALL': FAILED_BLOCK_ALL_WORDING,
             'CFP_SELF_ABORT_PCT': SELF_ABORT_PERCENT}
 

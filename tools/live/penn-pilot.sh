@@ -77,6 +77,9 @@ CFP_OP_MOVE_BACK=
 CFP_OP_BULK_PAUSE=
 CFP_OP_BULK_RESUME=
 CFP_OP_UNENROL=
+CFP_REV_BULK_PAUSE=
+CFP_REV_BULK_RESUME=
+CFP_REV_UNENROL=
 CFP_SCOPE_LEG_SECONDS=
 CFP_FAILED_BLOCK_ALL=
 CFP_SELF_ABORT_PCT=
@@ -1230,7 +1233,7 @@ cfp_bulk_phase() {
     # Timed pauses only: never an open-ended (until 0) pause.
     [ "$cfp_bk_until" -gt "$cfp_bk_now" ] || cfp_stop BULK pause_not_timed
     cfp_bk_pauses="{\"person\":\"penn\",\"until\":$cfp_bk_until},{\"person\":\"$CFP_PILOT_B\",\"until\":$cfp_bk_until}"
-    cfp_sync_send BULK "$CFP_OP_BULK_PAUSE" "$(cfp_stage_json move "$((CFP_REV + 1))" "$cfp_bk_pauses")" "$CFP_BOTH"
+    cfp_sync_send BULK "$CFP_OP_BULK_PAUSE" "$(cfp_stage_json move "$CFP_REV_BULK_PAUSE" "$cfp_bk_pauses")" "$CFP_BOTH"
     cfp_status_settle BULK pause_all_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":$CFP_KIDS_JSON}" \
         "\"person\":\"penn\",\"until\":$cfp_bk_until" "\"person\":\"$CFP_PILOT_B\",\"until\":$cfp_bk_until"
     cfp_bk_rev1=$CFP_REV
@@ -1239,7 +1242,7 @@ cfp_bulk_phase() {
     cfp_bk_v4=$cfp_bc4 cfp_bk_v6=$cfp_bc6
     case $cfp_bk_v4 in unknown|0) cfp_block_all_failed ipv4_chain_not_blocking;; esac
     cfp_observe "$CFP_RESUME_OBSERVE" paused BULK
-    cfp_sync BULK "$CFP_OP_BULK_RESUME" "$(cfp_stage_json back "$((CFP_REV + 1))" '')" "$CFP_BOTH"
+    cfp_sync BULK "$CFP_OP_BULK_RESUME" "$(cfp_stage_json back "$CFP_REV_BULK_RESUME" '')" "$CFP_BOTH"
     cfp_status_settle BULK resume_all_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
     [ "$(cfp_penn_state)" = clear ] || cfp_stop BULK penn_kernel_state_not_clear
     cfp_bulk_chain_state
@@ -1283,6 +1286,7 @@ cfp_inventory_phase() {
     cfp_iv_salt=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')
     [ "${#cfp_iv_salt}" = 64 ] || cfp_stop INVENTORY salt_unavailable
     cfp_iv_ms=
+    cfp_iv_counts=
     cfp_iv_first=
     for cfp_iv_n in 1 2 3; do
         cfp_safe_band || cfp_stop INVENTORY safe_band_unavailable
@@ -1296,8 +1300,10 @@ cfp_inventory_phase() {
             cfp_stop INVENTORY "inventory_unsupported exit=$cfp_iv_rc"
         fi
         cfp_inventory_check "$CFP_DIR/inventory.json" || { rm -f "$CFP_DIR/inventory.json"; cfp_stop INVENTORY "inventory_$cfp_iv_why"; }
-        if [ -z "$cfp_iv_first" ]; then cfp_iv_first="$cfp_iv_count $cfp_iv_shape"
-        elif [ "$cfp_iv_first" != "$cfp_iv_count $cfp_iv_shape" ]; then rm -f "$CFP_DIR/inventory.json"; cfp_stop INVENTORY inventory_shape_changed; fi
+        # The device count may move between samples (a lease expires, a guest joins); the shape may not.
+        cfp_iv_counts="${cfp_iv_counts:+$cfp_iv_counts,}$cfp_iv_count"
+        if [ -z "$cfp_iv_first" ]; then cfp_iv_first=$cfp_iv_shape
+        elif [ "$cfp_iv_first" != "$cfp_iv_shape" ]; then rm -f "$CFP_DIR/inventory.json"; cfp_stop INVENTORY inventory_shape_changed; fi
         rm -f "$CFP_DIR/inventory.json"
     done
     # The service's real path: the stripped wrapper in --rpc-only mode.
@@ -1308,9 +1314,9 @@ cfp_inventory_phase() {
     cfp_iv_wfirst=$cfp_iv_first
     cfp_inventory_check "$CFP_DIR/inventory.w.json" || { rm -f "$CFP_DIR/inventory.w.json"; cfp_stop INVENTORY "wrapper_inventory_$cfp_iv_why"; }
     rm -f "$CFP_DIR/inventory.w.json"
-    [ "$cfp_iv_wfirst" = "$cfp_iv_count $cfp_iv_shape" ] || cfp_stop INVENTORY wrapper_inventory_shape_differs
+    [ "$cfp_iv_wfirst" = "$cfp_iv_shape" ] || cfp_stop INVENTORY wrapper_inventory_shape_differs
     cfp_iv_salt=
-    cfr_out "MEASURE inventory measured devices=$cfp_iv_count protected_listed=0 penn_devices_listed=2 truncated=$cfp_iv_trunc bytes=$cfp_iv_bytes shape=$cfp_iv_shape reply_salted_sha256=$cfp_iv_hash elapsed_ms=$cfp_iv_ms wrapper_rpc_only=same_shape"
+    cfr_out "MEASURE inventory measured device_counts=$cfp_iv_counts protected_listed=0 penn_devices_listed=2 truncated=$cfp_iv_trunc bytes=$cfp_iv_bytes shape=$cfp_iv_shape reply_salted_sha256=$cfp_iv_hash elapsed_ms=$cfp_iv_ms wrapper_rpc_only=same_shape"
     cfr_ok INVENTORY
 }
 
@@ -1322,7 +1328,7 @@ cfp_audit_count() {
     else cfr_out 'MEASURE scope_audit unmeasured no_audit_lines_on_device'; fi
 }
 cfp_scope_remove_phase() {
-    cfp_sync SCOPE-REMOVE "$CFP_OP_UNENROL" "$(cfp_stage_json enroll "$((CFP_REV + 1))" '')" "$CFP_FLOOR"
+    cfp_sync SCOPE-REMOVE "$CFP_OP_UNENROL" "$(cfp_stage_json enroll "$CFP_REV_UNENROL" '')" "$CFP_FLOOR"
     CFP_RPC_ALLOW=$CFP_FLOOR
     CFP_KIDS_JSON="[\"$CFP_FLOOR\"]"
     CFP_PENN2_IP=
@@ -1396,7 +1402,7 @@ cfp_main() {
     if [ -n "$CFP_V2" ]; then
         for cfr_value in "$CFP_PHONE_IP" "$CFP_PHONE_MAC" "$CFP_PILOT_B" "$CFP_POLICY_PHONE" "$CFP_POLICY_MOVE" "$CFP_POLICY_BACK" \
             "$CFP_OP_PHONE" "$CFP_OP_MOVE" "$CFP_OP_MOVE_BACK" "$CFP_OP_BULK_PAUSE" "$CFP_OP_BULK_RESUME" "$CFP_OP_UNENROL" \
-            "$CFP_SCOPE_LEG_SECONDS" "$CFP_FAILED_BLOCK_ALL" "$CFP_SELF_ABORT_PCT" "$CFP_WORST_SCOPE_ADD_1" "$CFP_WORST_SCOPE_ADD_2" \
+            "$CFP_REV_BULK_PAUSE" "$CFP_REV_BULK_RESUME" "$CFP_REV_UNENROL" "$CFP_SCOPE_LEG_SECONDS" "$CFP_FAILED_BLOCK_ALL" "$CFP_SELF_ABORT_PCT" "$CFP_WORST_SCOPE_ADD_1" "$CFP_WORST_SCOPE_ADD_2" \
             "$CFP_WORST_MOVE" "$CFP_WORST_BULK" "$CFP_WORST_INVENTORY" "$CFP_WORST_SCOPE_REMOVE"; do
             [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
         done

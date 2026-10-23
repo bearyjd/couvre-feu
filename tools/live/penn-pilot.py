@@ -205,9 +205,9 @@ def phase_worst_seconds(timing, devices=1, scope=False, scope_target=False):
 
 def new_phase_worst_seconds(timing):
     """Worst case of the v2 phases (every cfctl call keeps the safe-band wait)."""
-    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS, COUNTERS_WORST_SECONDS,
-                                      READ_TIMEOUT_SECONDS, status_settle_worst_seconds(timing),
-                                      iteration_worst_seconds(timing), timing['resumeObserveSeconds'])
+    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS, READ_TIMEOUT_SECONDS,
+                                      status_settle_worst_seconds(timing), iteration_worst_seconds(timing),
+                                      timing['resumeObserveSeconds'], SAFE_BAND_WAIT_SECONDS)
 
 
 def worst_case_seconds(timing, devices=1, scope=False, scope_target=False):
@@ -449,7 +449,8 @@ def plan(config, env):
             stage['policySha256'] = hashlib.sha256(stage['policyJson'].encode()).hexdigest()
         details.update({'selfAbortPercent': V2.SELF_ABORT_PERCENT,
                         'selfAbortSeconds': V2.self_abort_seconds(config['remoteTimeoutSeconds']),
-                        'operationIds': dict(V2.OPERATION_IDS)})
+                        'operationIds': dict(V2.OPERATION_IDS),
+                        'derivedSyncs': V2.derived_syncs(config, pilot_policies(config))})
         details.update({'legs': scope_legs(config), 'pilotPolicies': stages,
                         'failedBlockAllWording': FAILED_BLOCK_ALL_WORDING,
                         'failedBlockAllWordingDecidedBy': FAILED_BLOCK_ALL_DECIDED_BY})
