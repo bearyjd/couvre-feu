@@ -48,6 +48,9 @@ PHONE = {'ip': '192.0.2.34', 'mac': '02:00:00:00:00:34'}
 V2_PHASES = ['PAYLOAD', 'IDENTITY', 'PREREQ', 'SNAPSHOT', 'BASELINE', 'INSTALL', 'ENROLL', 'SCOPE-ADD-1', 'SCOPE-ADD-2',
              'PAUSE', 'RESUME', 'MOVE', 'BULK', 'EXPIRY', 'DNS', 'INVENTORY', 'SCOPE-REMOVE', 'UNINSTALL', 'RESTORE',
              'CONNECTIVITY']
+# CT107 (infrastructure container): fictional, must be protected in every v2 config.
+CT107 = {'ip': '192.0.2.50', 'mac': '02:00:00:00:00:50'}
+STAGES = ['enroll', 'enroll_phone', 'move', 'move_back']
 NEW_PHASES = ['SCOPE-ADD-1', 'SCOPE-ADD-2', 'MOVE', 'BULK', 'INVENTORY', 'SCOPE-REMOVE']
 SHIPPED_TIMING = {'pauseSeconds': 180, 'pauseObserveSeconds': 60, 'resumeObserveSeconds': 20, 'expirySeconds': 120,
                   'expiryToleranceSeconds': 150, 'pollSeconds': 10, 'expiryPollSeconds': 5, 'statusSettleSeconds': 45}
@@ -813,7 +816,8 @@ class PilotPlanTests(PilotBase):
         self.assertEqual(self.tool.worst_case_seconds(shipped), 3318)
         self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3318)
         self.assertIn('CFP_RPC_ALLOW', payload)  # the template default, not a generated parameter
-        self.assertEqual(self.tool.load_config(self.write_config()), self.tool.FR.load_config(self.write_config()))
+        self.assertEqual(self.tool.load_config(self.write_config()),
+                         dict(self.tool.FR.load_config(self.write_config()), schemaVersion=1))
 
     def test_second_device_config_is_validated_before_ssh(self):
         roles = self.config['roles']
@@ -1056,8 +1060,9 @@ class PilotConfigV2Tests(PilotBase):
     """Config v2: Chromebook-only floor, phone as scope_target, pilot_b validator, phases, timing, plan fields."""
 
     def v2(self, roles=None, **changes):
-        roles = dict(self.config['roles'], scope_target=PHONE) if roles is None else roles
-        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 10800))
+        roles = dict(self.config['roles'], ct107=CT107, scope_target=PHONE) if roles is None else roles
+        changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8100))
 
     def v2_config(self, **changes):
         return self.tool.load_config(self.write_config(**self.v2(**changes)))
@@ -1095,11 +1100,12 @@ class PilotConfigV2Tests(PilotBase):
                (dict(PHONE, mac=MGMT['mac']), 'scope_target'), (dict(PHONE, mac=PENN['mac']), 'scope_target'),
                (dict(PHONE, mac=self.tool.SCOPE_TEST_MAC), 'scope_target'), (dict(PHONE, ip=PENN['ip']), 'scope_target'),
                (dict(PHONE, ip=HOST), 'scope_target'), (dict(PHONE, ip=MGMT['ip']), 'scope_target'),
+               (dict(PHONE, mac=CT107['mac']), 'scope_target'), (dict(PHONE, ip=CT107['ip']), 'scope_target'),
                (dict(PHONE, mac='03:00:00:00:00:34'), 'unicast'), (dict(PHONE, mac='02:00:00:00:00:3A'), 'canonical'),
                (dict(PHONE, name='x'), 'scope_target'), ({'ip': PHONE['ip']}, 'scope_target'), ('phone', 'scope_target')]
         for target, reason in bad:
             with self.subTest(target=target):
-                self.refused_before_ssh(self.write_config(**self.v2(roles=dict(roles, scope_target=target))), reason)
+                self.refused_before_ssh(self.write_config(**self.v2(roles=dict(roles, ct107=CT107, scope_target=target))), reason)
 
     def test_pilot_b_is_a_constant_never_from_config(self):
         self.assertEqual(self.tool.PILOT_B, 'pilot_b')
@@ -1119,7 +1125,7 @@ class PilotConfigV2Tests(PilotBase):
                                                       {'id': 'pilot_b', 'macs': [PENN['mac']]}])
         self.assertEqual([stage['revision'] for _, stage in policies], [1, 2, 3, 4])
         for stage, policy in policies:
-            self.assertIs(self.tool.assert_policy_pilot(policy, config, policy), policy)
+            self.assertIs(self.tool.assert_policy_pilot(policy, config, self.tool.expected_stage_policy(stage, config)), policy)
         good = by_stage['move']
 
         def mutated(change):
@@ -1142,11 +1148,22 @@ class PilotConfigV2Tests(PilotBase):
             'doh': mutated(lambda p: p.update(doh={'ipv4': ['192.0.2.53'], 'ipv6': []})),
             'extra field': mutated(lambda p: p.update(extra=1)),
             'not exactly the expected policy': mutated(lambda p: p.update(revision=9)),
+            # Type-strict emptiness: falsy is not empty (0 == False, '' and {} are falsy but not [] / the DoH shape).
+            **{f'{key} {value!r}': mutated(lambda p, key=key, value=value: p.update({key: value}))
+               for key in ('pauses', 'schedules', 'doh') for value in (0, '', {}, None, False)},
+            'bool revision': mutated(lambda p: p.update(revision=True)),
+            'float version': mutated(lambda p: p.update(version=1.0)),
+            # Non-string ids are a Refusal, never a TypeError.
+            **{f'id {value!r}': mutated(lambda p, value=value: p['people'][1].update(id=value))
+               for value in (['x'], {}, 5, None, True)},
+            'phone under pilot_b, chromebook missing': mutated(lambda p: p.update(
+                people=[{'id': 'pilot_b', 'macs': [PHONE['mac']]}])),
         }
+        independent_only = {'not exactly the expected policy', 'phone under pilot_b, chromebook missing'}
         for name, policy in cases.items():
             # Once against the good expected policy, once with the bad policy as its own expected value, so each
             # structural guard is exercised without the final equality check masking it.
-            for expected in ((good, policy) if name != 'not exactly the expected policy' else (good,)):
+            for expected in ((good, policy) if name not in independent_only else (good,)):
                 with self.subTest(name, expected='good' if expected is good else 'self'):
                     with self.assertRaises(self.tool.Refusal):
                         self.tool.assert_policy_pilot(policy, config, expected)
@@ -1160,6 +1177,13 @@ class PilotConfigV2Tests(PilotBase):
             policy['people'][0]['macs'] = [protected]
             with self.subTest(tampered=protected), self.assertRaises(self.tool.Refusal):
                 self.tool.assert_policy_pilot(policy, tampered, policy)
+            # ct107 is protected too, even if a tampered config left it out of the historical list.
+        tampered = copy.deepcopy(config)
+        tampered['roles']['scope_target']['mac'] = CT107['mac']
+        policy = copy.deepcopy(good)
+        policy['people'][0]['macs'] = [CT107['mac']]
+        with self.assertRaises(self.tool.Refusal):
+            self.tool.assert_policy_pilot(policy, tampered, policy)
         # The guard also holds when the expected policy itself is the bad one.
         with self.assertRaises(self.tool.Refusal):
             self.tool.assert_policy_pilot(cases['pilot_b overlapping penn'], config, cases['pilot_b overlapping penn'])
@@ -1202,10 +1226,6 @@ class PilotConfigV2Tests(PilotBase):
             self.assertGreater(v2[phase], 0)
         leg, call = self.tool.SCOPE_LEG_SECONDS, self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_ALLOWANCE_SECONDS
         self.assertEqual(leg, 60)
-        # a commit leg is budgeted: both legs of ADD-1 and the leg of ADD-2 / REMOVE fit in their phase
-        self.assertGreaterEqual(v2['SCOPE-ADD-1'], 2 * leg + 5 * call)
-        self.assertGreaterEqual(v2['SCOPE-ADD-2'], leg + 4 * call)
-        self.assertGreaterEqual(v2['SCOPE-REMOVE'], leg + 2 * call)
         self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True),
                          self.tool.worst_case_seconds(shipped) + sum(v2[phase] for phase in NEW_PHASES))
         details = self.plan_details(self.write_config(**self.v2()))
@@ -1227,6 +1247,10 @@ class PilotConfigV2Tests(PilotBase):
         self.assertTrue(config['host'].startswith('192.0.2.'))
         self.assertEqual(config['roles']['scope_target']['mac'], '02:00:00:00:00:34')
         self.assertGreaterEqual(config['remoteTimeoutSeconds'], worst)
+        # ... and within the v2 cap, minimum + 900 s, of the shape the example describes (no SCOPE phase).
+        self.assertLessEqual(config['remoteTimeoutSeconds'],
+                             self.tool.remote_timeout_limit(self.tool.worst_case_seconds(shipped, scope_target=True)))
+        self.assertEqual(config['protectedHistoricalMacs'].count(config['roles']['ct107']['mac']), 1)
 
     def test_remote_timeout_cap_is_explicit_per_schema(self):
         self.assertEqual(self.tool.V2_MAX_REMOTE_TIMEOUT_SECONDS, 10800)
@@ -1259,6 +1283,163 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual(set(phases), set(V2_PHASES))
         skipped = text.replace('PHASE MOVE OK\n', '')
         self.assertEqual(self.tool.classify(skipped, 0, False, tuple(V2_PHASES))[0], 'FAIL')
+
+
+    def policy_people(self, config, stage):
+        return self.tool.expected_stage_policy(stage, config)['people']
+
+    def test_expected_policy_is_built_per_stage_from_config_and_membership_is_exact(self):
+        config = self.v2_config()
+        chromebook, phone = PENN['mac'], PHONE['mac']
+        both = sorted([chromebook, phone])
+        self.assertEqual(self.policy_people(config, 'enroll'), [{'id': 'penn', 'macs': [chromebook]}])
+        self.assertEqual(self.policy_people(config, 'enroll_phone'), [{'id': 'penn', 'macs': both}])
+        self.assertEqual(self.policy_people(config, 'move'), [{'id': 'penn', 'macs': [phone]},
+                                                              {'id': 'pilot_b', 'macs': [chromebook]}])
+        self.assertEqual(self.policy_people(config, 'move_back'), [{'id': 'penn', 'macs': both}])
+        for stage in STAGES:
+            expected = self.tool.expected_stage_policy(stage, config)
+            self.assertEqual((expected['pauses'], expected['schedules'], expected['doh']), ([], [], {'ipv4': [], 'ipv6': []}))
+        with self.assertRaises(self.tool.Refusal):
+            self.tool.expected_stage_policy('nope', config)
+        wrong = {'enroll': [{'id': 'penn', 'macs': [phone]}],
+                 'enroll_phone': [{'id': 'penn', 'macs': [chromebook]}],
+                 'move': [{'id': 'pilot_b', 'macs': [phone]}],
+                 'move_back': [{'id': 'penn', 'macs': [phone]}, {'id': 'pilot_b', 'macs': [chromebook]}]}
+        for stage, people in wrong.items():
+            policy = dict(self.tool.expected_stage_policy(stage, config), people=people)
+            with self.subTest(stage), self.assertRaises(self.tool.Refusal):
+                self.tool.assert_policy_pilot(policy, config, self.tool.expected_stage_policy(stage, config))
+        # A stage-3 policy is not acceptable where stage 2 is expected, and vice versa.
+        with self.assertRaises(self.tool.Refusal):
+            self.tool.assert_policy_pilot(self.tool.expected_stage_policy('move', config), config,
+                                          self.tool.expected_stage_policy('enroll_phone', config))
+
+    def test_remote_timeout_is_capped_at_minimum_plus_slack(self):
+        self.assertEqual(self.tool.V2_TIMEOUT_SLACK_SECONDS, 900)
+        self.assertEqual(self.tool.remote_timeout_limit(5000), 5900)
+        self.assertEqual(self.tool.remote_timeout_limit(10000), self.tool.V2_MAX_REMOTE_TIMEOUT_SECONDS)
+        minimum = self.plan_details(self.write_config(**self.v2()))['minimumRemoteTimeoutSeconds']
+        limit = minimum + 900
+        details = self.plan_details(self.write_config(**self.v2(remoteTimeoutSeconds=limit)))
+        self.assertEqual(details['remoteTimeoutSeconds'], limit)
+        self.assertEqual(details['maximumRemoteTimeoutSeconds'], limit)
+        self.refused_before_ssh(self.write_config(**self.v2(remoteTimeoutSeconds=limit + 1)), 'at most')
+        self.refused_before_ssh(self.write_config(**self.v2(remoteTimeoutSeconds=10800)), 'minimumRemoteTimeoutSeconds')
+        code, _, err = self.invoke('plan', self.write_config(**self.v2(remoteTimeoutSeconds=limit + 1)))
+        self.assertIn(str(minimum), err)
+
+    def test_v2_disclosure_echoes_scope_target_timeouts_and_break_glass(self):
+        code, out, err = self.invoke('plan', self.write_config(**self.v2()))
+        self.assertEqual(code, 0, err)
+        minimum = self.plan_details(self.write_config(**self.v2()))['minimumRemoteTimeoutSeconds']
+        tail = out[out.rindex('}') + 1:]
+        self.assertIn(f'scope_target {PHONE["ip"]} {PHONE["mac"]}', tail)
+        self.assertIn(f'minimumRemoteTimeoutSeconds {minimum}', tail)
+        self.assertIn(f'maximumRemoteTimeoutSeconds {minimum + 900}', tail)
+        self.assertIn('break-glass', tail)
+        self.assertIn('manual password login on the router', tail)
+        self.assertIn('never disabled', tail)
+        # v1 prints none of it.
+        self.assertNotIn('break-glass', self.invoke('plan', self.write_config())[1])
+
+    def test_v2_protected_set_requires_ct107_adults_and_management(self):
+        roles = self.config['roles']
+        full = dict(roles, ct107=CT107, scope_target=PHONE)
+        self.refused_before_ssh(self.write_config(**self.v2(roles=dict(roles, scope_target=PHONE))), 'ct107')
+        self.refused_before_ssh(self.write_config(**self.v2(protectedHistoricalMacs=HISTORICAL)), 'ct107')
+        self.refused_before_ssh(self.write_config(roles=dict(roles, ct107=CT107)), 'schemaVersion 2')
+        for ct107, reason in ((dict(CT107, mac=MGMT['mac']), 'ct107'), (dict(CT107, mac=JD['mac']), 'ct107'),
+                              (dict(CT107, ip=HOST), 'ct107'), (dict(CT107, ip=MGMT['ip']), 'ct107'),
+                              (dict(CT107, mac='03:00:00:00:00:50'), 'unicast'), ({'ip': CT107['ip']}, 'ct107'), ('x', 'ct107')):
+            with self.subTest(ct107=ct107):
+                self.refused_before_ssh(self.write_config(**self.v2(roles=dict(full, ct107=ct107))), reason)
+        config = self.v2_config()
+        self.assertEqual(config['roles']['ct107'], CT107)
+        protected = self.tool.protected_macs(config)
+        self.assertLessEqual({MGMT['mac'], JD['mac'], CT107['mac'], *HISTORICAL}, protected)
+        self.assertNotIn(PHONE['mac'], protected)
+        self.assertEqual(self.plan_details(self.write_config(**self.v2()))['roles']['ct107'], CT107)
+
+    def test_v2_digest_binds_roles_protected_profile_and_commit_and_is_mandatory(self):
+        path = self.write_config(**self.v2())
+        details = self.plan_details(path)
+        other = copy.deepcopy(details['roles'])
+        other['scope_target']['ip'] = '192.0.2.35'
+        self.assertNotEqual(self.tool.plan_digest(dict(details, roles=other)), details['planSha256'])
+        for field, other in (('protectedHistoricalMacs', ['02:00:00:00:00:41']), ('platformProfile', 'gl-xe3000-4.8.3-logd-011-v1'),
+                             ('sourceCommit', '0' * 40)):
+            with self.subTest(field):
+                self.assertNotEqual(self.tool.plan_digest(dict(details, **{field: other})), details['planSha256'])
+        for field in ('legs', 'pilotPolicies', 'failedBlockAllWording', 'failedBlockAllWordingDecidedBy',
+                      'configSchemaVersion', 'roles', 'protectedHistoricalMacs', 'platformProfile', 'sourceCommit'):
+            partial = {key: value for key, value in details.items() if key != field}
+            with self.subTest(missing=field), self.assertRaises(self.tool.Refusal):
+                self.tool.plan_digest(partial)
+        # v1 keeps its field set: roles etc. are not bound outside v2.
+        v1 = self.plan_details(self.write_config())
+        self.assertEqual(self.tool.plan_digest(dict(v1, roles={}, sourceCommit='0' * 40)), v1['planSha256'])
+
+    def test_loaded_config_keeps_its_real_schema_version(self):
+        self.assertEqual(self.v2_config()['schemaVersion'], 2)
+        self.assertEqual(self.tool.load_config(self.write_config())['schemaVersion'], 1)
+        self.assertEqual(self.tool.config_schema_version(self.v2_config()), 2)
+
+    def test_rehearsal_validator_rejects_the_pilot_example_and_readme_documents_v2(self):
+        example = REPO / 'tools/live/config.pilot.example.json'
+        with self.assertRaises(self.tool.Refusal):
+            self.tool.FR.load_config(str(example))
+        self.tool.load_config(str(example))
+        self.assertIn('ct107', example.read_text())
+        readme = (REPO / 'tools/live/README.md').read_text()
+        for needle in ('schemaVersion` 2', 'scope_target', 'config.pilot.example.json', 'minimumRemoteTimeoutSeconds + 900',
+                       'break-glass', 'TODO(T3)', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'refuses v2 plans'):
+            with self.subTest(needle):
+                self.assertIn(needle, readme)
+
+    def test_penn_pilot_stays_under_the_file_size_cap_and_v2_pieces_live_in_a_sibling(self):
+        self.assertLessEqual(len((REPO / 'tools/live/penn-pilot.py').read_text().splitlines()), 800)
+        self.assertTrue((REPO / 'tools/live/penn_pilot_v2.py').is_file())
+        self.assertEqual(set(self.tool.NEW_PHASES), set(self.tool.new_phase_worst_seconds(self.tool.TIMING)))
+        self.assertEqual(self.tool.PHASES_V2, tuple(V2_PHASES))
+
+    def test_shipped_worst_case_timings_are_pinned_exactly(self):
+        shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
+        v2 = self.tool.phase_worst_seconds(shipped, scope=True, scope_target=True)
+        self.assertEqual(v2, {'ENROLL': 609, 'PAUSE': 465, 'RESUME': 345, 'EXPIRY': 847, 'DNS': 80, 'SCOPE': 165,
+                              'SCOPE-ADD-1': 822, 'SCOPE-ADD-2': 940, 'MOVE': 896, 'BULK': 806, 'INVENTORY': 468,
+                              'SCOPE-REMOVE': 589})
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3318)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 7839)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 8004)
+
+    def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
+        details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
+        phases = details['phases']
+        self.assertEqual(phases[phases.index('SCOPE'):phases.index('SCOPE') + 2], ['SCOPE', 'SCOPE-ADD-1'])
+        self.assertEqual(phases[phases.index('SCOPE') - 1], 'ENROLL')
+        self.assertEqual([phase for phase in phases if phase != 'SCOPE'], V2_PHASES)
+        self.assertEqual(details['minimumRemoteTimeoutSeconds'],
+                         self.tool.worst_case_seconds(self.tool.TIMING, scope=True, scope_target=True))
+        self.assertGreater(details['minimumRemoteTimeoutSeconds'],
+                           self.plan_details(self.write_config(**self.v2()))['minimumRemoteTimeoutSeconds'])
+        self.refused_before_ssh(self.write_config(**self.v2(scopeNegativeTest=True,
+                                                            remoteTimeoutSeconds=details['minimumRemoteTimeoutSeconds'] - 1)),
+                                'at least')
+
+    def test_classify_requires_v2_phase_order_and_no_duplicates(self):
+        expected = tuple(V2_PHASES)
+
+        def text(names):
+            return '\n'.join(['MUTATION_BEGIN'] + [f'PHASE {name} OK' for name in names] + [self.tool.PASS_LINE]) + '\n'
+        self.assertEqual(self.tool.classify(text(V2_PHASES), 0, False, expected)[0], 'PASS')
+        swapped = list(V2_PHASES)
+        i, j = swapped.index('MOVE'), swapped.index('BULK')
+        swapped[i], swapped[j] = swapped[j], swapped[i]
+        self.assertEqual(self.tool.classify(text(swapped), 0, False, expected)[0], 'FAIL')
+        doubled = V2_PHASES[:V2_PHASES.index('MOVE') + 1] + ['MOVE'] + V2_PHASES[V2_PHASES.index('MOVE') + 1:]
+        self.assertEqual(self.tool.classify(text(doubled), 0, False, expected)[0], 'FAIL')
+        self.assertEqual(self.tool.classify(text(V2_PHASES + ['SCOPE']), 0, False, expected)[0], 'FAIL')
 
 
 class PilotFixtureTests(PilotBase):
