@@ -89,6 +89,8 @@ Privacy: the evidence directory is committed to nobody, but it is still kept fre
 
 Fixture limits. The fixture cannot reach the shipped (stripped) wrappers' absolute `/usr/sbin/cfctl`, so the fixture-only `CFP_WRAPPER_DIR` (honoured only when the script runs under `CF_TEST_MODE`) points the wrapper positives at the repository's test-mode-capable wrappers; the stripped wrappers' positive paths are first measured live. The fixture's fake ssh runs the commit legs under a pty; that stand-in is test code, not the T4 driver.
 
+Deferred to T4 (the leg-2 driver). `penn-pilot.py` must: match stdout lines against `^CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})$` only and start each leg once per marker, with the plan's digest-bound argv (`legs`) and the base from the marker; type the last six hex digits of the scope target's MAC only after the exact prompt `Type the last 6 hex digits of the address (no colons) to confirm: `; allow `SCOPE_LEG_SECONDS` per leg, no retry; keep the leg output as evidence with the MAC masked; end any running leg before leg 1's teardown can race it (leg 1 stops with `scope_leg_timeout` after 60 s, but a leg can outlive a STOP for another reason); then set `LEG2_DRIVER_IMPLEMENTED`. Its tests must include a leg started without a marker and a prompt-text mismatch (both must be impossible), which cannot be tested here.
+
 The remote script is the filled `first-rehearsal.sh` with its final call removed, followed by `penn-pilot.sh`, which reuses every `cfr_*` helper. It runs these phases in order:
 
 | Phase | What happens |
