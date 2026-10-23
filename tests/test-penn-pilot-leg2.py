@@ -293,9 +293,11 @@ class DriverTests(DriverBase):
 
 
 class BindingTests(DriverBase):
-    def refused(self, details, sha=None):
-        with self.assertRaises(self.tool.Refusal):
-            self.drive([[0.1, 'x']], details=details, sha=sha)
+    def refused(self, details, sha=None, resigned=False):
+        # A re-signed plan is approved by its own digest: only the checks behind the digest can refuse it.
+        with self.assertRaises(self.tool.Refusal) as caught:
+            self.drive([[0.1, 'x']], details=details, sha=sha or details['planSha256'])
+        self.assertEqual('approved digest' in str(caught.exception), not resigned, str(caught.exception))
         self.assertEqual(self.ssh_calls(), [])
 
     def test_the_driver_refuses_a_plan_that_is_not_the_approved_digest(self):
@@ -352,15 +354,15 @@ class BindingTests(DriverBase):
                 details['sshArgv'] = [new if item == old else item for item in details['sshArgv']]
                 for leg in details['legs']:
                     leg['sshArgv'] = [new if item == old else item for item in leg['sshArgv']]
-                self.refused(self.resign(details))
+                self.refused(self.resign(details), resigned=True)
         details = json.loads(json.dumps(self.details))
         for argv in [details['sshArgv']] + [leg['sshArgv'] for leg in details['legs']]:
             argv[:] = [('UserKnownHostsFile=/dev/null' if item.startswith('UserKnownHostsFile=') else item) for item in argv]
-        self.refused(self.resign(details))
+        self.refused(self.resign(details), resigned=True)
         details = json.loads(json.dumps(self.details))
         for argv in [details['sshArgv']] + [leg['sshArgv'] for leg in details['legs']]:
             argv[5:5] = ['-o', 'StrictHostKeyChecking=no']
-        self.refused(self.resign(details))
+        self.refused(self.resign(details), resigned=True)
 
     def test_a_resigned_plan_with_a_foreign_command_or_mac_is_refused(self):
         for index, template in ((0, '/usr/sbin/cfctl scope-add {MAC} --base {BASE} && id'),
@@ -371,13 +373,13 @@ class BindingTests(DriverBase):
                 details = json.loads(json.dumps(self.details))
                 details['legs'][index]['commandTemplate'] = template
                 details['legs'][index]['sshArgv'][-1] = template
-                self.refused(self.resign(details))
+                self.refused(self.resign(details), resigned=True)
         details = json.loads(json.dumps(self.details))
         details['legs'][0]['scopeTargetMac'] = '02:00:00:00:00:99'
-        self.refused(self.resign(details))
+        self.refused(self.resign(details), resigned=True)
         details = json.loads(json.dumps(self.details))
         details['legs'][0]['retry'] = True
-        self.refused(self.resign(details))
+        self.refused(self.resign(details), resigned=True)
 
 
 class HygieneTests(DriverBase):
