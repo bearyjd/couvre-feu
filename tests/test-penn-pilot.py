@@ -706,11 +706,11 @@ class PilotPlanTests(PilotBase):
         # First attempt's neighbour read, the window, then one admitted attempt (neighbour read + call).
         self.assertEqual(tool.status_settle_worst_seconds(timing), 8 + 45 + 8 + call)
         phases = tool.phase_worst_seconds(timing)
-        self.assertEqual(phases['ENROLL'], 3 * call + tool.COUNTERS_WORST_SECONDS + 193)
+        self.assertEqual(phases['ENROLL'], 3 * call + tool.COUNTERS_WORST_SECONDS + 195)
         self.assertEqual({name: tool.worst_case_seconds(timing, devices, scope)
                           for name, devices, scope in (('one', 1, False), ('two', 2, False),
                                                        ('one_scope', 1, True), ('two_scope', 2, True))},
-                         {'one': 3633, 'two': 3765, 'one_scope': 3813, 'two_scope': 3945})
+                         {'one': 3651, 'two': 3785, 'one_scope': 3833, 'two_scope': 3967})
         self.assertLessEqual(tool.worst_case_seconds(timing, 2, True), tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
         self.assertEqual(SHIPPED_TIMING['statusSettleSeconds'], 45)
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()
@@ -735,7 +735,7 @@ class PilotPlanTests(PilotBase):
                     + tool.status_settle_worst_seconds(timing))
         self.assertEqual(tool.phase_worst_seconds(timing)['EXPIRY'], expected)
         # The shipped timing: with the pause extension, the ENROLL and post-expiry status settles and the KILL grace.
-        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3633)
+        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3651)
         details = self.plan_details(self.write_config())
         self.assertEqual(details['timing']['cfctlAllowanceSeconds'], 45)
         config = tool.FR.load_config(self.write_config())
@@ -869,8 +869,8 @@ class PilotPlanTests(PilotBase):
         for key in ('scopeNegativeTest', 'scopePolicyJson', 'scopePolicySha256', 'scopeTestMac'):
             self.assertNotIn(key, details)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 3633)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3633)
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3651)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3651)
         self.assertIn('CFP_RPC_ALLOW', payload)  # the template default, not a generated parameter
         self.assertEqual(self.tool.load_config(self.write_config()),
                          dict(self.tool.FR.load_config(self.write_config()), schemaVersion=1))
@@ -916,8 +916,8 @@ class PilotPlanTests(PilotBase):
         self.assertNotIn('CFP_SCOPE_TEST', params)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_CALL_SECONDS
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3633 + call)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3765)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3651 + call)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3785)
         self.assertEqual(int(params['CFP_WORST_ENROLL']),
                          self.tool.phase_worst_seconds(self.tool.TIMING)['ENROLL'] + call)
         config = self.tool.load_config(config_path)
@@ -933,9 +933,9 @@ class PilotPlanTests(PilotBase):
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_CALL_SECONDS
         scope_worst = call + 2 * self.tool.FIREWALL_STATE_WORST_SECONDS
         self.assertEqual(self.tool.FIREWALL_STATE_WORST_SECONDS, 3 * self.tool.READ_TIMEOUT_SECONDS)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3633 + scope_worst)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3813)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3945)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3651 + scope_worst)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3833)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3967)
         self.assertLessEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), self.tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
         disabled = self.plan_details(self.write_config(**self.two_devices(scopeNegativeTest=False)))
         self.assertEqual(disabled['phases'], list(self.tool.PHASES))
@@ -1118,7 +1118,7 @@ class PilotConfigV2Tests(PilotBase):
     def v2(self, roles=None, **changes):
         roles = dict(self.config['roles'], ct107=CT107, scope_target=PHONE) if roles is None else roles
         changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
-        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 10000))
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 10100))
 
     def v2_config(self, **changes):
         return self.tool.load_config(self.write_config(**self.v2(**changes)))
@@ -1157,7 +1157,7 @@ class PilotConfigV2Tests(PilotBase):
             del missing[field]
             with self.assertRaises(self.tool.Refusal):
                 self.tool.plan_digest(missing)
-        self.assertEqual(details['selfAbortSeconds'], 10000 * 70 // 100)
+        self.assertEqual(details['selfAbortSeconds'], details['remoteTimeoutSeconds'] * 70 // 100)
 
     def test_v1_behaviour_is_explicit(self):
         v1 = self.plan_details(self.write_config())
@@ -1544,12 +1544,12 @@ class PilotConfigV2Tests(PilotBase):
     def test_shipped_worst_case_timings_are_pinned_exactly(self):
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         v2 = self.tool.phase_worst_seconds(shipped, scope=True, scope_target=True)
-        self.assertEqual(v2, {'ENROLL': 669, 'PAUSE': 480, 'RESUME': 360, 'EXPIRY': 892, 'DNS': 80, 'SCOPE': 180,
-                              'SCOPE-ADD-1': 806, 'SCOPE-ADD-2': 1129, 'MOVE': 1562, 'BULK': 1606, 'INVENTORY': 538,
-                              'SCOPE-REMOVE': 997})
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 3633)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 10271)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 10451)
+        self.assertEqual(v2, {'ENROLL': 677, 'PAUSE': 482, 'RESUME': 362, 'EXPIRY': 898, 'DNS': 80, 'SCOPE': 182,
+                              'SCOPE-ADD-1': 814, 'SCOPE-ADD-2': 1143, 'MOVE': 1582, 'BULK': 1626, 'INVENTORY': 546,
+                              'SCOPE-REMOVE': 1009})
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3651)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 10371)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 10553)
 
     def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
         details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
@@ -3268,6 +3268,72 @@ class PilotHardeningT3cTests(PilotShellBase):
         self.assertNotIn('CHILD_COMPLETED', done.stdout)
         self.assertNotIn('UNREACHABLE', done.stdout)
 
+    def test_group_term_in_the_supervision_startup_window_cannot_remove_deadlines(self):
+        busybox = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')
+        if not Path(busybox).is_file():
+            self.skipTest('local BusyBox required')
+        source = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        function = re.search(r'^cfp_run\(\) \{\n.*?^\}', source, re.M | re.S).group()
+        ready = '\nwhile [ ! -e "$H/ready" ]; do sleep .01; done\n'
+        signal_now = '\nkill -TERM "-$$"\n'
+        # Deterministic scheduling: hold a background watchdog before its first trap and signal from the parent
+        # immediately after fork. A supervisor with no watcher fork receives the same signal before its poll loop.
+        if 'cfp_run_wd=$!' in function:
+            function = function.replace("trap '' HUP INT TERM", "sleep .2\n      trap '' HUP INT TERM", 1)
+            function = function.replace('CFP_RUN_LIVE=$cfp_run_pid', 'CFP_RUN_LIVE=$cfp_run_pid' + ready, 1)
+            function = function.replace('cfp_run_wd=$!', 'cfp_run_wd=$!' + signal_now, 1)
+        else:
+            function = function.replace('CFP_RUN_LIVE=$cfp_run_pid', 'CFP_RUN_LIVE=$cfp_run_pid' + ready + signal_now, 1)
+        child = ('#!/bin/sh\ntrap \'echo term > "$H/term"; exit 143\' TERM\n'
+                 'trap \'echo exit > "$H/exit"\' EXIT\necho ready > "$H/ready"\nsleep 4\necho CHILD_COMPLETED\n')
+        body = function + '\n' + self.signal_trap() + '\ncfp_cfctl status --json\necho UNREACHABLE\n'
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(body, allowance=1, grace=1, shell=f'{busybox} ash'),
+                               files={'cfctl.sh': child}, session=f'setsid {busybox} ash', timeout=12)
+        self.assertLess(time.monotonic() - begun, 3.5, 'startup signal removed the commit deadlines')
+        self.assertTrue((done.home / 'term').exists(), done.stdout + done.stderr)
+        self.assertTrue((done.home / 'exit').exists(), done.stdout + done.stderr)
+        self.assertEqual(self.stop_of(done), ['STOP SIGNAL interrupted'])
+        self.assertNotIn('CHILD_COMPLETED', done.stdout)
+        self.assertNotIn('UNREACHABLE', done.stdout)
+
+    def test_supervision_clock_failure_terms_then_bounds_cleanup_and_fails_closed(self):
+        child = ('#!/bin/sh\ntrap \'echo term > "$H/term"; exit 143\' TERM\n'
+                 'trap \'echo exit > "$H/exit"\' EXIT\necho ready > "$H/ready"\nsleep 4\n')
+        clock = ('n=0\ncfp_run_clock() { n=$((n+1)); if [ "$n" = 1 ]; then CFP_RUN_NOW_CS=0; return 0; fi; '
+                 'while [ ! -e "$H/ready" ]; do sleep .01; done; return 1; }\n')
+        interrupt = ('( trap \'\' HUP INT TERM; for tick in 1 2 3 4 5 6 7 8 9 10; do '
+                     '[ -e "$H/term" ] && break; sleep .03; done; '
+                     'if [ -e "$H/term" ]; then sleep .1; kill -TERM "-$$"; fi ) >/dev/null 2>&1 &\n')
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(clock + interrupt + 'cfp_cfctl status --json; echo "RC:$?"\n', allowance=10, grace=1),
+                               files={'cfctl.sh': child}, session='setsid sh', timeout=12)
+        self.assertLess(time.monotonic() - begun, 3.5, 'clock failure left an unbounded commit')
+        self.assertGreaterEqual(time.monotonic() - begun, 1, 'clock failure skipped the full cleanup grace')
+        self.assertTrue((done.home / 'term').exists(), 'clock failure did not try TERM cleanup')
+        self.assertTrue((done.home / 'exit').exists(), 'clock failure skipped lock cleanup')
+        self.assertNotIn('RC:0', done.stdout)
+        self.assertEqual(self.stop_of(done), ['STOP SIGNAL supervision_clock_unreadable'])
+
+    def test_clock_failure_after_term_preserves_exit_cleanup_without_a_second_term(self):
+        busybox = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')
+        if not Path(busybox).is_file():
+            self.skipTest('local BusyBox required')
+        child = ('#!/bin/sh\ntrap \'echo term >> "$H/terms"; exit 143\' TERM\n'
+                 'trap \'echo cleaning > "$H/cleaning"; sleep 2; echo cleaned > "$H/cleaned"\' EXIT\n'
+                 'sleep 30 &\nwait\n')
+        clock = ('n=0\ncfp_run_clock() { n=$((n+1)); case $n in '
+                 '1|2) CFP_RUN_NOW_CS=0;; 3) CFP_RUN_NOW_CS=100;; '
+                 '*) while [ ! -e "$H/cleaning" ]; do sleep .01; done; return 1;; esac; }\n')
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(clock + 'cfp_cfctl status --json\n', allowance=1, grace=3,
+                                               shell=f'{busybox} ash'), files={'cfctl.sh': child}, timeout=12,
+                               session=f'{busybox} ash')
+        self.assertEqual((done.home / 'terms').read_text().splitlines(), ['term'], 'clock failure delivered a second TERM')
+        self.assertTrue((done.home / 'cleaned').exists(), 'clock failure interrupted EXIT lock cleanup')
+        self.assertLess(time.monotonic() - begun, 6.5, 'fallback exceeded allowance + grace + polling slack')
+        self.assertEqual(self.stop_of(done), ['STOP SIGNAL supervision_clock_unreadable'])
+
     # --- M1 ---------------------------------------------------------------------------------------------------
 
     def test_a_term_during_a_cfctl_call_waits_for_the_child_before_stopping(self):
@@ -3466,11 +3532,11 @@ class PilotHardeningT3cTests(PilotShellBase):
     def test_the_teardown_reserve_covers_the_whole_worst_case_teardown(self):
         tool = self.tool
         fixed = (tool.LEG2_CANCEL_WAIT_SECONDS + tool.TEARDOWN_SAFE_BAND_WAIT_SECONDS + tool.UNINSTALL_ALLOWANCE_SECONDS
-                 + tool.KILL_GRACE_SECONDS)
-        self.assertEqual(fixed, 401)
+                 + tool.KILL_GRACE_SECONDS + tool.SUPERVISION_POLL_SLACK_SECONDS)
+        self.assertEqual(fixed, 403)
         success = fixed + tool.TEARDOWN_SNAPSHOT_READS_SECONDS + tool.TEARDOWN_CONNECTIVITY_READS_SECONDS
         failure = fixed + tool.TEARDOWN_SNAPSHOT_READS_SECONDS + tool.TEARDOWN_KERNEL_STATE_READS_SECONDS
-        self.assertEqual((success, failure), (449, 465))
+        self.assertEqual((success, failure), (451, 467))
         self.assertEqual(tool.TEARDOWN_RESERVE_SECONDS, 480)
         self.assertLessEqual(max(success, failure), tool.TEARDOWN_RESERVE_SECONDS)
         self.assertGreaterEqual(tool.UNINSTALL_ALLOWANCE_SECONDS, tool.INSTALL_ALLOWANCE_SECONDS)
@@ -3486,7 +3552,7 @@ class PilotHardeningT3cTests(PilotShellBase):
         tool = self.tool
         worst = tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING), 2, True)
         self.assertLessEqual(worst, tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
-        self.assertEqual(worst, 3945)
+        self.assertEqual(worst, 3967)
 
 
 if __name__ == '__main__':

@@ -8,7 +8,7 @@
   "authorizationPath": "/home/operator/private/couvre-feu/authorization-penn-pilot.txt",
   "deadlineUtc": "2026-01-01T12:00:00Z",
   "platformProfile": "gl-xe3000-4.8.3-os-trust-v1",
-  "remoteTimeoutSeconds": 10500,
+  "remoteTimeoutSeconds": 10700,
   "roles": {
     "management": {"ip": "192.0.2.10", "mac": "02:00:00:00:00:10"},
     "jd_adult": {"ip": "192.0.2.20", "mac": "02:00:00:00:00:20"},

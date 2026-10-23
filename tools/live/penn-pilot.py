@@ -127,10 +127,11 @@ HOST_PROBE = {'intervalSeconds': 15, 'samples': 3, 'timeoutSeconds': 2, 'dnsMarg
 SAFE_BAND_WAIT_SECONDS = 72
 V1_MAX_REMOTE_TIMEOUT_SECONDS = 4200
 # Each cfctl, wrapper and uninstall child gets TERM at its allowance (it releases its locks) and KILL only
-# KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), so one call's worst case is allowance + grace.
+# KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), plus up to one 1 s poll at each deadline.
 CFCTL_ALLOWANCE_SECONDS = 45
 KILL_GRACE_SECONDS = 15
-CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS
+SUPERVISION_POLL_SLACK_SECONDS = 2
+CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS + SUPERVISION_POLL_SLACK_SECONDS
 INSTALL_ALLOWANCE_SECONDS = 240
 # The uninstall is never given a shorter deadline than the install.
 UNINSTALL_ALLOWANCE_SECONDS = INSTALL_ALLOWANCE_SECONDS
@@ -144,8 +145,8 @@ TEARDOWN_SAFE_BAND_WAIT_SECONDS = 71
 TEARDOWN_SNAPSHOT_READS_SECONDS = 5 * 8
 TEARDOWN_CONNECTIVITY_READS_SECONDS = 8
 TEARDOWN_KERNEL_STATE_READS_SECONDS = 3 * 8
-# Teardown: leg-2 cancel wait 75 + one safe-band wait 71 + uninstall TERM allowance 240 + KILL grace 15 = 401 s, then
-# 449 s on success (+ snapshot 40 + connectivity 8) or 465 s on failure (+ snapshot 40 + kernel state 24).
+# Teardown: leg-2 cancel wait 75 + safe-band wait 71 + uninstall 240 + grace 15 + polling 2 = 403 s, then
+# 451 s on success (+ snapshot 40 + connectivity 8) or 467 s on failure (+ snapshot 40 + kernel state 24).
 TEARDOWN_RESERVE_SECONDS = 480
 # Router-side `timeout -s KILL` bound for each read-only iptables/ipset read.
 READ_TIMEOUT_SECONDS = 8
