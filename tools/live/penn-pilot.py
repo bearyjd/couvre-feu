@@ -22,8 +22,7 @@ add and remove, and `roles.ct107` {ip, mac} (its MAC also in protectedHistorical
 infrastructure container. v2 replaces `penn_child_2` (a v2 config that sets it is refused) and caps
 `remoteTimeoutSeconds` at min(10800, minimumRemoteTimeoutSeconds + 900). schemaVersion 1 configs are kept as
 the legacy shape: no `scope_target`, the old phases, a 4200 s cap (the rehearsal tool's 3600 s no longer covers two devices). The template implements every v2 phase;
-the SCOPE commit legs need a TTY and are started by the leg-2 pty driver (T4), so `execute` still refuses a v2
-plan (`LEG2_DRIVER_IMPLEMENTED`). v2 also makes the remote script begin its teardown at 70% of remoteTimeoutSeconds.
+the SCOPE commit legs need a TTY and are started by the leg-2 pty driver (penn_pilot_leg2.py). v2 also makes the remote script begin its teardown at 70% of remoteTimeoutSeconds.
 
 Exit codes: 0 PASS, 1 REFUSED before any router mutation, 2 STOPPED/FAIL/UNKNOWN
 after mutation possibly began.
@@ -73,6 +72,8 @@ def _load_sibling(name):
 FR = _load_rehearsal()
 V2 = _load_sibling('penn_pilot_v2')
 V2.bind(FR)
+LEG2 = _load_sibling('penn_pilot_leg2')
+LEG2.bind(FR, V2)
 Refusal = FR.Refusal
 EXIT_PASS, EXIT_REFUSED, EXIT_FAIL = FR.EXIT_PASS, FR.EXIT_REFUSED, FR.EXIT_FAIL
 REMOTE_PASS, REMOTE_REFUSED, REMOTE_FAIL = FR.REMOTE_PASS, FR.REMOTE_REFUSED, FR.REMOTE_FAIL
@@ -92,10 +93,9 @@ PHASES_V2, NEW_PHASES = V2.PHASES_V2, V2.NEW_PHASES
 # What penn-pilot.sh runs; execute refuses any plan with another phase.
 IMPLEMENTED_PHASES = PHASES + ('SCOPE',) + NEW_PHASES
 # The SCOPE-ADD/SCOPE-REMOVE phases print `CFP_LEG2_READY <leg> <base>` and then wait for a commit leg that needs a
-# TTY (cfctl reads a typed confirmation). The local pty driver that starts those legs is T4; until it exists a v2
-# run could only wait 60 s and stop, so execute refuses v2 plans. T4 removes this guard (the legs are already
-# digest-bound in the plan).
-LEG2_DRIVER_IMPLEMENTED = False
+# TTY (cfctl reads a typed confirmation). penn_pilot_leg2.py is the local pty driver that starts those legs from
+# the plan's digest-bound `legs`; execute runs a v2 plan through it.
+LEG2_DRIVER_IMPLEMENTED = True
 ALL_PHASES = PHASES_V2 + ('SCOPE',)
 PERSON, PILOT_B, SCOPE_TARGET_ROLE, SECOND_ROLE = V2.PERSON, V2.PILOT_B, V2.SCOPE_TARGET_ROLE, V2.SECOND_ROLE
 V2_MAX_REMOTE_TIMEOUT_SECONDS, V2_TIMEOUT_SLACK_SECONDS = V2.V2_MAX_REMOTE_TIMEOUT_SECONDS, V2.V2_TIMEOUT_SLACK_SECONDS
@@ -127,10 +127,11 @@ HOST_PROBE = {'intervalSeconds': 15, 'samples': 3, 'timeoutSeconds': 2, 'dnsMarg
 SAFE_BAND_WAIT_SECONDS = 72
 V1_MAX_REMOTE_TIMEOUT_SECONDS = 4200
 # Each cfctl, wrapper and uninstall child gets TERM at its allowance (it releases its locks) and KILL only
-# KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), so one call's worst case is allowance + grace.
+# KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), plus up to one 1 s poll at each deadline.
 CFCTL_ALLOWANCE_SECONDS = 45
 KILL_GRACE_SECONDS = 15
-CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS
+SUPERVISION_POLL_SLACK_SECONDS = 2
+CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS + SUPERVISION_POLL_SLACK_SECONDS
 INSTALL_ALLOWANCE_SECONDS = 240
 # The uninstall is never given a shorter deadline than the install.
 UNINSTALL_ALLOWANCE_SECONDS = INSTALL_ALLOWANCE_SECONDS
@@ -144,8 +145,8 @@ TEARDOWN_SAFE_BAND_WAIT_SECONDS = 71
 TEARDOWN_SNAPSHOT_READS_SECONDS = 5 * 8
 TEARDOWN_CONNECTIVITY_READS_SECONDS = 8
 TEARDOWN_KERNEL_STATE_READS_SECONDS = 3 * 8
-# Teardown: leg-2 cancel wait 75 + one safe-band wait 71 + uninstall TERM allowance 240 + KILL grace 15 = 401 s, then
-# 449 s on success (+ snapshot 40 + connectivity 8) or 465 s on failure (+ snapshot 40 + kernel state 24).
+# Teardown: leg-2 cancel wait 75 + safe-band wait 71 + uninstall 240 + grace 15 + polling 2 = 403 s, then
+# 451 s on success (+ snapshot 40 + connectivity 8) or 467 s on failure (+ snapshot 40 + kernel state 24).
 TEARDOWN_RESERVE_SECONDS = 480
 # Router-side `timeout -s KILL` bound for each read-only iptables/ipset read.
 READ_TIMEOUT_SECONDS = 8
@@ -480,7 +481,7 @@ def plan(config, env):
                         'selfAbortSeconds': V2.self_abort_seconds(config['remoteTimeoutSeconds']),
                         'operationIds': dict(V2.OPERATION_IDS),
                         'derivedSyncs': V2.derived_syncs(config, pilot_policies(config))})
-        details.update({'legs': scope_legs(config), 'pilotPolicies': stages,
+        details.update({'legs': scope_legs(config, argv), 'pilotPolicies': stages,
                         'failedBlockAllWording': FAILED_BLOCK_ALL_WORDING,
                         'failedBlockAllWordingDecidedBy': FAILED_BLOCK_ALL_DECIDED_BY})
     details['planSha256'] = plan_digest(details)
@@ -548,6 +549,7 @@ class HostProbes:
 
     def start(self):
         def loop():
+            LEG2.block_signals()  # the run's SIGTERM/SIGHUP/SIGINT handling belongs to the main thread alone
             while not self.stop_event.wait(HOST_PROBE['intervalSeconds']):
                 self.sample('during')
         self.thread = threading.Thread(target=loop, daemon=True)
@@ -649,12 +651,11 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
     missing = [phase for phase in pilot_phases(config) if phase not in IMPLEMENTED_PHASES]
     if missing:
         raise Refusal('phases not implemented by the pilot template yet: ' + ', '.join(missing))
-    if scope_target_enabled(config) and not LEG2_DRIVER_IMPLEMENTED:
-        raise Refusal('leg-2 pty driver absent (T4): the SCOPE commit legs would never start; the legs are '
-                      'digest-bound in the plan, only the driver is missing')
     details, payload = plan(config, env)
     if not hmac.compare_digest(details['planSha256'], expected_plan_sha):
         raise Refusal(f'plan sha256 {details["planSha256"]} differs from the disclosed value')
+    # v2: the leg-2 driver re-checks the digest and every leg argv before anything is sent.
+    driver = LEG2.Driver(details, expected_plan_sha, plan_digest) if details.get('legs') else None
     FR.check_deadline(config, now_fn())
     details['authorizationSha256'] = FR.regular_file_sha256(config['authorizationPath'], 'authorizationPath')
     FR.check_agent(config, env)
@@ -678,8 +679,13 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
         probes.collect('before')
         probes.start()
         try:
-            remote_exit, timed_out = FR.run_ssh(details['sshArgv'], payload, env, stdout_fd, stderr_fd,
-                                                details['localTimeoutSeconds'])
+            if driver:
+                remote_exit, timed_out, leg_report = driver.run(payload, env, stdout_fd, stderr_fd,
+                                                                Path(directory, 'stdout.log'), details['localTimeoutSeconds'])
+            else:
+                remote_exit, timed_out = FR.run_ssh(details['sshArgv'], payload, env, stdout_fd, stderr_fd,
+                                                    details['localTimeoutSeconds'])
+                leg_report = None
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
@@ -695,12 +701,16 @@ def execute(config, expected_plan_sha, env, now_fn, probe):
         measured = measurements(stdout_text.splitlines())
         FR.write_evidence(directory, 'exit-code.txt', f'{remote_exit}\n')
         FR.write_evidence(directory, 'host-probes.json', json.dumps(probes.samples, indent=2) + '\n')
+        if leg_report is not None:
+            FR.write_evidence(directory, 'legs.json', json.dumps(leg_report, indent=2, sort_keys=True) + '\n')
         summary = {'outcome': outcome, 'exitCode': code, 'remoteExit': remote_exit, 'timedOut': timed_out,
                    'reasons': reasons, 'phases': phases, 'measurements': measured, 'hostProbes': host,
                    'pauseRulesKernelTimeBound': False, 'payloadSha256': details['payloadSha256'],
                    'planSha256': details['planSha256'], 'sourceCommit': details['sourceCommit'],
                    'startedUtc': started.strftime('%Y-%m-%dT%H:%M:%SZ'),
                    'finishedUtc': now_fn().strftime('%Y-%m-%dT%H:%M:%SZ')}
+        if leg_report is not None:
+            summary['legs'] = leg_report  # a v1 run has no legs: its summary keeps the v1 key set
         FR.write_evidence(directory, 'summary.json', json.dumps(summary, indent=2, sort_keys=True) + '\n')
         for line in FR.console_lines(directory, stdout_text, PRINTED):
             print(line)

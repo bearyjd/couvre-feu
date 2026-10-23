@@ -7,6 +7,7 @@ Everything here is pure: configuration validation, the v2 policy validator and i
 expectation, the Leg-2 commit command table, the v2 phase worst cases and the digest/disclosure rules."""
 import json
 import re
+import shlex
 from typing import Any
 
 
@@ -62,6 +63,8 @@ V2_MAX_REMOTE_TIMEOUT_SECONDS = 10800
 V2_TIMEOUT_SLACK_SECONDS = 900
 # Leg 2 (local pty driver): hard timeout of each commit leg, no retry.
 SCOPE_LEG_SECONDS = 60
+# Router-side: TERM (cfctl's traps release the platform lock) at the leg's seconds, KILL backstop this much later.
+SCOPE_LEG_KILL_GRACE_SECONDS = 15
 SCOPE_LEGS = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
               ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove'))
 POLICY_KEYS = {'version', 'revision', 'people', 'pauses', 'schedules', 'doh'}
@@ -228,14 +231,54 @@ def pilot_policies(config, base, candidates=candidate_policies):
             for name, policy in candidates(config, base)]
 
 
-def scope_legs(config):
-    """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values."""
+LEG_SUPERVISOR = '''seconds=$1; grace=$2; shift 2
+exec 3<&0
+trap '' HUP INT TERM
+( trap - HUP INT TERM; exec setsid "$@" ) <&3 3<&- &
+p=$!
+exec 3<&-
+( n=0
+  while kill -0 "$p" 2>/dev/null; do
+    sleep 1
+    kill -0 "$p" 2>/dev/null || break
+    n=$((n+1))
+    if [ "$n" -eq "$seconds" ]; then
+      kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+    fi
+    if [ "$n" -ge "$((seconds+grace))" ]; then
+      kill -KILL "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null
+      break
+    fi
+  done ) </dev/null >/dev/null 2>&1 &
+w=$!
+wait "$p" 2>/dev/null; rc=$?
+# The watchdog inherits ignored TERM; join its at-most-one-second sleep instead of leaking it.
+wait "$w" 2>/dev/null
+kill -KILL "-$p" 2>/dev/null
+exit "$rc"
+'''
+
+
+def remote_leg_command(form, op, seconds, grace=SCOPE_LEG_KILL_GRACE_SECONDS):
+    """Fixed supervisor plus positional argv: no config value becomes shell syntax. The baseline requires setsid
+    to exec without forking. Preserve the tty on fd 0; signal the entire child group, including a foreground sync
+    that would defer ash's TERM trap. Ignore disconnect signals in the supervisor so its watchdog survives ssh."""
+    inner = f'{op} {{MAC}} --base {{BASE}}'
+    command = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
+               else f"env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
+    return f'/bin/sh -c {shlex.quote(LEG_SUPERVISOR)} pilot-leg {seconds} {grace} {command}'
+
+
+def scope_legs(config, ssh_argv):
+    """Leg-2 commands use a fixed process-group supervisor, TERM at the allowance then KILL after the grace. Each binds its whole ssh
+    argv: the leg-1 argv with `-e none -tt` for `-T` (no ssh escape character on the pty) and the template last."""
+    if len(ssh_argv) < 4 or ssh_argv[-3] != '-T':
+        raise Refusal('leg-1 ssh argv has no -T to turn into -tt')
     legs = []
     for leg, form, op in SCOPE_LEGS:
-        inner = f'{op} {{MAC}} --base {{BASE}}'
-        template = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
-                    else f"env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
-        legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template, 'pty': True,
+        template = remote_leg_command(form, op, SCOPE_LEG_SECONDS, SCOPE_LEG_KILL_GRACE_SECONDS)
+        legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template,
+                     'sshArgv': ssh_argv[:-3] + ['-e', 'none', '-tt', ssh_argv[-2], template], 'pty': True,
                      'timeoutSeconds': SCOPE_LEG_SECONDS, 'retry': False, 'confirmation': 'last6hex',
                      'scopeTargetMac': config['roles'][SCOPE_TARGET_ROLE]['mac']})
     return legs
@@ -330,7 +373,10 @@ def digest_fields(details):
 def disclosure_lines(details):
     """Operator-facing lines printed after a v2 plan: owner confirmation, timeout bounds, break-glass recovery."""
     target = details['roles'][SCOPE_TARGET_ROLE]
-    return [
+    legs = [f'LEG {leg["leg"]} (pty, {leg["timeoutSeconds"]} s, no retry, confirmation = last 6 hex digits of the scope '
+            f'target MAC): {shlex.join(leg["sshArgv"]).replace("{MAC}", "<MAC>").replace("{BASE}", "<BASE>")}'
+            for leg in details['legs']]
+    return legs + [
         f'OWNER CONFIRMATION: scope_target {target["ip"]} {target["mac"]} is the only device added to and removed from '
         "Penn's scope. Confirm Penn owns it; it must not be an adult, management, CT107 or admin device.",
         f'minimumRemoteTimeoutSeconds {details["minimumRemoteTimeoutSeconds"]}; '

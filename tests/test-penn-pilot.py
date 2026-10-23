@@ -69,6 +69,9 @@ FAST_TIMING = {'pauseSeconds': 90, 'pauseObserveSeconds': 2, 'resumeObserveSecon
 FAKE_SSH = r'''
 import json, os, pty, re, select, shlex, signal, subprocess, sys, threading, time
 spec = json.load(open(os.environ['FAKE_SSH_SPEC']))
+if '-tt' in sys.argv:
+    # A commit leg started by the T4 driver: tests/fake-leg-ssh.py plays ssh -tt (it logs its own argv).
+    os.execv(sys.executable, [sys.executable, '-B', spec['leg_helper']] + sys.argv[1:])
 with open(spec['log'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\n')
 payload = sys.stdin.buffer.read()
@@ -83,53 +86,10 @@ def cron(until):
         time.sleep(0.2)
     subprocess.run(shell + [spec['cfctl'], 'expire'], env=env, stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-MARKER = re.compile(r'^CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})$')
-def run_leg(leg, base):
-    # Test stand-in for the T4 pty driver: one leg under a pty, the confirmation typed only after the exact prompt.
-    cfg = spec['leg2']
-    if leg in cfg.get('skip', []):
-        return
-    mac = cfg['phone']
-    digits = '000000' if leg in cfg.get('wrong_digits', []) else mac.replace(':', '')[-6:]
-    op = 'scope-add' if leg in ('2a', '2c') else 'scope-remove'
-    leg_env = dict(env)
-    leg_env.pop('SSH_ORIGINAL_COMMAND', None)
-    if leg in ('2a', '2b'):
-        argv = shell + [spec['cfctl'], op, mac, '--base', base]
-    else:
-        leg_env['SSH_ORIGINAL_COMMAND'] = 'cfctl %s %s --base %s' % (op, mac, base)
-        argv = shell + [cfg['wrapper_scope'], 'pilot']
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.execvpe(argv[0], argv, leg_env)
-    out, sent, deadline = b'', False, time.time() + 60
-    while time.time() < deadline:
-        ready, _, _ = select.select([fd], [], [], 1)
-        if ready:
-            try:
-                chunk = os.read(fd, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            out += chunk
-            if not sent and b'to confirm: ' in out:
-                os.write(fd, (digits + '\n').encode())
-                sent = True
-    try:
-        _, status = os.waitpid(pid, 0)
-    except ChildProcessError:
-        status = 0
-    result = out.decode(errors='replace').replace(mac, '<mac>').strip().splitlines()
-    with open(cfg['log'], 'a') as handle:
-        handle.write(json.dumps({'leg': leg, 'exit': os.waitstatus_to_exitcode(status), 'last': result[-1] if result else ''}) + '\n')
 for line in child.stdout:
     sys.stdout.buffer.write(line)
     sys.stdout.flush()
     text = line.decode().rstrip('\n')
-    leg_match = MARKER.match(text)
-    if leg_match and spec.get('leg2'):
-        threading.Thread(target=run_leg, args=leg_match.groups(), daemon=True).start()
     for prefix, path in spec.get('touch_on', {}).items():
         if text.startswith(prefix):
             if isinstance(path, list):
@@ -746,11 +706,11 @@ class PilotPlanTests(PilotBase):
         # First attempt's neighbour read, the window, then one admitted attempt (neighbour read + call).
         self.assertEqual(tool.status_settle_worst_seconds(timing), 8 + 45 + 8 + call)
         phases = tool.phase_worst_seconds(timing)
-        self.assertEqual(phases['ENROLL'], 3 * call + tool.COUNTERS_WORST_SECONDS + 193)
+        self.assertEqual(phases['ENROLL'], 3 * call + tool.COUNTERS_WORST_SECONDS + 195)
         self.assertEqual({name: tool.worst_case_seconds(timing, devices, scope)
                           for name, devices, scope in (('one', 1, False), ('two', 2, False),
                                                        ('one_scope', 1, True), ('two_scope', 2, True))},
-                         {'one': 3633, 'two': 3765, 'one_scope': 3813, 'two_scope': 3945})
+                         {'one': 3651, 'two': 3785, 'one_scope': 3833, 'two_scope': 3967})
         self.assertLessEqual(tool.worst_case_seconds(timing, 2, True), tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
         self.assertEqual(SHIPPED_TIMING['statusSettleSeconds'], 45)
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()
@@ -775,7 +735,7 @@ class PilotPlanTests(PilotBase):
                     + tool.status_settle_worst_seconds(timing))
         self.assertEqual(tool.phase_worst_seconds(timing)['EXPIRY'], expected)
         # The shipped timing: with the pause extension, the ENROLL and post-expiry status settles and the KILL grace.
-        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3633)
+        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3651)
         details = self.plan_details(self.write_config())
         self.assertEqual(details['timing']['cfctlAllowanceSeconds'], 45)
         config = tool.FR.load_config(self.write_config())
@@ -909,8 +869,8 @@ class PilotPlanTests(PilotBase):
         for key in ('scopeNegativeTest', 'scopePolicyJson', 'scopePolicySha256', 'scopeTestMac'):
             self.assertNotIn(key, details)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 3633)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3633)
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3651)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3651)
         self.assertIn('CFP_RPC_ALLOW', payload)  # the template default, not a generated parameter
         self.assertEqual(self.tool.load_config(self.write_config()),
                          dict(self.tool.FR.load_config(self.write_config()), schemaVersion=1))
@@ -956,8 +916,8 @@ class PilotPlanTests(PilotBase):
         self.assertNotIn('CFP_SCOPE_TEST', params)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_CALL_SECONDS
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3633 + call)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3765)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3651 + call)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3785)
         self.assertEqual(int(params['CFP_WORST_ENROLL']),
                          self.tool.phase_worst_seconds(self.tool.TIMING)['ENROLL'] + call)
         config = self.tool.load_config(config_path)
@@ -973,9 +933,9 @@ class PilotPlanTests(PilotBase):
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_CALL_SECONDS
         scope_worst = call + 2 * self.tool.FIREWALL_STATE_WORST_SECONDS
         self.assertEqual(self.tool.FIREWALL_STATE_WORST_SECONDS, 3 * self.tool.READ_TIMEOUT_SECONDS)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3633 + scope_worst)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3813)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3945)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3651 + scope_worst)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3833)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3967)
         self.assertLessEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), self.tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
         disabled = self.plan_details(self.write_config(**self.two_devices(scopeNegativeTest=False)))
         self.assertEqual(disabled['phases'], list(self.tool.PHASES))
@@ -1158,7 +1118,7 @@ class PilotConfigV2Tests(PilotBase):
     def v2(self, roles=None, **changes):
         roles = dict(self.config['roles'], ct107=CT107, scope_target=PHONE) if roles is None else roles
         changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
-        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 10000))
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 10100))
 
     def v2_config(self, **changes):
         return self.tool.load_config(self.write_config(**self.v2(**changes)))
@@ -1197,7 +1157,7 @@ class PilotConfigV2Tests(PilotBase):
             del missing[field]
             with self.assertRaises(self.tool.Refusal):
                 self.tool.plan_digest(missing)
-        self.assertEqual(details['selfAbortSeconds'], 10000 * 70 // 100)
+        self.assertEqual(details['selfAbortSeconds'], details['remoteTimeoutSeconds'] * 70 // 100)
 
     def test_v1_behaviour_is_explicit(self):
         v1 = self.plan_details(self.write_config())
@@ -1343,12 +1303,20 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual([(leg['leg'], leg['form'], leg['op']) for leg in legs],
                          [('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
                           ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove')])
-        self.assertEqual(legs[0]['commandTemplate'], '/usr/sbin/cfctl scope-add {MAC} --base {BASE}')
-        self.assertEqual(legs[1]['commandTemplate'], '/usr/sbin/cfctl scope-remove {MAC} --base {BASE}')
-        self.assertEqual(legs[2]['commandTemplate'],
-                         "env SSH_ORIGINAL_COMMAND='cfctl scope-add {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
-        self.assertEqual(legs[3]['commandTemplate'],
-                         "env SSH_ORIGINAL_COMMAND='cfctl scope-remove {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
+        for leg in legs:
+            argv = shlex.split(leg['commandTemplate'])
+            self.assertEqual(argv[:2], ['/bin/sh', '-c'])
+            self.assertEqual(argv[3:6], ['pilot-leg', '60', '15'])
+            self.assertIn('kill -TERM "-$p"', argv[2])
+            self.assertIn('kill -KILL "-$p"', argv[2])
+            if leg['form'] == 'cfctl':
+                self.assertEqual(argv[6:], ['/usr/sbin/cfctl', leg['op'], '{MAC}', '--base', '{BASE}'])
+            else:
+                self.assertEqual(argv[6:], ['env', f'SSH_ORIGINAL_COMMAND=cfctl {leg["op"]} {{MAC}} --base {{BASE}}',
+                                           '/usr/sbin/cfctl-scope', 'pilot'])
+        base = details['sshArgv']
+        for leg in legs:  # the leg-1 argv with `-e none -tt` for `-T`: no ssh escape character on the pty
+            self.assertEqual(leg['sshArgv'], base[:-3] + ['-e', 'none', '-tt', base[-2], leg['commandTemplate']])
         for leg in legs:
             self.assertEqual((leg['pty'], leg['timeoutSeconds'], leg['retry'], leg['confirmation']),
                              (True, 60, False, 'last6hex'))
@@ -1424,17 +1392,17 @@ class PilotConfigV2Tests(PilotBase):
         v1, _ = self.parameters(self.write_config())
         self.assertEqual(list(v1), SINGLE_PARAMETER_KEYS)
 
-    def test_execute_refuses_v2_until_the_leg2_driver_exists_and_never_for_a_missing_phase(self):
+    def test_execute_runs_v2_through_the_leg2_driver_and_never_for_a_missing_phase(self):
         config = self.write_config(**self.v2())
         sha = self.plan_details(config)['planSha256']
         # The template implements every v2 phase ...
         self.assertEqual(self.tool.IMPLEMENTED_PHASES, self.tool.PHASES + ('SCOPE',) + self.tool.NEW_PHASES)
         self.assertEqual(set(self.tool.pilot_phases(self.tool.load_config(config))) - set(self.tool.IMPLEMENTED_PHASES), set())
-        # ... but the TTY commit legs have no driver yet (T4): a v2 run could only wait and stop.
-        self.assertIs(self.tool.LEG2_DRIVER_IMPLEMENTED, False)
-        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
+        # ... and the TTY commit legs have their driver (T4): a plan whose digest is not the approved one starts nothing.
+        self.assertIs(self.tool.LEG2_DRIVER_IMPLEMENTED, True)
+        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', '0' * 64)
         self.assertEqual(code, 1)
-        self.assertIn('leg-2 pty driver absent (T4)', err)
+        self.assertIn('differs from the disclosed value', err)
         self.assertNotIn('not implemented', err)
         self.assertFalse(self.ssh_log.exists())
         # A phase the template lacks is still refused first.
@@ -1561,7 +1529,7 @@ class PilotConfigV2Tests(PilotBase):
         self.assertIn('ct107', example.read_text())
         readme = (REPO / 'tools/live/README.md').read_text()
         for needle in ('schemaVersion` 2', 'scope_target', 'config.pilot.example.json', 'minimumRemoteTimeoutSeconds + 900',
-                       'break-glass', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'leg-2 pty driver absent (T4)', 'CFP_LEG2_READY',
+                       'break-glass', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'penn_pilot_leg2.py', 'CFP_LEG2_READY',
                        'remote_self_abort', 'teardown_proof', 'block_all_unchanged', 'CFP_WRAPPER_DIR'):
             with self.subTest(needle):
                 self.assertIn(needle, readme)
@@ -1576,12 +1544,12 @@ class PilotConfigV2Tests(PilotBase):
     def test_shipped_worst_case_timings_are_pinned_exactly(self):
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         v2 = self.tool.phase_worst_seconds(shipped, scope=True, scope_target=True)
-        self.assertEqual(v2, {'ENROLL': 669, 'PAUSE': 480, 'RESUME': 360, 'EXPIRY': 892, 'DNS': 80, 'SCOPE': 180,
-                              'SCOPE-ADD-1': 806, 'SCOPE-ADD-2': 1129, 'MOVE': 1562, 'BULK': 1606, 'INVENTORY': 538,
-                              'SCOPE-REMOVE': 997})
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 3633)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 10271)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 10451)
+        self.assertEqual(v2, {'ENROLL': 677, 'PAUSE': 482, 'RESUME': 362, 'EXPIRY': 898, 'DNS': 80, 'SCOPE': 182,
+                              'SCOPE-ADD-1': 814, 'SCOPE-ADD-2': 1143, 'MOVE': 1582, 'BULK': 1626, 'INVENTORY': 546,
+                              'SCOPE-REMOVE': 1009})
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3651)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 10371)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 10553)
 
     def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
         details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
@@ -1630,6 +1598,8 @@ class PilotFixtureTests(PilotBase):
         self.assertTrue(any(f'"observed":{{"kids":["{PENN["mac"]}"],"paused":[]}}' in line for line in stdout))
         summary = json.loads((self.evidence() / 'summary.json').read_text())
         self.assertEqual(summary['outcome'], 'PASS')
+        self.assertNotIn('legs', summary)  # v1 has no leg-2 driver: its summary keeps the v1 key set
+        self.assertFalse((self.evidence() / 'legs.json').exists())
         measured = summary['measurements']
         self.assertEqual(measured['packet_blocking']['label'], 'measured')
         self.assertRegex(measured['packet_blocking']['detail'], r'reject_delta=14 ')  # +7 per family
@@ -2939,14 +2909,12 @@ cfp_teardown
 
 
 class PilotV2FixtureTests(PilotShellBase):
-    """End to end against the fixture router, schema v2. The fake ssh stands in for the T4 pty driver: it runs each
-    commit leg under a pty when it sees a valid marker. Slow (every phase installs, syncs and uninstalls)."""
+    """End to end against the fixture router, schema v2. The real T4 driver starts each commit leg when it sees a valid
+    marker; tests/fake-leg-ssh.py plays `ssh -tt` (own pty, the repository's cfctl). Slow (every phase installs, syncs
+    and uninstalls)."""
 
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.object(self.tool, 'LEG2_DRIVER_IMPLEMENTED', True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         leg_patch = mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 15)
         leg_patch.start()
         self.addCleanup(leg_patch.stop)
@@ -2970,7 +2938,8 @@ class PilotV2FixtureTests(PilotShellBase):
         target.chmod(0o700)
         self.leg_log = self.work / 'legs.jsonl'
         self.spec['env'].update(CFP_WRAPPER_DIR=str(REPO / 'router'))
-        self.spec['leg2'] = {'phone': PHONE['mac'], 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['leg2'] = {'mode': 'fixture', 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['leg_helper'] = str(REPO / 'tests/fake-leg-ssh.py')
         self.spec['cfctl'] = str(self.root / 'usr/sbin/cfctl')
 
     def run_v2(self, **changes):
@@ -3002,9 +2971,12 @@ class PilotV2FixtureTests(PilotShellBase):
         phases = [line.split()[1] for line in stdout if line.startswith('PHASE ') and line.endswith(' OK')]
         self.assertEqual(phases, V2_PHASES)
         # Four commit legs ran under a pty, none refused; each marker is a strict line printed once.
-        legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
-        self.assertEqual(sorted(leg['leg'] for leg in legs), ['2a', '2b', '2c', '2d'])
-        self.assertTrue(all(leg['exit'] == 0 and '"ok":true' in leg['last'] for leg in legs), legs)
+        legs = json.loads((self.evidence() / 'legs.json').read_text())['legs']
+        self.assertEqual([leg['leg'] for leg in legs], ['2a', '2b', '2c', '2d'])
+        self.assertTrue(all((leg['outcome'], leg['exit'], leg['ok'], leg['confirmationSent']) == ('exited', 0, True, True)
+                            for leg in legs), legs)
+        ssh_calls = [json.loads(line) for line in self.ssh_log.read_text().splitlines()]
+        self.assertEqual([('-T' in call, '-tt' in call) for call in ssh_calls], [(True, False)] + [(False, True)] * 4)
         self.assertFalse([line for line in stdout if line.startswith('CFP_LEG2_CANCEL')])
         markers = [line for line in stdout if line.startswith('CFP_LEG2_READY')]
         self.assertEqual([m.split()[1] for m in markers], ['2a', '2b', '2c', '2d'])
@@ -3024,15 +2996,17 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assertIn('scope_candidates=0', measured['teardown_proof']['detail'])
         self.assertEqual(self.stage_leftovers, [])
         self.assert_no_leaks()
-        self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
+        self.assertEqual(summary['legs']['legs'], legs)
 
     def test_v2_leg_that_never_runs_stops_and_tears_down_once_with_exact_restore(self):
-        self.spec['leg2']['skip'] = ['2c']
+        # The 2c leg's ssh dies before it reaches cfctl: leg 1 sees no change, stops, and nothing is retried.
+        self.spec['leg2']['exit255_match'] = 'scope-add.*cfctl-scope'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()
         self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
         self.assertIn('STOP SCOPE-ADD-2 scope_leg_timeout', stdout)
+        self.assertEqual(sum('-tt' in json.loads(line) for line in self.ssh_log.read_text().splitlines()), 3)
         # The outstanding leg is cancelled before the single uninstall.
         self.assertLess(stdout.index('CFP_LEG2_CANCEL 2c'), next(i for i, l in enumerate(stdout) if l.startswith('INFO run uninstall.sh once')))
         self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
@@ -3046,14 +3020,15 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assert_no_leaks()
 
     def test_v2_wrong_confirmation_is_a_refused_leg_and_leg_one_does_not_believe_anything(self):
-        self.spec['leg2']['wrong_digits'] = ['2a']
+        self.spec['leg2']['wrong_digits_match'] = r'/usr/sbin/cfctl scope-add'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()
         self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
         self.assertIn('STOP SCOPE-ADD-1 scope_leg_timeout', stdout)
-        legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
-        self.assertIn('scope_confirmation_mismatch', legs[0]['last'])
+        legs = json.loads((self.evidence() / 'legs.json').read_text())['legs']
+        self.assertEqual((legs[0]['ok'], legs[0]['errors']), (False, ['scope_confirmation_mismatch']))
+        self.assertEqual(len(legs), 1)
         self.assertEqual(stdout[-1], 'PENN_PILOT_STOPPED_RESTORED')
         self.assertEqual(self.router_snapshot(), before)
 
@@ -3270,6 +3245,95 @@ class PilotHardeningT3cTests(PilotShellBase):
 
     GC_SETUP = 'cp "$(command -v sleep)" "$H/cfp-gc-sleep"\n'
 
+    def test_group_term_during_a_blocked_commit_preserves_watchdog_deadlines_and_teardown(self):
+        busybox = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')
+        if not Path(busybox).is_file():
+            self.skipTest('local BusyBox required')
+        child = ('#!/bin/sh\n: > "$H/lock"\necho $$ > "$H/commit.pid"\n'
+                 'trap \'echo term > "$H/term"; exit 143\' TERM\n'
+                 'trap \'rm -f "$H/lock"; echo exit > "$H/exit"\' EXIT\n'
+                 'echo ready > "$H/ready"\nsleep 4\necho CHILD_COMPLETED\n')
+        body = (self.signal_trap() + '\n'
+                'cfp_stop() { [ ! -e "$H/lock" ] || exit 78; echo TEARDOWN; exit 77; }\n'
+                '( while [ ! -e "$H/ready" ]; do sleep .01; done; sleep .1; kill -TERM "-$$" ) &\n'
+                'cfp_cfctl status --json\necho UNREACHABLE\n')
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(body, allowance=1, grace=1, shell=f'{busybox} ash'),
+                               files={'cfctl.sh': child}, session=f'setsid {busybox} ash', timeout=12)
+        self.assertLess(time.monotonic() - begun, 3.5, 'watchdog deadlines disappeared after group TERM')
+        self.assertEqual(done.returncode, 77, done.stdout + done.stderr)
+        self.assertTrue((done.home / 'term').exists(), 'group TERM killed the watchdog before the commit deadline')
+        self.assertTrue((done.home / 'exit').exists(), 'commit lock cleanup did not finish')
+        self.assertIn('TEARDOWN', done.stdout)
+        self.assertNotIn('CHILD_COMPLETED', done.stdout)
+        self.assertNotIn('UNREACHABLE', done.stdout)
+
+    def test_group_term_in_the_supervision_startup_window_cannot_remove_deadlines(self):
+        busybox = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')
+        if not Path(busybox).is_file():
+            self.skipTest('local BusyBox required')
+        source = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        function = re.search(r'^cfp_run\(\) \{\n.*?^\}', source, re.M | re.S).group()
+        ready = '\nwhile [ ! -e "$H/ready" ]; do sleep .01; done\n'
+        signal_now = '\nkill -TERM "-$$"\n'
+        # Deterministic scheduling: hold a background watchdog before its first trap and signal from the parent
+        # immediately after fork. A supervisor with no watcher fork receives the same signal before its poll loop.
+        if 'cfp_run_wd=$!' in function:
+            function = function.replace("trap '' HUP INT TERM", "sleep .2\n      trap '' HUP INT TERM", 1)
+            function = function.replace('CFP_RUN_LIVE=$cfp_run_pid', 'CFP_RUN_LIVE=$cfp_run_pid' + ready, 1)
+            function = function.replace('cfp_run_wd=$!', 'cfp_run_wd=$!' + signal_now, 1)
+        else:
+            function = function.replace('CFP_RUN_LIVE=$cfp_run_pid', 'CFP_RUN_LIVE=$cfp_run_pid' + ready + signal_now, 1)
+        child = ('#!/bin/sh\ntrap \'echo term > "$H/term"; exit 143\' TERM\n'
+                 'trap \'echo exit > "$H/exit"\' EXIT\necho ready > "$H/ready"\nsleep 4\necho CHILD_COMPLETED\n')
+        body = function + '\n' + self.signal_trap() + '\ncfp_cfctl status --json\necho UNREACHABLE\n'
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(body, allowance=1, grace=1, shell=f'{busybox} ash'),
+                               files={'cfctl.sh': child}, session=f'setsid {busybox} ash', timeout=12)
+        self.assertLess(time.monotonic() - begun, 3.5, 'startup signal removed the commit deadlines')
+        self.assertTrue((done.home / 'term').exists(), done.stdout + done.stderr)
+        self.assertTrue((done.home / 'exit').exists(), done.stdout + done.stderr)
+        self.assertEqual(self.stop_of(done), ['STOP SIGNAL interrupted'])
+        self.assertNotIn('CHILD_COMPLETED', done.stdout)
+        self.assertNotIn('UNREACHABLE', done.stdout)
+
+    def test_supervision_clock_failure_terms_then_bounds_cleanup_and_fails_closed(self):
+        child = ('#!/bin/sh\ntrap \'echo term > "$H/term"; exit 143\' TERM\n'
+                 'trap \'echo exit > "$H/exit"\' EXIT\necho ready > "$H/ready"\nsleep 4\n')
+        clock = ('n=0\ncfp_run_clock() { n=$((n+1)); if [ "$n" = 1 ]; then CFP_RUN_NOW_CS=0; return 0; fi; '
+                 'while [ ! -e "$H/ready" ]; do sleep .01; done; return 1; }\n')
+        interrupt = ('( trap \'\' HUP INT TERM; for tick in 1 2 3 4 5 6 7 8 9 10; do '
+                     '[ -e "$H/term" ] && break; sleep .03; done; '
+                     'if [ -e "$H/term" ]; then sleep .1; kill -TERM "-$$"; fi ) >/dev/null 2>&1 &\n')
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(clock + interrupt + 'cfp_cfctl status --json; echo "RC:$?"\n', allowance=10, grace=1),
+                               files={'cfctl.sh': child}, session='setsid sh', timeout=12)
+        self.assertLess(time.monotonic() - begun, 3.5, 'clock failure left an unbounded commit')
+        self.assertGreaterEqual(time.monotonic() - begun, 1, 'clock failure skipped the full cleanup grace')
+        self.assertTrue((done.home / 'term').exists(), 'clock failure did not try TERM cleanup')
+        self.assertTrue((done.home / 'exit').exists(), 'clock failure skipped lock cleanup')
+        self.assertNotIn('RC:0', done.stdout)
+        self.assertEqual(self.stop_of(done), ['STOP SIGNAL supervision_clock_unreadable'])
+
+    def test_clock_failure_after_term_preserves_exit_cleanup_without_a_second_term(self):
+        busybox = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')
+        if not Path(busybox).is_file():
+            self.skipTest('local BusyBox required')
+        child = ('#!/bin/sh\ntrap \'echo term >> "$H/terms"; exit 143\' TERM\n'
+                 'trap \'echo cleaning > "$H/cleaning"; sleep 2; echo cleaned > "$H/cleaned"\' EXIT\n'
+                 'sleep 30 &\nwait\n')
+        clock = ('n=0\ncfp_run_clock() { n=$((n+1)); case $n in '
+                 '1|2) CFP_RUN_NOW_CS=0;; 3) CFP_RUN_NOW_CS=100;; '
+                 '*) while [ ! -e "$H/cleaning" ]; do sleep .01; done; return 1;; esac; }\n')
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(clock + 'cfp_cfctl status --json\n', allowance=1, grace=3,
+                                               shell=f'{busybox} ash'), files={'cfctl.sh': child}, timeout=12,
+                               session=f'{busybox} ash')
+        self.assertEqual((done.home / 'terms').read_text().splitlines(), ['term'], 'clock failure delivered a second TERM')
+        self.assertTrue((done.home / 'cleaned').exists(), 'clock failure interrupted EXIT lock cleanup')
+        self.assertLess(time.monotonic() - begun, 6.5, 'fallback exceeded allowance + grace + polling slack')
+        self.assertEqual(self.stop_of(done), ['STOP SIGNAL supervision_clock_unreadable'])
+
     # --- M1 ---------------------------------------------------------------------------------------------------
 
     def test_a_term_during_a_cfctl_call_waits_for_the_child_before_stopping(self):
@@ -3468,11 +3532,11 @@ class PilotHardeningT3cTests(PilotShellBase):
     def test_the_teardown_reserve_covers_the_whole_worst_case_teardown(self):
         tool = self.tool
         fixed = (tool.LEG2_CANCEL_WAIT_SECONDS + tool.TEARDOWN_SAFE_BAND_WAIT_SECONDS + tool.UNINSTALL_ALLOWANCE_SECONDS
-                 + tool.KILL_GRACE_SECONDS)
-        self.assertEqual(fixed, 401)
+                 + tool.KILL_GRACE_SECONDS + tool.SUPERVISION_POLL_SLACK_SECONDS)
+        self.assertEqual(fixed, 403)
         success = fixed + tool.TEARDOWN_SNAPSHOT_READS_SECONDS + tool.TEARDOWN_CONNECTIVITY_READS_SECONDS
         failure = fixed + tool.TEARDOWN_SNAPSHOT_READS_SECONDS + tool.TEARDOWN_KERNEL_STATE_READS_SECONDS
-        self.assertEqual((success, failure), (449, 465))
+        self.assertEqual((success, failure), (451, 467))
         self.assertEqual(tool.TEARDOWN_RESERVE_SECONDS, 480)
         self.assertLessEqual(max(success, failure), tool.TEARDOWN_RESERVE_SECONDS)
         self.assertGreaterEqual(tool.UNINSTALL_ALLOWANCE_SECONDS, tool.INSTALL_ALLOWANCE_SECONDS)
@@ -3488,7 +3552,7 @@ class PilotHardeningT3cTests(PilotShellBase):
         tool = self.tool
         worst = tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING), 2, True)
         self.assertLessEqual(worst, tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
-        self.assertEqual(worst, 3945)
+        self.assertEqual(worst, 3967)
 
 
 if __name__ == '__main__':

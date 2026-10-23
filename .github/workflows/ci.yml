@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py, test-penn-pilot.py, test-scope-admin.py, test-inventory.py]
+        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py, test-penn-pilot.py, test-penn-pilot-leg2.py, test-penn-pilot-leg2-guards.py, test-scope-admin.py, test-inventory.py]
         partition: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
           pattern: fixture-receipt-*
           merge-multiple: true
           path: .ci-fixture-receipts
-      - name: Prove all 20 unique partitions match complete source discovery
+      - name: Prove all 36 unique partitions match complete source discovery
         env:
           CF_TEST_SHELL: busybox ash
         run: python3 tests/run-fixtures.py --verify-receipts .ci-fixture-receipts --plan .ci-fixture-plan/couvre-feu-plan.json

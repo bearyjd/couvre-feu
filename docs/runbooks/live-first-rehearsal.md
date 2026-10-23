@@ -71,6 +71,16 @@ The remote script refuses to begin INSTALL if more than 300 s have passed since 
 
 `remoteTimeoutSeconds` (default 1800 s) is a generous last-resort router-side `timeout -s KILL`. BusyBox `timeout` kills only its direct child, the rehearsal shell, so installer or uninstaller processes could keep running after it. Size the timeout well above the expected few-minute runtime so the script bounds itself first.
 
+INSTALL is deliberately unbounded: a hung installer may outlive that timeout and leave an empty-policy installation and a stale install lock; nothing is enrolled or paused then. A KILL watchdog would skip lock cleanup and can kill before the journal is ready, when the single uninstall refuses. This is an accepted residual for M5 code merges (2026-10-23), but **M4b blocks the first live rehearsal and permanent install**: add router dead-owner install-lock recovery and uninstall support for a pre-journal kill, issue a new release id and complete a full adversarial review/test cycle before either live step.
+
+### Stale install lock recovery
+
+These are manual recovery steps, each requiring approval for its exact live-router invocation. Password login to the router is the break-glass path and is never disabled.
+
+1. Log in with the router password. Inspect processes and `/tmp/couvrefeu-install.lock/pid`; confirm no installer, uninstall/recovery process or descendant is still running. A timeout or dead recorded PID alone does not prove this. Do not remove a live lock or kill an installer blindly.
+2. After confirming the install lock is stale, remove only its owned entries and the empty directory: `rm -f /tmp/couvrefeu-install.lock/pid /tmp/couvrefeu-install.lock/token`, then `rmdir /tmp/couvrefeu-install.lock`. These are the entries and cleanup used by `unlock_install()` in `router/lib/install-common.sh`; acquisition has no dead-owner recovery. Preserve the journal. Resolve any separate platform lock through its documented recovery procedure, not this command.
+3. Inspect the journal and installed recovery release, then run `/etc/.couvrefeu-release-<id>/uninstall.sh` once with the actual installed release id. If the release is absent or the journal lacks `ready`, stop and preserve the evidence: current `preflight()` refuses an incomplete backup, so lock removal alone cannot recover a pre-journal kill. That case needs a separately reviewed manual recovery; M4b must fix it before live use.
+
 ## On FAIL or UNKNOWN
 
 - Preserve the evidence directory unchanged. It holds `plan.json`, `stdout.log`, `stderr.log`, `exit-code.txt` and `summary.json`.
@@ -79,7 +89,7 @@ The remote script refuses to begin INSTALL if more than 300 s have passed since 
 - INSTALL failed: the installer kept its journal. Uninstall was deliberately not attempted. Read the recovery runbook and get approval for a specific recovery command.
 - UNINSTALL refused: drift protection kept the journal and the changed files. Resolve the drift explicitly. Never delete the journal.
 - RESTORE failed: the `DIFF -` and `DIFF +` lines show the before and after records. Report them before doing anything else.
-- UNKNOWN (ssh exit 255, timeout, Ctrl-C): the router may still be mid-transaction. Before any inspection, wait until both `/tmp/couvrefeu-install.lock` and `/tmp/couvrefeu-platform.lock` are gone. Then, with a separately approved read-only command, read `<stage>/phase.log`, using the `INFO staging` path from local `stdout.log`. A final `FIRST_REHEARSAL_PASS` or `FAIL_AFTER_MUTATION` line, followed by `STAGE_RETAINED`, means the script finished. If neither line is present, the script did not finish. Inspect the journal state before deciding on recovery. Removing a retained staging directory needs its own approval.
+- UNKNOWN (ssh exit 255, timeout, Ctrl-C): the router may still be mid-transaction. Wait for `/tmp/couvrefeu-install.lock` and `/tmp/couvrefeu-platform.lock` to clear; if the install lock persists, use the separately approved [stale-lock recovery](#stale-install-lock-recovery) inspection rather than assuming the installer ended. Then, with a separately approved read-only command, read `<stage>/phase.log`, using the `INFO staging` path from local `stdout.log`. A final `FIRST_REHEARSAL_PASS` or `FAIL_AFTER_MUTATION` line, followed by `STAGE_RETAINED`, means the script finished. If neither line is present, the script did not finish. Inspect the journal state before deciding on recovery. Removing a retained staging directory needs its own approval.
 
 ## Restored and non-restored attributes
 
