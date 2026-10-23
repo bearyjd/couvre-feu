@@ -246,9 +246,13 @@ cfp_run() {
     ( trap - TERM; exec setsid $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
     cfp_run_pid=$!
     CFP_RUN_LIVE=$cfp_run_pid
-    ( cfp_w=0
+    ( # A subshell resets the pilot's trapped signals to default: protect the watchdog itself from group signals.
+      trap '' HUP INT TERM
+      cfp_w=0
       while kill -0 "$cfp_run_pid" 2>/dev/null; do
-          sleep 1; cfp_w=$((cfp_w + 1))
+          sleep 1
+          kill -0 "$cfp_run_pid" 2>/dev/null || break
+          cfp_w=$((cfp_w + 1))
           if [ "$cfp_w" -eq "$cfp_run_t" ]; then
               : > "$cfp_run_mark"
               kill -TERM "-$cfp_run_pid" 2>/dev/null || kill -TERM "$cfp_run_pid" 2>/dev/null
@@ -270,8 +274,14 @@ cfp_run() {
         cfp_run_rc2=$?
         [ "$cfp_run_rc2" = 127 ] || cfp_run_rc=$cfp_run_rc2
     done
-    kill "$cfp_run_wd" 2>/dev/null
+    # Join its at-most-one-second sleep; it never runs past allowance + grace. A new trapped signal may interrupt
+    # this wait too, so repeat the join before teardown. The post-sleep owner check prevents signalling a reaped PID.
+    cfp_run_seen=$CFP_SIG_COUNT
     wait "$cfp_run_wd" 2>/dev/null
+    while [ "$CFP_SIG_COUNT" != "$cfp_run_seen" ]; do
+        cfp_run_seen=$CFP_SIG_COUNT
+        wait "$cfp_run_wd" 2>/dev/null
+    done
     if [ -e "$cfp_run_mark" ]; then
         # The child was signalled: anything of its group that outlived it is KILLed, then the lock is checked.
         kill -KILL "-$cfp_run_pid" 2>/dev/null

@@ -3245,6 +3245,29 @@ class PilotHardeningT3cTests(PilotShellBase):
 
     GC_SETUP = 'cp "$(command -v sleep)" "$H/cfp-gc-sleep"\n'
 
+    def test_group_term_during_a_blocked_commit_preserves_watchdog_deadlines_and_teardown(self):
+        busybox = shutil.which('busybox') or str(Path.home() / '.local/bin/busybox')
+        if not Path(busybox).is_file():
+            self.skipTest('local BusyBox required')
+        child = ('#!/bin/sh\n: > "$H/lock"\necho $$ > "$H/commit.pid"\n'
+                 'trap \'echo term > "$H/term"; exit 143\' TERM\n'
+                 'trap \'rm -f "$H/lock"; echo exit > "$H/exit"\' EXIT\n'
+                 'echo ready > "$H/ready"\nsleep 4\necho CHILD_COMPLETED\n')
+        body = (self.signal_trap() + '\n'
+                'cfp_stop() { [ ! -e "$H/lock" ] || exit 78; echo TEARDOWN; exit 77; }\n'
+                '( while [ ! -e "$H/ready" ]; do sleep .01; done; sleep .1; kill -TERM "-$$" ) &\n'
+                'cfp_cfctl status --json\necho UNREACHABLE\n')
+        begun = time.monotonic()
+        done = self.run_driver(self.sig_driver(body, allowance=1, grace=1, shell=f'{busybox} ash'),
+                               files={'cfctl.sh': child}, session=f'setsid {busybox} ash', timeout=12)
+        self.assertLess(time.monotonic() - begun, 3.5, 'watchdog deadlines disappeared after group TERM')
+        self.assertEqual(done.returncode, 77, done.stdout + done.stderr)
+        self.assertTrue((done.home / 'term').exists(), 'group TERM killed the watchdog before the commit deadline')
+        self.assertTrue((done.home / 'exit').exists(), 'commit lock cleanup did not finish')
+        self.assertIn('TEARDOWN', done.stdout)
+        self.assertNotIn('CHILD_COMPLETED', done.stdout)
+        self.assertNotIn('UNREACHABLE', done.stdout)
+
     # --- M1 ---------------------------------------------------------------------------------------------------
 
     def test_a_term_during_a_cfctl_call_waits_for_the_child_before_stopping(self):

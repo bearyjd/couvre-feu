@@ -235,7 +235,7 @@ trap 'rm -f {shlex.quote(str(lock))}; echo exit > {shlex.quote(str(exited))}' EX
 
 class SignalTests(L2.DriverBase):
     SCRIPT = '''
-import importlib.util, json, os, signal, subprocess, sys, time
+import importlib.util, inspect, json, os, signal, subprocess, sys, time
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('penn_pilot', sys.argv[1])
 tool = importlib.util.module_from_spec(spec)
@@ -249,6 +249,18 @@ if os.environ.get('PROBE_THREAD'):  # the pilot's own host-probe thread, started
     probes = tool.HostProbes(lambda host: {}, 'host.invalid')
     probes.start()
 inject = os.environ.get('INJECT', '')
+if inject == 'ack-finally':
+    tool.LEG2.ACK_SECONDS = .05
+    lines, first = inspect.getsourcelines(tool.LEG2.send_ack)
+    cleanup = first + next(i for i, line in enumerate(lines) if line.strip() == 'finally:') + 1
+    def trace(frame, event, arg):
+        if frame.f_code is tool.LEG2.send_ack.__code__ and event == 'line' and frame.f_lineno == cleanup:
+            sys.settrace(None)
+            process = frame.f_locals['process']
+            open(sys.argv[4] + '.pid', 'w').write(str(process.pid))
+            os.kill(os.getpid(), signal.SIGTERM)
+        return trace
+    sys.settrace(trace)
 if inject == 'mask':  # a stop that lands right after the last handler is installed
     real_signal = signal.signal
     def installing(number, handler):
@@ -257,18 +269,19 @@ if inject == 'mask':  # a stop that lands right after the last handler is instal
             os.kill(os.getpid(), signal.SIGTERM)
         return old
     signal.signal = installing
-if inject.startswith('popen:'):  # a stop that lands right after the Nth child was started, before it is assigned
+if inject.startswith('popen:') or inject == 'ack-finally':
     real_popen, started = subprocess.Popen, []
     def popen(*args, **kwargs):
         child = real_popen(*args, **kwargs)
         started.append(child)
-        if len(started) == int(inject[6:]):
+        if len(started) == (2 if inject == 'ack-finally' else int(inject[6:])):
             open(sys.argv[4] + '.pid', 'w').write(str(child.pid))
             if os.environ.get('WAIT_CHILD'):
                 deadline = time.monotonic() + 10
                 while not os.path.exists(os.environ['WAIT_CHILD']) and time.monotonic() < deadline:
                     time.sleep(.01)
-            os.kill(os.getpid(), signal.SIGTERM)
+            if inject != 'ack-finally':
+                os.kill(os.getpid(), signal.SIGTERM)
         return child
     subprocess.Popen = popen
 originals = {number: signal.getsignal(number) for number in tool.LEG2.SIGNALS}
@@ -313,6 +326,18 @@ except KeyboardInterrupt:
         pid = int((self.work / 'out.log.pid').read_text())
         self.addCleanup(lambda: os.killpg(pid, signal.SIGKILL) if L2.alive(pid) else None)
         self.assertTrue(wait_dead(pid, 2), 'ack SSH escaped cleanup during spawn')
+        self.child_dead()
+
+    def test_a_first_stop_at_ack_finally_entry_cannot_skip_driver_owned_cleanup(self):
+        self.run_signalled([], inject='ack-finally', ack=True)
+        pid = int((self.work / 'out.log.pid').read_text())
+        def cleanup():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(cleanup)
+        self.assertTrue(wait_dead(pid, 2), 'ACK survived first signal at finally entry')
         self.child_dead()
 
     def test_ack_timeout_also_kills_its_descendants(self):

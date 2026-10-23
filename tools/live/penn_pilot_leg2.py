@@ -248,7 +248,7 @@ class Leg:
                        'confirmationSent': self.sent, 'bytes': self.total, 'stderrBytes': self.stderr_bytes, 'seconds': int(now - self.started)}
 
 
-def send_ack(argv, path, env):
+def send_ack(argv, path, env, owner=None):
     """Create the acknowledgement file on the router with ONE short ssh (the leg-1 argv, ACK_SCRIPT as the command).
     Returns 'sent', 'busy' (a cfctl process was still alive on the router: nothing written) or 'failed'. Only called
     once no leg is in flight and none can start."""
@@ -258,6 +258,8 @@ def send_ack(argv, path, env):
         with uninterruptible():
             process = subprocess.Popen(argv[:-1] + [script], stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+            if owner is not None:
+                owner.ack_process = process
         code = process.wait(timeout=ACK_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         return 'failed'
@@ -269,6 +271,8 @@ def send_ack(argv, path, env):
                 except ProcessLookupError:
                     pass
                 process.wait()
+                if owner is not None:
+                    owner.ack_process = None
     return {0: 'sent', ACK_BUSY: 'busy'}.get(code, 'failed')
 
 
@@ -377,7 +381,7 @@ class Driver:
         Always reaps everything, also on SIGTERM, SIGHUP and SIGINT."""
         if not self.files_unchanged():
             raise Refusal('known hosts or identity file differs from the approved plan: nothing was sent')
-        self.results, self.ignored, self.active, self.pending, self.env = [], 0, None, None, env
+        self.results, self.ignored, self.active, self.pending, self.ack_process, self.env = [], 0, None, None, None, env
         self.locked = self.cancelled = False
         self.ack, self.pinned_state = 'none', 'ok'
         # The mask is captured, and the signals blocked, BEFORE any handler is installed: a signal that arrives while the
@@ -430,6 +434,14 @@ class Driver:
         if self.active:
             self.active.kill('aborted' if aborted else 'killed_leg1_ended', time.monotonic())
             self.results.append(self.active.result)
+        # send_ack can be interrupted at its finally entry; its child remains owned here until protected reaping ends.
+        if self.ack_process is not None:
+            try:
+                os.killpg(self.ack_process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.ack_process.wait()
+            self.ack_process = None
         if process is not None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -475,7 +487,7 @@ class Driver:
         elif not self.files_unchanged():
             self.locked, self.ack, self.pinned_state = True, 'refused', 'changed'
         else:
-            self.ack = send_ack(self.argv, path, self.env)
+            self.ack = send_ack(self.argv, path, self.env, self)
 
     def marker(self, leg, base, now):
         index = len(self.results) + (1 if self.active else 0)
