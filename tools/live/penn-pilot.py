@@ -16,6 +16,14 @@ are unchanged): `roles.penn_child_2` {ip, mac} enrolls a second device of the
 same person, and `scopeNegativeTest: true` adds the SCOPE phase (an out-of-scope
 rpc-sync after enrollment that must be cleanly rejected with no firewall change).
 
+Config schema v2 (`schemaVersion` 2; the v2 pieces live in penn_pilot_v2.py): the install floor is the
+Chromebook (`roles.penn_child`) only, `roles.scope_target` {ip, mac} is the phone that the later SCOPE phases
+add and remove, and `roles.ct107` {ip, mac} (its MAC also in protectedHistoricalMacs) is the protected
+infrastructure container. v2 replaces `penn_child_2` (a v2 config that sets it is refused) and caps
+`remoteTimeoutSeconds` at min(10800, minimumRemoteTimeoutSeconds + 900). schemaVersion 1 configs are kept as
+the legacy shape: no `scope_target`, the old phases, the old 3600 s cap. A v2 plan can be produced and
+disclosed, but `execute` refuses it until the pilot template implements every planned phase.
+
 Exit codes: 0 PASS, 1 REFUSED before any router mutation, 2 STOPPED/FAIL/UNKNOWN
 after mutation possibly began.
 """
@@ -50,7 +58,20 @@ def _load_rehearsal():
     return module
 
 
+def _load_sibling(name):
+    # Same -I / bytecode constraints as _load_rehearsal.
+    sys.dont_write_bytecode = True
+    path = Path(__file__).resolve().with_name(name + '.py')
+    spec = importlib.util.spec_from_file_location('couvre_feu_' + name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 FR = _load_rehearsal()
+V2 = _load_sibling('penn_pilot_v2')
+V2.bind(FR)
 Refusal = FR.Refusal
 EXIT_PASS, EXIT_REFUSED, EXIT_FAIL = FR.EXIT_PASS, FR.EXIT_REFUSED, FR.EXIT_FAIL
 REMOTE_PASS, REMOTE_REFUSED, REMOTE_FAIL = FR.REMOTE_PASS, FR.REMOTE_REFUSED, FR.REMOTE_FAIL
@@ -66,11 +87,19 @@ PHASES = ('PAYLOAD', 'IDENTITY', 'PREREQ', 'SNAPSHOT', 'BASELINE', 'INSTALL', 'E
 PASS_LINE = 'PENN_PILOT_PASS'
 STOPPED_LINE = 'PENN_PILOT_STOPPED_RESTORED'
 STOPPED_NO_CONNECTIVITY_LINE = 'PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED'
-PERSON = 'penn'
+PHASES_V2, NEW_PHASES = V2.PHASES_V2, V2.NEW_PHASES
+# What penn-pilot.sh runs today; execute refuses any plan with another phase (the MOVE/BULK/INVENTORY/SCOPE
+# phases land with the template).
+IMPLEMENTED_PHASES = PHASES + ('SCOPE',)
+ALL_PHASES = PHASES_V2 + ('SCOPE',)
+PERSON, PILOT_B, SCOPE_TARGET_ROLE, SECOND_ROLE = V2.PERSON, V2.PILOT_B, V2.SCOPE_TARGET_ROLE, V2.SECOND_ROLE
+V2_MAX_REMOTE_TIMEOUT_SECONDS, V2_TIMEOUT_SLACK_SECONDS = V2.V2_MAX_REMOTE_TIMEOUT_SECONDS, V2.V2_TIMEOUT_SLACK_SECONDS
+FAILED_BLOCK_ALL_WORDING, FAILED_BLOCK_ALL_DECIDED_BY = V2.FAILED_BLOCK_ALL_WORDING, V2.FAILED_BLOCK_ALL_DECIDED_BY
+SCOPE_LEG_SECONDS = V2.SCOPE_LEG_SECONDS
+remote_timeout_limit, scope_legs, protected_macs = V2.remote_timeout_limit, V2.scope_legs, V2.protected_macs
+expected_stage_policy, assert_policy_pilot = V2.expected_stage_policy, V2.assert_policy_pilot
 OPERATION_ID = 'penn-pilot-enroll-1'
-SECOND_ROLE = 'penn_child_2'
-# Synthetic, unicast, locally administered and never a household device.
-SCOPE_TEST_MAC = '02:00:00:00:00:99'
+SCOPE_TEST_MAC = V2.SCOPE_TEST_MAC
 SCOPE_OPERATION_ID = 'penn-pilot-scope-1'
 SCOPE_ERROR = 'rpc_scope_overlap'
 DNS_PROBE_NAME = 'example.com'
@@ -112,7 +141,7 @@ ALWAYS_UNMEASURED = {
     'ipv6_client_traffic': 'not measured',
     'acceleration_offload_coverage': 'not measured; offload left untouched',
 }
-MAC_TOKEN = re.compile(r'[0-9a-f]{2}(?::[0-9a-f]{2}){5}')
+MAC_TOKEN = V2.MAC_TOKEN
 PARAM_VALUE = re.compile(r'[0-9A-Za-z.:_ {}\[\]",-]+')
 
 
@@ -142,7 +171,7 @@ def status_settle_worst_seconds(timing):
             + SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS)
 
 
-def phase_worst_seconds(timing, devices=1, scope=False):
+def phase_worst_seconds(timing, devices=1, scope=False, scope_target=False):
     """Worst case of each post-install phase, as the remote script budgets it."""
     call = SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS
     snap, read, iteration = COUNTERS_WORST_SECONDS, READ_TIMEOUT_SECONDS, iteration_worst_seconds(timing)
@@ -164,13 +193,21 @@ def phase_worst_seconds(timing, devices=1, scope=False):
     if scope:
         # one rpc-sync (expected rejection) between two firewall-state reads
         phases['SCOPE'] = call + 2 * FIREWALL_STATE_WORST_SECONDS
+    if scope_target:
+        phases.update(new_phase_worst_seconds(timing))
     return phases
 
 
-def worst_case_seconds(timing, devices=1, scope=False):
+def new_phase_worst_seconds(timing):
+    """Worst case of the v2 phases (every cfctl call keeps the safe-band wait)."""
+    return V2.new_phase_worst_seconds(SAFE_BAND_WAIT_SECONDS + CFCTL_ALLOWANCE_SECONDS, COUNTERS_WORST_SECONDS,
+                                      READ_TIMEOUT_SECONDS, status_settle_worst_seconds(timing))
+
+
+def worst_case_seconds(timing, devices=1, scope=False, scope_target=False):
     # The install waits for one safe band before running.
     return (timing['premutationBudgetSeconds'] + SAFE_BAND_WAIT_SECONDS + INSTALL_ALLOWANCE_SECONDS
-            + sum(phase_worst_seconds(timing, devices, scope).values()) + TEARDOWN_RESERVE_SECONDS)
+            + sum(phase_worst_seconds(timing, devices, scope, scope_target).values()) + TEARDOWN_RESERVE_SECONDS)
 
 
 def penn_macs(config):
@@ -178,19 +215,29 @@ def penn_macs(config):
     return sorted(config['roles'][role]['mac'] for role in ('penn_child', SECOND_ROLE) if role in config['roles'])
 
 
+def scope_target_enabled(config):
+    return SCOPE_TARGET_ROLE in config['roles']
+
+
+def config_schema_version(config):
+    return config.get('schemaVersion', 1)
+
+
 def scope_enabled(config):
     return config.get('scopeNegativeTest') is True
 
 
 def pilot_phases(config):
+    base = PHASES_V2 if scope_target_enabled(config) else PHASES
     if not scope_enabled(config):
-        return PHASES
-    index = PHASES.index('PAUSE')
-    return PHASES[:index] + ('SCOPE',) + PHASES[index:]
+        return base
+    index = base.index('SCOPE-ADD-1' if scope_target_enabled(config) else 'PAUSE')
+    return base[:index] + ('SCOPE',) + base[index:]
 
 
 def config_budget(config):
-    return {'devices': len(penn_macs(config)), 'scope': scope_enabled(config)}
+    return {'devices': len(penn_macs(config)), 'scope': scope_enabled(config),
+            'scope_target': scope_target_enabled(config)}
 
 
 def _strict_document(path):
@@ -207,32 +254,40 @@ def _strict_document(path):
         raise Refusal(f'config is not strict JSON: {error}') from None
 
 
+def _schema_version(document):
+    version = document.get('schemaVersion') if isinstance(document, dict) else None
+    if isinstance(version, bool) or version not in (1, 2):
+        raise Refusal('schemaVersion must be 1 (legacy pilot) or 2 (scope_target pilot)')
+    return version
+
+
 def load_config(path):
-    """The rehearsal schema plus the pilot-only optional keys; refused before any SSH."""
+    """The rehearsal schema plus the pilot-only keys; refused before any SSH.
+
+    schemaVersion 1 is the legacy shape (optional penn_child_2, rehearsal timeout cap); schemaVersion 2 adds the
+    required ct107 and scope_target, replaces penn_child_2 and lifts the timeout cap for the longer phase list.
+    The loaded config carries its real `schemaVersion`."""
     document = _strict_document(path)
     if not isinstance(document, dict):
         return FR.validate_config(document)
-    base = {key: value for key, value in document.items() if key != 'scopeNegativeTest'}
+    version = _schema_version(document)
     roles = document.get('roles')
-    second = None
-    if isinstance(roles, dict) and SECOND_ROLE in roles:
-        second = roles[SECOND_ROLE]
-        base['roles'] = {role: entry for role, entry in roles.items() if role != SECOND_ROLE}
+    extra = V2.pilot_roles(roles, version)
+    base = {key: value for key, value in document.items() if key != 'scopeNegativeTest'}
+    base['schemaVersion'] = 1
+    if extra:
+        base['roles'] = {role: entry for role, entry in roles.items() if role not in V2.PILOT_ROLES}
+    timeout = None
+    if version == 2:
+        timeout = V2.v2_timeout(document)
+        base['remoteTimeoutSeconds'] = 1800
     config = FR.validate_config(base)
+    if timeout is not None:
+        config['remoteTimeoutSeconds'] = timeout
     scope = document.get('scopeNegativeTest', False)
     if not isinstance(scope, bool):
         raise Refusal('scopeNegativeTest must be true or false')
-    if second is not None:
-        if not isinstance(second, dict) or set(second) != {'ip', 'mac'}:
-            raise Refusal(f'roles.{SECOND_ROLE} must contain exactly ip and mac')
-        entry = {'ip': FR.canonical_ipv4(second['ip'], f'roles.{SECOND_ROLE}.ip'),
-                 'mac': FR.canonical_mac(second['mac'], f'roles.{SECOND_ROLE}.mac')}
-        macs = {role['mac'] for role in config['roles'].values()} | set(config['protectedHistoricalMacs'])
-        ips = {role['ip'] for role in config['roles'].values()} | {config['host']}
-        if entry['mac'] in macs | {SCOPE_TEST_MAC} or entry['ip'] in ips:
-            raise Refusal(f'roles.{SECOND_ROLE} must have a MAC and IP distinct from every role, the host, '
-                          'protected MACs and the scope test MAC')
-        config = dict(config, roles=dict(config['roles'], **{SECOND_ROLE: entry}))
+    config = dict(V2.add_pilot_roles(config, extra), schemaVersion=version)
     if scope:
         known = {role['mac'] for role in config['roles'].values()} | set(config['protectedHistoricalMacs'])
         if SCOPE_TEST_MAC in known:
@@ -262,6 +317,11 @@ def assert_policy_only_penn(policy, config):
     if MAC_TOKEN.findall(json.dumps(policy).lower()) != macs:
         raise Refusal('enrollment policy contains a MAC other than penn_child')
     return policy
+
+
+def pilot_policies(config):
+    """The v2 policy sequence (stage, policy), each validated against its independently built expectation."""
+    return V2.pilot_policies(config, enrollment_policy(config))
 
 
 def scope_policy(config):
@@ -299,7 +359,9 @@ def build_payload(config, commit, blobs, timing):
               'CFP_ITERATION_WORST': iteration_worst_seconds(timing),
               'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS}
     budget = config_budget(config)
-    values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing, **budget).items()})
+    # Only phases the template implements get a parameter (the v2 phase names are not shell identifiers).
+    values.update({f'CFP_WORST_{phase}': seconds for phase, seconds in phase_worst_seconds(timing, **budget).items()
+                   if phase in IMPLEMENTED_PHASES})
     # Single-device configurations emit no further parameters (the shell defaults apply).
     if SECOND_ROLE in config['roles']:
         macs = penn_macs(config)
@@ -324,13 +386,15 @@ PLAN_DIGEST_FIELDS = FR.PLAN_DIGEST_FIELDS + ('tool', 'phases', 'timing', 'hostP
                                               'operationId', 'policySha256')
 
 
-# Bound only when present, so single-device plans keep their field set.
+# Bound only when present, so legacy (v1) plans keep their field set and digest.
 OPTIONAL_DIGEST_FIELDS = ('scopeNegativeTest', 'scopePolicySha256')
 
 
 def plan_digest(details):
     bound = {field: details[field] for field in PLAN_DIGEST_FIELDS}
     bound.update({field: details[field] for field in OPTIONAL_DIGEST_FIELDS if field in details})
+    # v2: the legs, policies, wording, roles, protected set, profile and commit are mandatory, never dropped.
+    bound.update(V2.digest_fields(details))
     return hashlib.sha256(json.dumps(bound, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -339,6 +403,10 @@ def plan(config, env):
     minimum = worst_case_seconds(TIMING, **config_budget(config))
     if config['remoteTimeoutSeconds'] < minimum:
         raise Refusal(f'remoteTimeoutSeconds must be at least {minimum} for the pilot worst case')
+    limit = remote_timeout_limit(minimum) if config_schema_version(config) == 2 else None
+    if limit is not None and config['remoteTimeoutSeconds'] > limit:
+        raise Refusal(f'remoteTimeoutSeconds must be at most {limit} (minimumRemoteTimeoutSeconds {minimum} + '
+                      f'{V2_TIMEOUT_SLACK_SECONDS} s, hard max {V2_MAX_REMOTE_TIMEOUT_SECONDS} s)')
     commit, blobs = FR.head_source()
     payload, rehearsal_sha, pilot_sha, policy_json = build_payload(config, commit, blobs, TIMING)
     argv = FR.ssh_argv(config, env)
@@ -363,6 +431,17 @@ def plan(config, env):
         details.update({'scopeNegativeTest': True, 'scopeTestMac': SCOPE_TEST_MAC, 'scopeOperationId': SCOPE_OPERATION_ID,
                         'scopeExpectedError': SCOPE_ERROR, 'scopePolicyJson': scope_json,
                         'scopePolicySha256': hashlib.sha256(scope_json.encode()).hexdigest()})
+    if scope_target_enabled(config):
+        details['maximumRemoteTimeoutSeconds'] = limit
+        details['configSchemaVersion'] = config_schema_version(config)
+        stages = [{'stage': name, 'revision': policy['revision'],
+                   'policyJson': json.dumps(policy, separators=(',', ':'), sort_keys=False)}
+                  for name, policy in pilot_policies(config)]
+        for stage in stages:
+            stage['policySha256'] = hashlib.sha256(stage['policyJson'].encode()).hexdigest()
+        details.update({'legs': scope_legs(config), 'pilotPolicies': stages,
+                        'failedBlockAllWording': FAILED_BLOCK_ALL_WORDING,
+                        'failedBlockAllWordingDecidedBy': FAILED_BLOCK_ALL_DECIDED_BY})
     details['planSha256'] = plan_digest(details)
     return details, payload
 
@@ -487,12 +566,12 @@ def classify(stdout_text, remote_exit, timed_out, expected=PHASES):
     phases = {}
     for line in lines:
         parts = line.split(' ', 3)
-        if len(parts) >= 3 and parts[0] == 'PHASE' and parts[1] in PHASES + ('SCOPE',):
+        if len(parts) >= 3 and parts[0] == 'PHASE' and parts[1] in ALL_PHASES:
             phases.setdefault(parts[1], []).append(parts[2] if len(parts) == 3 else parts[2] + ' ' + parts[3])
     stopped = any(line.startswith('STOP ') for line in lines)
     passed = (not timed_out and remote_exit == REMOTE_PASS and lines.count(PASS_LINE) == 1 and lines[-1] == PASS_LINE
               and 'MUTATION_BEGIN' in lines and not stopped
-              and all(phases.get(name) == ['OK'] for name in expected) and set(phases) == set(expected))
+              and all(phases.get(name) == ['OK'] for name in expected) and list(phases) == list(expected))
     if passed:
         return 'PASS', EXIT_PASS, phases
     refused = (not timed_out and remote_exit == REMOTE_REFUSED and 'MUTATION_BEGIN' not in lines
@@ -526,6 +605,9 @@ PRINTED = ('PHASE ', 'DIFF ', 'REFUSED_', 'FAIL_', 'STOP', 'MEASURE ', 'PENN_KER
 def execute(config, expected_plan_sha, env, now_fn, probe):
     if not re.fullmatch(r'[0-9a-f]{64}', expected_plan_sha or ''):
         raise Refusal('--expect-plan-sha256 must be 64 lowercase hex characters')
+    missing = [phase for phase in pilot_phases(config) if phase not in IMPLEMENTED_PHASES]
+    if missing:
+        raise Refusal('phases not implemented by the pilot template yet: ' + ', '.join(missing))
     details, payload = plan(config, env)
     if not hmac.compare_digest(details['planSha256'], expected_plan_sha):
         raise Refusal(f'plan sha256 {details["planSha256"]} differs from the disclosed value')
@@ -597,8 +679,11 @@ def run(argv, *, env=None, now_fn=None, probe=None):
     usage = 'usage: penn-pilot.py plan CONFIG | execute CONFIG --expect-plan-sha256 HEX'
     try:
         if len(argv) == 2 and argv[0] == 'plan':
-            details, _ = plan(load_config(argv[1]), env)
+            config = load_config(argv[1])
+            details, _ = plan(config, env)
             print(json.dumps(details, indent=2, sort_keys=True))
+            if scope_target_enabled(config):
+                print('\n'.join(V2.disclosure_lines(details)))
             print('PLAN ONLY: nothing was sent. Disclose this output, then run:')
             print('python3 -I tools/live/penn-pilot.py execute ' + shlex.quote(argv[1])
                   + ' --expect-plan-sha256 ' + details['planSha256'])

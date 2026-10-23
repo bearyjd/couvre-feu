@@ -55,6 +55,25 @@ Both are read only by `penn-pilot.py` (the rehearsal schema is unchanged) and li
 | `roles.penn_child_2` | `{ip, mac}` of a second device of the same person `penn`. Canonical unicast MAC; its MAC and IP must differ from every role, the host, every protected historical MAC and the scope test MAC. The install uses `--rpc-allow` once per device in sorted order, the policy names person `penn` with both MACs (sorted), and the plan discloses both MACs (from this private config only) |
 | `scopeNegativeTest` | `true` or `false` (default). `true` adds the SCOPE phase between ENROLL and PAUSE |
 
+### Config schema v2 (`scope_target`) and `config.pilot.example.json`
+
+`penn-pilot.py` reads `schemaVersion` 1 (the legacy shape above, unchanged) or 2. [`config.pilot.example.json`](config.pilot.example.json) is the v2 example (fictional MACs and documentation IPs only). It is separate from `config.example.json` on purpose: `first-rehearsal.py` accepts only `schemaVersion` 1 and rejects the pilot-only roles, so the rehearsal can never be started from a pilot config by mistake (a test asserts this).
+
+| | `schemaVersion` 1 | `schemaVersion` 2 |
+|---|---|---|
+| Extra roles | optional `roles.penn_child_2` | required `roles.scope_target` and `roles.ct107`; `penn_child_2` is refused |
+| Install floor | `penn_child` (and `penn_child_2`) | `penn_child` (the Chromebook) only |
+| Phases | the list below | `ENROLL`, `SCOPE-ADD-1`, `SCOPE-ADD-2`, `PAUSE`, `RESUME`, `MOVE`, `BULK`, `EXPIRY`, `DNS`, `INVENTORY`, `SCOPE-REMOVE`; the optional `SCOPE` negative test sits before `SCOPE-ADD-1` |
+| `remoteTimeoutSeconds` | 600-3600 | at least `minimumRemoteTimeoutSeconds` and at most `min(10800, minimumRemoteTimeoutSeconds + 900)` |
+
+- `roles.scope_target` `{ip, mac}` is the phone of the same person. The later phases add it to Penn's scope and remove it again. It must differ from every role, the host, every protected MAC (including `ct107`) and the synthetic scope test MAC. The plan echoes it in an owner-confirmation line: confirm Penn owns that device.
+- `roles.ct107` `{ip, mac}` is the CT107 infrastructure container. Its MAC must also be listed in `protectedHistoricalMacs`, so the protected set always holds the management device, the adult device, CT107 and every historical adult device. No pilot policy may name any of them.
+- The policy validator builds each stage's expected policy from the config alone (enroll, enroll_phone, move, move_back) and refuses any other membership, any non-empty or non-list `pauses`/`schedules`, any `doh` other than empty lists, and any non-string id.
+- The v2 plan digest binds the roles, the protected set, the platform profile, the source commit, the legs, the stage policies, the failed-block-all wording and `configSchemaVersion`; a v2 plan missing any of them is refused.
+- The timeout cap exists so an unattended session cannot be given an arbitrarily long budget: a router-side `timeout -s KILL` that fires late leaves the pilot's changes in place longer. The break-glass cleanup path: recovery is a manual password login on the router. This pilot never disables or confines password/admin login to the router or CT107; follow "If the single uninstall is absent or refuses" below.
+- `execute` refuses v2 plans until `penn-pilot.sh` implements every planned phase (T3). `plan` works today and discloses the legs, policies and timing.
+- TODO(T3): `penn-pilot.sh` is owned by T3 and has no remote self-abort yet. Add one that begins the teardown when elapsed time reaches 70% of `CFP_REMOTE_TIMEOUT`, so the router-side `timeout -s KILL` (the full `remoteTimeoutSeconds`) is only a last resort. A run that reaches the 70% mark ends STOPPED (restored) rather than PASS, by design; T3 must pick the mark with that in mind.
+
 The remote script is the filled `first-rehearsal.sh` with its final call removed, followed by `penn-pilot.sh`, which reuses every `cfr_*` helper. It runs these phases in order:
 
 | Phase | What happens |
