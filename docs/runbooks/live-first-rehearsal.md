@@ -4,6 +4,8 @@ This runbook covers the one-session rehearsal that must succeed before any one-d
 
 Everything runs in one SSH invocation, so the identity and prerequisite evidence is from the same session as the mutation. The tool never retries.
 
+Before any rehearsal, complete the M4b gate and separately approved read-only `setsid` prerequisite inspection in the [v2 pilot runbook](live-penn-pilot-v2.md#before-the-rehearsal). A successful empty-policy rehearsal precedes that pilot.
+
 ## 1. Prepare the private configuration
 
 Copy [`tools/live/config.example.json`](../../tools/live/config.example.json) to a private directory outside the repository and fill in the real values. The schema is in [`tools/live/README.md`](../../tools/live/README.md). Create the evidence directory with mode 0700 on a persistent, private filesystem (not tmpfs). Write the user's approval to the `authorizationPath` file and set `deadlineUtc` to the end of the approved window.

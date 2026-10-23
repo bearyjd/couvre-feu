@@ -358,6 +358,8 @@ Apply requires an approved cached exact-base/runtime observation within 30 secon
 
 ## Ordered live gates
 
+M4b blocks the first live rehearsal and permanent installation: router dead-owner install-lock recovery, pre-journal uninstall recovery, a new release id and a full adversarial review/test cycle are required. Complete the separately approved read-only `setsid` inspection before rehearsal; retain password login and full administrator recovery access. See the [v2 pilot runbook](runbooks/live-penn-pilot-v2.md).
+
 1. **Access and inspection:** independently approve any public-key provisioning;
    preserve exact original authorization bytes/modes/absence. Establish trusted host
    identity and public-key-only access. Then approve bounded read-only inspection
@@ -373,7 +375,7 @@ Apply requires an approved cached exact-base/runtime observation within 30 secon
    service-key provisioning and runtime confinement checks. Admit only the supplied
    network MAC after unique fresh attribution. Run the disclosed finite status,
    pause, resume, timed-pause and service-off-expiry sequence with child/adult probes.
-   The single-session tool is [`tools/live/penn-pilot.py`](../tools/live/README.md#one-device-penn-pilot-penn-pilotpy).
+   The single-session tool is [`tools/live/penn-pilot.py`](../tools/live/README.md#penn-pilot-one-or-two-devices-penn-pilotpy).
    It does not provision a service key, and pause rules have no kernel time bound,
    so it uses only timed pauses and always tears down.
 4. **Resilience:** reload, reboot and recovery each need their own approved script
