@@ -135,6 +135,16 @@ def leg_two():
     bridge(cfg, command)
 
 
+def ack():
+    """The driver's acknowledgement write (`: > <path>` as the remote command): recorded, optionally failing/hanging."""
+    cfg = spec.get('ack', {})
+    if cfg.get('hang'):
+        time.sleep(300)
+    sys.exit(255 if cfg.get('fail') else 0)
+
+
+if '-tt' not in argv and argv[-1].startswith(': > '):
+    ack()
 if '-tt' in argv:
     leg_two()
 elif '-T' in argv:

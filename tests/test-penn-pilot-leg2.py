@@ -299,6 +299,40 @@ class DriverTests(DriverBase):
         self.assertFalse(alive(int(self.pidfile.read_text())))
         self.assertEqual(len(self.leg_calls()), 1)
 
+    ACK_PATH = '/tmp/couvre-feu-first.Ab3dEf/leg2-idle'
+
+    def ack_calls(self):
+        return [call for call in self.ssh_calls() if '-tt' not in call and call[-1].startswith(': > ')]
+
+    def test_ack_is_written_over_a_pinned_ssh_only_after_the_cancelled_leg_is_dead(self):
+        self.drive([[0.2, f'CFP_LEG2_READY 2a {BASE}'], [1.0, 'CFP_LEG2_CANCEL 2a'], [0, f'CFP_LEG2_ACK_FILE {self.ACK_PATH}'],
+                    [0.5, f'CFP_LEG2_ACK_FILE {self.ACK_PATH}'], [1.0, 'PHASE UNINSTALL OK']], hang_after_read=True)
+        (leg,) = self.legs()
+        self.assertEqual(leg['outcome'], 'killed_on_cancel')
+        self.assertEqual(self.outcome[2]['ack'], 'sent')
+        (call,) = self.ack_calls()
+        self.assertEqual(call[-1], f': > {self.ACK_PATH}')
+        self.assertEqual(call[:-1], self.details['sshArgv'][1:-1])
+        self.assertIn('StrictHostKeyChecking=yes', call)
+
+    def test_ack_without_a_cancel_or_with_a_foreign_path_is_ignored(self):
+        self.drive([[0.2, f'CFP_LEG2_ACK_FILE {self.ACK_PATH}'], [0.2, 'CFP_LEG2_CANCEL 2a'],
+                    [0, 'CFP_LEG2_ACK_FILE /etc/passwd'], [0, 'CFP_LEG2_ACK_FILE /tmp/couvre-feu-first.Ab3dEf/../x/leg2-idle'],
+                    [0.5, 'END']])
+        self.assertEqual(self.ack_calls(), [])
+        self.assertEqual(self.outcome[2]['ack'], 'none')
+        self.assertEqual(self.outcome[2]['ignoredMarkers'], 1)
+
+    def test_ack_with_no_running_leg_and_failed_or_hung_ssh_is_reported_not_fatal(self):
+        patcher = mock.patch.object(self.tool.LEG2, 'ACK_SECONDS', 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for knob in ({'fail': True}, {'hang': True}):
+            self.spec.update(ack=knob)
+            rc, timed_out, results = self.drive([[0.2, 'CFP_LEG2_CANCEL 2a'], [0, f'CFP_LEG2_ACK_FILE {self.ACK_PATH}'],
+                                                 [0.3, 'END']])
+            self.assertEqual((rc, timed_out, results['ack']), (0, False, 'failed'))
+
     def test_a_cancel_before_any_marker_blocks_the_leg(self):
         self.drive([[0.2, 'CFP_LEG2_CANCEL 2a'], [0, f'CFP_LEG2_READY 2a {BASE}'], [1.0, 'END']])
         self.assertEqual(self.legs(), [])

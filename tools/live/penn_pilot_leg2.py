@@ -37,6 +37,9 @@ def bind(first_rehearsal):
 
 MARKER = re.compile(r'CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})')
 CANCEL = re.compile(r'CFP_LEG2_CANCEL 2[a-d]')
+# Leg 1's teardown names the router-side acknowledgement file; the only path the driver will ever write.
+ACK_FILE = re.compile(r'CFP_LEG2_ACK_FILE (/tmp/couvre-feu-first\.[A-Za-z0-9]{6}/leg2-idle)')
+ACK_SECONDS = 8
 PROMPT = 'Type the last 6 hex digits of the address (no colons) to confirm: '
 # (leg, form, op) in the only order the plan may list them.
 LEG_TABLE = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
@@ -201,6 +204,17 @@ class Leg:
                        'confirmationSent': self.sent, 'bytes': self.total, 'stderrBytes': self.stderr_bytes, 'seconds': int(now - self.started)}
 
 
+def send_ack(argv, path, env):
+    """Create the acknowledgement file on the router with ONE short ssh (the leg-1 argv, the command replaced).
+    Returns 'sent' or 'failed'. Only called once no leg is in flight and none can start."""
+    try:
+        done = subprocess.run(argv[:-1] + [f': > {path}'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, env=env, start_new_session=True, timeout=ACK_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return 'failed'
+    return 'sent' if done.returncode == 0 else 'failed'
+
+
 class Tail:
     """Complete lines appended to a file since the last call; a partial last line waits for its newline."""
 
@@ -258,7 +272,7 @@ class Driver:
                                    start_new_session=True)
         feeder = threading.Thread(target=feed, args=(process.stdin, payload), daemon=True)
         feeder.start()
-        results, ignored, active, pending, locked = [], 0, None, None, False
+        results, ignored, active, pending, locked, ack = [], 0, None, None, False, 'none'
         timed_out, aborted, begun = False, True, time.monotonic()
         try:
             while True:
@@ -275,6 +289,12 @@ class Driver:
                     if active.result:
                         results.append(active.result)
                         active = None
+                for found in map(ACK_FILE.fullmatch, lines):
+                    # Honoured only after a cancel (locked), with every leg already ended above, once.
+                    if found and locked and not active and ack == 'none':
+                        ack = send_ack(self.argv, found.group(1), env)
+                    elif found:
+                        ignored += 1
                 for leg, base in markers:
                     index = len(results) + (1 if active else 0)
                     if locked or pending or index >= len(self.legs) or self.legs[index]['leg'] != leg:
@@ -303,4 +323,4 @@ class Driver:
             process.wait()
             feeder.join(5)
             tail.close()
-        return process.returncode, timed_out, {'legs': results, 'ignoredMarkers': ignored}
+        return process.returncode, timed_out, {'legs': results, 'ignoredMarkers': ignored, 'ack': ack}
