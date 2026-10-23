@@ -226,8 +226,12 @@ cfp_elapsed_ok() {
 # -k, so a small watchdog does it. The child is started by `exec setsid`: in a non-interactive shell the background
 # subshell is not a process-group leader, so setsid execs in place instead of forking (checked with util-linux and
 # busybox 1.33 setsid), the child keeps the pid $! reports and the pid cfctl records in the lock ($$), and the pid is
-# also the new group id. A setsid that did fork would only make the group signal miss; the watchdog then falls back to
-# the child's own pid and the pid-match stale check reports nothing. The subshell resets TERM because the teardown
+# also the new group id. A setsid that did fork returns 0 in the parent at once while the child runs on detached:
+# cfp_run would return success, the watchdog would end and cfctl would run unbounded, so cfp_baseline refuses such a
+# setsid before any mutation (setsid_forks). The group signal is `kill -TERM -PID` with no `--` (busybox 1.33 kill
+# rejects `--` as an invalid number and fails although it signals, so the fallback to the bare pid would always run
+# and deliver a second TERM that cuts the child's EXIT trap); the bare-pid fallback is only for a group that does not
+# exist. The subshell resets TERM because the teardown
 # ignores it and an ignored signal would otherwise be inherited by the child. A hung child can never stall the session
 # until the router-side last-resort timeout. A signal that the stop trap takes while the child is alive does not start
 # the teardown on top of it: cfp_on_signal only notes it, this function reaps the child (it ends at its own end or at
@@ -247,10 +251,10 @@ cfp_run() {
           sleep 1; cfp_w=$((cfp_w + 1))
           if [ "$cfp_w" -eq "$cfp_run_t" ]; then
               : > "$cfp_run_mark"
-              kill -TERM -- "-$cfp_run_pid" 2>/dev/null || kill -TERM "$cfp_run_pid" 2>/dev/null
+              kill -TERM "-$cfp_run_pid" 2>/dev/null || kill -TERM "$cfp_run_pid" 2>/dev/null
           fi
           if [ "$cfp_w" -ge "$((cfp_run_t + CFP_KILL_GRACE))" ]; then
-              kill -KILL -- "-$cfp_run_pid" 2>/dev/null || kill -KILL "$cfp_run_pid" 2>/dev/null
+              kill -KILL "-$cfp_run_pid" 2>/dev/null || kill -KILL "$cfp_run_pid" 2>/dev/null
               break
           fi
       done ) >/dev/null 2>&1 </dev/null &
@@ -270,7 +274,7 @@ cfp_run() {
     wait "$cfp_run_wd" 2>/dev/null
     if [ -e "$cfp_run_mark" ]; then
         # The child was signalled: anything of its group that outlived it is KILLed, then the lock is checked.
-        kill -KILL -- "-$cfp_run_pid" 2>/dev/null
+        kill -KILL "-$cfp_run_pid" 2>/dev/null
         [ "$cfp_run_rc" = 0 ] || cfp_stale_lock_check "$cfp_run_pid"
     fi
     CFP_RUN_LIVE=
@@ -290,12 +294,18 @@ cfp_on_signal() {
 # anything else) holds legitimately is not ours. Record it here (the caller owns this call's stdout, so nothing is
 # printed) and say so in cfp_stop / the teardown instead of waiting on it.
 cfp_stale_lock_check() {
-    if printf '%s\n' "$1" | cmp -s - "$CFR_PLATFORM_LOCK/pid" 2>/dev/null; then CFP_STALE_LOCK=1; fi
+    if printf '%s\n' "$1" | cmp -s - "$CFR_PLATFORM_LOCK/pid" 2>/dev/null; then CFP_STALE_LOCK=1
+    elif [ -d "$CFR_PLATFORM_LOCK" ] && [ ! -e "$CFR_PLATFORM_LOCK/pid" ]; then CFP_STALE_LOCK=3; fi
 }
 cfp_stale_lock_report() {
-    [ "$CFP_STALE_LOCK" = 1 ] || return 0
-    CFP_STALE_LOCK=2
-    cfr_info "stale_platform_lock $CFR_PLATFORM_LOCK left by a killed child; manual recovery: cfctl recover-platform-lock; password login is the recovery path"
+    case $CFP_STALE_LOCK in
+        1)
+            CFP_STALE_LOCK=2
+            cfr_info "stale_platform_lock $CFR_PLATFORM_LOCK left by a killed child; manual recovery: cfctl recover-platform-lock; password login is the recovery path";;
+        3)
+            CFP_STALE_LOCK=4
+            cfr_info "platform_lock_unowned $CFR_PLATFORM_LOCK has no pid file after a signalled child; manual recovery: cfctl recover-platform-lock; password login is the recovery path";;
+    esac
 }
 
 # --- Read-only adult probes -------------------------------------------------
@@ -317,6 +327,11 @@ cfp_baseline() {
         command -v "$cfp_tool" >/dev/null 2>&1 || cfr_refuse BASELINE "missing_tool $cfp_tool"
     done
     cfp_cs >/dev/null || cfr_refuse BASELINE uptime_unreadable
+    # A forking setsid would let cfp_run return 0 at once with the child detached and unbounded: it must exec in place.
+    # shellcheck disable=SC2086
+    ( exec setsid $CFR_SH -c 'exit 7' ) </dev/null >/dev/null 2>&1 5>&- &
+    wait "$!"
+    [ "$?" = 7 ] || cfr_refuse BASELINE setsid_forks
     cfp_crond_count baseline
     CFP_BASE_DNS_CS=0
     for cfp_i in 1 2 3; do
@@ -822,7 +837,10 @@ cfp_stop() {
     # A stop taken inside cfp_run runs under its caller's stdout redirection: the evidence goes to the session again.
     [ "$CFP_FD5" != 1 ] || exec 1>&5
     # A KILLed child left the platform lock: that, not the generic failure, is what the operator must act on.
-    if [ "$CFP_STALE_LOCK" != 0 ]; then set -- "$1" platform_lock_stale_after_kill; cfp_stale_lock_report; fi
+    case $CFP_STALE_LOCK in
+        1|2) set -- "$1" platform_lock_stale_after_kill; cfp_stale_lock_report;;
+        3|4) set -- "$1" platform_lock_unowned; cfp_stale_lock_report;;
+    esac
     cfr_fail "$1" "$2"
     [ -n "$CFP_STOPPED" ] || CFP_STOPPED=$1
     cfr_out "STOP $1 $2"

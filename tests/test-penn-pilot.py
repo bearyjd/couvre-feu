@@ -2113,7 +2113,7 @@ class PilotShellBase(PilotBase):
 
     STUB_STOP = 'cfp_stop() { printf \'STOP %s %s\\n\' "$1" "$2"; exit 77; }'
 
-    def run_driver(self, driver, files=None, params=None, timeout=120, stub_stop=True):
+    def run_driver(self, driver, files=None, params=None, timeout=120, stub_stop=True, session='sh'):
         _, payload = self.parameters(self.write_config(**self.v2_changes()))
         head = payload[:payload.rindex(self.TAIL)]
         for key, value in (params or {}).items():
@@ -2126,7 +2126,7 @@ class PilotShellBase(PilotBase):
         (home / 'script.sh').write_text(head + '\n' + PRELUDE % {'h': shlex.quote(str(home)), 'driver': driver,
                                                                   'stop': self.STUB_STOP if stub_stop else ':'})
         env = {'PATH': os.environ['PATH'], 'LC_ALL': 'C', 'HOME': str(home)}
-        done = subprocess.run(['sh', str(home / 'script.sh')], env=env, stdin=subprocess.DEVNULL, capture_output=True,
+        done = subprocess.run(shlex.split(session) + [str(home / 'script.sh')], env=env, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, timeout=timeout, check=False)
         done.home = home
         return done
@@ -3362,6 +3362,81 @@ class PilotHardeningT3cTests(PilotShellBase):
         files = {'cfctl.sh': '#!/bin/sh\n' + self.LOCKING.replace('\\n', '\n') + 'exit 3\n'}
         done = self.run_driver(self.sig_driver(self.STALE_DRIVER, allowance=5, grace=2), files=files, timeout=60)
         self.assertIn('RC:3 STALE:0', done.stdout, done.stdout + done.stderr)
+
+    # --- H1 / M-a / M-b / L1 (review fix pass) ------------------------------------------------------------------
+
+    BUSYBOX = 'busybox ash'
+
+    @unittest.skipUnless(shutil.which('busybox'), 'busybox absent')
+    def test_a_timed_out_cfctl_gets_exactly_one_term_and_releases_its_lock_under_busybox_ash(self):
+        # busybox 1.33 `kill -TERM -- -PID` prints "invalid number" and fails while still signalling the group: the
+        # fallback then sent a second TERM that cut the child's slow (pure-shell, so interruptible) EXIT trap (the lock release). The watchdog runs in
+        # the session shell, so the session itself is busybox ash here.
+        cfctl = ('#!/bin/sh\nrel() { i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done; rm -f "$PLOCK/pid"; rmdir "$PLOCK"; echo released > "$H/rel.$N"; }\n'
+                 'mkdir "$PLOCK"\necho $$ > "$PLOCK/pid"\ntrap rel 0\n'
+                 'trap \'echo t >> "$H/terms.$N"; exit 143\' TERM\nwhile :; do :; done\n')
+        body = ('for N in 1 2 3 4 5 6; do export N\ncfp_cfctl status --json > /dev/null; rc=$?\n'
+                'echo "RUN:$N RC:$rc TERMS:$(grep -c t "$H/terms.$N") REL:$([ -e "$H/rel.$N" ] && echo yes || echo no)'
+                ' LOCK:$([ -d "$PLOCK" ] && echo held || echo free)"\ndone\n')
+        done = self.run_driver(self.sig_driver(body, allowance=1, grace=5, shell=self.BUSYBOX), files={'cfctl.sh': cfctl},
+                               timeout=120, session=self.BUSYBOX)
+        runs = re.findall(r'^RUN:\d+ RC:143 TERMS:1 REL:yes LOCK:free$', done.stdout, re.M)
+        self.assertEqual(len(runs), 6, done.stdout + done.stderr)
+        self.assertNotIn('invalid number', done.stderr)
+
+    def test_no_kill_in_the_pilot_uses_the_double_dash_form(self):
+        text = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        self.assertEqual(re.findall(r'(?m)^[^#\n]*\bkill\b[^\n]* -- [^\n]*$', text), [])
+
+    BASELINE_STUBS = ('cfp_cs() { echo 1; }\ncfp_crond_count() { :; }\ncfp_dns() { echo "ok 1"; }\n'
+                      'cfp_ping() { echo "0 0"; }\ncfp_adult_probe() { return 0; }\n'
+                      'mkdir -p "$H/bin"\nfor t in ping nslookup; do printf "#!/bin/sh\\nexit 0\\n" > "$H/bin/$t"; chmod +x "$H/bin/$t"; done\n')
+
+    def baseline_run(self, setup, shell='sh'):
+        driver = (f'export H\nCFR_SH={shlex.quote(shell)}\n' + self.BASELINE_STUBS + setup + 'PATH=$H/bin:$PATH\ncfp_baseline\n')
+        return self.run_driver(driver, timeout=60)
+
+    def test_a_forking_setsid_is_refused_before_any_mutation(self):
+        fake = 'printf "#!/bin/sh\\n( \\"\\$@\\" ) </dev/null >/dev/null 2>&1 &\\nexit 0\\n" > "$H/bin/setsid"; chmod +x "$H/bin/setsid"\n'
+        done = self.baseline_run(fake)
+        self.assertIn('PHASE BASELINE FAIL setsid_forks', done.stdout, done.stdout + done.stderr)
+        self.assertIn('REFUSED_BEFORE_MUTATION BASELINE', done.stdout)
+        self.assertEqual(done.returncode, 10)
+
+    def test_an_in_place_setsid_passes_the_baseline_self_test(self):
+        shells = [('sh', ''), ('sh', 'system')]
+        if shutil.which('busybox'):
+            shells += [(self.BUSYBOX, ''), ('sh', 'busybox')]
+        for shell, applet in shells:
+            with self.subTest(shell=shell, setsid=applet or 'default'):
+                setup = 'ln -sf "$(command -v busybox)" "$H/bin/setsid"\n' if applet == 'busybox' else ''
+                done = self.baseline_run(setup, shell=shell)
+                self.assertIn('PHASE BASELINE OK', done.stdout, done.stdout + done.stderr)
+                self.assertNotIn('setsid_forks', done.stdout)
+
+    LOCK_NO_PID = '#!/bin/sh\ntrap \'\' TERM\nmkdir "$PLOCK"\nwhile :; do sleep 1; done >/dev/null 2>&1\n'
+
+    def test_a_signalled_child_that_leaves_a_lock_without_a_pid_file_is_reported_unowned(self):
+        driver = self.sig_driver(self.TEARDOWN + 'cfp_cfctl status --json > /dev/null || cfp_stop PHASE rpc_status_failed\n',
+                                 allowance=1, grace=2)
+        done = self.run_driver(driver, files={'cfctl.sh': self.LOCK_NO_PID, 'uninstall.sh': 'exit 1\n'}, timeout=60, stub_stop=False)
+        self.assertEqual(self.stop_of(done), ['STOP PHASE platform_lock_unowned'], done.stdout + done.stderr)
+        note = [line for line in done.stdout.splitlines() if line.startswith('INFO platform_lock_unowned')]
+        self.assertEqual(len(note), 1, done.stdout)
+        self.assertIn('cfctl recover-platform-lock', note[0])
+        self.assertIn('password login', note[0])
+        self.assertNotIn('stale_platform_lock', done.stdout)
+        self.assertEqual(done.stdout.count('run uninstall.sh once'), 1)
+
+    def test_no_unowned_report_without_a_lock_directory(self):
+        files = {'cfctl.sh': '#!/bin/sh\ntrap \'\' TERM\nwhile :; do sleep 1; done >/dev/null 2>&1\n'}
+        done = self.run_driver(self.sig_driver(self.STALE_DRIVER, allowance=1, grace=2), files=files, timeout=60)
+        self.assertIn('RC:137 STALE:0', done.stdout, done.stdout + done.stderr)
+
+    def test_children_of_cfr_run_sh_do_not_inherit_fd_5(self):
+        files = {'child.sh': 'if [ -e "/proc/$$/fd/5" ]; then echo open; else echo closed; fi > "$H/fd5"\n'}
+        done = self.run_driver('export H\nCFR_SH=sh\nexec 5>&1\ncfr_run_sh "$H/child.sh"\n', files=files, timeout=30)
+        self.assertEqual((done.home / 'fd5').read_text().strip(), 'closed', done.stdout + done.stderr)
 
     # --- L5 ---------------------------------------------------------------------------------------------------
 
