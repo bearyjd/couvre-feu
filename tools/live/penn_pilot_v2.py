@@ -1,14 +1,27 @@
 """Config schema v2 pieces of the Penn pilot, split out of penn-pilot.py (file size cap).
 
-Loaded by penn-pilot.py with `FR` (the first-rehearsal module) already set on this module, so `Refusal` is the
-same class the pilot catches. Not a script: it has no entry point and is never run directly. Standard library only.
+Imports cleanly on its own. penn-pilot.py calls `bind(first_rehearsal_module)` right after loading it, which sets
+`FR` and makes `Refusal` the same class the pilot catches. Not a script: it has no entry point. Standard library only.
 
 Everything here is pure: configuration validation, the v2 policy validator and its independent per-stage
 expectation, the Leg-2 commit command table, the v2 phase worst cases and the digest/disclosure rules."""
 import json
 import re
+from typing import Any
 
-Refusal = FR.Refusal  # noqa: F821  (FR is injected by penn-pilot.py before this module body runs)
+
+class Refusal(Exception):
+    """Placeholder until `bind` swaps in the first-rehearsal Refusal."""
+
+
+FR: Any = None
+
+
+def bind(first_rehearsal):
+    """Bind the first-rehearsal module: its canonicalisers and its Refusal class."""
+    global FR, Refusal
+    FR = first_rehearsal
+    Refusal = first_rehearsal.Refusal
 
 PERSON = 'penn'
 # Tool-synthesised second person for the MOVE phase; never read from the config.
@@ -178,9 +191,9 @@ def assert_policy_pilot(policy, config, expected):
     return policy
 
 
-def pilot_policies(config, base):
-    """The v2 policy sequence (stage, policy): enrol Chromebook, add phone, MOVE A, MOVE back; each validated
-    against its independently built expectation. `base` is the enrollment policy shape to derive them from."""
+def candidate_policies(config, base):
+    """The candidate (stage, policy) sequence: enrol Chromebook, add phone, MOVE A, MOVE back. `base` is the
+    enrollment policy shape to derive them from."""
     chromebook, phone = config['roles']['penn_child']['mac'], config['roles'][SCOPE_TARGET_ROLE]['mac']
 
     def stage(revision, people):
@@ -189,8 +202,14 @@ def pilot_policies(config, base):
     policies = (stage(1, [{'id': PERSON, 'macs': [chromebook]}]), stage(2, [{'id': PERSON, 'macs': both}]),
                 stage(3, [{'id': PERSON, 'macs': [phone]}, {'id': PILOT_B, 'macs': [chromebook]}]),
                 stage(4, [{'id': PERSON, 'macs': both}]))
+    return list(zip(STAGES, policies))
+
+
+def pilot_policies(config, base, candidates=candidate_policies):
+    """The v2 policy sequence (stage, policy), each candidate validated against its independently built
+    expectation. `candidates` is injectable so tests can feed wrong candidates."""
     return [(name, assert_policy_pilot(policy, config, expected_stage_policy(name, config)))
-            for name, policy in zip(STAGES, policies)]
+            for name, policy in candidates(config, base)]
 
 
 def scope_legs(config):

@@ -1114,6 +1114,30 @@ class PilotConfigV2Tests(PilotBase):
         move = {stage['stage']: json.loads(stage['policyJson']) for stage in stages}['move']
         self.assertEqual([person['id'] for person in move['people']], ['penn', 'pilot_b'])
 
+    def test_v2_sibling_imports_standalone_and_binds(self):
+        code = ("import importlib.util, sys; sys.dont_write_bytecode = True; "
+                "spec = importlib.util.spec_from_file_location('v2', sys.argv[1]); m = importlib.util.module_from_spec(spec); "
+                "spec.loader.exec_module(m); print(m.FR is None, callable(m.bind))")
+        done = subprocess.run([sys.executable, '-B', '-I', '-c', code, str(REPO / 'tools/live/penn_pilot_v2.py')],
+                              capture_output=True, text=True, check=False)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, 'True True'), done.stderr)
+        self.assertNotIn('noqa: F821', (REPO / 'tools/live/penn_pilot_v2.py').read_text())
+        self.assertIs(self.tool.V2.FR, self.tool.FR)
+        self.assertIs(self.tool.V2.Refusal, self.tool.Refusal)
+
+    def test_pilot_policies_refuse_a_wrong_candidate_for_every_stage(self):
+        config = self.v2_config()
+        base = self.tool.enrollment_policy(config)
+        V2 = self.tool.V2
+        good = V2.candidate_policies(config, base)
+        self.assertEqual([name for name, _ in V2.pilot_policies(config, base)], list(V2.STAGES))
+        for index, (stage, _) in enumerate(good):
+            wrong = good[(index + 1) % len(good)][1]
+            candidates = [(name, wrong if i == index else policy) for i, (name, policy) in enumerate(good)]
+            with self.subTest(stage=stage):
+                with self.assertRaises(self.tool.Refusal):
+                    V2.pilot_policies(config, base, lambda c, b, cands=candidates: cands)
+
     def test_pilot_policy_validator_fails_closed(self):
         config = self.v2_config()
         policies = self.tool.pilot_policies(config)

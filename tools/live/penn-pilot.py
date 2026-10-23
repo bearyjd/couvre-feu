@@ -58,21 +58,20 @@ def _load_rehearsal():
     return module
 
 
-def _load_sibling(name, **injected):
-    # Same -I / bytecode constraints as _load_rehearsal. The injected names are set before the module body runs.
+def _load_sibling(name):
+    # Same -I / bytecode constraints as _load_rehearsal.
     sys.dont_write_bytecode = True
     path = Path(__file__).resolve().with_name(name + '.py')
     spec = importlib.util.spec_from_file_location('couvre_feu_' + name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    for key, value in injected.items():
-        setattr(module, key, value)
     spec.loader.exec_module(module)
     return module
 
 
 FR = _load_rehearsal()
-V2 = _load_sibling('penn_pilot_v2', FR=FR)
+V2 = _load_sibling('penn_pilot_v2')
+V2.bind(FR)
 Refusal = FR.Refusal
 EXIT_PASS, EXIT_REFUSED, EXIT_FAIL = FR.EXIT_PASS, FR.EXIT_REFUSED, FR.EXIT_FAIL
 REMOTE_PASS, REMOTE_REFUSED, REMOTE_FAIL = FR.REMOTE_PASS, FR.REMOTE_REFUSED, FR.REMOTE_FAIL
