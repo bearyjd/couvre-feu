@@ -39,6 +39,15 @@ PHASES_V2 = ('PAYLOAD', 'IDENTITY', 'PREREQ', 'SNAPSHOT', 'BASELINE', 'INSTALL',
              'CONNECTIVITY')
 NEW_PHASES = ('SCOPE-ADD-1', 'SCOPE-ADD-2', 'MOVE', 'BULK', 'INVENTORY', 'SCOPE-REMOVE')
 STAGES = ('enroll', 'enroll_phone', 'move', 'move_back')
+# The policy revision of each stage, in run order. rpc-sync requires policy.revision == expected_revision + 1 and
+# `cfctl pause`/`resume` each add one, so the real sequence is: 1 enroll, 2 phone, 3 pause, 4 resume, 5 move A,
+# 6 pause pilot_b, 7 resume pilot_b, 8 move back. The BULK syncs derive their revisions at run time (9 and 10).
+STAGE_REVISIONS = {'enroll': 1, 'enroll_phone': 2, 'move': 5, 'move_back': 8}
+# Tool-chosen operation ids (the router keeps one receipt per id), never read from the config.
+OPERATION_IDS = {'enroll_phone': 'penn-pilot-phone-1', 'move': 'penn-pilot-move-1', 'move_back': 'penn-pilot-move-2',
+                 'bulk_pause': 'penn-pilot-bulk-1', 'bulk_resume': 'penn-pilot-bulk-2', 'unenrol': 'penn-pilot-unenrol-1'}
+# The remote script begins its teardown at this share of remoteTimeoutSeconds (v2 only; v1 keeps its legacy shape).
+SELF_ABORT_PERCENT = 70
 # Q6, decided by the user: a failed block-all is reported as `unchanged` (provable by the firewall
 # fingerprint compare), never `not_blocking` (a packet claim the tool cannot measure).
 FAILED_BLOCK_ALL_WORDING = 'unchanged'
@@ -53,7 +62,7 @@ SCOPE_LEGS = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
 POLICY_KEYS = {'version', 'revision', 'people', 'pauses', 'schedules', 'doh'}
 # Bound into the plan digest of every v2 plan; a missing one is a refusal, never a silent drop.
 V2_ONLY_DIGEST_FIELDS = ('configSchemaVersion', 'legs', 'pilotPolicies', 'failedBlockAllWording',
-                         'failedBlockAllWordingDecidedBy')
+                         'failedBlockAllWordingDecidedBy', 'selfAbortPercent', 'operationIds')
 V2_DIGEST_FIELDS = V2_ONLY_DIGEST_FIELDS + ('roles', 'protectedHistoricalMacs', 'platformProfile', 'sourceCommit')
 
 
@@ -139,8 +148,9 @@ def expected_stage_policy(stage, config):
     """The exact policy of one v2 stage, built from the config alone (never from the policy being validated)."""
     chromebook, phone = config['roles']['penn_child']['mac'], config['roles'][SCOPE_TARGET_ROLE]['mac']
     both = sorted([chromebook, phone])
-    spec = {'enroll': (1, [(PERSON, [chromebook])]), 'enroll_phone': (2, [(PERSON, both)]),
-            'move': (3, [(PERSON, [phone]), (PILOT_B, [chromebook])]), 'move_back': (4, [(PERSON, both)])}
+    members = {'enroll': [(PERSON, [chromebook])], 'enroll_phone': [(PERSON, both)],
+               'move': [(PERSON, [phone]), (PILOT_B, [chromebook])], 'move_back': [(PERSON, both)]}
+    spec = {name: (STAGE_REVISIONS[name], who) for name, who in members.items()}
     if stage not in spec:
         raise Refusal(f'unknown pilot policy stage {stage!r}')
     revision, people = spec[stage]
@@ -199,9 +209,10 @@ def candidate_policies(config, base):
     def stage(revision, people):
         return dict(base, revision=revision, people=people)
     both = sorted([chromebook, phone])
-    policies = (stage(1, [{'id': PERSON, 'macs': [chromebook]}]), stage(2, [{'id': PERSON, 'macs': both}]),
-                stage(3, [{'id': PERSON, 'macs': [phone]}, {'id': PILOT_B, 'macs': [chromebook]}]),
-                stage(4, [{'id': PERSON, 'macs': both}]))
+    policies = (stage(STAGE_REVISIONS['enroll'], [{'id': PERSON, 'macs': [chromebook]}]),
+                stage(STAGE_REVISIONS['enroll_phone'], [{'id': PERSON, 'macs': both}]),
+                stage(STAGE_REVISIONS['move'], [{'id': PERSON, 'macs': [phone]}, {'id': PILOT_B, 'macs': [chromebook]}]),
+                stage(STAGE_REVISIONS['move_back'], [{'id': PERSON, 'macs': both}]))
     return list(zip(STAGES, policies))
 
 
@@ -225,23 +236,50 @@ def scope_legs(config):
     return legs
 
 
-def new_phase_worst_seconds(call, snap, read, settle):
-    """Worst case of the v2 phases. `call` is one cfctl call (safe-band wait + allowance), `snap` one counters
-    snapshot, `read` one read-only firewall read, `settle` one status settle; each leg is its hard timeout."""
+# A local exec that never reaches cfctl's lock (wrapper argv negatives, the no-TTY refusal, a logread count).
+LOCAL_EXEC_SECONDS = 10
+
+
+def new_phase_worst_seconds(call, snap, read, settle, iteration=0, observe=0):
+    """Worst case of the v2 phases, counted from the calls penn-pilot.sh makes. `call` is one cfctl call (safe-band
+    wait + allowance), `snap` one counters snapshot, `read` one read-only firewall read, `settle` the extra worst case
+    of one status settle beyond its first status call, `iteration` one adult-probe iteration and `observe` the
+    BULK observation window. A leg poll loop ends within SCOPE_LEG_SECONDS plus the one call it started inside it."""
+    leg, local = SCOPE_LEG_SECONDS, LOCAL_EXEC_SECONDS
     return {
-        # preview, no-TTY refusal, status, status, status, one slack call; legs 2a and 2b
-        'SCOPE-ADD-1': 6 * call + 2 * SCOPE_LEG_SECONDS,
-        # preview, two argv negatives, status, rpc-sync enrolling the phone, one slack call; leg 2c; settle
-        'SCOPE-ADD-2': 6 * call + SCOPE_LEG_SECONDS + settle,
-        # sync A, pause, resume, sync B, status, one slack call; kernel reads; settle
-        'MOVE': 6 * call + 2 * read + settle,
-        # two syncs, two status reads; per-family chain counts before and after; settle
-        'BULK': 4 * call + 2 * snap + settle,
+        # preview, status, two leg polls; the no-TTY refusal is local
+        'SCOPE-ADD-1': 4 * call + 2 * leg + local,
+        # wrapper preview, status after the argv negatives, poll, status + rpc-sync, settle's first status; negatives local
+        'SCOPE-ADD-2': 6 * call + leg + local + settle,
+        # sync A and B (status + sync), pause, resume, two settles; firewall shape x2 and kernel reads; one probe
+        'MOVE': 8 * call + 2 * settle + 10 * read + iteration,
+        # pause_all and resume_all (status + sync + settle's first status each); kernel and chain reads per state
+        'BULK': 6 * call + 2 * settle + 10 * read + observe + iteration,
         # three rpc-inventory reads and one wrapper read
-        'INVENTORY': 4 * call,
-        # unenrol sync, status, status; leg 2d; settle
-        'SCOPE-REMOVE': 3 * call + SCOPE_LEG_SECONDS + settle,
+        'INVENTORY': 4 * call + local,
+        # unenrol (status + sync + settle), status for the base, poll; the logread count is local
+        'SCOPE-REMOVE': 5 * call + settle + leg + local,
     }
+
+
+def template_parameters(config, policies):
+    """The CFP_* values only the v2 template reads (v1 emits none of them). `policies` is the validated
+    (stage, policy) sequence; the template re-derives each one from the MACs and refuses a mismatch."""
+    stages = {name: json.dumps(policy, separators=(',', ':'), sort_keys=False) for name, policy in policies}
+    target = config['roles'][SCOPE_TARGET_ROLE]
+    return {'CFP_V2': 1, 'CFP_PHONE_IP': target['ip'], 'CFP_PHONE_MAC': target['mac'], 'CFP_PILOT_B': PILOT_B,
+            'CFP_POLICY_PHONE': stages['enroll_phone'], 'CFP_POLICY_MOVE': stages['move'],
+            'CFP_POLICY_BACK': stages['move_back'],
+            'CFP_OP_PHONE': OPERATION_IDS['enroll_phone'], 'CFP_OP_MOVE': OPERATION_IDS['move'],
+            'CFP_OP_MOVE_BACK': OPERATION_IDS['move_back'], 'CFP_OP_BULK_PAUSE': OPERATION_IDS['bulk_pause'],
+            'CFP_OP_BULK_RESUME': OPERATION_IDS['bulk_resume'], 'CFP_OP_UNENROL': OPERATION_IDS['unenrol'],
+            'CFP_SCOPE_LEG_SECONDS': SCOPE_LEG_SECONDS, 'CFP_FAILED_BLOCK_ALL': FAILED_BLOCK_ALL_WORDING,
+            'CFP_SELF_ABORT_PCT': SELF_ABORT_PERCENT}
+
+
+def self_abort_seconds(remote_timeout):
+    """Elapsed seconds at which the remote script begins its teardown."""
+    return remote_timeout * SELF_ABORT_PERCENT // 100
 
 
 def digest_fields(details):

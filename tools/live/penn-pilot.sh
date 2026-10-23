@@ -7,6 +7,13 @@
 # RESUME EXPIRY DNS UNINSTALL RESTORE CONNECTIVITY (SCOPE only when the private
 # config sets scopeNegativeTest). A second Penn device (CFP_PENN2_*) is enrolled
 # under the same person; "paused" means every device is in the paused set.
+# Schema v2 (CFP_V2=1): the install floor is the Chromebook only and the phone
+# (CFP_PHONE_*) is added to Penn's scope and enrolled later. The phase list is
+# ENROLL [SCOPE] SCOPE-ADD-1 SCOPE-ADD-2 PAUSE RESUME MOVE BULK EXPIRY DNS
+# INVENTORY SCOPE-REMOVE. scope-add/remove need a TTY and a typed confirmation, so
+# leg 1 (this script) only prints `CFP_LEG2_READY <leg> <base>` and re-reads
+# rpc-status until the scope changed; the local tool starts the commit leg (T4).
+# v2 also begins its teardown at CFP_SELF_ABORT_PCT percent of the remote timeout.
 # After MUTATION_BEGIN every path
 # ends in one teardown: installed uninstall.sh once, exact snapshot compare and
 # connectivity. Pauses are always timed (--until); pause rules carry no kernel
@@ -56,6 +63,29 @@ CFP_SCOPE_OPERATION_ID=
 CFP_SCOPE_ERROR=
 CFP_SCOPE_POLICY=
 CFP_WORST_SCOPE=
+# Emitted only for schema v2 (absent means v1: no scope_target phases, no self-abort).
+CFP_V2=
+CFP_PHONE_IP=
+CFP_PHONE_MAC=
+CFP_PILOT_B=
+CFP_POLICY_PHONE=
+CFP_POLICY_MOVE=
+CFP_POLICY_BACK=
+CFP_OP_PHONE=
+CFP_OP_MOVE=
+CFP_OP_MOVE_BACK=
+CFP_OP_BULK_PAUSE=
+CFP_OP_BULK_RESUME=
+CFP_OP_UNENROL=
+CFP_SCOPE_LEG_SECONDS=
+CFP_FAILED_BLOCK_ALL=
+CFP_SELF_ABORT_PCT=
+CFP_WORST_SCOPE_ADD_1=
+CFP_WORST_SCOPE_ADD_2=
+CFP_WORST_MOVE=
+CFP_WORST_BULK=
+CFP_WORST_INVENTORY=
+CFP_WORST_SCOPE_REMOVE=
 # @CF_PILOT_PARAMETERS_END@
 
 CFP_DIR=
@@ -65,10 +95,11 @@ CFP_NE_SALT=
 # then +1 per pause or resume; cron `cfctl expire` keeps it).
 CFP_REV=0
 CFP_MUTATED=0
+CFP_PROOF_FAILED=0
 CFP_TEARDOWN=0
 CFP_STOPPED=
 CFP_FRESH_STATES='REACHABLE DELAY'
-CFP_FILES='rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh settle.neigh settle.tokens settle.map counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final activity.json scope-request.json scope-sync.json coverage.clock coverage.neigh4 coverage.neigh6 coverage.leases coverage.addr4 coverage.addr6 fw.before fw.after fw.ipset fw.rules'
+CFP_FILES='preview.out wrapper.out inventory.json inventory.w.json fw.move0 fw.move1 fw.raw bulk.chain rpc-status.json request.json rpc-sync.json status.json rules.S rules.L rules.one rules.out members members.list members.all guard.S dns.out ping.out identity.neigh settle.neigh settle.tokens settle.map counters.enrolled counters.prepause counters.pause0 counters.pause1 counters.resume0 counters.resume1 counters.expired counters.final activity.json scope-request.json scope-sync.json coverage.clock coverage.neigh4 coverage.neigh6 coverage.leases coverage.addr4 coverage.addr6 fw.before fw.after fw.ipset fw.rules'
 
 cfp_cleanup() {
     if [ -n "$CFP_DIR" ] && [ -d "$CFP_DIR" ] && [ ! -L "$CFP_DIR" ] && [ "$CFR_STDOUT_LOST" != 1 ]; then
@@ -247,6 +278,7 @@ cfp_identity() {
     ip -4 neigh show dev br-lan > "$CFP_DIR/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
     cfp_refresh_probe penn_child "$CFR_PENN_IP" "$CFR_PENN_MAC"
     [ -z "$CFP_PENN2_MAC" ] || cfp_refresh_probe penn_child_2 "$CFP_PENN2_IP" "$CFP_PENN2_MAC"
+    [ -z "$CFP_V2" ] || cfp_refresh_probe scope_target "$CFP_PHONE_IP" "$CFP_PHONE_MAC"
     ip -4 neigh show dev br-lan > "$CFP_DIR/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
     if [ ! -f "$CFR_LEASES" ] || [ -L "$CFR_LEASES" ]; then cfr_refuse IDENTITY leases_unavailable; fi
     # shellcheck disable=SC2086
@@ -259,6 +291,13 @@ cfp_identity() {
         # The first device's IP must not carry the second device's MAC either.
         awk -v mac="$CFP_PENN2_MAC" -v ip="$CFR_PENN_IP" '$1==ip{for(i=2;i<NF;i++)if($i=="lladdr"&&tolower($(i+1))==mac)bad=1}END{exit bad}' "$CFP_DIR/identity.neigh" ||
             cfr_refuse IDENTITY penn_child_2_mac_on_penn_ip
+    fi
+    if [ -n "$CFP_V2" ]; then
+        # shellcheck disable=SC2086
+        cfp_identity_device scope_target "$CFP_PHONE_IP" "$CFP_PHONE_MAC" protected_mac_on_scope_target_ip \
+            "$CFR_MGMT_MAC" "$CFR_JD_MAC" "$CFR_PENN_MAC" $CFR_HISTORICAL_MACS
+        awk -v mac="$CFP_PHONE_MAC" -v ip="$CFR_PENN_IP" '$1==ip{for(i=2;i<NF;i++)if($i=="lladdr"&&tolower($(i+1))==mac)bad=1}END{exit bad}' "$CFP_DIR/identity.neigh" ||
+            cfr_refuse IDENTITY scope_target_mac_on_penn_ip
     fi
     # The synthetic SCOPE MAC must not belong to any live device.
     if [ -n "$CFP_SCOPE_TEST" ]; then
@@ -351,9 +390,9 @@ cfp_pause() {
     cfp_p_t0=$(cfp_now)
     [ -n "$cfp_p_t0" ] || { cfr_info 'clock_unavailable'; return 1; }
     CFP_UNTIL=$((cfp_p_t0 + $1 + cfp_extra))
-    cfr_info "pause $CFP_PERSON until=$CFP_UNTIL seconds=$1 latency_margin_s=$cfp_extra"
+    cfr_info "pause ${CFP_PAUSE_WHO:-$CFP_PERSON} until=$CFP_UNTIL seconds=$1 latency_margin_s=$cfp_extra"
     # The printed status line is the gate (exit status alone is not evidence).
-    cfr_run_sh "$CFR_CFCTL" pause "$CFP_PERSON" --until "$CFP_UNTIL" > "$CFP_DIR/status.json" || cfr_info "pause exit $?"
+    cfr_run_sh "$CFR_CFCTL" pause "${CFP_PAUSE_WHO:-$CFP_PERSON}" --until "$CFP_UNTIL" > "$CFP_DIR/status.json" || cfr_info "pause exit $?"
     cfp_lat_note "$cfp_p_t0"
     cfr_info "pause_call latency_s=$cfp_lat remaining_s=$((CFP_UNTIL - ${cfp_lat_now:-$CFP_UNTIL}))"
 }
@@ -407,6 +446,7 @@ cfp_neigh_evidence() {
                 "$CFR_JD_MAC") cfp_ne_label=jd_adult;;
                 "$CFR_PENN_MAC") cfp_ne_label=penn_child;;
                 "$CFP_PENN2_MAC") cfp_ne_label=penn_child_2;;
+                "$CFP_PHONE_MAC") cfp_ne_label=scope_target;;
             esac
             for cfp_ne_old in $CFR_HISTORICAL_MACS; do [ "$cfp_ne_tok" != "$cfp_ne_old" ] || cfp_ne_label=protected; done
         fi
@@ -450,6 +490,7 @@ cfp_status_settle() {
         fi
         cfp_status_transient "$CFP_DIR/status.json" "$cfp_ss_rev" "$@" || { cfr_info "$cfp_ss_log not_transient"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
         [ "$((cfp_ss_now - cfp_ss_t0))" -lt "$((CFP_STATUS_SETTLE - 1))" ] || { cfr_info "$cfp_ss_log gave_up"; cfp_stop "$cfp_ss_phase" "$cfp_ss_reason"; }
+        cfp_abort_check "$cfp_ss_phase"
         cfp_elapsed_ok "$((CFP_ITERATION_WORST + CFP_READ_TIMEOUT + 72 + CFP_CFCTL_ALLOWANCE))" ||
             cfp_stop "$cfp_ss_phase" remote_budget_reserved_for_teardown
         cfp_adult_probe "$cfp_ss_phase" || cfp_stop "$cfp_ss_phase" "adult_disruption $CFP_ADULT_REASON"
@@ -473,9 +514,11 @@ cfp_paused_members() {
 }
 # Prints paused (every Penn device in the set), clear (none), partial (some)
 # or unknown (an unreadable set is never read as clear).
-cfp_penn_state() {
+cfp_penn_state() { cfp_set_state "$CFP_RPC_ALLOW"; }
+# $1 space-separated MACs: paused (all in the paused set), clear (none), partial or unknown.
+cfp_set_state() {
     if ! cfp_paused_members > "$CFP_DIR/members.list"; then printf 'unknown\n'; return 0; fi
-    awk -v set="$CFP_RPC_ALLOW" 'BEGIN{n=split(set,a," ");for(i=1;i<=n;i++)want[a[i]]=1}
+    awk -v set="$1" 'BEGIN{n=split(set,a," ");for(i=1;i<=n;i++)want[a[i]]=1}
         ($0 in want)&&!seen[$0]++{c++}END{if(c==n)print "paused";else if(c+0==0)print "clear";else print "partial"}' "$CFP_DIR/members.list"
 }
 # Diagnostic only: paused=, guard_reachable= (cf_fwd jumps to a cf2_[ab]_g in
@@ -577,6 +620,7 @@ cfp_observe() {
         cfp_o_now=$(cfp_now)
         [ -n "$cfp_o_now" ] || cfp_stop "$3" clock_unavailable
         [ "$cfp_o_now" -lt "$cfp_end" ] || break
+        cfp_abort_check "$3"
         cfp_elapsed_ok "$CFP_ITERATION_WORST" || cfp_stop "$3" remote_budget_reserved_for_teardown
         cfp_adult_probe "$3" || cfp_stop "$3" "adult_disruption $CFP_ADULT_REASON"
         cfp_state_check "$2" "$3"
@@ -617,6 +661,7 @@ cfp_teardown() {
     cfr_ok UNINSTALL
     cfp_crond_count after_uninstall
     cfr_restore
+    cfp_teardown_proof
     # CFR_FAILED is already 1 after a STOP; isolate the connectivity result.
     cfp_failed=$CFR_FAILED
     CFR_FAILED=0
@@ -624,7 +669,7 @@ cfp_teardown() {
     cfp_connectivity=$CFR_FAILED
     [ "$cfp_failed" = 0 ] || CFR_FAILED=1
     if [ "$CFR_FAILED" = 0 ] && [ -z "$CFP_STOPPED" ]; then cfr_out PENN_PILOT_PASS; exit 0; fi
-    if [ -n "$CFP_STOPPED" ] && cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then
+    if [ -n "$CFP_STOPPED" ] && [ "$CFP_PROOF_FAILED" = 0 ] && cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then
         cfr_out "STOPPED_AFTER_MUTATION $CFP_STOPPED"
         if [ "$cfp_connectivity" = 0 ]; then cfr_out PENN_PILOT_STOPPED_RESTORED
         else cfr_out PENN_PILOT_STOPPED_RESTORED_CONNECTIVITY_FAILED; fi
@@ -634,7 +679,18 @@ cfp_teardown() {
     exit 20
 }
 # $1 phase, $2 its worst-case seconds: start it only if it can finish before the reserve.
-cfp_budget() { cfp_elapsed_ok "$2" || cfp_stop "$1" remote_budget_reserved_for_teardown; }
+cfp_budget() {
+    cfp_abort_check "$1"
+    cfp_elapsed_ok "$2" || cfp_stop "$1" remote_budget_reserved_for_teardown
+}
+# v2 only (CFP_SELF_ABORT_PCT set): begin the teardown at that percent of the remote timeout, so the router-side
+# `timeout -s KILL` (the full timeout) stays a last resort. A run that reaches the mark ends STOPPED (restored).
+cfp_abort_check() {
+    [ -n "$CFP_SELF_ABORT_PCT" ] || return 0
+    cfp_ab_now=$(cfp_now)
+    [ -n "$cfp_ab_now" ] || cfp_stop "$1" clock_unavailable
+    [ "$(((cfp_ab_now - CFR_START) * 100))" -lt "$((CFP_REMOTE_TIMEOUT * CFP_SELF_ABORT_PCT))" ] || cfp_stop "$1" remote_self_abort
+}
 
 # Failure evidence only: no refresh, retry or policy change. Every read reserves
 # its full timeout plus output overhead before touching the teardown reserve.
@@ -835,6 +891,7 @@ cfp_expiry_phase() {
     cfp_last=0
     CFP_UNKNOWN=0
     while :; do
+        cfp_abort_check EXPIRY
         cfp_elapsed_ok "$CFP_ITERATION_WORST" || cfp_stop EXPIRY remote_budget_reserved_for_teardown
         cfp_t=$(cfp_now)
         [ -n "$cfp_t" ] || cfp_stop EXPIRY clock_unavailable
@@ -882,6 +939,439 @@ cfp_dns_phase() {
     cfr_ok DNS
 }
 
+# --- Schema v2 (scope_target) --------------------------------------------------
+# Leg 1 only: the scope commit needs a TTY and a typed confirmation, so the local tool (T4) starts each commit leg
+# when it sees the marker. Leg 1 never trusts a leg's report: it re-reads rpc-status until the scope changed.
+# Privacy: scope-preview prints a lease hostname and protected MACs, rpc-inventory lists every LAN device. Their raw
+# output goes to files in the stage dir (removed by cfp_cleanup) and is never echoed; only counts, booleans and
+# hashes reach stdout.
+
+# Space-separated MACs, C-sorted pair.
+cfp_sorted_pair() { printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//'; }
+# "a b" -> ["a","b"]
+cfp_mac_json() { printf '%s\n' "$1" | awk '{printf "[";for(i=1;i<=NF;i++)printf "%s\"%s\"",(i>1?",":""),$i;printf "]"}'; }
+# $1 person id, $2 space-separated MACs
+cfp_person_json() { printf '{"id":"%s","macs":%s}' "$1" "$(cfp_mac_json "$2")"; }
+# $1 stage (enroll|phone|move|back), $2 revision, $3 pauses array body. Built from the MACs IDENTITY checked, never
+# from a parameter, so a tampered CFP_POLICY_* parameter cannot reach the router.
+cfp_stage_json() {
+    case $1 in
+        enroll) cfp_sj_people=$(cfp_person_json penn "$CFR_PENN_MAC");;
+        phone|back) cfp_sj_people=$(cfp_person_json penn "$CFP_BOTH");;
+        move) cfp_sj_people="$(cfp_person_json penn "$CFP_PHONE_MAC"),$(cfp_person_json pilot_b "$CFR_PENN_MAC")";;
+        *) return 1;;
+    esac
+    printf '{"version":1,"revision":%s,"people":[%s],"pauses":[%s],"schedules":[],"doh":{"ipv4":[],"ipv6":[]}}' "$2" "$cfp_sj_people" "$3"
+}
+# PAYLOAD check: the phone is a distinct unprotected device and every stage policy parameter equals the policy this
+# script derives from the MACs (at the revision the parameter names).
+cfp_v2_check() {
+    [ "$CFP_PILOT_B" = pilot_b ] || return 1
+    case $CFP_PHONE_MAC in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *) return 1;;
+    esac
+    [ "$CFP_PHONE_MAC" != "$CFR_PENN_MAC" ] && [ "$CFP_PHONE_IP" != "$CFR_PENN_IP" ] || return 1
+    for cfp_v2_m in "$CFR_MGMT_MAC" "$CFR_JD_MAC" $CFR_HISTORICAL_MACS; do
+        [ "$cfp_v2_m" != "$CFP_PHONE_MAC" ] || return 1
+    done
+    CFP_FLOOR=$CFR_PENN_MAC
+    CFP_BOTH=$(cfp_sorted_pair "$CFR_PENN_MAC" "$CFP_PHONE_MAC")
+    for cfp_v2_s in "enroll:$CFP_POLICY" "phone:$CFP_POLICY_PHONE" "move:$CFP_POLICY_MOVE" "back:$CFP_POLICY_BACK"; do
+        cfp_v2_name=${cfp_v2_s%%:*}
+        cfp_v2_given=${cfp_v2_s#*:}
+        cfp_v2_rev=${cfp_v2_given#'{"version":1,"revision":'}
+        cfp_v2_rev=${cfp_v2_rev%%,*}
+        case $cfp_v2_rev in ''|*[!0-9]*) return 1;; esac
+        [ "$cfp_v2_given" = "$(cfp_stage_json "$cfp_v2_name" "$cfp_v2_rev" '')" ] || return 1
+    done
+}
+
+# --- rpc-status / rpc-sync helpers ---------------------------------------------
+# Parses $CFP_DIR/rpc-status.json (one scoped reply line) into cfp_gen, cfp_digest, cfp_rev_seen, cfp_sc_sha and
+# cfp_sc_list (space-separated scope).
+cfp_status_parse() {
+    cfp_rs=$CFP_DIR/rpc-status.json
+    awk 'END{exit NR!=1}' "$cfp_rs" || return 1
+    cfp_gen=$(sed -n 's/^{"rpc_version":1,"generation":"\([0-9a-f]\{64\}\)",.*/\1/p' "$cfp_rs")
+    cfp_digest=$(sed -n 's/.*,"policyDigest":"\([0-9a-f]\{64\}\)",.*/\1/p' "$cfp_rs")
+    cfp_rev_seen=$(sed -n 's/.*"acceptedPolicy":{"version":1,"revision":\([0-9][0-9]*\),.*/\1/p' "$cfp_rs")
+    cfp_sc_sha=$(sed -n 's/.*,"scope":\[[^]]*\],"scopeSha":"\([0-9a-f]\{64\}\)"}$/\1/p' "$cfp_rs")
+    cfp_sc_list=$(sed -n 's/.*,"scope":\[\([^]]*\)\],"scopeSha":"[0-9a-f]\{64\}"}$/\1/p' "$cfp_rs" | tr ',' ' ' | tr -d '"')
+    [ "${#cfp_gen}" = 64 ] && [ "${#cfp_digest}" = 64 ] && [ "${#cfp_sc_sha}" = 64 ] && [ -n "$cfp_rev_seen" ] && [ -n "$cfp_sc_list" ]
+}
+# One rpc-status read with its parse; $1 phase.
+cfp_status_read() {
+    cfp_cfctl rpc-status --json > "$CFP_DIR/rpc-status.json" || cfp_stop "$1" rpc_status_failed
+    cfp_status_parse || cfp_stop "$1" rpc_status_unparsed
+}
+# The router's scopeSha of a space-separated MAC list (sorted, one per line, trailing newline).
+# shellcheck disable=SC2086
+cfp_scope_sha() { printf '%s\n' $1 | LC_ALL=C sort | sha256sum | awk '{print $1}'; }
+# $1 phase. One status read (CAS: the revision must be the one the pilot's own calls set).
+cfp_sync_prepare() {
+    cfp_status_read "$1"
+    [ "$cfp_rev_seen" = "$CFP_REV" ] || cfp_stop "$1" "revision_unexpected seen=$cfp_rev_seen want=$CFP_REV"
+}
+# $1 phase, $2 operation id, $3 policy JSON, $4 space-separated MACs the policy must name (all of them, nothing else).
+# One rpc-sync after cfp_sync_prepare, never retried; exactly one receipt, accepted at the next revision.
+cfp_sync_send() {
+    cfp_sy_phase=$1 cfp_sy_op=$2 cfp_sy_policy=$3 cfp_sy_macs=$4
+    case $cfp_sy_policy in
+        '{"version":1,"revision":'"$((CFP_REV + 1))"',"people":'*) ;;
+        *) cfp_stop "$cfp_sy_phase" policy_revision_mismatch;;
+    esac
+    printf '{"rpc_version":1,"generation":"%s","operation_id":"%s","expected_revision":%s,"expected_digest":"%s","policy":%s}\n' \
+        "$cfp_gen" "$cfp_sy_op" "$CFP_REV" "$cfp_digest" "$cfp_sy_policy" > "$CFP_DIR/request.json" || cfp_stop "$cfp_sy_phase" request_write_failed
+    cfp_policy_macs "$(cat "$CFP_DIR/request.json")" "$cfp_sy_macs" || cfp_stop "$cfp_sy_phase" request_unexpected_macs
+    cfr_info "rpc-sync operation=$cfp_sy_op"
+    cfp_cfctl_input "$CFP_DIR/request.json" rpc-sync > "$CFP_DIR/rpc-sync.json" || {
+        cfp_rc=$?
+        cfr_info "rpc-sync exit=$cfp_rc $(tr '\n' ' ' < "$CFP_DIR/rpc-sync.json")"
+        cfp_stop "$cfp_sy_phase" rpc_sync_failed
+    }
+    cfp_sy_base=$(sed -n "s/.*\"receipt\":{\"operationId\":\"$cfp_sy_op\",\"requestDigest\":\"[0-9a-f]*\",\"baseRevision\":\([0-9][0-9]*\),.*/\1/p" "$CFP_DIR/rpc-sync.json")
+    cfp_sy_acc=$(sed -n "s/.*\"receipt\":{\"operationId\":\"$cfp_sy_op\",.*\"acceptedRevision\":\([0-9][0-9]*\),\"acceptedDigest\".*/\1/p" "$CFP_DIR/rpc-sync.json")
+    [ -n "$cfp_sy_base" ] && [ -n "$cfp_sy_acc" ] || cfp_stop "$cfp_sy_phase" receipt_missing
+    [ "$cfp_sy_base" = "$CFP_REV" ] && [ "$cfp_sy_acc" = "$((CFP_REV + 1))" ] || cfp_stop "$cfp_sy_phase" "receipt_revision_unexpected base=$cfp_sy_base accepted=$cfp_sy_acc"
+    CFP_REV=$cfp_sy_acc
+}
+cfp_sync() { cfp_sync_prepare "$1"; cfp_sync_send "$@"; }
+# The last rpc-sync reply contains the fragment $1.
+cfp_reply_has() { grep -Fq "$1" "$CFP_DIR/rpc-sync.json"; }
+
+# --- scope preview, wrapper runs and the leg-2 marker --------------------------
+# Wrapper copies are the installed ones; fixtures may point CFP_WRAPPER_DIR at test-mode-capable copies.
+cfp_wrapper_dir() {
+    cfp_wd=$CFR_ROOT/usr/sbin
+    if [ "$CFR_FIXTURE" = 1 ] && [ -n "${CFP_WRAPPER_DIR:-}" ]; then cfp_wd=$CFP_WRAPPER_DIR; fi
+    printf '%s\n' "$cfp_wd"
+}
+# $1 wrapper name, $2 SSH_ORIGINAL_COMMAND, rest: wrapper argv. stdin is /dev/null; child diagnostics go to the stage log.
+cfp_wrapper_run() {
+    cfp_wr_name=$1 cfp_wr_cmd=$2; shift 2
+    # shellcheck disable=SC2086
+    env SSH_ORIGINAL_COMMAND="$cfp_wr_cmd" $CFR_SH "$(cfp_wrapper_dir)/$cfp_wr_name" "$@" </dev/null 2>>"$CFR_STAGE/child.log"
+}
+# $1 phase, $2 direct|wrapper. Raw output stays in preview.out; sets cfp_pv_sha, cfp_pv_count, cfp_pv_absent.
+cfp_preview() {
+    cfp_safe_band || cfp_stop "$1" safe_band_unavailable
+    if [ "$2" = wrapper ]; then cfp_wrapper_run cfctl-scope "cfctl scope-preview $CFP_PHONE_MAC" pilot > "$CFP_DIR/preview.out" || cfp_stop "$1" scope_preview_failed
+    else cfr_run_sh "$CFR_CFCTL" scope-preview "$CFP_PHONE_MAC" > "$CFP_DIR/preview.out" || cfp_stop "$1" scope_preview_failed; fi
+    cfp_pv_line=$(tail -n 1 "$CFP_DIR/preview.out")
+    case $cfp_pv_line in
+        "{\"ok\":true,\"action\":\"scope-preview\",\"mac\":\"$CFP_PHONE_MAC\","*",\"errors\":[]}") ;;
+        *) cfp_stop "$1" scope_preview_unparsed;;
+    esac
+    case $cfp_pv_line in *'"inScope":false,'*) ;; *) cfp_stop "$1" scope_target_in_scope_at_start;; esac
+    case $cfp_pv_line in *'"evidence":true,'*) ;; *) cfp_stop "$1" scope_target_no_evidence;; esac
+    case $cfp_pv_line in
+        *'"addRefusal":null,'*) ;;
+        *) cfp_pv_why=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*"addRefusal":"\([a-z_]*\)".*/\1/p')
+           cfp_stop "$1" "scope_add_refused ${cfp_pv_why:-unknown}";;
+    esac
+    cfp_pv_sha=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*,"scopeSha":"\([0-9a-f]\{64\}\)",.*/\1/p')
+    cfp_pv_count=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*,"scopeCount":\([0-9][0-9]*\),.*/\1/p')
+    cfp_pv_absent=$(printf '%s\n' "$cfp_pv_line" | sed -n 's/.*,"protectedAbsent":\([0-9][0-9]*\),.*/\1/p')
+    [ "${#cfp_pv_sha}" = 64 ] && [ -n "$cfp_pv_count" ] && [ -n "$cfp_pv_absent" ] || cfp_stop "$1" scope_preview_unparsed
+    cfr_out "MEASURE scope_preview_$3 measured in_scope=false evidence=true add_refusal=none scope_entries=$cfp_pv_count protected_absent=$cfp_pv_absent"
+}
+# The live scope file is read lock-free: the commit leg takes the runtime and platform locks and refuses when they
+# are held, so the poll must not hold them. Its sha256 is the router's scopeSha (the file is canonical, LF-terminated).
+cfp_scope_file_sha() { sha256sum "$CFR_ROOT/etc/couvrefeu/rpc-allowed" 2>/dev/null | awk '{print $1}'; }
+# $1 phase, $2 leg id (2a..2d), $3 base scopeSha the leg commits against, $4 scopeSha that proves the leg's effect,
+# $5 add|remove. Prints the marker once, then polls the scope file until it became $4 and confirms with ONE
+# authoritative rpc-status read (sha and the phone's membership). The leg's own report is never used. A scope that is
+# neither $3 nor $4, a mismatching re-read or CFP_SCOPE_LEG_SECONDS without change stops the pilot.
+cfp_leg2() {
+    cfp_l_phase=$1 cfp_l_leg=$2 cfp_l_base=$3 cfp_l_want=$4 cfp_l_op=$5
+    cfp_safe_band || cfp_stop "$cfp_l_phase" safe_band_unavailable
+    cfr_out "CFP_LEG2_READY $cfp_l_leg $cfp_l_base"
+    cfp_l_t0=$(cfp_now)
+    [ -n "$cfp_l_t0" ] || cfp_stop "$cfp_l_phase" clock_unavailable
+    while :; do
+        cfp_abort_check "$cfp_l_phase"
+        cfp_elapsed_ok "$((CFP_CFCTL_ALLOWANCE + 72 + 2))" || cfp_stop "$cfp_l_phase" remote_budget_reserved_for_teardown
+        cfp_l_sha=$(cfp_scope_file_sha)
+        if [ "$cfp_l_sha" = "$cfp_l_want" ]; then break; fi
+        if [ -n "$cfp_l_sha" ] && [ "$cfp_l_sha" != "$cfp_l_base" ]; then cfp_stop "$cfp_l_phase" scope_sha_unexpected; fi
+        cfp_l_now=$(cfp_now)
+        [ -n "$cfp_l_now" ] || cfp_stop "$cfp_l_phase" clock_unavailable
+        [ "$((cfp_l_now - cfp_l_t0))" -lt "$CFP_SCOPE_LEG_SECONDS" ] || cfp_stop "$cfp_l_phase" scope_leg_timeout
+        sleep 2
+    done
+    cfp_status_read "$cfp_l_phase"
+    [ "$cfp_sc_sha" = "$cfp_l_want" ] || cfp_stop "$cfp_l_phase" scope_reread_mismatch
+    case " $cfp_sc_list " in
+        *" $CFP_PHONE_MAC "*) cfp_l_in=add;;
+        *) cfp_l_in=remove;;
+    esac
+    [ "$cfp_l_in" = "$cfp_l_op" ] || cfp_stop "$cfp_l_phase" scope_membership_unexpected
+    [ "$(cfp_scope_sha "$cfp_sc_list")" = "$cfp_l_want" ] || cfp_stop "$cfp_l_phase" scope_sha_inconsistent
+    cfr_out "MEASURE scope_leg_$cfp_l_leg measured scope_sha_changed membership=$cfp_l_op reread_rpc_status"
+}
+
+cfp_scope_add_1_phase() {
+    cfp_preview SCOPE-ADD-1 direct add_1
+    CFP_BASE0=$cfp_pv_sha
+    # No TTY: cfctl must refuse before platform admission, with exactly this reply and no state change.
+    cfp_na=$(cfr_run_sh "$CFR_CFCTL" scope-add "$CFP_PHONE_MAC" --base "$CFP_BASE0")
+    cfp_nrc=$?
+    { [ "$cfp_nrc" = 1 ] && [ "$cfp_na" = '{"ok":false,"errors":["scope_tty_required"]}' ]; } || cfp_stop SCOPE-ADD-1 scope_tty_refusal_unexpected
+    cfp_status_read SCOPE-ADD-1
+    [ "$cfp_sc_sha" = "$CFP_BASE0" ] || cfp_stop SCOPE-ADD-1 scope_changed_by_refusal
+    [ "$(cfp_scope_sha "$cfp_sc_list")" = "$CFP_BASE0" ] || cfp_stop SCOPE-ADD-1 scope_sha_inconsistent
+    CFP_SC_LIST0=$cfp_sc_list
+    cfr_out 'MEASURE scope_no_tty_refusal measured scope_tty_required exit=1 state_unchanged'
+    # shellcheck disable=SC2086
+    CFP_SC_ADDED=$(printf '%s\n' $CFP_SC_LIST0 "$CFP_PHONE_MAC" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+    CFP_SHA_ADDED=$(cfp_scope_sha "$CFP_SC_ADDED")
+    cfp_leg2 SCOPE-ADD-1 2a "$CFP_BASE0" "$CFP_SHA_ADDED" add
+    cfp_leg2 SCOPE-ADD-1 2b "$CFP_SHA_ADDED" "$CFP_BASE0" remove
+    cfr_ok SCOPE-ADD-1
+}
+# Wrapper argv negatives exit 2 before exec: no cfctl, no state change.
+cfp_wrapper_negatives() {
+    cfp_wn=0
+    for cfp_wn_cmd in 'cfctl scope-add bad' "cfctl scope-add $CFP_PHONE_MAC --base short" \
+        "cfctl scope-add $CFP_PHONE_MAC --base $CFP_BASE0 extra" 'cfctl scope-preview'; do
+        cfp_wn_out=$(cfp_wrapper_run cfctl-scope "$cfp_wn_cmd" pilot)
+        cfp_wn_rc=$?
+        { [ "$cfp_wn_rc" = 2 ] && [ -z "$cfp_wn_out" ]; } || cfp_stop SCOPE-ADD-2 wrapper_negative_accepted
+        cfp_wn=$((cfp_wn + 1))
+    done
+    cfr_out "MEASURE scope_wrapper_argv_negatives measured rejected=$cfp_wn exit=2 no_output"
+}
+cfp_scope_add_2_phase() {
+    cfp_preview SCOPE-ADD-2 wrapper add_2
+    [ "$cfp_pv_sha" = "$CFP_BASE0" ] || cfp_stop SCOPE-ADD-2 scope_not_restored_after_leg_2b
+    cfp_wrapper_negatives
+    cfp_status_read SCOPE-ADD-2
+    [ "$cfp_sc_sha" = "$CFP_BASE0" ] || cfp_stop SCOPE-ADD-2 scope_changed_by_negatives
+    cfp_leg2 SCOPE-ADD-2 2c "$CFP_BASE0" "$CFP_SHA_ADDED" add
+    cfp_sync SCOPE-ADD-2 "$CFP_OP_PHONE" "$CFP_POLICY_PHONE" "$CFP_BOTH"
+    CFP_RPC_ALLOW=$CFP_BOTH
+    CFP_KIDS_JSON=$(cfp_mac_json "$CFP_BOTH")
+    CFP_PENN2_IP=$CFP_PHONE_IP
+    CFP_PENN2_MAC=$CFP_PHONE_MAC
+    cfp_status_settle SCOPE-ADD-2 phone_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
+    cfr_ok SCOPE-ADD-2
+}
+
+# --- MOVE: the Chromebook moves to pilot_b and back; the block follows the device -----------------
+# Lock-free firewall shape for the move-back compare: cfp_fw_state without the slot line and with the slot letter
+# normalised (every apply may flip a/b).
+cfp_fw_shape() {
+    cfp_fw_state "$CFP_DIR/fw.raw" || return 1
+    sed -e '/^slot /d' -e 's/cf2_[ab]_/cf2_X_/g' "$CFP_DIR/fw.raw" > "$1"
+    rm -f "$CFP_DIR/fw.raw"
+}
+cfp_move_phase() {
+    cfp_fw_shape "$CFP_DIR/fw.move0" || cfp_stop MOVE firewall_read_failed
+    cfp_sync MOVE "$CFP_OP_MOVE" "$CFP_POLICY_MOVE" "$CFP_BOTH"
+    cfp_reply_has "{\"id\":\"pilot_b\",\"macs\":[\"$CFR_PENN_MAC\"]}" || cfp_stop MOVE pilot_b_not_populated
+    cfp_reply_has "{\"id\":\"penn\",\"macs\":[\"$CFP_PHONE_MAC\"]}" || cfp_stop MOVE penn_not_phone_only
+    cfp_status_settle MOVE move_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
+    CFP_PAUSE_WHO=$CFP_PILOT_B
+    cfp_pause "$CFP_PAUSE_SECONDS" || cfp_stop MOVE pause_failed
+    CFP_PAUSE_WHO=
+    cfp_status_has "$CFP_DIR/status.json" "\"effectivePauses\":[{\"person\":\"$CFP_PILOT_B\",\"until\":$CFP_UNTIL}]" \
+        "\"paused\":[\"$CFR_PENN_MAC\"]" || cfp_stop MOVE pause_not_effective
+    CFP_REV=$((CFP_REV + 1))
+    cfp_move_kernel_check paused clear
+    cfp_adult_probe MOVE || cfp_stop MOVE "adult_disruption $CFP_ADULT_REASON"
+    cfp_cfctl resume "$CFP_PILOT_B" > "$CFP_DIR/status.json" || :
+    cfp_status_has "$CFP_DIR/status.json" '"effectivePauses":[]' '"paused":[]' || cfp_stop MOVE resume_not_clean
+    CFP_REV=$((CFP_REV + 1))
+    cfp_move_kernel_check clear clear
+    cfp_sync MOVE "$CFP_OP_MOVE_BACK" "$CFP_POLICY_BACK" "$CFP_BOTH"
+    cfp_reply_has "{\"id\":\"penn\",\"macs\":$(cfp_mac_json "$CFP_BOTH")}" || cfp_stop MOVE penn_not_restored
+    if grep -Fq "$CFP_PILOT_B" "$CFP_DIR/rpc-sync.json"; then cfp_stop MOVE pilot_b_left_populated; fi
+    cfp_status_settle MOVE move_back_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
+    cfp_fw_shape "$CFP_DIR/fw.move1" || cfp_stop MOVE firewall_read_failed
+    cmp -s "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1" || cfp_stop MOVE firewall_not_restored_after_move_back
+    cfr_out 'MEASURE move_block_follows_device measured chromebook_paused=1 phone_paused=0 adult_probe_ok moved_back=1 pilot_b_absent=1 filter_ipset_shape_unchanged'
+    cfr_ok MOVE
+}
+# $1 want state of the Chromebook alone, $2 want state of the phone alone (paused|clear), by kernel paused-set member.
+cfp_move_kernel_check() {
+    cfp_mk_c=$(cfp_set_state "$CFR_PENN_MAC")
+    cfp_mk_p=$(cfp_set_state "$CFP_PHONE_MAC")
+    [ "$cfp_mk_c" = "$1" ] || cfp_stop MOVE "chromebook_kernel_state_not_$1"
+    [ "$cfp_mk_p" = "$2" ] || cfp_stop MOVE "phone_kernel_state_not_$2"
+}
+
+# --- BULK: pause_all and resume_all over penn and pilot_b are ONE rpc-sync each -------------------
+# Paused-rule count of the forward chain per family (unknown when unreadable). Sets cfp_bc4 and cfp_bc6.
+cfp_bulk_chain_state() {
+    cfp_bs=$(cfp_slot) || { cfp_bc4=unknown; cfp_bc6=unknown; return 0; }
+    if cfp_chain_counts 4 filter "cf2_${cfp_bs}_f" > "$CFP_DIR/bulk.chain" 2>/dev/null; then
+        cfp_bc4=$(awk '$1=="paused"{n++}END{print n+0}' "$CFP_DIR/bulk.chain")
+    else cfp_bc4=unknown; fi
+    if cfp_chain_counts 6 filter "cf2_${cfp_bs}_f" > "$CFP_DIR/bulk.chain" 2>/dev/null; then
+        cfp_bc6=$(awk '$1=="paused"{n++}END{print n+0}' "$CFP_DIR/bulk.chain")
+    else cfp_bc6=unknown; fi
+}
+# A failed block-all is reported with the single decided wording (CFP_FAILED_BLOCK_ALL, `unchanged`): provable by
+# the firewall fingerprint compare, never a packet claim.
+cfp_block_all_failed() {
+    cfp_fw_shape "$CFP_DIR/fw.move1" 2>/dev/null && if cmp -s "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1"; then cfr_info 'bulk firewall_fingerprint same'; else cfr_info 'bulk firewall_fingerprint differs'; fi
+    cfp_stop BULK "block_all_$CFP_FAILED_BLOCK_ALL $1"
+}
+cfp_bulk_phase() {
+    cfp_fw_shape "$CFP_DIR/fw.move0" || cfp_stop BULK firewall_read_failed
+    cfp_bk_rev0=$CFP_REV
+    cfp_sync_prepare BULK
+    cfp_bk_now=$(cfp_now)
+    [ -n "$cfp_bk_now" ] || cfp_stop BULK clock_unavailable
+    cfp_bk_extra=$CFP_LAT_MAX
+    [ "$cfp_bk_extra" -le "$CFP_CFCTL_ALLOWANCE" ] || cfp_bk_extra=$CFP_CFCTL_ALLOWANCE
+    cfp_bk_until=$((cfp_bk_now + CFP_PAUSE_SECONDS + cfp_bk_extra))
+    # Timed pauses only: never an open-ended (until 0) pause.
+    [ "$cfp_bk_until" -gt "$cfp_bk_now" ] || cfp_stop BULK pause_not_timed
+    cfp_bk_pauses="{\"person\":\"penn\",\"until\":$cfp_bk_until},{\"person\":\"$CFP_PILOT_B\",\"until\":$cfp_bk_until}"
+    cfp_sync_send BULK "$CFP_OP_BULK_PAUSE" "$(cfp_stage_json move "$((CFP_REV + 1))" "$cfp_bk_pauses")" "$CFP_BOTH"
+    cfp_status_settle BULK pause_all_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":$CFP_KIDS_JSON}" \
+        "\"person\":\"penn\",\"until\":$cfp_bk_until" "\"person\":\"$CFP_PILOT_B\",\"until\":$cfp_bk_until"
+    cfp_bk_rev1=$CFP_REV
+    [ "$(cfp_penn_state)" = paused ] || cfp_block_all_failed set_not_paused
+    cfp_bulk_chain_state
+    cfp_bk_v4=$cfp_bc4 cfp_bk_v6=$cfp_bc6
+    case $cfp_bk_v4 in unknown|0) cfp_block_all_failed ipv4_chain_not_blocking;; esac
+    cfp_observe "$CFP_RESUME_OBSERVE" paused BULK
+    cfp_sync BULK "$CFP_OP_BULK_RESUME" "$(cfp_stage_json back "$((CFP_REV + 1))" '')" "$CFP_BOTH"
+    cfp_status_settle BULK resume_all_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
+    [ "$(cfp_penn_state)" = clear ] || cfp_stop BULK penn_kernel_state_not_clear
+    cfp_bulk_chain_state
+    [ "$((cfp_bk_rev1 - cfp_bk_rev0))" = 1 ] && [ "$((CFP_REV - cfp_bk_rev1))" = 1 ] || cfp_stop BULK bulk_receipt_count_unexpected
+    cfr_out "MEASURE bulk_receipts measured pause_all=1 resume_all=1 revisions=$cfp_bk_rev0,$cfp_bk_rev1,$CFP_REV"
+    case $cfp_bk_v6 in
+        unknown|0) cfr_out "MEASURE bulk_ipv6 unmeasured partial_or_unconfirmed paused_rules=$cfp_bk_v6 not_retried";;
+        *) cfr_out "MEASURE bulk_ipv6 measured paused_rules=$cfp_bk_v6";;
+    esac
+    cfr_out "MEASURE bulk_ipv4 measured paused_rules=$cfp_bk_v4 set_members=$(printf '%s\n' "$CFP_BOTH" | awk '{print NF}')"
+    cfr_ok BULK
+}
+
+# --- INVENTORY: counts, shape and hashes only -------------------------------------
+# $1 reply file. Sets cfp_iv_* ; returns non-zero with cfp_iv_why. The reply is never printed.
+cfp_inventory_check() {
+    cfp_iv_why=
+    if [ ! -s "$1" ]; then cfp_iv_why=empty_reply; return 1; fi
+    if grep -Fq '"errors":["invalid_command"]' "$1"; then cfp_iv_why=invalid_command; return 1; fi
+    awk 'END{exit NR!=1}' "$1" || { cfp_iv_why=not_one_line; return 1; }
+    grep -q '^{"inventory_version":1,"generation":"[0-9a-f]\{64\}","routerTime":[0-9][0-9]*,"devices":\[' "$1" || { cfp_iv_why=not_inventory_v1; return 1; }
+    if ! grep -q ',"errors":\[\]}$' "$1"; then
+        cfp_iv_why=$(sed -n 's/.*,"errors":\["\([a-z0-9_]*\)".*/\1/p' "$1")
+        cfp_iv_why=reply_errors_${cfp_iv_why:-unknown}; return 1
+    fi
+    cfp_iv_bytes=$(wc -c < "$1" | tr -d ' ')
+    [ "$cfp_iv_bytes" -lt 131072 ] || { cfp_iv_why=reply_too_large; return 1; }
+    cfp_iv_count=$(grep -o '{"mac":"' "$1" | wc -l | tr -d ' ')
+    if grep -q '"truncated":true,' "$1"; then cfp_iv_trunc=true; else cfp_iv_trunc=false; fi
+    for cfp_iv_m in "$CFR_MGMT_MAC" "$CFR_JD_MAC" $CFR_HISTORICAL_MACS; do
+        if grep -Fq "\"mac\":\"$cfp_iv_m\"" "$1"; then cfp_iv_why=protected_device_listed; return 1; fi
+    done
+    for cfp_iv_m in "$CFR_PENN_MAC" "$CFP_PHONE_MAC"; do
+        grep -Fq "\"mac\":\"$cfp_iv_m\"" "$1" || { cfp_iv_why=penn_device_missing; return 1; }
+    done
+    # Top-level key set: the devices array is blanked, the remaining keys are listed in order.
+    cfp_iv_shape=$(sed 's/"devices":\[.*\],"truncated"/"devices":[],"truncated"/' "$1" | grep -o '"[a-z_]*":' | tr -d '\n' | sha256sum | awk '{print substr($1,1,12)}')
+    cfp_iv_hash=$({ printf '%s' "$cfp_iv_salt"; cat "$1"; } | sha256sum | awk '{print substr($1,1,12)}')
+}
+cfp_inventory_phase() {
+    cfp_iv_salt=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')
+    [ "${#cfp_iv_salt}" = 64 ] || cfp_stop INVENTORY salt_unavailable
+    cfp_iv_ms=
+    cfp_iv_first=
+    for cfp_iv_n in 1 2 3; do
+        cfp_safe_band || cfp_stop INVENTORY safe_band_unavailable
+        cfp_iv_t0=$(cfp_cs) || cfp_iv_t0=0
+        cfr_run_sh "$CFR_CFCTL" rpc-inventory --json > "$CFP_DIR/inventory.json"
+        cfp_iv_rc=$?
+        cfp_iv_t1=$(cfp_cs) || cfp_iv_t1=$cfp_iv_t0
+        cfp_iv_ms="${cfp_iv_ms:+$cfp_iv_ms,}$(((cfp_iv_t1 - cfp_iv_t0) * 10))"
+        if [ "$cfp_iv_rc" != 0 ] && ! grep -Fq '"inventory_version":1' "$CFP_DIR/inventory.json"; then
+            rm -f "$CFP_DIR/inventory.json"
+            cfp_stop INVENTORY "inventory_unsupported exit=$cfp_iv_rc"
+        fi
+        cfp_inventory_check "$CFP_DIR/inventory.json" || { rm -f "$CFP_DIR/inventory.json"; cfp_stop INVENTORY "inventory_$cfp_iv_why"; }
+        if [ -z "$cfp_iv_first" ]; then cfp_iv_first="$cfp_iv_count $cfp_iv_shape"
+        elif [ "$cfp_iv_first" != "$cfp_iv_count $cfp_iv_shape" ]; then rm -f "$CFP_DIR/inventory.json"; cfp_stop INVENTORY inventory_shape_changed; fi
+        rm -f "$CFP_DIR/inventory.json"
+    done
+    # The service's real path: the stripped wrapper in --rpc-only mode.
+    cfp_safe_band || cfp_stop INVENTORY safe_band_unavailable
+    cfp_wrapper_run cfctl-ssh 'cfctl rpc-inventory --json' --rpc-only > "$CFP_DIR/inventory.w.json"
+    cfp_iw_rc=$?
+    if [ "$cfp_iw_rc" != 0 ]; then rm -f "$CFP_DIR/inventory.w.json"; cfp_stop INVENTORY "wrapper_inventory_failed exit=$cfp_iw_rc"; fi
+    cfp_iv_wfirst=$cfp_iv_first
+    cfp_inventory_check "$CFP_DIR/inventory.w.json" || { rm -f "$CFP_DIR/inventory.w.json"; cfp_stop INVENTORY "wrapper_inventory_$cfp_iv_why"; }
+    rm -f "$CFP_DIR/inventory.w.json"
+    [ "$cfp_iv_wfirst" = "$cfp_iv_count $cfp_iv_shape" ] || cfp_stop INVENTORY wrapper_inventory_shape_differs
+    cfp_iv_salt=
+    cfr_out "MEASURE inventory measured devices=$cfp_iv_count protected_listed=0 penn_devices_listed=2 truncated=$cfp_iv_trunc bytes=$cfp_iv_bytes shape=$cfp_iv_shape reply_salted_sha256=$cfp_iv_hash elapsed_ms=$cfp_iv_ms wrapper_rpc_only=same_shape"
+    cfr_ok INVENTORY
+}
+
+# --- SCOPE-REMOVE: unenrol first (scope_mac_in_use), then the leg --------------------
+cfp_audit_count() {
+    if ! command -v logread >/dev/null 2>&1; then cfr_out 'MEASURE scope_audit unmeasured logread_absent'; return 0; fi
+    cfp_au=$(timeout -s KILL "$CFP_READ_TIMEOUT" logread -e couvrefeu 2>/dev/null </dev/null | awk '/ scope-(add|remove) phase=(intent|commit) /{n++}END{print n+0}') || cfp_au=0
+    if [ "$cfp_au" -gt 0 ]; then cfr_out "MEASURE scope_audit measured lines=$cfp_au"
+    else cfr_out 'MEASURE scope_audit unmeasured no_audit_lines_on_device'; fi
+}
+cfp_scope_remove_phase() {
+    cfp_sync SCOPE-REMOVE "$CFP_OP_UNENROL" "$(cfp_stage_json enroll "$((CFP_REV + 1))" '')" "$CFP_FLOOR"
+    CFP_RPC_ALLOW=$CFP_FLOOR
+    CFP_KIDS_JSON="[\"$CFP_FLOOR\"]"
+    CFP_PENN2_IP=
+    CFP_PENN2_MAC=
+    cfp_status_settle SCOPE-REMOVE unenrol_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
+    cfp_status_read SCOPE-REMOVE
+    [ "$cfp_sc_sha" = "$CFP_SHA_ADDED" ] || cfp_stop SCOPE-REMOVE scope_changed_before_leg
+    cfp_leg2 SCOPE-REMOVE 2d "$CFP_SHA_ADDED" "$CFP_BASE0" remove
+    cfp_audit_count
+    cfr_ok SCOPE-REMOVE
+}
+
+# Read-only proof after UNINSTALL and RESTORE (v1 and v2): no scope candidate left, the cf* ipset and chain
+# lines as before, the /etc/crontabs crond count back to baseline, no person in state, no release directory.
+cfp_cf_lines() { awk '{for(i=1;i<=NF;i++)if($i~/^cf/){n++;break}}END{print n+0}' "$@" 2>/dev/null; }
+cfp_teardown_proof() {
+    CFP_PROOF_FAILED=0
+    cfp_tp_scope=0
+    for cfp_tp_f in "$CFR_ROOT"/etc/couvrefeu/runtime/.scope.* "$CFR_ROOT"/etc/couvrefeu/.scope.*; do
+        if [ -e "$cfp_tp_f" ] || [ -L "$cfp_tp_f" ]; then cfp_tp_scope=$((cfp_tp_scope + 1)); fi
+    done
+    cfp_tp_sets=$(cfp_cf_lines "$CFR_STAGE/text.after.ipset" "$CFR_STAGE/text.after.ipsetsave")
+    cfp_tp_sets0=$(cfp_cf_lines "$CFR_STAGE/text.before.ipset" "$CFR_STAGE/text.before.ipsetsave")
+    cfp_tp_v4=$(cfp_cf_lines "$CFR_STAGE/text.after.iptables")
+    cfp_tp_v40=$(cfp_cf_lines "$CFR_STAGE/text.before.iptables")
+    cfp_tp_v6=$(cfp_cf_lines "$CFR_STAGE/text.after.ip6tables")
+    cfp_tp_v60=$(cfp_cf_lines "$CFR_STAGE/text.before.ip6tables")
+    cfp_tp_people=0
+    if [ -f "$CFR_ROOT/etc/couvrefeu/state" ] && grep -Eq 'penn|pilot_b' "$CFR_ROOT/etc/couvrefeu/state"; then cfp_tp_people=1; fi
+    cfp_tp_rel=absent
+    if [ -e "$CFR_RELEASE_DIR" ]; then cfp_tp_rel=present; fi
+    [ "$cfp_tp_scope" = 0 ] || { cfr_fail RESTORE teardown_scope_candidate_left; CFP_PROOF_FAILED=1; }
+    [ "$cfp_tp_sets" = "$cfp_tp_sets0" ] || { cfr_fail RESTORE teardown_cf_ipset_left; CFP_PROOF_FAILED=1; }
+    { [ "$cfp_tp_v4" = "$cfp_tp_v40" ] && [ "$cfp_tp_v6" = "$cfp_tp_v60" ]; } || { cfr_fail RESTORE teardown_cf_chain_left; CFP_PROOF_FAILED=1; }
+    [ "${CFP_CROND_UNINSTALL:-x}" = "${CFP_CROND_BASELINE:-y}" ] || { cfr_fail RESTORE teardown_crond_count_changed; CFP_PROOF_FAILED=1; }
+    [ "$cfp_tp_people" = 0 ] || { cfr_fail RESTORE teardown_person_left_in_state; CFP_PROOF_FAILED=1; }
+    [ "$cfp_tp_rel" = absent ] || { cfr_fail RESTORE teardown_release_dir_left; CFP_PROOF_FAILED=1; }
+    cfr_out "MEASURE teardown_proof measured scope_candidates=$cfp_tp_scope cf_ipset_lines=$cfp_tp_sets/$cfp_tp_sets0 cf_iptables_lines=$cfp_tp_v4/$cfp_tp_v40 cf_ip6tables_lines=$cfp_tp_v6/$cfp_tp_v60 crond_etc=${CFP_CROND_UNINSTALL:-?}/${CFP_CROND_BASELINE:-?} state_people=$cfp_tp_people release_dir=$cfp_tp_rel"
+}
+
+# The post-install phase order (DEC-4 for v2).
+cfp_phase_list() {
+    if [ -n "$CFP_V2" ]; then
+        printf '%s\n' "ENROLL ${CFP_SCOPE_TEST:+SCOPE }SCOPE-ADD-1 SCOPE-ADD-2 PAUSE RESUME MOVE BULK EXPIRY DNS INVENTORY SCOPE-REMOVE"
+    else
+        printf '%s\n' "ENROLL ${CFP_SCOPE_TEST:+SCOPE }PAUSE RESUME EXPIRY DNS"
+    fi
+}
+
 cfp_main() {
     umask 077
     CFR_START=$(date +%s)
@@ -903,12 +1393,22 @@ cfp_main() {
         CFP_RPC_ALLOW=$CFR_PENN_MAC
         CFP_KIDS_JSON="[\"$CFR_PENN_MAC\"]"
     fi
+    if [ -n "$CFP_V2" ]; then
+        for cfr_value in "$CFP_PHONE_IP" "$CFP_PHONE_MAC" "$CFP_PILOT_B" "$CFP_POLICY_PHONE" "$CFP_POLICY_MOVE" "$CFP_POLICY_BACK" \
+            "$CFP_OP_PHONE" "$CFP_OP_MOVE" "$CFP_OP_MOVE_BACK" "$CFP_OP_BULK_PAUSE" "$CFP_OP_BULK_RESUME" "$CFP_OP_UNENROL" \
+            "$CFP_SCOPE_LEG_SECONDS" "$CFP_FAILED_BLOCK_ALL" "$CFP_SELF_ABORT_PCT" "$CFP_WORST_SCOPE_ADD_1" "$CFP_WORST_SCOPE_ADD_2" \
+            "$CFP_WORST_MOVE" "$CFP_WORST_BULK" "$CFP_WORST_INVENTORY" "$CFP_WORST_SCOPE_REMOVE"; do
+            [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
+        done
+        [ -z "$CFP_PENN2_MAC$CFP_PENN2_IP" ] || cfr_refuse PAYLOAD penn_child_2_with_scope_target
+    fi
     if [ -n "$CFP_SCOPE_TEST" ]; then
         for cfr_value in "$CFP_SCOPE_MAC" "$CFP_SCOPE_OPERATION_ID" "$CFP_SCOPE_ERROR" "$CFP_SCOPE_POLICY" "$CFP_WORST_SCOPE"; do
             [ -n "$cfr_value" ] || cfr_refuse PAYLOAD parameters_missing
         done
     fi
     cfr_setup_paths || cfr_refuse PAYLOAD unsafe_environment
+    [ -z "$CFP_V2" ] || cfp_v2_check || cfr_refuse PAYLOAD policy_stage_mismatch
     [ "$(id -u)" = 0 ] || [ "$CFR_FIXTURE" = 1 ] || cfr_refuse PAYLOAD root_required
     trap cfp_cleanup 0
     trap 'exit 10' HUP INT TERM PIPE
@@ -933,7 +1433,7 @@ cfp_main() {
     cfr_install --activate || cfp_stop INSTALL installer_exit_nonzero
     cfr_ok INSTALL
     cfp_crond_count after_install
-    for cfp_phase in ENROLL ${CFP_SCOPE_TEST:+SCOPE} PAUSE RESUME EXPIRY DNS; do
+    for cfp_phase in $(cfp_phase_list); do
         case $cfp_phase in
             ENROLL) cfp_budget ENROLL "$CFP_WORST_ENROLL"; cfp_enroll;;
             SCOPE) cfp_budget SCOPE "$CFP_WORST_SCOPE"; cfp_scope_phase;;
@@ -941,6 +1441,12 @@ cfp_main() {
             RESUME) cfp_budget RESUME "$CFP_WORST_RESUME"; cfp_resume_phase;;
             EXPIRY) cfp_budget EXPIRY "$CFP_WORST_EXPIRY"; cfp_expiry_phase;;
             DNS) cfp_budget DNS "$CFP_WORST_DNS"; cfp_dns_phase;;
+            SCOPE-ADD-1) cfp_budget SCOPE-ADD-1 "$CFP_WORST_SCOPE_ADD_1"; cfp_scope_add_1_phase;;
+            SCOPE-ADD-2) cfp_budget SCOPE-ADD-2 "$CFP_WORST_SCOPE_ADD_2"; cfp_scope_add_2_phase;;
+            MOVE) cfp_budget MOVE "$CFP_WORST_MOVE"; cfp_move_phase;;
+            BULK) cfp_budget BULK "$CFP_WORST_BULK"; cfp_bulk_phase;;
+            INVENTORY) cfp_budget INVENTORY "$CFP_WORST_INVENTORY"; cfp_inventory_phase;;
+            SCOPE-REMOVE) cfp_budget SCOPE-REMOVE "$CFP_WORST_SCOPE_REMOVE"; cfp_scope_remove_phase;;
         esac
     done
     cfp_teardown

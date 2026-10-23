@@ -65,7 +65,7 @@ FAST_TIMING = {'pauseSeconds': 90, 'pauseObserveSeconds': 2, 'resumeObserveSecon
                'expiryToleranceSeconds': 120, 'pollSeconds': 1, 'expiryPollSeconds': 1, 'statusSettleSeconds': 12, 'safeBandStart': 0,
                'safeBandEnd': 59, 'dnsMarginCs': 150, 'rttMarginMs': 500, 'premutationBudgetSeconds': 360}
 FAKE_SSH = r'''
-import json, os, re, shlex, signal, subprocess, sys, threading, time
+import json, os, pty, re, select, shlex, signal, subprocess, sys, threading, time
 spec = json.load(open(os.environ['FAKE_SSH_SPEC']))
 with open(spec['log'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\n')
@@ -81,10 +81,53 @@ def cron(until):
         time.sleep(0.2)
     subprocess.run(shell + [spec['cfctl'], 'expire'], env=env, stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+MARKER = re.compile(r'^CFP_LEG2_READY (2[a-d]) ([0-9a-f]{64})$')
+def run_leg(leg, base):
+    # Test stand-in for the T4 pty driver: one leg under a pty, the confirmation typed only after the exact prompt.
+    cfg = spec['leg2']
+    if leg in cfg.get('skip', []):
+        return
+    mac = cfg['phone']
+    digits = '000000' if leg in cfg.get('wrong_digits', []) else mac.replace(':', '')[-6:]
+    op = 'scope-add' if leg in ('2a', '2c') else 'scope-remove'
+    leg_env = dict(env)
+    leg_env.pop('SSH_ORIGINAL_COMMAND', None)
+    if leg in ('2a', '2b'):
+        argv = shell + [spec['cfctl'], op, mac, '--base', base]
+    else:
+        leg_env['SSH_ORIGINAL_COMMAND'] = 'cfctl %s %s --base %s' % (op, mac, base)
+        argv = shell + [cfg['wrapper_scope'], 'pilot']
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe(argv[0], argv, leg_env)
+    out, sent, deadline = b'', False, time.time() + 60
+    while time.time() < deadline:
+        ready, _, _ = select.select([fd], [], [], 1)
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if not sent and b'to confirm: ' in out:
+                os.write(fd, (digits + '\n').encode())
+                sent = True
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+    result = out.decode(errors='replace').replace(mac, '<mac>').strip().splitlines()
+    with open(cfg['log'], 'a') as handle:
+        handle.write(json.dumps({'leg': leg, 'exit': os.waitstatus_to_exitcode(status), 'last': result[-1] if result else ''}) + '\n')
 for line in child.stdout:
     sys.stdout.buffer.write(line)
     sys.stdout.flush()
     text = line.decode().rstrip('\n')
+    leg_match = MARKER.match(text)
+    if leg_match and spec.get('leg2'):
+        threading.Thread(target=run_leg, args=leg_match.groups(), daemon=True).start()
     for prefix, path in spec.get('touch_on', {}).items():
         if text.startswith(prefix):
             open(path, 'w').close()
@@ -259,7 +302,10 @@ class PilotBase(unittest.TestCase):
         for run in (self.evidence_root / 'evidence').iterdir():
             for line in (run / 'stdout.log').read_text().splitlines():
                 if line.startswith('INFO staging /tmp/couvre-feu-first.'):
-                    shutil.rmtree(line.split(' ', 2)[2], ignore_errors=True)
+                    stage = line.split(' ', 2)[2]
+                    self.stage_leftovers = sorted(str(p.relative_to(stage)) for p in Path(stage).rglob('*')) \
+                        if Path(stage).is_dir() else []
+                    shutil.rmtree(stage, ignore_errors=True)
         return result
 
     def evidence(self):
@@ -652,7 +698,12 @@ class PilotPlanTests(PilotBase):
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()
         self.assertEqual(script.count('cfp_status_settle ENROLL penn_not_observed '), 1)
         self.assertEqual(script.count('cfp_status_settle EXPIRY status_not_clean_after_expiry '), 1)
-        self.assertEqual(len(re.findall(r'(?m)^\s+cfp_status_settle ', script)), 2)
+        # v2 adds exactly these read-only settled gates (never after a mutating pause/resume call itself).
+        sites = re.findall(r'(?m)^\s+cfp_status_settle ([A-Z0-9-]+) ([a-z_]+) ', script)
+        self.assertEqual(sites, [('ENROLL', 'penn_not_observed'), ('EXPIRY', 'status_not_clean_after_expiry'),
+                                 ('SCOPE-ADD-2', 'phone_not_observed'), ('MOVE', 'move_not_observed'),
+                                 ('MOVE', 'move_back_not_observed'), ('BULK', 'pause_all_not_observed'),
+                                 ('BULK', 'resume_all_not_observed'), ('SCOPE-REMOVE', 'unenrol_not_observed')])
         # PAUSE, RESUME and the expiry pause gate the mutating call's own reply line, unchanged.
         self.assertIn('cfp_status_has "$CFP_DIR/status.json" "\\"effectivePauses\\":[{', script)
         self.assertIn('|| cfp_stop RESUME resume_not_clean', script)
@@ -1062,7 +1113,7 @@ class PilotConfigV2Tests(PilotBase):
     def v2(self, roles=None, **changes):
         roles = dict(self.config['roles'], ct107=CT107, scope_target=PHONE) if roles is None else roles
         changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
-        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8100))
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8500))
 
     def v2_config(self, **changes):
         return self.tool.load_config(self.write_config(**self.v2(**changes)))
@@ -1147,7 +1198,9 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual(by_stage['enroll_phone']['people'], [{'id': 'penn', 'macs': sorted([PENN['mac'], PHONE['mac']])}])
         self.assertEqual(by_stage['move']['people'], [{'id': 'penn', 'macs': [PHONE['mac']]},
                                                       {'id': 'pilot_b', 'macs': [PENN['mac']]}])
-        self.assertEqual([stage['revision'] for _, stage in policies], [1, 2, 3, 4])
+        # rpc-sync needs revision == expected + 1 and pause/resume each add one: 1 enroll, 2 phone, 3-4 pause/resume,
+        # 5 move A, 6-7 pilot_b pause/resume, 8 move back.
+        self.assertEqual([stage['revision'] for _, stage in policies], [1, 2, 5, 8])
         for stage, policy in policies:
             self.assertIs(self.tool.assert_policy_pilot(policy, config, self.tool.expected_stage_policy(stage, config)), policy)
         good = by_stage['move']
@@ -1284,20 +1337,42 @@ class PilotConfigV2Tests(PilotBase):
         self.refused_before_ssh(self.write_config(**self.v2(remoteTimeoutSeconds=True)), 'remoteTimeoutSeconds')
         self.assertEqual(self.v2_config(remoteTimeoutSeconds=10800)['remoteTimeoutSeconds'], 10800)
 
-    def test_payload_params_exclude_unimplemented_phases(self):
+    def test_v2_payload_params_are_shell_identifiers_and_include_every_implemented_phase(self):
         params, payload = self.parameters(self.write_config(**self.v2()))
-        self.assertEqual(list(params), SINGLE_PARAMETER_KEYS)
-        self.assertFalse([key for key in params if any(c in key for c in '-')])
-        self.assertNotIn(PHONE['mac'], payload.split('# @CF_PILOT_PARAMETERS_BEGIN@')[1].split('# @CF_PILOT_PARAMETERS_END@')[0])
+        region = payload.split('# @CF_PILOT_PARAMETERS_BEGIN@')[1].split('# @CF_PILOT_PARAMETERS_END@')[0]
+        # Every emitted assignment is a valid sh variable (a hyphen would be a silent no-op command).
+        self.assertTrue(all(re.fullmatch(r'CFP_[A-Z0-9_]+', key) for key in params))
+        self.assertEqual(len(re.findall(r"(?m)^[A-Za-z_][A-Za-z0-9_-]*='", region)), len(params))
+        self.assertEqual(list(params)[:len(SINGLE_PARAMETER_KEYS)], SINGLE_PARAMETER_KEYS)
+        for phase in ('SCOPE_ADD_1', 'SCOPE_ADD_2', 'MOVE', 'BULK', 'INVENTORY', 'SCOPE_REMOVE'):
+            self.assertRegex(params[f'CFP_WORST_{phase}'], r'^[0-9]+$')
+        self.assertEqual(params['CFP_V2'], '1')
+        self.assertEqual(params['CFP_SELF_ABORT_PCT'], '70')
+        self.assertEqual(params['CFP_FAILED_BLOCK_ALL'], 'unchanged')
+        self.assertEqual(params['CFP_PHONE_MAC'], PHONE['mac'])
+        # The floor policy (and the enroll stage) never names the phone; v1 emits none of the v2 keys.
+        self.assertNotIn(PHONE['mac'], params['CFP_POLICY'])
+        v1, _ = self.parameters(self.write_config())
+        self.assertEqual(list(v1), SINGLE_PARAMETER_KEYS)
 
-    def test_execute_refuses_unimplemented_phases_before_ssh(self):
+    def test_execute_refuses_v2_until_the_leg2_driver_exists_and_never_for_a_missing_phase(self):
         config = self.write_config(**self.v2())
         sha = self.plan_details(config)['planSha256']
+        # The template implements every v2 phase ...
+        self.assertEqual(self.tool.IMPLEMENTED_PHASES, self.tool.PHASES + ('SCOPE',) + self.tool.NEW_PHASES)
+        self.assertEqual(set(self.tool.pilot_phases(self.tool.load_config(config))) - set(self.tool.IMPLEMENTED_PHASES), set())
+        # ... but the TTY commit legs have no driver yet (T4): a v2 run could only wait and stop.
+        self.assertIs(self.tool.LEG2_DRIVER_IMPLEMENTED, False)
         code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
         self.assertEqual(code, 1)
-        self.assertIn('not implemented', err)
+        self.assertIn('leg-2 pty driver absent (T4)', err)
+        self.assertNotIn('not implemented', err)
         self.assertFalse(self.ssh_log.exists())
-        self.assertEqual(self.tool.IMPLEMENTED_PHASES, self.tool.PHASES + ('SCOPE',))
+        # A phase the template lacks is still refused first.
+        with mock.patch.object(self.tool, 'IMPLEMENTED_PHASES', self.tool.PHASES):
+            code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
+        self.assertEqual(code, 1)
+        self.assertIn('not implemented', err)
 
     def test_classification_accepts_new_phase_names(self):
         lines = ['MUTATION_BEGIN'] + [f'PHASE {name} OK' for name in V2_PHASES] + [self.tool.PASS_LINE]
@@ -1417,9 +1492,11 @@ class PilotConfigV2Tests(PilotBase):
         self.assertIn('ct107', example.read_text())
         readme = (REPO / 'tools/live/README.md').read_text()
         for needle in ('schemaVersion` 2', 'scope_target', 'config.pilot.example.json', 'minimumRemoteTimeoutSeconds + 900',
-                       'break-glass', 'TODO(T3)', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'refuses v2 plans'):
+                       'break-glass', '70%', 'roles.ct107', 'SCOPE-ADD-1', 'leg-2 pty driver absent (T4)', 'CFP_LEG2_READY',
+                       'remote_self_abort', 'teardown_proof', 'block_all_unchanged', 'CFP_WRAPPER_DIR'):
             with self.subTest(needle):
                 self.assertIn(needle, readme)
+        self.assertNotIn('TODO(T3)', readme)
 
     def test_penn_pilot_stays_under_the_file_size_cap_and_v2_pieces_live_in_a_sibling(self):
         self.assertLessEqual(len((REPO / 'tools/live/penn-pilot.py').read_text().splitlines()), 800)
@@ -1431,11 +1508,11 @@ class PilotConfigV2Tests(PilotBase):
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         v2 = self.tool.phase_worst_seconds(shipped, scope=True, scope_target=True)
         self.assertEqual(v2, {'ENROLL': 609, 'PAUSE': 465, 'RESUME': 345, 'EXPIRY': 847, 'DNS': 80, 'SCOPE': 165,
-                              'SCOPE-ADD-1': 822, 'SCOPE-ADD-2': 940, 'MOVE': 896, 'BULK': 806, 'INVENTORY': 468,
-                              'SCOPE-REMOVE': 589})
+                              'SCOPE-ADD-1': 598, 'SCOPE-ADD-2': 950, 'MOVE': 1412, 'BULK': 1198, 'INVENTORY': 478,
+                              'SCOPE-REMOVE': 833})
         self.assertEqual(self.tool.worst_case_seconds(shipped), 3318)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 7839)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 8004)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 8787)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 8952)
 
     def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
         details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
@@ -1878,6 +1955,727 @@ class PilotFixtureTests(PilotBase):
         self.assertIn('PHASE IDENTITY FAIL penn_child_2_not_fresh', stdout)
         self.assertNotIn('MUTATION_BEGIN', stdout)
         self.assertEqual(self.router_snapshot(), before)
+
+
+PRELUDE = r'''
+H=%(h)s
+CFR_STAGE=$H/stage
+mkdir -p "$CFR_STAGE/pilot" "$H/root"
+CFP_DIR=$CFR_STAGE/pilot
+CFR_SH=sh
+CFR_FIXTURE=1
+CFR_ROOT=$H/root
+CFR_START=$(date +%%s)
+CFR_CFCTL=$CFR_ROOT/usr/sbin/cfctl
+cfp_safe_band() { return 0; }
+%(stop)s
+cfp_v2_check || { echo 'V2CHECK_FAILED'; exit 66; }
+%(driver)s
+'''
+
+# A tiny rpc model: files rev, scopesha, scopejson under $H; status/sync stubs read and write them.
+RPC_STUBS = r'''
+G=0000000000000000000000000000000000000000000000000000000000000001
+D=0000000000000000000000000000000000000000000000000000000000000002
+cfp_cfctl() {
+    case "$1" in
+        rpc-status)
+            printf '{"rpc_version":1,"generation":"%s","acceptedPolicy":{"version":1,"revision":%s,"people":[],"pauses":[]},"policyDigest":"%s","currentOperationId":null,"routerTime":1,"receipt":null,"status":{},"errors":[],"scope":[%s],"scopeSha":"%s"}\n' \
+                "$G" "$(cat "$H/rev")" "$D" "$(cat "$H/scopejson")" "$(cat "$H/scopesha")";;
+        *) return 1;;
+    esac
+}
+cfp_scope_file_sha() { cat "$H/filesha"; }
+cfp_cfctl_input() {
+    echo sync >> "$H/calls"
+    op=$(sed -n 's/.*"operation_id":"\([^"]*\)".*/\1/p' "$1")
+    cp "$1" "$H/request.$op.json"
+    r=$(cat "$H/rev"); n=$((r + 1)); echo "$n" > "$H/rev"
+    printf '{"rpc_version":1,"generation":"%s","receipt":{"operationId":"%s","requestDigest":"%s","baseRevision":%s,"baseDigest":"%s","acceptedRevision":%s,"acceptedDigest":"%s","outcome":"accepted","current":true},"errors":[]}\n' "$G" "$op" "$D" "$r" "$D" "$n" "$D"
+}
+cfp_status_settle() { echo settle >> "$H/calls"; }
+cfp_observe() { echo observe >> "$H/calls"; }
+cfp_fw_shape() { printf 'shape\n' > "$1"; }
+cfp_slot() { echo a; }
+cfp_penn_state() { cat "$H/penn_state"; }
+cfp_chain_counts() { echo "chain $1" >> "$H/calls"; cat "$H/chain$1" ; }
+'''
+
+
+def device_json(mac, host=None):
+    name = 'null' if host is None else f'"{host}"'
+    return f'{{"mac":"{mac}","ipv4":["192.0.2.9"],"hostname":{name},"source":"both"}}'
+
+
+def inventory_reply(macs, hosts=None, truncated='false', errors=''):
+    hosts = hosts or {}
+    devices = ','.join(device_json(mac, hosts.get(mac)) for mac in macs)
+    return ('{"inventory_version":1,"generation":"' + 'a' * 64 + '","routerTime":1800000100,"devices":[' + devices
+            + f'],"truncated":{truncated},"errors":[{errors}]}}')
+
+
+SENTINEL_HOST = 'sentinel-host-9f3c'
+SENTINEL_MAC = '02:00:00:00:00:77'
+
+
+class PilotShellBase(PilotBase):
+    """Function-level harness: the generated v2 payload minus its final call, run under `sh` with a driver that
+    stubs the router (seconds per run instead of minutes). It runs the template's own functions."""
+    TAIL = '# Parse everything above first; no child can read the remaining script.\ncfp_main </dev/null'
+
+    def v2_changes(self, **changes):
+        roles = dict(self.config['roles'], ct107=CT107, scope_target=PHONE)
+        changes.setdefault('protectedHistoricalMacs', HISTORICAL + [CT107['mac']])
+        # The v2 local timeout is far longer than v1's: the authorization deadline must outlast it.
+        changes.setdefault('deadlineUtc', (self.now + datetime.timedelta(hours=5)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+        return dict(changes, schemaVersion=2, roles=roles, remoteTimeoutSeconds=changes.get('remoteTimeoutSeconds', 8500))
+
+    STUB_STOP = 'cfp_stop() { printf \'STOP %s %s\\n\' "$1" "$2"; exit 77; }'
+
+    def run_driver(self, driver, files=None, params=None, timeout=120, stub_stop=True):
+        _, payload = self.parameters(self.write_config(**self.v2_changes()))
+        head = payload[:payload.rindex(self.TAIL)]
+        for key, value in (params or {}).items():
+            head += f"\n{key}='{value}'"
+        home = self.work / 'harness'
+        shutil.rmtree(home, ignore_errors=True)
+        home.mkdir()
+        for name, text in (files or {}).items():
+            (home / name).write_text(text)
+        (home / 'script.sh').write_text(head + '\n' + PRELUDE % {'h': shlex.quote(str(home)), 'driver': driver,
+                                                                  'stop': self.STUB_STOP if stub_stop else ':'})
+        env = {'PATH': os.environ['PATH'], 'LC_ALL': 'C', 'HOME': str(home)}
+        done = subprocess.run(['sh', str(home / 'script.sh')], env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, check=False)
+        done.home = home
+        return done
+
+    def stop_of(self, done):
+        return [line for line in done.stdout.splitlines() if line.startswith('STOP ')]
+
+    @staticmethod
+    def scope_sha(macs):
+        """The router's scopeSha: sha256 of the C-sorted MACs, one per line."""
+        return hashlib.sha256(''.join(mac + '\n' for mac in sorted(macs)).encode()).hexdigest()
+
+    def rpc_files(self, rev=8, scope=(PENN['mac'],)):
+        return {'rev': f'{rev}\n', 'scopesha': self.scope_sha(scope) + '\n', 'filesha': self.scope_sha(scope) + '\n',
+                'scopejson': ','.join(f'"{mac}"' for mac in scope) + '\n'}
+
+
+class PilotShellInventoryTests(PilotShellBase):
+    """INVENTORY: counts, shape and hashes only; the raw reply (hostnames, non-Penn MACs) is never printed."""
+
+    DRIVER = r'''
+cfr_run_sh() { cat "$H/reply"; return "${REPLY_RC:-0}"; }
+cfp_wrapper_run() { cat "$H/reply"; return "${WRAPPER_RC:-0}"; }
+cfp_inventory_phase
+echo "LEFT:$(ls "$CFP_DIR" | tr '\n' ' ')"
+'''
+
+    def inventory(self, reply, rc=0, wrapper_rc=0, wrapper_reply=None):
+        driver = f'REPLY_RC={rc}\nWRAPPER_RC={wrapper_rc}\n' + self.DRIVER
+        return self.run_driver(driver, files={'reply': reply + '\n'})
+
+    def good_reply(self, **changes):
+        macs = [PENN['mac'], PHONE['mac'], SENTINEL_MAC]
+        return inventory_reply(macs, hosts={SENTINEL_MAC: SENTINEL_HOST, PENN['mac']: 'chromebook-x'}, **changes)
+
+    def test_good_reply_is_summarised_without_hostnames_or_foreign_macs(self):
+        done = self.inventory(self.good_reply())
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('PHASE INVENTORY OK', done.stdout)
+        line = next(line for line in done.stdout.splitlines() if line.startswith('MEASURE inventory measured '))
+        self.assertRegex(line, r'devices=3 protected_listed=0 penn_devices_listed=2 truncated=false bytes=[0-9]+ '
+                               r'shape=[0-9a-f]{12} reply_salted_sha256=[0-9a-f]{12} elapsed_ms=[0-9]+,[0-9]+,[0-9]+ '
+                               r'wrapper_rpc_only=same_shape$')
+        for leaked in (SENTINEL_HOST, SENTINEL_MAC, 'chromebook-x'):
+            self.assertNotIn(leaked, done.stdout)
+            self.assertNotIn(leaked, done.stderr)
+        # Raw replies are removed as soon as they are summarised, not only at cleanup.
+        self.assertRegex(done.stdout, r'LEFT:\s*$')
+        self.assertFalse(list((done.home / 'stage/pilot').glob('inventory*')))
+
+    def test_salted_hash_differs_per_run_but_shape_is_stable(self):
+        first = self.inventory(self.good_reply())
+        second = self.inventory(self.good_reply())
+        pick = lambda done, key: re.search(key + r'=([0-9a-f]{12})', done.stdout).group(1)  # noqa: E731
+        self.assertEqual(pick(first, 'shape'), pick(second, 'shape'))
+        self.assertNotEqual(pick(first, 'reply_salted_sha256'), pick(second, 'reply_salted_sha256'))
+
+    def test_truncated_flag_is_recorded(self):
+        done = self.inventory(self.good_reply(truncated='true'))
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn('truncated=true', done.stdout)
+
+    def test_protected_device_in_the_listing_stops(self):
+        for protected in (MGMT['mac'], JD['mac'], HISTORICAL[0], CT107['mac']):
+            with self.subTest(protected=protected):
+                reply = inventory_reply([PENN['mac'], PHONE['mac'], protected], hosts={protected: SENTINEL_HOST})
+                done = self.inventory(reply)
+                self.assertEqual(self.stop_of(done), ['STOP INVENTORY inventory_protected_device_listed'])
+                self.assertNotIn('PHASE INVENTORY OK', done.stdout)
+                self.assertNotIn(SENTINEL_HOST, done.stdout + done.stderr)
+                self.assertNotIn(protected, done.stdout + done.stderr)
+
+    def test_a_missing_penn_device_stops(self):
+        for macs in ([PENN['mac']], [PHONE['mac']], [SENTINEL_MAC]):
+            with self.subTest(macs=macs):
+                done = self.inventory(inventory_reply(macs + [SENTINEL_MAC]))
+                self.assertEqual(self.stop_of(done), ['STOP INVENTORY inventory_penn_device_missing'])
+
+    def test_old_router_and_broken_replies_stop_with_a_reason(self):
+        cases = {'invalid_command': ('{"ok":false,"errors":["invalid_command"]}', 2, 'inventory_unsupported exit=2'),
+                 'empty': ('', 2, 'inventory_unsupported exit=2'),
+                 'errors': (self.good_reply().replace('"errors":[]', '"errors":["inventory_unavailable"]'), 1,
+                            'inventory_reply_errors_inventory_unavailable'),
+                 'two lines': (self.good_reply() + '\n' + self.good_reply(), 0, 'inventory_not_one_line'),
+                 'not v1': ('{"inventory_version":2}', 0, 'inventory_not_inventory_v1')}
+        for name, (reply, rc, reason) in cases.items():
+            with self.subTest(case=name):
+                done = self.inventory(reply, rc=rc)
+                self.assertEqual(self.stop_of(done), [f'STOP INVENTORY {reason}'], done.stdout)
+                self.assertNotIn(SENTINEL_HOST, done.stdout + done.stderr)
+
+    def test_reply_at_the_size_limit_stops(self):
+        reply = inventory_reply([PENN['mac'], PHONE['mac']])
+        padded = reply.replace('],"truncated"', ',' + device_json(SENTINEL_MAC, SENTINEL_HOST * 8000) + '],"truncated"')
+        self.assertGreater(len(padded), 131072)
+        done = self.inventory(padded)
+        self.assertEqual(self.stop_of(done), ['STOP INVENTORY inventory_reply_too_large'])
+        self.assertNotIn(SENTINEL_HOST, done.stdout + done.stderr)
+
+    def test_wrapper_path_failure_or_differing_shape_stops(self):
+        done = self.run_driver('REPLY_RC=0\nWRAPPER_RC=3\n' + self.DRIVER, files={'reply': self.good_reply() + '\n'})
+        self.assertEqual(self.stop_of(done), ['STOP INVENTORY wrapper_inventory_failed exit=3'])
+        done = self.run_driver(self.DRIVER.replace('cfp_wrapper_run() { cat "$H/reply"; return "${WRAPPER_RC:-0}"; }',
+                                                   'cfp_wrapper_run() { sed "s/\\"truncated\\"/\\"cut\\"/" "$H/reply"; }'),
+                               files={'reply': self.good_reply() + '\n'})
+        self.assertEqual(len(self.stop_of(done)), 1)
+        self.assertNotIn('PHASE INVENTORY OK', done.stdout)
+
+    def test_stage_cleanup_removes_every_raw_file(self):
+        # An interrupted phase leaves the raw reply only until cfp_cleanup removes it.
+        driver = 'echo secret > "$CFP_DIR/inventory.json"; echo secret > "$CFP_DIR/preview.out"; echo s > "$CFP_DIR/inventory.w.json"\n' \
+                 'CFR_STAGE=\ncfp_cleanup\n[ ! -d "$CFP_DIR" ] || echo DIRTHERE; echo END'
+        done = self.run_driver(driver)
+        self.assertIn('END', done.stdout)
+        self.assertNotIn('DIRTHERE', done.stdout)
+
+
+class PilotShellBulkTests(PilotShellBase):
+    """BULK: pause_all and resume_all are ONE rpc-sync each; IPv4 and IPv6 chain state is recorded."""
+
+    def bulk(self, penn_state='paused', chain4='paused 0\n', chain6='paused 0\n', extra=''):
+        both = ' '.join(sorted([PENN['mac'], PHONE['mac']]))
+        kids = '[' + ','.join(f'"{m}"' for m in both.split()) + ']'
+        driver = (RPC_STUBS + f'CFP_RPC_ALLOW="{both}"\nCFP_KIDS_JSON=\'{kids}\'\nCFP_REV=8\nCFP_LAT_MAX=0\n' + extra
+                  + 'cfp_bulk_phase\necho "REV:$CFP_REV"\n')
+        files = dict(self.rpc_files(rev=8), penn_state=penn_state + '\n', chain4=chain4, chain6=chain6, calls='')
+        return self.run_driver(driver, files=files)
+
+    def calls(self, done):
+        return (done.home / 'calls').read_text().split()
+
+    def test_exactly_one_sync_per_bulk_operation_and_revisions_step_by_one(self):
+        # The kernel set reads paused after pause_all and clear after resume_all.
+        done = self.bulk(extra=self.SEQ)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.calls(done).count('sync'), 2)
+        self.assertIn('PHASE BULK OK', done.stdout)
+        self.assertIn('MEASURE bulk_receipts measured pause_all=1 resume_all=1 revisions=8,9,10', done.stdout)
+        self.assertIn('REV:10', done.stdout)
+        first = (done.home / 'request.penn-pilot-bulk-1.json').read_text()
+        second = (done.home / 'request.penn-pilot-bulk-2.json').read_text()
+        self.assertIn('"operation_id":"penn-pilot-bulk-1"', first)
+        self.assertIn('"operation_id":"penn-pilot-bulk-2"', second)
+        # pause_all names both persons with the same timed, non-zero until; resume_all has no pauses.
+        match = re.search(r'"pauses":\[\{"person":"penn","until":([0-9]+)\},\{"person":"pilot_b","until":([0-9]+)\}\]', first)
+        self.assertTrue(match, first)
+        self.assertEqual(match.group(1), match.group(2))
+        self.assertGreater(int(match.group(1)), int(datetime.datetime.now().timestamp()))
+        self.assertIn('"pauses":[],', second)
+        self.assertIn(f'{{"id":"pilot_b","macs":["{PENN["mac"]}"]}}', first)
+        self.assertNotIn('pilot_b', second)
+
+    # Paused on the first read (after pause_all), clear afterwards (command substitutions: state lives in a file).
+    SEQ = ('cfp_penn_state() { c=$(cat "$H/ps" 2>/dev/null || echo 0); c=$((c + 1)); echo $c > "$H/ps"; '
+           '[ "$c" -gt 1 ] && echo clear || echo paused; }\n')
+
+    def test_a_failed_block_all_uses_the_single_constant_wording(self):
+        done = self.bulk(penn_state='clear')
+        self.assertEqual(self.stop_of(done), ['STOP BULK block_all_unchanged set_not_paused'])
+        self.assertEqual(self.calls(done).count('sync'), 1)
+        self.assertIn('INFO bulk firewall_fingerprint same', done.stdout)
+        self.assertNotIn('not_blocking', done.stdout)
+        done = self.bulk(chain4='', extra=self.SEQ)
+        self.assertEqual(self.stop_of(done), ['STOP BULK block_all_unchanged ipv4_chain_not_blocking'])
+
+    def test_ipv6_partial_is_recorded_not_retried_and_not_a_failure(self):
+        done = self.bulk(chain6='', extra=self.SEQ)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('MEASURE bulk_ipv6 unmeasured partial_or_unconfirmed paused_rules=0 not_retried', done.stdout)
+        self.assertIn('MEASURE bulk_ipv4 measured paused_rules=1 set_members=2', done.stdout)
+        self.assertEqual(self.calls(done).count('chain'), 4)  # (v4, v6) while paused, (v4, v6) after resume: no retry
+
+    def test_a_revision_the_pilot_did_not_set_stops_before_any_sync(self):
+        done = self.bulk(extra='echo 9 > "$H/rev"\n')
+        self.assertEqual(self.stop_of(done), ['STOP BULK revision_unexpected seen=9 want=8'])
+        self.assertEqual(self.calls(done).count('sync'), 0)
+
+    def test_a_double_sync_or_wrong_receipt_revision_stops(self):
+        stub = 'cfp_cfctl_input() { echo sync >> "$H/calls"; op=$(sed -n \'s/.*"operation_id":"\\([^"]*\\)".*/\\1/p\' "$1"); ' \
+               'printf \'{"receipt":{"operationId":"%s","requestDigest":"aa","baseRevision":8,"baseDigest":"bb","acceptedRevision":10,"acceptedDigest":"cc"}}\\n\' "$op"; }\n'
+        done = self.bulk(extra=self.SEQ + stub)
+        self.assertEqual(self.stop_of(done), ['STOP BULK receipt_revision_unexpected base=8 accepted=10'])
+
+
+class PilotShellMoveScopeTests(PilotShellBase):
+    """MOVE kernel checks, SCOPE preview/refusal/marker, SCOPE-REMOVE ordering, self-abort and the teardown proof."""
+
+    def test_stage_policies_equal_the_policies_the_template_derives(self):
+        done = self.run_driver('echo CHECKED')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('CHECKED', done.stdout)
+        stages = self.plan_details(self.write_config(**self.v2_changes()))['pilotPolicies']
+        params, _ = self.parameters(self.write_config(**self.v2_changes()))
+        self.assertEqual({'enroll': params['CFP_POLICY'], 'enroll_phone': params['CFP_POLICY_PHONE'],
+                          'move': params['CFP_POLICY_MOVE'], 'move_back': params['CFP_POLICY_BACK']},
+                         {stage['stage']: stage['policyJson'] for stage in stages})
+
+    def test_a_tampered_stage_policy_or_pilot_b_refuses_the_payload(self):
+        both = sorted([PENN['mac'], PHONE['mac']])
+        wrong = {'CFP_POLICY_MOVE': '{"version":1,"revision":5,"people":[{"id":"penn","macs":["%s","%s"]},{"id":"pilot_b","macs":["%s"]}],'
+                                    '"pauses":[],"schedules":[],"doh":{"ipv4":[],"ipv6":[]}}' % (both[0], both[1], PENN['mac']),
+                 'CFP_POLICY_PHONE': '{"version":1,"revision":2,"people":[{"id":"penn","macs":["%s"]}],"pauses":[],"schedules":[],'
+                                     '"doh":{"ipv4":[],"ipv6":[]}}' % PENN['mac'],
+                 'CFP_POLICY_BACK': '{"version":1,"revision":8,"people":[{"id":"penn","macs":["%s","%s"]},{"id":"mine","macs":[]}],'
+                                    '"pauses":[],"schedules":[],"doh":{"ipv4":[],"ipv6":[]}}' % (both[0], both[1]),
+                 'CFP_PILOT_B': 'mine'}
+        for key, value in wrong.items():
+            with self.subTest(key=key):
+                payload_driver = f"{key}='{value}'\n"
+                _, payload = self.parameters(self.write_config(**self.v2_changes()))
+                head = payload[:payload.rindex(self.TAIL)] + '\n' + payload_driver
+                home = self.work / 'tamper'
+                shutil.rmtree(home, ignore_errors=True)
+                home.mkdir()
+                (home / 's.sh').write_text(head + '\ncfp_v2_check && echo ACCEPTED || echo REFUSED\n')
+                done = subprocess.run(['sh', str(home / 's.sh')], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                      env={'PATH': os.environ['PATH'], 'LC_ALL': 'C'}, check=False)
+                self.assertIn('REFUSED', done.stdout, done.stderr)
+
+    PREVIEW_DRIVER = r'''
+cfr_run_sh() {
+    case "$*" in
+        *scope-preview*) cat "$H/preview";;
+        *scope-add*) cat "$H/refusal"; return "${REFUSAL_RC:-1}";;
+    esac
+}
+cfp_wrapper_run() { cat "$H/preview"; }
+cfp_scope_add_1_phase
+'''
+
+    def preview(self, in_scope='false', evidence='true', add='null', host=SENTINEL_HOST):
+        text = (f'scope-preview {PHONE["mac"]}\n  address: locally administered\n  evidence: lease 192.0.2.34 expires 1 name {host}\n'
+                f'  WARNING: 1 protected device(s) not seen on the LAN now: {JD["mac"]}\n')
+        line = (f'{{"ok":true,"action":"scope-preview","mac":"{PHONE["mac"]}","locallyAdministered":true,"inScope":{in_scope},'
+                f'"evidence":{evidence},"scopeSha":"{self.scope_sha([PENN["mac"]])}","scopeCount":1,"addRefusal":{add},"removeRefusal":"scope_mac_absent",'
+                f'"protectedAbsent":1,"errors":[]}}')
+        return text + line + '\n'
+
+    def scope_one(self, preview=None, refusal='{"ok":false,"errors":["scope_tty_required"]}\n', rc=1, rev_files=None, extra=''):
+        files = dict(self.rpc_files(), preview=preview or self.preview(), refusal=refusal)
+        files.update(rev_files or {})
+        driver = RPC_STUBS + f'REFUSAL_RC={rc}\n' + extra + self.PREVIEW_DRIVER
+        return self.run_driver(driver, files=files, timeout=60)
+
+    def test_preview_prints_only_counts_and_never_the_hostname_or_protected_macs(self):
+        # Leg 2 is not started here, so the phase times out at the marker; the output up to there is what matters.
+        done = self.scope_one(extra='CFP_SCOPE_LEG_SECONDS=1\n')
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_leg_timeout'])
+        self.assertIn('MEASURE scope_preview_add_1 measured in_scope=false evidence=true add_refusal=none scope_entries=1 protected_absent=1',
+                      done.stdout)
+        self.assertIn('MEASURE scope_no_tty_refusal measured scope_tty_required exit=1 state_unchanged', done.stdout)
+        for leaked in (SENTINEL_HOST, JD['mac'], MGMT['mac']):
+            self.assertNotIn(leaked, done.stdout + done.stderr)
+
+    def test_marker_is_one_strict_line_and_precedes_any_poll(self):
+        extra = ('CFP_SCOPE_LEG_SECONDS=1\ncfr_out() { printf \'%s\\n\' "$1"; case $1 in CFP_LEG2_READY*) echo marker >> "$H/calls";; esac; }\n'
+                 'cfp_cfctl_logged() { echo read >> "$H/calls"; }\n')
+        done = self.scope_one(extra=extra.replace('cfp_cfctl_logged() { echo read >> "$H/calls"; }\n', ''))
+        markers = [line for line in done.stdout.splitlines() if line.startswith('CFP_LEG2_READY')]
+        self.assertEqual(len(markers), 1)
+        self.assertRegex(markers[0], r'^CFP_LEG2_READY 2a [0-9a-f]{64}$')
+        self.assertEqual(markers[0].split()[2], self.scope_sha([PENN['mac']]))
+        self.assertLess(done.stdout.index('CFP_LEG2_READY'), done.stdout.index('STOP SCOPE-ADD-1'))
+        # one rpc-status read (after the refusal) precedes the marker; the poll starts after it
+        calls = (done.home / 'calls').read_text().split()
+        self.assertEqual(calls.count('marker'), 1)
+
+    def test_leg_effect_is_proved_by_rereading_rpc_status_and_leg_report_is_ignored(self):
+        # The leg "reports" success on the marker line but the scope never changed: timeout, not success.
+        done = self.scope_one(extra='CFP_SCOPE_LEG_SECONDS=1\n')
+        self.assertNotIn('PHASE SCOPE-ADD-1 OK', done.stdout)
+        self.assertNotIn('MEASURE scope_leg_2a', done.stdout)
+        # The scope becomes the right one while the phase polls: it proceeds to the remove leg (marker 2b, new base).
+        both = [PENN['mac'], PHONE['mac']]
+        sha_added = self.scope_sha(both)
+        sorted_both = sorted(both)
+        extra = (f'CFP_SCOPE_LEG_SECONDS=3\n( sleep 1; echo {sha_added} > "$H/filesha"; echo {sha_added} > "$H/scopesha"; '
+                 f'echo \'"{sorted_both[0]}","{sorted_both[1]}"\' > "$H/scopejson" ) &\n')
+        done = self.scope_one(extra=extra)
+        self.assertIn('MEASURE scope_leg_2a measured scope_sha_changed membership=add reread_rpc_status', done.stdout)
+        markers = [line.split()[1:] for line in done.stdout.splitlines() if line.startswith('CFP_LEG2_READY')]
+        self.assertEqual(markers, [['2a', self.scope_sha([PENN['mac']])], ['2b', sha_added]])
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_leg_timeout'])
+
+    def test_unexpected_scope_sha_or_membership_stops_immediately(self):
+        # During the poll: a scope that is neither the base nor the expected one.
+        done = self.scope_one(extra='CFP_SCOPE_LEG_SECONDS=5\n( sleep 1; echo ' + 'd' * 64 + ' > "$H/filesha" ) &\n')
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_sha_unexpected'])
+        # The file says the leg worked but the authoritative re-read disagrees: the leg's effect is not believed.
+        sha_added = self.scope_sha([PENN['mac'], PHONE['mac']])
+        done = self.scope_one(extra=f'CFP_SCOPE_LEG_SECONDS=5\n( sleep 1; echo {sha_added} > "$H/filesha" ) &\n')
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_reread_mismatch'])
+        # The right sha on both reads but the phone is not in the listed scope: membership mismatch.
+        done = self.scope_one(extra=f'CFP_SCOPE_LEG_SECONDS=5\n( sleep 1; echo {sha_added} > "$H/filesha"; '
+                                    f'echo {sha_added} > "$H/scopesha" ) &\n')
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_membership_unexpected'])
+
+    def test_no_tty_refusal_must_be_exactly_scope_tty_required(self):
+        for refusal, rc in (('{"ok":false,"errors":["scope_confirmation_required"]}\n', 1),
+                            ('{"ok":false,"errors":["scope_tty_required"]}\n', 0), ('', 1), ('{"ok":true}\n', 0)):
+            with self.subTest(refusal=refusal, rc=rc):
+                done = self.scope_one(refusal=refusal, rc=rc)
+                self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_tty_refusal_unexpected'])
+                self.assertNotIn('CFP_LEG2_READY', done.stdout)
+
+    def test_preview_refusals_stop_before_the_marker(self):
+        cases = {'in scope': (self.preview(in_scope='true'), 'scope_target_in_scope_at_start'),
+                 'no evidence': (self.preview(evidence='false'), 'scope_target_no_evidence'),
+                 'add refused': (self.preview(add='"scope_mac_protected"'), 'scope_add_refused scope_mac_protected')}
+        for name, (text, reason) in cases.items():
+            with self.subTest(case=name):
+                done = self.scope_one(preview=text)
+                self.assertEqual(self.stop_of(done), [f'STOP SCOPE-ADD-1 {reason}'])
+                self.assertNotIn('CFP_LEG2_READY', done.stdout)
+
+    def test_state_changed_by_the_refusal_stops(self):
+        done = self.scope_one(extra='cfp_status_read() { echo ' + 'e' * 64 + ' > "$H/scopesha"; cfp_cfctl rpc-status --json > "$CFP_DIR/rpc-status.json"; cfp_status_parse; }\n')
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 scope_changed_by_refusal'])
+
+    def test_wrapper_argv_negatives_must_exit_2_with_no_output(self):
+        base = RPC_STUBS + f'CFP_BASE0={"c" * 64}\n'  # any 64-hex base
+        ok = self.run_driver(base + 'cfp_wrapper_run() { return 2; }\ncfp_wrapper_negatives\n')
+        self.assertIn('MEASURE scope_wrapper_argv_negatives measured rejected=4 exit=2 no_output', ok.stdout)
+        for body in ('return 0', 'echo out; return 2', 'return 1', 'return 127'):
+            with self.subTest(body=body):
+                done = self.run_driver(base + f'cfp_wrapper_run() {{ {body}; }}\ncfp_wrapper_negatives\n')
+                self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-2 wrapper_negative_accepted'])
+        # The four commands are exactly the malformed grammar the wrapper must refuse.
+        log = self.run_driver(base + 'cfp_wrapper_run() { echo "$2" >> "$H/seen"; return 2; }\ncfp_wrapper_negatives\n')
+        seen = (log.home / 'seen').read_text().splitlines()
+        self.assertEqual(seen, ['cfctl scope-add bad', f'cfctl scope-add {PHONE["mac"]} --base short',
+                                f'cfctl scope-add {PHONE["mac"]} --base {"c" * 64} extra', 'cfctl scope-preview'])
+
+    def test_move_kernel_state_is_checked_per_device(self):
+        driver = 'cfp_set_state() { cat "$H/state.$(echo "$1" | tr : _)"; }\ncfp_move_kernel_check %s %s\necho DONE\n'
+        files = {f'state.{PENN["mac"].replace(":", "_")}': 'paused\n', f'state.{PHONE["mac"].replace(":", "_")}': 'clear\n'}
+        ok = self.run_driver(driver % ('paused', 'clear'), files=files)
+        self.assertIn('DONE', ok.stdout)
+        # The block did not follow the device: the phone is paused instead of the Chromebook.
+        swapped = {f'state.{PENN["mac"].replace(":", "_")}': 'clear\n', f'state.{PHONE["mac"].replace(":", "_")}': 'paused\n'}
+        done = self.run_driver(driver % ('paused', 'clear'), files=swapped)
+        self.assertEqual(self.stop_of(done), ['STOP MOVE chromebook_kernel_state_not_paused'])
+        both = {key: 'paused\n' for key in files}
+        done = self.run_driver(driver % ('paused', 'clear'), files=both)
+        self.assertEqual(self.stop_of(done), ['STOP MOVE phone_kernel_state_not_clear'])
+
+    def test_scope_remove_unenrols_before_the_remove_leg(self):
+        driver = (RPC_STUBS + f'CFP_SC_ADDED="x"\nCFP_SHA_ADDED={"c" * 64}\nCFP_BASE0={"b" * 64}\nCFP_REV=8\n'
+                  'cfp_sync() { echo "sync $2" >> "$H/order"; CFP_REV=$((CFP_REV + 1)); }\n'
+                  'cfp_status_read() { echo status >> "$H/order"; cfp_sc_sha=$CFP_SHA_ADDED; }\n'
+                  'cfp_leg2() { echo "leg $2" >> "$H/order"; }\n'
+                  'cfp_audit_count() { :; }\ncfp_scope_remove_phase\n')
+        done = self.run_driver(driver, files=self.rpc_files())
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual((done.home / 'order').read_text().split('\n')[:-1], ['sync penn-pilot-unenrol-1', 'status', 'leg 2d'])
+        self.assertIn('PHASE SCOPE-REMOVE OK', done.stdout)
+        # The unenrol policy is the floor policy (Chromebook only) at the next revision.
+        driver2 = (RPC_STUBS + f'CFP_SHA_ADDED={"c" * 64}\nCFP_BASE0={"b" * 64}\nCFP_REV=12\n'
+                   'cfp_leg2() { :; }\ncfp_audit_count() { :; }\n'
+                   'cfp_scope_remove_phase\n')
+        done = self.run_driver(driver2, files=self.rpc_files(rev=12))
+        request = (done.home / 'request.penn-pilot-unenrol-1.json').read_text()
+        self.assertIn(f'"policy":{{"version":1,"revision":13,"people":[{{"id":"penn","macs":["{PENN["mac"]}"]}}],"pauses":[]', request)
+        self.assertNotIn(PHONE['mac'], request)
+
+    SELF_ABORT = r'''
+CFP_SELF_ABORT_PCT=%(pct)s
+CFP_REMOTE_TIMEOUT=1000
+CFR_START=$(( $(date +%%s) - %(elapsed)s ))
+cfp_budget TESTPHASE 10
+echo SURVIVED
+'''
+
+    def test_self_abort_begins_teardown_at_seventy_percent(self):
+        for elapsed, survives in ((690, True), (701, False), (999, False)):
+            with self.subTest(elapsed=elapsed):
+                done = self.run_driver(self.SELF_ABORT % {'pct': 70, 'elapsed': elapsed})
+                if survives:
+                    self.assertIn('SURVIVED', done.stdout)
+                else:
+                    self.assertEqual(self.stop_of(done), ['STOP TESTPHASE remote_self_abort'])
+        # v1 (no percent) keeps the legacy shape.
+        done = self.run_driver(self.SELF_ABORT % {'pct': "''", 'elapsed': 999})
+        self.assertIn('STOP TESTPHASE remote_budget_reserved_for_teardown', done.stdout)
+
+    def test_self_abort_fires_inside_the_leg_poll_loop(self):
+        driver = (RPC_STUBS + 'CFP_SELF_ABORT_PCT=70\nCFP_REMOTE_TIMEOUT=1000\nCFR_START=$(( $(date +%s) - 800 ))\n'
+                  'cfp_leg2 SCOPE-ADD-1 2a ' + 'c' * 64 + ' ' + 'd' * 64 + ' add\n')
+        done = self.run_driver(driver, files=self.rpc_files())
+        self.assertEqual(self.stop_of(done), ['STOP SCOPE-ADD-1 remote_self_abort'])
+
+    def test_teardown_proof_checks_leftovers_and_prints_counts_only(self):
+        setup = (
+            'CFR_STAGE=$H/stage; CFR_ROOT=$H/root; CFR_RELEASE_DIR=$CFR_ROOT/etc/.couvrefeu-release-x\n'
+            'for k in ipset ipsetsave iptables ip6tables; do : > "$CFR_STAGE/text.before.$k"; : > "$CFR_STAGE/text.after.$k"; done\n'
+            'CFP_CROND_UNINSTALL=2 CFP_CROND_BASELINE=2\n%s\ncfp_teardown_proof\necho "FAILED:$CFP_PROOF_FAILED"\n')
+        done = self.run_driver(setup % ':')
+        self.assertIn('MEASURE teardown_proof measured scope_candidates=0 cf_ipset_lines=0/0 cf_iptables_lines=0/0 '
+                      'cf_ip6tables_lines=0/0 crond_etc=2/2 state_people=0 release_dir=absent', done.stdout)
+        self.assertIn('FAILED:0', done.stdout)
+        leftovers = {
+            'teardown_scope_candidate_left': 'mkdir -p $CFR_ROOT/etc/couvrefeu/runtime; : > $CFR_ROOT/etc/couvrefeu/runtime/.scope.123',
+            'teardown_cf_ipset_left': 'echo "create cf2_a_p hash:mac" > "$CFR_STAGE/text.after.ipsetsave"',
+            'teardown_cf_chain_left': 'echo "-N cf_fwd" > "$CFR_STAGE/text.after.ip6tables"',
+            'teardown_crond_count_changed': 'CFP_CROND_UNINSTALL=3',
+            'teardown_person_left_in_state': 'mkdir -p $CFR_ROOT/etc/couvrefeu; printf "P\\tpilot_b\\tx\\n" > $CFR_ROOT/etc/couvrefeu/state',
+            'teardown_release_dir_left': 'mkdir -p "$CFR_RELEASE_DIR"'}
+        for reason, command in leftovers.items():
+            with self.subTest(reason=reason):
+                done = self.run_driver(setup % command)
+                self.assertIn(f'PHASE RESTORE FAIL {reason}', done.stdout)
+                self.assertIn('FAILED:1', done.stdout)
+
+    def function_text(self, name):
+        script = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        start = script.index(f'\n{name}() {{') + 1
+        return script[start:script.index('\n}\n', start)]
+
+    def test_every_stop_runs_exactly_one_teardown(self):
+        # The real cfp_stop (not the harness stub): it records the stop, prints it and hands over to the teardown once.
+        done = self.run_driver('cfp_teardown() { echo TEARDOWN; exit 20; }\ncfp_stop SCOPE-REMOVE leg_failed\necho NOT_REACHED',
+                               stub_stop=False)
+        lines = done.stdout.splitlines()
+        self.assertEqual(done.returncode, 20, done.stdout)
+        self.assertIn('PHASE SCOPE-REMOVE FAIL leg_failed', lines)
+        self.assertEqual(lines[-2:], ['STOP SCOPE-REMOVE leg_failed', 'TEARDOWN'])
+        self.assertNotIn('NOT_REACHED', lines)
+
+    def test_teardown_proof_runs_after_restore_and_before_connectivity(self):
+        body = self.function_text('cfp_teardown')
+        self.assertLess(body.index('cfr_restore'), body.index('cfp_teardown_proof'))
+        self.assertLess(body.index('cfp_teardown_proof'), body.index('cfr_connectivity'))
+        self.assertIn('"$CFP_PROOF_FAILED" = 0', body)
+
+    def test_self_abort_check_guards_every_wait_loop(self):
+        for name in ('cfp_budget', 'cfp_observe', 'cfp_status_settle', 'cfp_expiry_phase', 'cfp_leg2'):
+            with self.subTest(function=name):
+                self.assertIn('cfp_abort_check', self.function_text(name))
+
+    def test_template_never_touches_authentication_or_login_configuration(self):
+        text = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        self.assertIsNone(re.search(r'authorized_keys|dropbear|passwd|shadow|password|PasswordAuth|sshd|uci +(set|commit)', text, re.I))
+        self.assertNotIn('rm -rf', text)
+
+
+class PilotShellMoveFlowTests(PilotShellBase):
+    """The MOVE sequence against canned replies: the block follows the Chromebook and the move is undone."""
+
+    def reply(self, penn, pilot_b=None):
+        people = [f'{{"id":"penn","macs":{json.dumps(penn, separators=(",", ":"))}}}']
+        if pilot_b is not None:
+            people.append(f'{{"id":"pilot_b","macs":{json.dumps(pilot_b, separators=(",", ":"))}}}')
+        return '{"rpc_version":1,"acceptedPolicy":{"version":1,"revision":5,"people":[' + ','.join(people) + '],"pauses":[]}}\n'
+
+    def move(self, reply_a=None, reply_b=None, shape_after='shape', extra='', states='paused clear clear clear'):
+        both = sorted([PENN['mac'], PHONE['mac']])
+        reply_a = reply_a or self.reply([PHONE['mac']], [PENN['mac']])
+        reply_b = reply_b or self.reply(both)
+        kids = '[' + ','.join(f'"{m}"' for m in both) + ']'
+        driver = (
+            f'CFP_RPC_ALLOW="{" ".join(both)}"\nCFP_KIDS_JSON=\'{kids}\'\nCFP_REV=4\nCFP_PAUSE_SECONDS=180\nCFP_LAT_MAX=0\n'
+            'cfp_sync() { n=$(cat "$H/n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$H/n"; cp "$H/reply.$n" "$CFP_DIR/rpc-sync.json"; '
+            'echo "sync $2" >> "$H/calls"; CFP_REV=$((CFP_REV + 1)); }\n'
+            'cfp_status_settle() { :; }\n'
+            'cfp_pause() { CFP_UNTIL=2000000000; echo "pause $CFP_PAUSE_WHO" >> "$H/calls"; printf \'%s\\n\' "$PAUSE_STATUS" > "$CFP_DIR/status.json"; }\n'
+            f'PAUSE_STATUS=\'{{"ok":true,"drift":false,"errors":[],"effectivePauses":[{{"person":"pilot_b","until":2000000000}}],"paused":["{PENN["mac"]}"]}}\'\n'
+            'cfp_status_has() { grep -Fq "$2" "$1"; }\n'
+            'cfp_cfctl() { echo "cfctl $*" >> "$H/calls"; echo \'{"ok":true,"effectivePauses":[],"paused":[]}\' ; }\n'
+            'cfp_adult_probe() { return 0; }\n'
+            'cfp_set_state() { n=$(cat "$H/s" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$H/s"; '
+            'set -- $(cat "$H/states"); eval "echo \\${$n}"; }\n'
+            'cfp_fw_shape() { if [ ! -e "$H/shape0" ]; then echo shape > "$1"; : > "$H/shape0"; else cat "$H/shape1" > "$1"; fi; }\n' + extra
+            + 'cfp_move_phase\necho "REV:$CFP_REV"\n')
+        files = {'reply.1': reply_a, 'reply.2': reply_b, 'shape1': shape_after + '\n', 'states': states + '\n'}
+        return self.run_driver(driver, files=files)
+
+    def test_move_there_and_back_with_the_block_following_the_chromebook(self):
+        # Kernel reads in order: chromebook (paused), phone (clear) while pilot_b is paused; both clear after resume.
+        done = self.move(states='paused clear clear clear')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('PHASE MOVE OK', done.stdout)
+        calls = (done.home / 'calls').read_text().split('\n')
+        self.assertEqual([c for c in calls if c.startswith(('sync', 'pause', 'cfctl resume'))],
+                         ['sync penn-pilot-move-1', 'pause pilot_b', 'cfctl resume pilot_b', 'sync penn-pilot-move-2'])
+        self.assertIn('REV:8', done.stdout)
+
+    def test_move_stops_when_the_state_is_not_what_the_move_requires(self):
+        both = sorted([PENN['mac'], PHONE['mac']])
+        cases = {
+            'pilot_b not populated': (dict(reply_a=self.reply([PENN['mac'], PHONE['mac']])), 'pilot_b_not_populated'),
+            'chromebook in both persons': (dict(reply_a=self.reply(both, [PENN['mac']])), 'penn_not_phone_only'),
+            'pilot_b left populated': (dict(reply_b=self.reply(both, [PENN['mac']])), 'pilot_b_left_populated'),
+            'penn not restored': (dict(reply_b=self.reply([PHONE['mac']])), 'penn_not_restored'),
+            'firewall differs after move back': (dict(shape_after='shape-different'), 'firewall_not_restored_after_move_back'),
+            'phone paused instead': (dict(states='clear paused clear clear'), 'chromebook_kernel_state_not_paused'),
+            'still paused after resume': (dict(states='paused clear paused clear'), 'chromebook_kernel_state_not_clear')}
+        for name, (kwargs, reason) in cases.items():
+            with self.subTest(case=name):
+                done = self.move(**kwargs)
+                self.assertEqual(self.stop_of(done), [f'STOP MOVE {reason}'], done.stdout)
+                self.assertNotIn('PHASE MOVE OK', done.stdout)
+
+
+class PilotV2FixtureTests(PilotShellBase):
+    """End to end against the fixture router, schema v2. The fake ssh stands in for the T4 pty driver: it runs each
+    commit leg under a pty when it sees a valid marker. Slow (every phase installs, syncs and uninstalls)."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(self.tool, 'LEG2_DRIVER_IMPLEMENTED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        leg_patch = mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 15)
+        leg_patch.start()
+        self.addCleanup(leg_patch.stop)
+        leases = self.root / 'tmp/dhcp.leases'
+        leases.write_text(leases.read_text() + f'1800000000 {PHONE["mac"]} {PHONE["ip"]} phone *\n'
+                          f'1800000000 {SENTINEL_MAC} 192.0.2.77 {SENTINEL_HOST} *\n')
+        self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
+                                               dict(PENN, state='DELAY'), dict(PHONE, state='REACHABLE'),
+                                               dict(ip='192.0.2.77', mac=SENTINEL_MAC, state='REACHABLE')])
+        # Wrapper positives need a cfctl at $CF_BACKEND_DIR/cfctl: re-enter the fixture's installed cfctl with the
+        # test environment, keeping what the wrappers pass through.
+        env = {k: v for k, v in self.spec['env'].items() if k.startswith('CF_') or k == 'PATH'}
+        target = self.fixture.bin / 'cfctl'
+        target.write_text('#!/bin/sh\nexec env -i ' + ' '.join(shlex.quote(f'{k}={v}') for k, v in env.items())
+                         + ' SSH_CONNECTION="$SSH_CONNECTION" SSH_CLIENT="$SSH_CLIENT" CF_SCOPE_ADMIN="$CF_SCOPE_ADMIN" '
+                         + f'{os.environ.get("CF_TEST_SHELL", "sh")} {shlex.quote(str(self.root / "usr/sbin/cfctl"))} "$@"\n')
+        target.chmod(0o700)
+        self.leg_log = self.work / 'legs.jsonl'
+        self.spec['env'].update(CFP_WRAPPER_DIR=str(REPO / 'router'))
+        self.spec['leg2'] = {'phone': PHONE['mac'], 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['cfctl'] = str(self.root / 'usr/sbin/cfctl')
+
+    def run_v2(self, **changes):
+        self.status_double('s/NOTHING_TO_REWRITE//', 0)
+        code, out, err = self.execute(**self.v2_changes(**changes))
+        if not any((self.evidence_root / 'evidence').iterdir()):
+            self.fail(f'no evidence directory (refused before ssh): {out}{err}')
+        return code, out, err
+
+    status_double = PilotFixtureTests.status_double
+    router_double = PilotFixtureTests.router_double
+
+    def stdout_lines(self):
+        return (self.evidence() / 'stdout.log').read_text().splitlines()
+
+    def assert_no_leaks(self):
+        for path in self.evidence().iterdir():
+            text = path.read_text(errors='replace')
+            for leaked in (SENTINEL_HOST, SENTINEL_MAC):
+                self.assertNotIn(leaked, text, path.name)
+
+    def test_v2_happy_path_passes_in_order_and_restores_exactly(self):
+        before = self.router_snapshot()
+        code, out, err = self.run_v2()
+        stdout = self.stdout_lines()
+        self.assertEqual(code, 0, out + err + '\n'.join(stdout[-50:]))
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertEqual(stdout[-1], 'PENN_PILOT_PASS')
+        phases = [line.split()[1] for line in stdout if line.startswith('PHASE ') and line.endswith(' OK')]
+        self.assertEqual(phases, V2_PHASES)
+        # Four commit legs ran under a pty, none refused; each marker is a strict line printed once.
+        legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
+        self.assertEqual(sorted(leg['leg'] for leg in legs), ['2a', '2b', '2c', '2d'])
+        self.assertTrue(all(leg['exit'] == 0 and '"ok":true' in leg['last'] for leg in legs), legs)
+        markers = [line for line in stdout if line.startswith('CFP_LEG2_READY')]
+        self.assertEqual([m.split()[1] for m in markers], ['2a', '2b', '2c', '2d'])
+        self.assertTrue(all(re.fullmatch(r'CFP_LEG2_READY 2[a-d] [0-9a-f]{64}', m) for m in markers))
+        # rpc-sync: enroll, phone, move, move back, pause_all, resume_all, unenrol. BULK is two of them.
+        self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'] * 7)
+        summary = json.loads((self.evidence() / 'summary.json').read_text())
+        self.assertEqual(summary['outcome'], 'PASS')
+        measured = summary['measurements']
+        for name in ('scope_preview_add_1', 'scope_preview_add_2', 'scope_no_tty_refusal', 'scope_wrapper_argv_negatives',
+                     'scope_leg_2a', 'scope_leg_2d', 'move_block_follows_device', 'bulk_receipts', 'bulk_ipv4', 'bulk_ipv6',
+                     'inventory', 'teardown_proof'):
+            self.assertIn(name, measured)
+        self.assertEqual(measured['inventory']['label'], 'measured')
+        self.assertRegex(measured['inventory']['detail'], r'devices=[0-9]+ protected_listed=0 penn_devices_listed=2')
+        self.assertIn('revisions=8,9,10', measured['bulk_receipts']['detail'])
+        self.assertIn('scope_candidates=0', measured['teardown_proof']['detail'])
+        self.assertEqual(self.stage_leftovers, [])
+        self.assert_no_leaks()
+        self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
+
+    def test_v2_leg_that_never_runs_stops_and_tears_down_once_with_exact_restore(self):
+        self.spec['leg2']['skip'] = ['2c']
+        before = self.router_snapshot()
+        code, out, err = self.run_v2()
+        stdout = self.stdout_lines()
+        self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
+        self.assertIn('STOP SCOPE-ADD-2 scope_leg_timeout', stdout)
+        self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
+        self.assertEqual(stdout.count('PHASE UNINSTALL OK'), 1)
+        self.assertIn('PHASE RESTORE OK', stdout)
+        self.assertEqual(stdout[-1], 'PENN_PILOT_STOPPED_RESTORED')
+        self.assertNotIn('PHASE PAUSE OK', stdout)
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertEqual(self.stage_leftovers, [])
+        self.assertEqual(json.loads((self.evidence() / 'summary.json').read_text())['outcome'], 'STOPPED')
+        self.assert_no_leaks()
+
+    def test_v2_wrong_confirmation_is_a_refused_leg_and_leg_one_does_not_believe_anything(self):
+        self.spec['leg2']['wrong_digits'] = ['2a']
+        before = self.router_snapshot()
+        code, out, err = self.run_v2()
+        stdout = self.stdout_lines()
+        self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
+        self.assertIn('STOP SCOPE-ADD-1 scope_leg_timeout', stdout)
+        legs = [json.loads(line) for line in self.leg_log.read_text().splitlines()]
+        self.assertIn('scope_confirmation_mismatch', legs[0]['last'])
+        self.assertEqual(stdout[-1], 'PENN_PILOT_STOPPED_RESTORED')
+        self.assertEqual(self.router_snapshot(), before)
+
+    def test_v2_self_abort_at_seventy_percent_ends_stopped_and_restored(self):
+        # The router clock jumps past 70% of remoteTimeoutSeconds once ENROLL is done.
+        offset = self.work / 'clock-offset'
+        real_date = shutil.which('date')
+        self.router_double('date', f'if [ -e {shlex.quote(str(offset))} ] && [ "$1" = +%s ]; then echo $(( $({shlex.quote(real_date)} +%s) + 7000 )); exit 0; fi\n'
+                           f'exec {shlex.quote(real_date)} "$@"\n')
+        self.spec['touch_on']['PHASE ENROLL OK'] = str(offset)
+        before = self.router_snapshot()
+        code, out, err = self.run_v2()
+        stdout = self.stdout_lines()
+        self.assertEqual(code, 2, out + err + '\n'.join(stdout[-40:]))
+        self.assertTrue(any(line.startswith('STOP ') and line.endswith(' remote_self_abort') for line in stdout), stdout[-20:])
+        self.assertEqual(sum(line.startswith('INFO run uninstall.sh once') for line in stdout), 1)
+        self.assertEqual(self.router_snapshot(), before)
+        self.assertNotIn('PENN_PILOT_PASS', stdout)
 
 
 if __name__ == '__main__':
