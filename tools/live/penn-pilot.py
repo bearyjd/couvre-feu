@@ -420,6 +420,7 @@ def plan(config, env):
     payload, rehearsal_sha, pilot_sha, policy_json = build_payload(config, commit, blobs, TIMING)
     argv = FR.ssh_argv(config, env)
     details = {'tool': TOOL_PATH, 'sourceCommit': commit, 'releaseId': FR.release_id(blobs),
+               'emittedTreeSha256': FR.emitted_tree_sha256(FR.emitted_tree(blobs)),
                'platformProfile': config['platformProfile'], 'payloadSha256': hashlib.sha256(payload).hexdigest(),
                'payloadBytes': len(payload), 'remoteScriptSha256': rehearsal_sha, 'pilotScriptSha256': pilot_sha,
                'sshArgv': argv, 'sshCommandLine': shlex.join(argv), 'remoteTimeoutSeconds': config['remoteTimeoutSeconds'],
