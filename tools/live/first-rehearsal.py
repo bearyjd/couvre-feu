@@ -35,6 +35,9 @@ SOURCE_PATHS = SOURCE_DIRS + (STRIPPER_PATH,)
 RELEASE_MODULES = ('core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'state.awk', 'rules.awk', 'json.awk',
                    'vendor-platform.sh', 'activity.sh')
 BOUNDARY_PIN_FILES = ('install.sh', 'uninstall.sh', 'cfctl')
+# The router accepts exactly these manifest entries (platform-bootstrap.sh platform_external_closure).
+MANIFEST_FILES = ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope', 'lib/platform-bootstrap.sh',
+                  *('lib/' + name for name in RELEASE_MODULES))
 # Tracked under router/ but neither in release.sha256 nor used by install.sh: never shipped.
 UNSHIPPED_ROUTER_FILES = ('router/cron', 'router/firewall.include')
 PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
@@ -259,6 +262,12 @@ def ship_stripped_wrappers(blobs):
             shipped['router/' + name] = strip(wrapper.decode('utf-8'), lines).encode('utf-8')
         except ValueError as error:
             raise Refusal(f'router/{name}: {error}') from None
+        try:
+            syntax = subprocess.run(['sh', '-n'], input=shipped['router/' + name], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Refusal(f'router/{name}: cannot run sh -n: {type(error).__name__}') from None
+        if syntax.returncode:
+            raise Refusal(f'router/{name}: stripped wrapper fails sh -n')
     manifest = manifest_entries(shipped)
     for digest, rel in manifest:
         if hashlib.sha256(shipped['router/' + rel]).hexdigest() != digest:
@@ -291,6 +300,8 @@ def emitted_tree(blobs):
                    and path not in UNSHIPPED_ROUTER_FILES)
     if stray:
         raise Refusal(f'{stray[0]}: tracked under router/ but not in release.sha256 (shipped set must equal the manifest)')
+    if sorted(rel for _, rel in manifest_entries(blobs)) != sorted(MANIFEST_FILES):
+        raise Refusal('router/release.sha256: entries differ from the router\'s fixed manifest file set')
     return tree
 
 
