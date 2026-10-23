@@ -304,7 +304,7 @@ cfp_stale_lock_report() {
             cfr_info "stale_platform_lock $CFR_PLATFORM_LOCK left by a killed child; manual recovery: cfctl recover-platform-lock; password login is the recovery path";;
         3)
             CFP_STALE_LOCK=4
-            cfr_info "platform_lock_unowned $CFR_PLATFORM_LOCK has no pid file after a signalled child; manual recovery: cfctl recover-platform-lock; password login is the recovery path";;
+            cfr_info "platform_lock_unowned $CFR_PLATFORM_LOCK has no pid file after a signalled child; cfctl recover-platform-lock refuses a lock without a pid file: confirm no cfctl is running, then rmdir the lock directory by hand; password login is the recovery path";;
     esac
 }
 

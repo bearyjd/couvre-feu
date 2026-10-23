@@ -3423,7 +3423,9 @@ class PilotHardeningT3cTests(PilotShellBase):
         self.assertEqual(self.stop_of(done), ['STOP PHASE platform_lock_unowned'], done.stdout + done.stderr)
         note = [line for line in done.stdout.splitlines() if line.startswith('INFO platform_lock_unowned')]
         self.assertEqual(len(note), 1, done.stdout)
-        self.assertIn('cfctl recover-platform-lock', note[0])
+        self.assertIn('refuses a lock without a pid file', note[0])
+        self.assertIn('rmdir', note[0])
+        self.assertNotIn('then run cfctl recover-platform-lock', note[0])
         self.assertIn('password login', note[0])
         self.assertNotIn('stale_platform_lock', done.stdout)
         self.assertEqual(done.stdout.count('run uninstall.sh once'), 1)
