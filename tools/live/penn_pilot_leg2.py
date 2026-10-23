@@ -105,12 +105,14 @@ class Leg:
         self.expected = f'{entry["op"]} {mac} --base {base}\n{PROMPT}'
         self.digits = confirmation_digits(mac)
         self.started, self.deadline = now, now + entry['timeoutSeconds']
-        self.buffer, self.after, self.total = b'', b'', 0
+        self.buffer, self.after, self.total, self.stderr_bytes = b'', b'', 0, 0
         self.sent, self.result, self.master, self.process = False, None, None, None
         master, slave = os.openpty()
         try:
-            self.process = subprocess.Popen(entry['sshArgv'][:-1] + [command], stdin=slave, stdout=slave, stderr=slave,
-                                            env=env, start_new_session=True, close_fds=True)
+            # The pty carries only what the remote prints; the local client's own stderr (banners, warnings, which
+            # name the router) goes to a pipe that is only counted.
+            self.process = subprocess.Popen(entry['sshArgv'][:-1] + [command], stdin=slave, stdout=slave,
+                                            stderr=subprocess.PIPE, env=env, start_new_session=True, close_fds=True)
             self.master = master
         except OSError:
             os.close(master)
@@ -118,7 +120,15 @@ class Leg:
         finally:
             os.close(slave)
 
+    def drain_stderr(self):
+        while self.process is not None and self.process.stderr is not None and select.select([self.process.stderr], [], [], 0)[0]:
+            chunk = os.read(self.process.stderr.fileno(), 4096)
+            if not chunk:
+                return
+            self.stderr_bytes += len(chunk)
+
     def read(self):
+        self.drain_stderr()
         while self.master is not None and select.select([self.master], [], [], 0)[0]:
             try:
                 chunk = os.read(self.master, 4096)
@@ -166,6 +176,9 @@ class Leg:
         self.finish(outcome, None, now)
 
     def finish(self, outcome, code, now):
+        if self.process is not None and self.process.stderr is not None:
+            self.drain_stderr()
+            self.process.stderr.close()
         if self.master is not None:
             try:
                 os.close(self.master)
@@ -185,7 +198,7 @@ class Leg:
         self.result = {'leg': self.leg, 'form': self.entry['form'], 'op': self.entry['op'], 'outcome': outcome,
                        'exit': code, 'ok': outcome == 'exited' and code == 0 and reply.get('ok') is True,
                        'errors': [e for e in errors if isinstance(e, str) and REASON.fullmatch(e)][:8],
-                       'confirmationSent': self.sent, 'bytes': self.total, 'seconds': int(now - self.started)}
+                       'confirmationSent': self.sent, 'bytes': self.total, 'stderrBytes': self.stderr_bytes, 'seconds': int(now - self.started)}
 
 
 class Tail:
@@ -245,7 +258,7 @@ class Driver:
                                    start_new_session=True)
         feeder = threading.Thread(target=feed, args=(process.stdin, payload), daemon=True)
         feeder.start()
-        results, ignored, active, locked = [], 0, None, False
+        results, ignored, active, pending, locked = [], 0, None, None, False
         timed_out, aborted, begun = False, True, time.monotonic()
         try:
             while True:
@@ -254,20 +267,24 @@ class Driver:
                 halts = [CANCEL.fullmatch(line) is not None for line in lines if line.startswith('STOP ') or CANCEL.fullmatch(line)]
                 markers = [m.groups() for m in map(MARKER.fullmatch, lines) if m]
                 if halts:
-                    locked = True
+                    locked, pending = True, None
                     if active:
                         active.kill('killed_on_cancel' if halts[0] else 'killed_on_stop', now)
-                for leg, base in markers:
-                    index = len(results) + (1 if active else 0)
-                    if locked or active or index >= len(self.legs) or self.legs[index]['leg'] != leg:
-                        ignored += 1
-                    else:
-                        active = Leg(self.legs[index], base, env, now)
                 if active:
                     active.step(now)
                     if active.result:
                         results.append(active.result)
                         active = None
+                for leg, base in markers:
+                    index = len(results) + (1 if active else 0)
+                    if locked or pending or index >= len(self.legs) or self.legs[index]['leg'] != leg:
+                        ignored += 1
+                    elif active:
+                        pending = (index, base)  # leg 1 was quicker than this leg's ssh closing: start it right after
+                    else:
+                        active = Leg(self.legs[index], base, env, now)
+                if pending and not active and not locked:
+                    active, pending = Leg(self.legs[pending[0]], pending[1], env, now), None
                 if process.poll() is not None:
                     break
                 if now - begun > timeout:

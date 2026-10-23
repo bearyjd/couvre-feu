@@ -31,7 +31,7 @@ HELPER = REPO / 'tests/fake-leg-ssh.py'
 BASE = 'ab' * 32
 BASE2 = 'cd' * 32
 PROMPT = 'Type the last 6 hex digits of the address (no colons) to confirm: '
-LEG_KEYS = {'leg', 'form', 'op', 'outcome', 'exit', 'ok', 'errors', 'confirmationSent', 'bytes', 'seconds'}
+LEG_KEYS = {'leg', 'form', 'op', 'outcome', 'exit', 'ok', 'errors', 'confirmationSent', 'bytes', 'stderrBytes', 'seconds'}
 LEG_SECONDS = 2
 
 
@@ -159,6 +159,34 @@ class DriverTests(DriverBase):
         self.assertEqual(self.legs(), [])
         self.assertEqual(self.leg_calls(), [])
         self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_a_marker_that_arrives_while_the_previous_leg_is_still_closing_is_held_not_lost(self):
+        # Leg 1 re-reads the router and prints the next marker as soon as the scope changed; the previous leg's ssh may
+        # not have exited yet. Dropping that marker would stall leg 1 for 60 s and stop the gate.
+        self.drive([[0.2, f'CFP_LEG2_READY 2a {BASE}'], [0.8, f'CFP_LEG2_READY 2b {BASE2}'], [5.0, 'PHASE X OK']], linger=1.5)
+        self.assertEqual([(leg['leg'], leg['outcome'], leg['ok']) for leg in self.legs()],
+                         [('2a', 'exited', True), ('2b', 'exited', True)])
+        self.assertEqual(self.outcome[2]['ignoredMarkers'], 0)
+        self.assertEqual(self.leg_calls()[1][-1], f'/usr/sbin/cfctl scope-remove {PHONE["mac"]} --base {BASE2}')
+
+    def test_a_held_marker_is_dropped_by_stop_cancel_and_the_end_of_leg_one(self):
+        for name, third in (('stop', 'STOP SCOPE-ADD-1 x'), ('cancel', 'CFP_LEG2_CANCEL 2a')):
+            with self.subTest(name):
+                self.ssh_log.unlink(missing_ok=True)
+                self.drive([[0.2, f'CFP_LEG2_READY 2a {BASE}'], [0.6, f'CFP_LEG2_READY 2b {BASE}'], [0.1, third], [4.0, 'END']],
+                           linger=1.5)
+                self.assertEqual(len(self.leg_calls()), 1, name)
+        self.ssh_log.unlink(missing_ok=True)
+        self.drive([[0.2, f'CFP_LEG2_READY 2a {BASE}'], [0.6, f'CFP_LEG2_READY 2b {BASE}']], linger=3.0)
+        self.assertEqual(len(self.leg_calls()), 1)
+        self.assertEqual([leg['leg'] for leg in self.legs()], ['2a'])
+
+    def test_the_local_clients_own_stderr_is_neither_matched_nor_kept(self):
+        self.drive([[0.2, f'CFP_LEG2_READY 2a {BASE}'], [1.5, 'PHASE X OK']], stderr_line='Connection to 192.0.2.1 closed.')
+        (leg,) = self.legs()
+        self.assertEqual((leg['outcome'], leg['ok']), ('exited', True))
+        self.assertGreater(leg['stderrBytes'], 0)
+        self.assertNotIn('192.0.2.1', json.dumps(self.outcome[2]))
 
     def test_a_marker_for_another_leg_or_a_repeat_is_ignored_and_counted(self):
         self.drive([[0.2, f'CFP_LEG2_READY 2b {BASE}'], [0.2, f'CFP_LEG2_READY 2a {BASE}'], [1.2, f'CFP_LEG2_READY 2a {BASE}'],

@@ -66,6 +66,9 @@ def scripted(cfg, command):
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(0, termios.TCSANOW, attrs)
     time.sleep(cfg.get('delay', 0))
+    if cfg.get('stderr_line'):
+        sys.stderr.write(cfg['stderr_line'] + '\n')  # the local client's own warning (it names the router)
+        sys.stderr.flush()
     for line in cfg.get('before', []):
         print(line.replace('{mac}', mac), flush=True)
     text = cfg.get('prompt_text') or '%s %s --base %s\n%s' % (op, mac, base, PROMPT)
@@ -81,6 +84,7 @@ def scripted(cfg, command):
     ok = answer == mac.replace(':', '')[-6:]
     print(json.dumps({'ok': True, 'mac': mac} if ok else {'ok': False, 'errors': ['scope_confirmation_mismatch']}),
           flush=True)
+    time.sleep(cfg.get('linger', 0))  # the ssh client is slow to close the channel after the remote is done
     sys.exit(0 if ok else 1)
 
 
