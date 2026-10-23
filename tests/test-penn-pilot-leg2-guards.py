@@ -4,6 +4,7 @@ against a fake /proc, signal handling of the driver process, and re-hashing of t
 Same harness as tests/test-penn-pilot-leg2.py (fake ssh, no router). Fictional MACs and documentation IPs only."""
 import json
 import os
+import select
 from pathlib import Path
 import shlex
 import shutil
@@ -156,6 +157,82 @@ class BusyboxAckCommandTests(AckCommandTests):
             self.assertIn('BusyBox', shown.stdout + shown.stderr, applet)
 
 
+@unittest.skipUnless(local_busybox(), 'local BusyBox required for foreground-child signal semantics')
+class RemoteLegSupervisionTests(L2.DriverBase):
+    def test_foreground_child_receives_term_and_the_lock_is_released_before_teardown(self):
+        busybox = local_busybox()
+        lock, owner, descendant = (self.work / name for name in ('scope.lock', 'owner.pid', 'foreground.pid'))
+        term, exited = self.work / 'term', self.work / 'exit'
+        fixture = self.work / 'scope-fixture'
+        fixture.write_text(f'''#!{busybox} ash
+printf '%s' "$$" > {shlex.quote(str(owner))}
+: > {shlex.quote(str(lock))}
+trap 'echo term > {shlex.quote(str(term))}; exit 143' TERM
+trap 'rm -f {shlex.quote(str(lock))}; echo exit > {shlex.quote(str(exited))}' EXIT
+{busybox} ash -c 'echo $$ > "$1"; exec sleep 30' fixture {shlex.quote(str(descendant))}
+''')
+        fixture.chmod(0o700)
+        with mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 1), mock.patch.object(self.tool.V2, 'SCOPE_LEG_KILL_GRACE_SECONDS', 2):
+            leg = self.tool.V2.scope_legs(self.tool.load_config(self.config_path), self.details['sshArgv'])[0]
+        command = leg['commandTemplate'].replace('/usr/sbin/cfctl', shlex.quote(str(fixture)))
+        command = command.replace('timeout -s', f'{busybox} timeout -s')
+        command = command.replace('/bin/sh', f'{busybox} ash').replace('{MAC}', PHONE['mac']).replace('{BASE}', BASE)
+        process = subprocess.Popen([busybox, 'ash', '-c', command], start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 3
+            while not descendant.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(descendant.exists(), 'fixture foreground child never started')
+            os.killpg(process.pid, signal.SIGHUP)  # SSH channel closes; the remote watchdog must survive.
+            process.wait(8)
+            self.assertTrue(term.exists(), 'TERM cleanup never ran while foreground child was blocked')
+            self.assertTrue(exited.exists(), 'EXIT lock cleanup never ran')
+            self.assertFalse(lock.exists(), 'mock uninstall would refuse the stale lock')
+            self.assertTrue(wait_dead(int(descendant.read_text()), 2), 'foreground child survived the remote deadline')
+            teardown = subprocess.run([busybox, 'ash', '-c', 'test ! -e "$1"', 'uninstall', str(lock)], check=False)
+            self.assertEqual(teardown.returncode, 0)
+        finally:
+            for candidate in (owner, descendant):
+                if candidate.exists():
+                    pid = int(candidate.read_text())
+                    for kill in (os.killpg, os.kill):
+                        try:
+                            kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+    def test_both_commit_forms_keep_the_tty_and_deliver_confirmation(self):
+        busybox = local_busybox()
+        fixture = self.work / 'tty-fixture'
+        fixture.write_text(f'#!{busybox} ash\n[ -t 0 ] || exit 20\nprintf ready\nIFS= read -r answer\n[ "$answer" = 000034 ]\n')
+        fixture.chmod(0o700)
+        for leg in (self.details['legs'][0], self.details['legs'][2]):
+            command = leg['commandTemplate'].replace('/usr/sbin/cfctl-scope', shlex.quote(str(fixture)))
+            command = command.replace('/usr/sbin/cfctl', shlex.quote(str(fixture))).replace('/bin/sh', f'{busybox} ash')
+            master, slave = os.openpty()
+            process = subprocess.Popen([busybox, 'ash', '-c', command], stdin=slave, stdout=slave, stderr=slave,
+                                       start_new_session=True)
+            os.close(slave)
+            try:
+                self.assertTrue(select.select([master], [], [], 3)[0], 'no prompt: tty was lost')
+                self.assertEqual(os.read(master, 5), b'ready')
+                os.write(master, b'000034\n')
+                self.assertEqual(process.wait(4), 0)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                os.close(master)
+
+
 class SignalTests(L2.DriverBase):
     SCRIPT = '''
 import importlib.util, json, os, signal, subprocess, sys, time
@@ -187,6 +264,10 @@ if inject.startswith('popen:'):  # a stop that lands right after the Nth child w
         started.append(child)
         if len(started) == int(inject[6:]):
             open(sys.argv[4] + '.pid', 'w').write(str(child.pid))
+            if os.environ.get('WAIT_CHILD'):
+                deadline = time.monotonic() + 10
+                while not os.path.exists(os.environ['WAIT_CHILD']) and time.monotonic() < deadline:
+                    time.sleep(.01)
             os.kill(os.getpid(), signal.SIGTERM)
         return child
     subprocess.Popen = popen
@@ -201,9 +282,14 @@ except KeyboardInterrupt:
     sys.exit(7 if not blocked and restored else 9)
 '''
 
-    def run_signalled(self, signals, slow='0', threads=None, inject=None):
+    def run_signalled(self, signals, slow='0', threads=None, inject=None, ack=False):
         threads = dict(threads or {}, INJECT=inject or '')
         self.spec_for([marker(), [0, '@wait read 1'], [60, 'END']], hang_after_read=True, child=str(self.pidfile))
+        if ack:
+            self.spec_for([[.2, 'CFP_LEG2_CANCEL 2a'], [0, f'CFP_LEG2_ACK_FILE {ACK_PATH}'], [60, 'END']])
+            self.spec['ack'] = {'hang': True, 'child': str(self.pidfile)}
+            self.spec_path.write_text(json.dumps(self.spec))
+            threads['WAIT_CHILD'] = str(self.pidfile)
         script = self.work / 'driver-child.py'
         script.write_text(self.SCRIPT)
         for name, value in (('details', self.details), ('env', self.env)):
@@ -221,6 +307,20 @@ except KeyboardInterrupt:
                 time.sleep(0.4)
             child.send_signal(number)
         self.assertEqual(child.wait(30), 7)
+
+    def test_a_stop_during_ack_spawn_reaps_the_ack_and_its_whole_process_group(self):
+        self.run_signalled([], inject='popen:2', ack=True)
+        pid = int((self.work / 'out.log.pid').read_text())
+        self.addCleanup(lambda: os.killpg(pid, signal.SIGKILL) if L2.alive(pid) else None)
+        self.assertTrue(wait_dead(pid, 2), 'ack SSH escaped cleanup during spawn')
+        self.child_dead()
+
+    def test_ack_timeout_also_kills_its_descendants(self):
+        self.spec['ack'] = {'hang': True, 'child': str(self.pidfile)}
+        self.spec_path.write_text(json.dumps(self.spec))
+        with mock.patch.object(self.tool.LEG2, 'ACK_SECONDS', 1):
+            self.assertEqual(self.tool.LEG2.send_ack(self.details['sshArgv'], ACK_PATH, self.env), 'failed')
+        self.child_dead()
 
     def test_sigterm_and_sighup_kill_the_leg_leg_one_and_every_child_before_the_driver_dies(self):
         for number in (signal.SIGTERM, signal.SIGHUP):
@@ -322,7 +422,7 @@ class BindingTests(L2.DriverBase):
         for leg in self.details['legs']:
             self.assertEqual(leg['sshArgv'][:-1], base[:-3] + ['-e', 'none', '-tt', base[-2]])
             self.assertEqual(leg['sshArgv'][-1], leg['commandTemplate'])
-            self.assertTrue(leg['commandTemplate'].startswith(BOUND))
+            self.assertEqual(shlex.split(leg['commandTemplate'])[:2], ['/bin/sh', '-c'])
         for index in range(4):
             changed = self.fresh()
             changed['legs'][index]['sshArgv'][1] = '-x'
@@ -397,10 +497,14 @@ class BindingTests(L2.DriverBase):
         details['legs'][0]['retry'] = True
         self.refused(self.resign(details), resigned=True)
 
-    def test_the_kill_grace_of_the_nested_timeouts_is_the_same_in_the_plan_and_the_driver(self):
+    def test_the_kill_grace_of_the_group_supervisor_is_the_same_in_the_plan_and_the_driver(self):
         self.assertEqual(self.tool.V2.SCOPE_LEG_KILL_GRACE_SECONDS, self.tool.LEG2.LEG_KILL_GRACE_SECONDS)
         for leg in self.details['legs']:
-            self.assertTrue(leg['commandTemplate'].startswith(BOUND), leg['commandTemplate'])
+            self.assertEqual(shlex.split(leg['commandTemplate'])[3:6], ['pilot-leg', str(LEG_SECONDS), '15'])
+        details = self.fresh()
+        details['legs'][0]['commandTemplate'] = details['legs'][0]['commandTemplate'].replace('kill -TERM "-$p"', 'kill -TERM "$p"')
+        details['legs'][0]['sshArgv'][-1] = details['legs'][0]['commandTemplate']
+        self.refused(self.resign(details), resigned=True)
 
     def test_the_legs_are_copied_at_construction_so_later_edits_change_nothing(self):
         details = self.fresh()

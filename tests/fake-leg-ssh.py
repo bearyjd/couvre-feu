@@ -208,6 +208,10 @@ def leg_two():
 def ack():
     """The driver's acknowledgement command: optionally failing/hanging, or run for real against a fake /proc."""
     cfg = spec.get('ack', {})
+    if cfg.get('child'):
+        child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(300)'])
+        with open(cfg['child'], 'w') as handle:
+            handle.write(str(child.pid))
     if cfg.get('hang'):
         time.sleep(300)
     if cfg.get('fail'):

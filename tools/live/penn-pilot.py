@@ -73,7 +73,7 @@ FR = _load_rehearsal()
 V2 = _load_sibling('penn_pilot_v2')
 V2.bind(FR)
 LEG2 = _load_sibling('penn_pilot_leg2')
-LEG2.bind(FR)
+LEG2.bind(FR, V2)
 Refusal = FR.Refusal
 EXIT_PASS, EXIT_REFUSED, EXIT_FAIL = FR.EXIT_PASS, FR.EXIT_REFUSED, FR.EXIT_FAIL
 REMOTE_PASS, REMOTE_REFUSED, REMOTE_FAIL = FR.REMOTE_PASS, FR.REMOTE_REFUSED, FR.REMOTE_FAIL

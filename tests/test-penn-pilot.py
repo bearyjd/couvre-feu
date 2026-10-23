@@ -1303,13 +1303,17 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual([(leg['leg'], leg['form'], leg['op']) for leg in legs],
                          [('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
                           ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove')])
-        bound = 'timeout -s KILL 75 timeout -s TERM 60 '
-        self.assertEqual(legs[0]['commandTemplate'], bound + '/usr/sbin/cfctl scope-add {MAC} --base {BASE}')
-        self.assertEqual(legs[1]['commandTemplate'], bound + '/usr/sbin/cfctl scope-remove {MAC} --base {BASE}')
-        self.assertEqual(legs[2]['commandTemplate'],
-                         bound + "env SSH_ORIGINAL_COMMAND='cfctl scope-add {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
-        self.assertEqual(legs[3]['commandTemplate'],
-                         bound + "env SSH_ORIGINAL_COMMAND='cfctl scope-remove {MAC} --base {BASE}' /usr/sbin/cfctl-scope pilot")
+        for leg in legs:
+            argv = shlex.split(leg['commandTemplate'])
+            self.assertEqual(argv[:2], ['/bin/sh', '-c'])
+            self.assertEqual(argv[3:6], ['pilot-leg', '60', '15'])
+            self.assertIn('kill -TERM "-$p"', argv[2])
+            self.assertIn('kill -KILL "-$p"', argv[2])
+            if leg['form'] == 'cfctl':
+                self.assertEqual(argv[6:], ['/usr/sbin/cfctl', leg['op'], '{MAC}', '--base', '{BASE}'])
+            else:
+                self.assertEqual(argv[6:], ['env', f'SSH_ORIGINAL_COMMAND=cfctl {leg["op"]} {{MAC}} --base {{BASE}}',
+                                           '/usr/sbin/cfctl-scope', 'pilot'])
         base = details['sshArgv']
         for leg in legs:  # the leg-1 argv with `-e none -tt` for `-T`: no ssh escape character on the pty
             self.assertEqual(leg['sshArgv'], base[:-3] + ['-e', 'none', '-tt', base[-2], leg['commandTemplate']])
@@ -3016,7 +3020,7 @@ class PilotV2FixtureTests(PilotShellBase):
         self.assert_no_leaks()
 
     def test_v2_wrong_confirmation_is_a_refused_leg_and_leg_one_does_not_believe_anything(self):
-        self.spec['leg2']['wrong_digits_match'] = '^timeout -s KILL [0-9]+ timeout -s TERM [0-9]+ /usr/sbin/cfctl scope-add'
+        self.spec['leg2']['wrong_digits_match'] = r'/usr/sbin/cfctl scope-add'
         before = self.router_snapshot()
         code, out, err = self.run_v2()
         stdout = self.stdout_lines()

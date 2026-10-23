@@ -231,20 +231,52 @@ def pilot_policies(config, base, candidates=candidate_policies):
             for name, policy in candidates(config, base)]
 
 
+LEG_SUPERVISOR = '''seconds=$1; grace=$2; shift 2
+exec 3<&0
+trap '' HUP INT TERM
+( trap - HUP INT TERM; exec setsid "$@" ) <&3 3<&- &
+p=$!
+exec 3<&-
+( n=0
+  while kill -0 "$p" 2>/dev/null; do
+    sleep 1
+    kill -0 "$p" 2>/dev/null || break
+    n=$((n+1))
+    if [ "$n" -eq "$seconds" ]; then
+      kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+    fi
+    if [ "$n" -ge "$((seconds+grace))" ]; then
+      kill -KILL "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null
+      break
+    fi
+  done ) </dev/null >/dev/null 2>&1 &
+w=$!
+wait "$p" 2>/dev/null; rc=$?
+# The watchdog inherits ignored TERM; join its at-most-one-second sleep instead of leaking it.
+wait "$w" 2>/dev/null
+kill -KILL "-$p" 2>/dev/null
+exit "$rc"
+'''
+
+
+def remote_leg_command(form, op, seconds, grace=SCOPE_LEG_KILL_GRACE_SECONDS):
+    """Fixed supervisor plus positional argv: no config value becomes shell syntax. The baseline requires setsid
+    to exec without forking. Preserve the tty on fd 0; signal the entire child group, including a foreground sync
+    that would defer ash's TERM trap. Ignore disconnect signals in the supervisor so its watchdog survives ssh."""
+    inner = f'{op} {{MAC}} --base {{BASE}}'
+    command = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
+               else f"env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
+    return f'/bin/sh -c {shlex.quote(LEG_SUPERVISOR)} pilot-leg {seconds} {grace} {command}'
+
+
 def scope_legs(config, ssh_argv):
-    """Leg-2 commit commands, fixed text; {MAC} and {BASE} are substituted only by validated values. The command is
-    bounded on the router by nested timeouts, `timeout -s KILL <seconds + grace> timeout -s TERM <seconds>` (busybox
-    timeout has no -k; TERM first lets cfctl's traps release the platform lock, KILL skips them), so a leg whose local
-    ssh died cannot run on past its deadline. Each leg also binds its whole ssh
+    """Leg-2 commands use a fixed process-group supervisor, TERM at the allowance then KILL after the grace. Each binds its whole ssh
     argv: the leg-1 argv with `-e none -tt` for `-T` (no ssh escape character on the pty) and the template last."""
     if len(ssh_argv) < 4 or ssh_argv[-3] != '-T':
         raise Refusal('leg-1 ssh argv has no -T to turn into -tt')
     legs = []
     for leg, form, op in SCOPE_LEGS:
-        inner = f'{op} {{MAC}} --base {{BASE}}'
-        bound = f'timeout -s KILL {SCOPE_LEG_SECONDS + SCOPE_LEG_KILL_GRACE_SECONDS} timeout -s TERM {SCOPE_LEG_SECONDS} '
-        template = (f'{bound}/usr/sbin/cfctl {inner}' if form == 'cfctl'
-                    else f"{bound}env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
+        template = remote_leg_command(form, op, SCOPE_LEG_SECONDS, SCOPE_LEG_KILL_GRACE_SECONDS)
         legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template,
                      'sshArgv': ssh_argv[:-3] + ['-e', 'none', '-tt', ssh_argv[-2], template], 'pty': True,
                      'timeoutSeconds': SCOPE_LEG_SECONDS, 'retry': False, 'confirmation': 'last6hex',

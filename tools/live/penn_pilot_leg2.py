@@ -28,12 +28,13 @@ class Refusal(Exception):
 
 
 FR: Any = None
+V2: Any = None
 
 
-def bind(first_rehearsal):
-    """Bind the first-rehearsal module: its MAC canonicaliser and its Refusal class."""
-    global FR, Refusal
-    FR = first_rehearsal
+def bind(first_rehearsal, v2):
+    """Bind rehearsal validators/Refusal and the v2 fixed remote-command builder."""
+    global FR, V2, Refusal
+    FR, V2 = first_rehearsal, v2
     Refusal = first_rehearsal.Refusal
 
 
@@ -69,14 +70,8 @@ PROMPT = 'Type the last 6 hex digits of the address (no colons) to confirm: '
 # (leg, form, op) in the only order the plan may list them.
 LEG_TABLE = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
              ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove'))
-# The remote bound is `timeout -s KILL <seconds + grace> timeout -s TERM <seconds>`: TERM (the leg's own digest-bound
-# timeoutSeconds) lets cfctl's traps release the platform lock, KILL (no -k in busybox 1.33) is the backstop. Both
-# numbers are written without leading zeros.
+# The remote supervisor is exact fixed text from V2; its whole command and both allowances are digest-bound.
 LEG_KILL_GRACE_SECONDS = 15
-BOUND_RE = r'timeout -s KILL ([1-9][0-9]{0,2}) timeout -s TERM ([1-9][0-9]{0,2}) '
-TEMPLATES = {'cfctl': BOUND_RE + r'/usr/sbin/cfctl (scope-add|scope-remove) \{MAC\} --base \{BASE\}',
-             'cfctl-scope': BOUND_RE + r"env SSH_ORIGINAL_COMMAND='cfctl (scope-add|scope-remove) "
-                            r"\{MAC\} --base \{BASE\}' /usr/sbin/cfctl-scope pilot"}
 # The only ssh options a leg may carry besides the pinned known-hosts file (the leg-1 option set).
 FIXED_OPTIONS = {'IdentitiesOnly=yes', 'BatchMode=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null',
                  'ConnectTimeout=5', 'ConnectionAttempts=1', 'ForwardAgent=no', 'ClearAllForwardings=yes'}
@@ -120,10 +115,8 @@ def check_leg(entry, expected, details, base):
     if not isinstance(seconds, int) or isinstance(seconds, bool) or not 1 <= seconds <= 120:
         raise Refusal(f'leg {leg} timeout is not 1-120 seconds')
     template = entry.get('commandTemplate')
-    match = isinstance(template, str) and re.fullmatch(TEMPLATES[form], template)
     argv = entry.get('sshArgv')
-    if (not match or match.group(3) != op or int(match.group(2)) != seconds
-            or int(match.group(1)) != seconds + LEG_KILL_GRACE_SECONDS or not isinstance(argv, list)
+    if (template != V2.remote_leg_command(form, op, seconds, LEG_KILL_GRACE_SECONDS) or not isinstance(argv, list)
             or argv[-1:] != [template]):
         raise Refusal(f'leg {leg} command is not the fixed text')
     if argv[:-1] != base[:-3] + ['-e', 'none', '-tt', base[-2]]:
@@ -259,14 +252,24 @@ def send_ack(argv, path, env):
     """Create the acknowledgement file on the router with ONE short ssh (the leg-1 argv, ACK_SCRIPT as the command).
     Returns 'sent', 'busy' (a cfctl process was still alive on the router: nothing written) or 'failed'. Only called
     once no leg is in flight and none can start."""
+    process = None
     try:
         script = ACK_SCRIPT.replace('PATH_', path).replace('SCAN_', str(ACK_SCAN_SECONDS))
-        done = subprocess.run(argv[:-1] + [script], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True,
-                              timeout=ACK_SECONDS)
+        with uninterruptible():
+            process = subprocess.Popen(argv[:-1] + [script], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        code = process.wait(timeout=ACK_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         return 'failed'
-    return {0: 'sent', ACK_BUSY: 'busy'}.get(done.returncode, 'failed')
+    finally:
+        if process is not None:
+            with uninterruptible():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+    return {0: 'sent', ACK_BUSY: 'busy'}.get(code, 'failed')
 
 
 class Tail:

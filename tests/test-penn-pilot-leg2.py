@@ -199,7 +199,7 @@ class DriverTests(DriverBase):
         (call,) = self.leg_calls()
         planned = self.details['legs'][0]['sshArgv']
         self.assertEqual(call[:-1], planned[1:-1])
-        self.assertEqual(call[-1], f'{BOUND}/usr/sbin/cfctl scope-add {PHONE["mac"]} --base {BASE}')
+        self.assertEqual(call[-1], self.command(0))
         self.assertNotIn('-T', call)
         self.assertEqual(len(self.ssh_calls()), 2)
 
@@ -211,10 +211,7 @@ class DriverTests(DriverBase):
         self.assertEqual([(leg['leg'], leg['outcome']) for leg in self.legs()], [(l, 'exited') for l in ('2a', '2b', '2c', '2d')])
         commands = [call[-1] for call in self.leg_calls()]
         mac = PHONE['mac']
-        self.assertEqual(commands[0], f'{BOUND}/usr/sbin/cfctl scope-add {mac} --base {BASE}')
-        self.assertEqual(commands[1], f'{BOUND}/usr/sbin/cfctl scope-remove {mac} --base {BASE2}')
-        self.assertEqual(commands[2], f"{BOUND}env SSH_ORIGINAL_COMMAND='cfctl scope-add {mac} --base {BASE}' /usr/sbin/cfctl-scope pilot")
-        self.assertEqual(commands[3], f"{BOUND}env SSH_ORIGINAL_COMMAND='cfctl scope-remove {mac} --base {BASE2}' /usr/sbin/cfctl-scope pilot")
+        self.assertEqual(commands, [self.command(0), self.command(1, BASE2), self.command(2), self.command(3, BASE2)])
 
     def test_a_leg_never_starts_without_a_valid_marker_line(self):
         bad = [f'CFP_LEG2_READY 2a {"g" * 64}', f' CFP_LEG2_READY 2a {BASE}', f'CFP_LEG2_READY 2a {BASE[:-1]}',
