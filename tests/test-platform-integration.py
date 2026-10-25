@@ -239,8 +239,8 @@ class StrictEntryTests(unittest.TestCase):
         # Behavioural: real installed cfctl, EOF withheld, under this class's profile.
         self.install()
         tmp = self.root / 'tmp'
-        if not tmp.exists():
-            tmp.mkdir(); tmp.chmod(0o1777)
+        tmp.mkdir(exist_ok=True)
+        tmp.chmod(0o1777)  # Unconditional: a pre-existing tmp must also be the sticky stand-in.
         cfctl = str(self.root / 'usr/sbin/cfctl')
         baseline = subprocess.run(SHELL + [cfctl, 'expire'], env=self.env, capture_output=True, text=True, timeout=60)
         baseline_errors = json.loads(baseline.stdout)['errors']
