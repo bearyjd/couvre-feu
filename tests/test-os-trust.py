@@ -185,7 +185,7 @@ class DeadlineTests(unittest.TestCase):
     def test_slow_input_within_ten_seconds_still_checks_cumulative_deadline(self):
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-input-') as folder:
             root=Path(folder);(root/'tmp').mkdir()
-            body=f'''CF_BASE={root};CF_LOCAL_TEST=1;CF_TEST_TIMEOUT='{SHELL[0]} timeout';. "{REPO}/router/lib/core.sh";CF_PLATFORM_ENTRY_TICK=$(platform_clock_tick);CF_PLATFORM_ENTRY_TICK=$((CF_PLATFORM_ENTRY_TICK-1290));cf_sync_stage 0;printf unsafe'''
+            body=f'''CF_BASE={root};CF_LIB={REPO}/router/lib;CF_LOCAL_TEST=1;CF_TEST_TIMEOUT='{SHELL[0]} timeout';. "{REPO}/router/lib/core.sh";CF_PLATFORM_ENTRY_TICK=$(platform_clock_tick);CF_PLATFORM_ENTRY_TICK=$((CF_PLATFORM_ENTRY_TICK-1290));cf_sync_stage 0;printf unsafe'''
             child=subprocess.Popen(SHELL+['-c',self.setup+body],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:
                 time.sleep(.2);out,err=child.communicate('{}',timeout=5)
