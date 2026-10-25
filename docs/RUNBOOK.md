@@ -51,3 +51,24 @@ Service side: `npm run integration:start -- "<PRIVATE_MANIFEST>"` refuses an edi
 - Router: `router/uninstall.sh` restores originals by rename after drift checks and proves exact restoration. It refuses on drift and keeps the journal. Uninstall exactness is part of every rehearsal; do not enroll before it has been proven.
 - Service: database migrations (`PRAGMA user_version`, forward only) are not reversible. Before upgrading or any migration, stop the service and copy `integration.sqlite` together with `integration.sqlite-wal` and `integration.sqlite-shm` from `dataDir` into a private backup. Restore all three files together.
 - A manifest edit changes its digest and existing database bindings refuse it; use reviewed private backup and recovery or a fresh enrollment, never edit identity markers to bypass the refusal.
+
+## Known limits
+
+Couvre-feu enforces at the router. These cases are outside what a router can do:
+
+- Mobile data and hotspots: a device that leaves the home network is not enforced.
+- VPN and IP-direct traffic: traffic that avoids DNS or tunnels past the router is not reliably blocked.
+- A skilled kid: a determined child with technical knowledge may find a way around router-level controls.
+
+These are unproven; do not rely on them until live evidence exists:
+
+- Per-device and client-IPv6 traffic
+- Flow offload interaction
+- Inbound UDP
+- The 5 s cutoff
+- Confinement of the router key
+
+Other constraints:
+
+- Floor MACs (the protected devices set at install time) can be removed only by reinstalling.
+- Growing the installed scope widens what `rpc-activity` exposes to the service.

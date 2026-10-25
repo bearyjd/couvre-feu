@@ -16,8 +16,8 @@ Keep the real configuration outside the repository, in a private directory. [`co
 | `adminKeyFingerprint` | string | `SHA256:` followed by 43 base64 characters, as printed by `ssh-add -l` |
 | `knownHostsPath` | string | Absolute path to a regular file holding the pinned router host key (`StrictHostKeyChecking=yes`) |
 | `evidenceDir` | string | Absolute path to an existing directory you own, with no group or other write access. It is refused under `/tmp`, `/run`, `/dev/shm`, `/var/tmp` or on tmpfs. Each run creates a new `<UTC>-first-rehearsal/` directory there |
-| `authorizationPath` | string | Absolute path to a regular file recording the user's approval of this exact run. Its sha256 goes into the evidence |
-| `deadlineUtc` | string | `YYYY-MM-DDTHH:MM:SSZ`. `execute` refuses unless now + local timeout + 300 s is no later than this time |
+| `authorizationPath` | string | Absolute path to a regular file that records the approval of this exact run: the user's approval statement or a stable reference to it, the approved `planSha256`, the approved window and `deadlineUtc`, who approved, and the date. Its sha256 goes into the evidence; `execute` checks it, but it is not part of the plan digest (the path is), so the file may be written after `plan` |
+| `deadlineUtc` | string | `YYYY-MM-DDTHH:MM:SSZ`. `execute` refuses unless now + local timeout (`remoteTimeoutSeconds` + 60 s) + 300 s is no later than this time; checked twice, before the authorization file is read and after the evidence directory is created |
 | `platformProfile` | string | Optional. One of `strict`, `gl-xe3000-4.8.3-logd-011-v1`, `gl-xe3000-4.8.3-os-trust-v1` (the default) |
 | `remoteTimeoutSeconds` | integer | Optional, 600–3600, default 1800. Generous last-resort router-side `timeout -s KILL`; the script bounds itself first. The local timeout is this value + 60 s |
 | `roles.management` | object | `{"ip", "mac"}`. The SSH client device. Its MAC is protected |
@@ -134,6 +134,7 @@ The pilot's INSTALL step is deliberately unbounded: a hung installer can outlive
 
 Manual recovery uses password login to the router, which is never disabled. Confirm that no installer or recovery process remains before removing a stale install lock, then run the installed uninstall as described in the [rehearsal recovery instructions](../../docs/runbooks/live-first-rehearsal.md#stale-install-lock-recovery). A missing/incomplete journal still requires manual recovery; removing the lock does not repair it.
 
+<!-- TODO(M4b merge): drop this blocker note once M4b is merged and its receipt is signed -->
 Accepted on 2026-10-23 as a documented residual for M5 code merges. **M4b blocks the first live rehearsal and permanent install:** router dead-owner recovery for the install lock, uninstall tolerating a pre-journal kill, a new release id and a full adversarial review/test cycle are required first.
 
 ### If the single uninstall is absent or refuses
