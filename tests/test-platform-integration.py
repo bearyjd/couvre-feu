@@ -7,6 +7,7 @@ also cover bounded comm parsing and credential classification. Other adapter
 fixtures measure admission call counts, serialization and cleanup ordering;
 none establish actual platform trust or router latency.
 """
+import fcntl
 import hashlib
 import json
 import importlib.util
@@ -246,6 +247,15 @@ class StrictEntryTests(unittest.TestCase):
         # Only lock-free work reaches this backend error: expire got past every lock.
         self.assertIn('invalid_lan_address', baseline_errors, baseline.stdout + baseline.stderr)
         mutex = (self.root / '.couvrefeu-mutex').stat()
+        # Negative control: a held transaction mutex that creates none of the named lock
+        # files must make expire diverge from baseline, so the equality below discriminates.
+        with open(self.root / '.couvrefeu-mutex', 'rb') as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            contended = subprocess.run(SHELL + [cfctl, 'expire'], env=self.env, capture_output=True,
+                                       text=True, timeout=60)
+        self.assertNotEqual((contended.returncode, contended.stdout), (baseline.returncode, baseline.stdout),
+                            contended.stdout + contended.stderr)
+        self.assertIn('transaction_contention', contended.stdout + contended.stderr)
         for command in ('sync', 'rpc-sync'):
             with self.subTest(command=command):
                 child = subprocess.Popen(SHELL + [cfctl, command], env=self.env, stdin=subprocess.PIPE,
@@ -267,11 +277,17 @@ class StrictEntryTests(unittest.TestCase):
                         self.assertFalse((self.root / lock).exists(), lock)
                     self.assertNotIn((mutex.st_dev, mutex.st_ino), self._session_fds(child.pid),
                                      'stalled stdin holds the transaction mutex')
+                    # Liveness is sampled as expire starts: the stall has only a 10s input
+                    # deadline, which a loaded host may outlast during expire itself.
+                    self.assertIsNone(child.poll(), 'stalled command exited before expire started')
                     expire = subprocess.run(SHELL + [cfctl, 'expire'], env=self.env, capture_output=True,
                                             text=True, timeout=60)
                     self.assertEqual(json.loads(expire.stdout)['errors'], baseline_errors, expire.stdout + expire.stderr)
                     self.assertEqual(expire.returncode, baseline.returncode)
-                    self.assertIsNone(child.poll(), 'expire overlapped no stalled stdin')
+                    if child.poll() is not None:
+                        # Exited meanwhile: only the stalled stdin's own input deadline is acceptable.
+                        out, err = child.communicate(timeout=10)
+                        self.assertIn('input_deadline_or_read_failure', out + err)
                 finally:
                     if child.poll() is None:
                         os.killpg(child.pid, signal.SIGKILL)

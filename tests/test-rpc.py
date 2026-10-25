@@ -640,6 +640,34 @@ class RpcTests(RpcCommon, unittest.TestCase):
                     self.assertIsNone(self.observe(request['operation_id'])['receipt'])
                     self.assertEqual(self.observe()['acceptedPolicy']['revision'], 0)
 
+    def _process_fd_targets(self, child):
+        pid = child.pid
+        # Every fd of every process in the paused command's session (the STOPped shell need
+        # not be pid itself); only a per-fd race is tolerated, a vanished command is not.
+        if not Path(f'/proc/{pid}').exists():
+            self.fail('paused request vanished before the mutex premise was checked')
+        sid = os.getsid(pid)
+        targets = set()
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                if os.getsid(int(proc.name)) != sid:
+                    continue
+                fds = list((proc / 'fd').iterdir())
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    info = fd.stat()
+                except OSError:
+                    continue
+                targets.add((info.st_dev, info.st_ino))
+        # Non-vacuous: the scan must see the command's own stdout pipe.
+        own = os.fstat(child.stdout.fileno())
+        self.assertIn((own.st_dev, own.st_ino), targets, 'fd scan saw none of the paused command')
+        return targets
+
     def test_delayed_prelock_request_cannot_apply_after_reinstall(self):
         request = self.request()
         child = self.stopped(request, 'before_lock')
@@ -647,11 +675,8 @@ class RpcTests(RpcCommon, unittest.TestCase):
             # Premise: stdin is fully staged and the paused request holds no transaction mutex.
             self.assertEqual([p.name for p in (self.f.root / 'tmp').iterdir() if p.name.startswith('couvrefeu-input.')], [])
             mutex = (self.f.root / '.couvrefeu-mutex').stat()
-            try:
-                held = os.stat(f'/proc/{child.pid}/fd/9')
-                self.assertNotEqual((held.st_dev, held.st_ino), (mutex.st_dev, mutex.st_ino))
-            except FileNotFoundError:
-                pass
+            held = self._process_fd_targets(child)
+            self.assertNotIn((mutex.st_dev, mutex.st_ino), held, 'paused pre-lock request holds the mutex')
             self.assertEqual(self.script('uninstall.sh').returncode, 0)
             self.install()
             before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
