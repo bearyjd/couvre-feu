@@ -1595,6 +1595,36 @@ class CoreTests(unittest.TestCase):
             stage.rmdir()
         self.assertEqual(self.input_residue(), [])
 
+    def test_sync_stage_mktemp_exact_name_symlink_is_never_cleaned_through(self):
+        # mktemp creates nothing but reports an exactly-named entry that is a symlink to a
+        # foreign directory: the private-directory refusal must only rmdir-discard it, never
+        # rm -f input/json.awk through the link.
+        victim = self.fixture.root / "foreign" / "victim"
+        victim.mkdir(parents=True)
+        (victim / "input").write_text("preserve")
+        (victim / "json.awk").write_text("preserve")
+        link = self.fixture.root / "tmp" / "couvrefeu-input.symlnk"
+        link.symlink_to(victim)
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(link))}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((victim / "input").read_text(), "preserve")
+            self.assertEqual((victim / "json.awk").read_text(), "preserve")
+        finally:
+            link.unlink()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_resets_inherited_input_report_before_traps(self):
+        # An inherited cf_input_made (cfctl does not refuse lowercase names) must never reach
+        # cf_input_discard: a signal between trap installation and the reset would discard it.
+        # The window is builtins only, so assert source order inside cf_sync_stage.
+        src = (REPO / "router/lib/core.sh").read_text()
+        body = src[src.index("cf_sync_stage() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("cf_input_made=\n", body)
+        self.assertLess(body.index("cf_input_made=\n"), body.index("trap '"))
+
     def test_sync_stage_requires_sticky_world_writable_owned_tmp_parent(self):
         # The fixture tmp stands in for the router's 0:0:1777 /tmp (fixture owner in test mode).
         tmp = self.fixture.root / "tmp"

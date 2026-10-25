@@ -737,6 +737,8 @@ cf_sync_stage() {
     # tests) stops another local user from renaming or removing the private stage.
     if [ "$CF_LOCAL_TEST" = 1 ];then cf_input_parent_meta=$CF_OWNER:$(id -g):1777;else cf_input_parent_meta=0:0:1777;fi
     [ "$(stat -c '%u:%g:%a' "$cf_input_parent" 2>/dev/null)" = "$cf_input_parent_meta" ] || { cf_fail unsafe_input_directory;return 1; }
+    # Reset before the traps: an inherited value must never reach cf_input_discard.
+    cf_input_made=
     # Traps first, so a signal once the directory exists still removes it.
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release' 0
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 129' HUP
@@ -745,16 +747,16 @@ cf_sync_stage() {
     # Unpredictable name (mktemp, O_EXCL, 0700): no other local user can pre-create it
     # in the shared sticky tmp directory and so deny every sync. The raw report stays in
     # cf_input_made (signal traps only ever cf_input_discard it) and reaches CF_INPUT_DIR,
-    # and so the full cleanup, only after it matched the exact name in the parent.
-    cf_input_made=
+    # and so the full cleanup, only after it matched the exact name in the parent and
+    # is a real private directory (an exactly-named symlink is only rmdir-discarded).
     cf_input_made=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX" 2>/dev/null && printf x) || { cf_input_cleanup;cf_fail unsafe_input_directory;return 1; }
     cf_input_unwrap "$cf_input_made"
     case $cf_unwrap in
         "$cf_input_parent"/couvrefeu-input.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9])
+            cf_private_dir "$cf_unwrap" || { cf_input_fail unsafe_input_directory;return 1; }
             CF_INPUT_DIR=$cf_unwrap;cf_input_made=;;
-        *)cf_input_cleanup;cf_fail unsafe_input_directory;return 1;;
+        *)cf_input_fail unsafe_input_directory;return 1;;
     esac
-    cf_private_dir "$CF_INPUT_DIR" || { cf_input_fail unsafe_input_directory;return 1; }
     cf_input_parser || { cf_input_fail invalid_parser_source;return 1; }
     platform_deadline_check
     # Deadline and byte bound apply before acquiring any platform or policy lock.
