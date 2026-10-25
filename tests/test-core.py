@@ -1562,6 +1562,24 @@ class CoreTests(unittest.TestCase):
                 stage.rmdir()
         self.assertEqual(self.input_residue(), [])
 
+    def test_sync_stage_mktemp_suffix_with_slash_is_refused(self):
+        # "a/../b" is six characters: a "??????" suffix check would accept tmp/couvrefeu-input.a/../b
+        # and stage (then clean) inside tmp/b. Only an alphanumeric six-character suffix is accepted.
+        tmp = self.fixture.root / "tmp"
+        (tmp / "couvrefeu-input.a").mkdir(mode=0o700)
+        (tmp / "b").mkdir(mode=0o700)
+        (tmp / "b" / "input").write_text("preserve")
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(tmp) + "/couvrefeu-input.a/../b")}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((tmp / "b" / "input").read_text(), "preserve")
+        finally:
+            shutil.rmtree(tmp / "b")
+            if (tmp / "couvrefeu-input.a").is_dir():
+                (tmp / "couvrefeu-input.a").rmdir()
+        self.assertEqual(self.input_residue(), [])
+
     def test_sync_stage_mktemp_trailing_newline_report_is_refused(self):
         # $(...) strips trailing newlines: a report of "<valid name>\n\n" names a different
         # directory than the one created, so it is refused and the named entry is untouched.
