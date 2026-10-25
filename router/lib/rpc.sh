@@ -152,13 +152,14 @@ cf_rpc_main() {
         [ "$2" = --json ] || { cf_fail invalid_command;cf_rpc_reject;return 2; }
         if [ "$#" = 3 ];then cf_operation_valid "$3" || { cf_fail invalid_command;cf_rpc_reject;return 2; };CF_RESPONSE_ID=$3;fi
     fi
+    # Fixture pause after cfctl staging, before the transaction mutex and cf_lock.
+    cf_rpc_checkpoint before_lock
     cf_install_gate "$cf_action" || { cf_rpc_reject;return 1; }
     if [ "$cf_action" = rpc-sync ];then cf_sync_stage 1 || { cf_rpc_reject;return 1; };fi
     # RPC never recreates runtime paths after teardown; scoped activation owns them.
     cf_control_dirs && cf_state_load || { cf_rpc_reject;return 1; }
     [ -n "$CF_GENERATION" ] || { cf_fail rpc_disabled;cf_rpc_reject;return 1; }
     CF_RPC_REQUIRE_RUNTIME=1
-    cf_rpc_checkpoint before_lock
     cf_lock || { cf_rpc_reject;return 1; }
     cf_install_gate "$cf_action" && cf_control_dirs && cf_state_load && cf_clock && cf_protected_valid && cf_policy_safe || { cf_rpc_reject;return 1; }
     [ -n "$CF_GENERATION" ] || { cf_fail rpc_disabled;cf_rpc_reject;return 1; }

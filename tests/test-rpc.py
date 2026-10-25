@@ -644,6 +644,14 @@ class RpcTests(RpcCommon, unittest.TestCase):
         request = self.request()
         child = self.stopped(request, 'before_lock')
         try:
+            # Premise: stdin is fully staged and the paused request holds no transaction mutex.
+            self.assertFalse((self.f.root / f'tmp/couvrefeu-input.{child.pid}').exists())
+            mutex = (self.f.root / '.couvrefeu-mutex').stat()
+            try:
+                held = os.stat(f'/proc/{child.pid}/fd/9')
+                self.assertNotEqual((held.st_dev, held.st_ino), (mutex.st_dev, mutex.st_ino))
+            except FileNotFoundError:
+                pass
             self.assertEqual(self.script('uninstall.sh').returncode, 0)
             self.install()
             before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
@@ -663,9 +671,13 @@ class RpcTests(RpcCommon, unittest.TestCase):
             for path in sorted(self.f.root.rglob('*')):
                 info = path.lstat()
                 data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
-                result[str(path.relative_to(self.f.root))] = (info.st_mode, info.st_uid, info.st_gid,
-                                                             info.st_ino, info.st_nlink, info.st_size,
-                                                             info.st_mtime_ns, data)
+                name = str(path.relative_to(self.f.root))
+                # A refused competitor stages stdin in a private tmp/couvrefeu-input.PID entry
+                # before admission and removes it; only the shared tmp directory's own mtime
+                # may change. Any leftover/created/removed entry still differs by key below.
+                mtime = None if name == 'tmp' else info.st_mtime_ns
+                result[name] = (info.st_mode, info.st_uid, info.st_gid,
+                                info.st_ino, info.st_nlink, info.st_size, mtime, data)
             return result
 
         child = self.stopped(self.request(), 'before_write')
