@@ -481,14 +481,22 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
 
     def test_two_admins_with_one_base_one_wins_other_is_stale(self):
         base = self.base()
+        # scope_before_lock is after admission: the paused admin already holds the
+        # transaction mutex, so a concurrent admin is refused and must retry.
         first = self.start(['scope-add', NEW, '--base', base], 'scope_before_lock', confirm=tail6(NEW),
                            env=dict(self.f.env, CF_SCOPE_ADMIN='alpha'))
-        self.ok(self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta')))
+        busy = self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta'))
+        self.assertEqual(busy.returncode, 2, busy.stdout + busy.stderr)
+        self.assertIn('transaction_contention', busy.stderr)
+        self.assertEqual(self.status()['scope'], [KID])
         first.send_signal(signal.SIGCONT)
         stdout, stderr = first.communicate(timeout=120)
-        self.assertNotEqual(first.returncode, 0, stdout + stderr)
-        self.assertEqual(last_json(stdout)['errors'], ['scope_base_conflict'])
-        self.assertEqual(self.status()['scope'], [KID, NEW2])
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(self.status()['scope'], [KID, NEW])
+        stale = self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta'))
+        self.assertNotEqual(stale.returncode, 0, stale.stdout + stale.stderr)
+        self.assertEqual(last_json(stale.stdout)['errors'], ['scope_base_conflict'])
+        self.assertEqual(self.status()['scope'], [KID, NEW])
 
     def test_stop_and_crash_at_each_write_step_keeps_rpc_and_uninstall_working(self):
         self.assertEqual(self.script('uninstall.sh').returncode, 0)

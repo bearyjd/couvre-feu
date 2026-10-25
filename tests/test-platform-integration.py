@@ -14,10 +14,12 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import tarfile
 import sys
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -213,6 +215,68 @@ class StrictEntryTests(unittest.TestCase):
             self.assertNotEqual(self.run_entry('uninstall.sh').returncode, 0)
             self.assertTrue(done.exists())
 
+    def _session_fds(self, sid):
+        # Every fd of every process in the stalled command's session (cfctl, timeout, dd).
+        targets = set()
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                if os.getsid(int(proc.name)) != sid:
+                    continue
+                for fd in (proc / 'fd').iterdir():
+                    try:
+                        info = fd.stat()
+                        targets.add((info.st_dev, info.st_ino))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        return targets
+
+    def test_open_stdin_sync_holds_no_lock_and_expire_proceeds(self):
+        # Behavioural: real installed cfctl, EOF withheld, under this class's profile.
+        self.install()
+        tmp = self.root / 'tmp'
+        if not tmp.exists():
+            tmp.mkdir(); tmp.chmod(0o1777)
+        cfctl = str(self.root / 'usr/sbin/cfctl')
+        baseline = subprocess.run(SHELL + [cfctl, 'expire'], env=self.env, capture_output=True, text=True, timeout=60)
+        baseline_errors = json.loads(baseline.stdout)['errors']
+        # Only lock-free work reaches this backend error: expire got past every lock.
+        self.assertIn('invalid_lan_address', baseline_errors, baseline.stdout + baseline.stderr)
+        mutex = (self.root / '.couvrefeu-mutex').stat()
+        for command in ('sync', 'rpc-sync'):
+            with self.subTest(command=command):
+                child = subprocess.Popen(SHELL + [cfctl, command], env=self.env, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                         start_new_session=True)
+                try:
+                    child.stdin.write('{"version":1')
+                    child.stdin.flush()  # EOF withheld.
+                    deadline = time.monotonic() + 8
+                    staged = []
+                    while not staged:
+                        self.assertIsNone(child.poll(), 'stalled command exited before staging')
+                        self.assertLess(time.monotonic(), deadline, 'stdin stage never began')
+                        staged = [p for p in tmp.iterdir() if p.name.startswith('couvrefeu-input.')
+                                  and (p / 'input').exists() and (p / 'input').stat().st_size]
+                        time.sleep(0.01)
+                    for lock in ('tmp/couvrefeu-platform.lock', 'etc/couvrefeu/runtime/lock',
+                                 '.couvrefeu-install.lock'):
+                        self.assertFalse((self.root / lock).exists(), lock)
+                    self.assertNotIn((mutex.st_dev, mutex.st_ino), self._session_fds(child.pid),
+                                     'stalled stdin holds the transaction mutex')
+                    expire = subprocess.run(SHELL + [cfctl, 'expire'], env=self.env, capture_output=True,
+                                            text=True, timeout=60)
+                    self.assertEqual(json.loads(expire.stdout)['errors'], baseline_errors, expire.stdout + expire.stderr)
+                    self.assertEqual(expire.returncode, baseline.returncode)
+                    self.assertIsNone(child.poll(), 'expire overlapped no stalled stdin')
+                finally:
+                    if child.poll() is None:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.communicate(timeout=10)
+
 
 class VendorRecoveryTests(unittest.TestCase):
     # Same actual uninstall/restoration/cleanup code, with an explicitly private
@@ -222,6 +286,8 @@ class VendorRecoveryTests(unittest.TestCase):
     test_done_binding_survives_every_cleanup_boundary = StrictEntryTests.test_done_binding_survives_every_cleanup_boundary
     _cleanup_boundary_proof = StrictEntryTests._cleanup_boundary_proof
     test_completion_fifo_and_symlink_fifo_refuse_before_attestation = StrictEntryTests.test_completion_fifo_and_symlink_fifo_refuse_before_attestation
+    _session_fds = StrictEntryTests._session_fds
+    test_open_stdin_sync_holds_no_lock_and_expire_proceeds = StrictEntryTests.test_open_stdin_sync_holds_no_lock_and_expire_proceeds
 
     def setUp(self):
         StrictEntryTests.setUp(self)
@@ -424,9 +490,8 @@ class VendorAdmissionTests(unittest.TestCase):
         self.assertEqual(fixtures.full_snapshot(self.root), before)
 
     def test_failed_input_stage_after_vendor_admission_releases_owned_lock(self):
-        # Fallback path only: cfctl stages sync/rpc-sync before platform_admit.
-        cfctl = (REPO / 'router/cfctl').read_text()
-        self.assertLess(cfctl.index('cf_sync_stage "$cf_stage_entry_mode"'), cfctl.index('platform_admit runtime'))
+        # Fallback path only: cfctl stages sync/rpc-sync before platform_admit; the real-cfctl
+        # ordering is proven behaviourally by test_open_stdin_sync_holds_no_lock_and_expire_proceeds.
         timeout = SHELL[0] + ' timeout'
         for raw in ['{', ' ' * 65537]:
             with self.subTest(raw=raw[:4]):
