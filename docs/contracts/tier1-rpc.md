@@ -352,8 +352,9 @@ is tolerated). Residual, documented, not solved: (a) SIGSTOP cannot be ignored: 
 process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) a
 `platform_fail`/admission-deadline exit still writes one short line to stdout/stderr while a lock is held (the trap releases it right
 after; with `-ixon` and under 4 KiB of prior output this cannot block). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
-stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. Recovery for a wedged owner: kill the PID in `/etc/couvrefeu/runtime/lock/pid`; on a
-vendor profile, `cfctl recover-platform-lock` once that PID is gone. A "stopped owner counts as dead" lock watchdog was evaluated and
+stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. A stopped or dead recorded PID does not authorize lock removal. Interrupted-install recovery uses a complete authenticated external
+`cfctl recover-install-lock`, then that source's single ordinary `uninstall.sh`, after separately approved inspection; see
+[recovery](../runbooks/live-first-rehearsal.md#stale-install-lock-recovery). Live workers or ambiguous/legacy ownership refuse. A "stopped owner counts as dead" lock watchdog was evaluated and
 rejected: it would break mutual exclusion when the owner is continued (two writers) and the fixture checkpoints that deliberately hold
 the lock stopped.
 
@@ -408,3 +409,18 @@ the device)? Record the answer; until then the router audit line is UNVERIFIED-o
 leave IXON off for the session; (c) Ctrl-Z / Ctrl-S during `scope-preview` and during the confirmation prompt leave `rpc-status` usable.
 (d) every `/sys/class/net/*/address` on the GL device is readable and one line (a tunnel or cellular interface that is not
 would make every scope-add refuse with `scope_router_interfaces_unreadable`, fail closed).
+
+## Administrator install recovery boundary
+
+`cfctl recover-install-lock` is administrator-only and rejects service forced-command
+context. It is absent from the `cfctl-ssh` allow-list; M4b adds no service RPC verb,
+argument grammar, shell privilege or scope-administration capability. It must run
+from a complete independently authenticated external source, with fresh vendor
+attestation where selected, even when the installed recovery copy is absent/partial.
+It validates permanent kernel exclusion, boot/PID/starttime/token/mutex binding and
+immutable PREPARED before publishing the durable recovery-required fence. Runtime
+and fresh installation remain fenced until the single ordinary uninstaller retires
+owned transaction state; the permanent mutex inode remains. Cron/firewall callbacks
+use immutable generation-bound sources and reject stale generations. Ambiguous or
+production legacy state refuses; historical fixture recovery is data-only. Operator
+password login, full administrator shell/edit rights and PTY access remain available.

@@ -1989,6 +1989,86 @@ class ActivityTests(unittest.TestCase):
                 self.assertEqual(result.stdout, expected, result.stderr)
 
 
+class ZeroOwnedRuntimeTokenTests(unittest.TestCase):
+    TOKEN = 'a' * 64
+
+    def snapshot(self, root):
+        result = {}
+        for path in sorted(root.rglob('*')):
+            info = path.lstat()
+            data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
+            result[str(path.relative_to(root))] = (info.st_dev, info.st_ino, info.st_mode,
+                                                   info.st_uid, info.st_gid, info.st_nlink,
+                                                   info.st_size, info.st_mtime_ns, data)
+        return result
+
+    def assert_token_case(self, *, expected=TOKEN, contents=TOKEN + '\n', owned=1,
+                          locked=1, mode=0o600, variant=None, accepted=False):
+        fixture = RouterFixture()
+        self.addCleanup(fixture.close)
+        runtime = fixture.root / 'etc/couvrefeu/runtime'
+        lock = runtime / 'lock'
+        lock.mkdir(parents=True, mode=0o700)
+        runtime.chmod(0o700)
+        token = lock / 'token'
+        if contents is not None:
+            token.write_text(contents)
+            token.chmod(mode)
+        if variant == 'hardlink':
+            os.link(token, fixture.root / 'token-alias')
+        elif variant == 'symlink':
+            target = fixture.root / 'token-target'
+            token.rename(target)
+            token.symlink_to(target)
+        elif variant in ('foreign', 'reload'):
+            child = lock / variant
+            child.write_text('foreign evidence\n'); child.chmod(0o600)
+        before = None
+
+        def ready(process, raw):
+            nonlocal before
+            pid = lock / 'pid'
+            pid.write_text(f'{process.pid}\n'); pid.chmod(0o600)
+            before = self.snapshot(fixture.root)
+            return raw
+
+        script = ('read -r ready || exit 98; CF_BASE=$1; CF_LIB=$2; CF_LOCAL_TEST=1; '
+                  '. "$CF_LIB/core.sh"; . "$CF_LIB/firewall.sh"; '
+                  'CF_TRANSACTION_TOKEN=$3; CF_TRANSACTION_OWNED=$4; CF_LOCKED=$5; '
+                  'cf_zero_owned_runtime')
+        result = run_owned_process(fixture.shell + ['-c', script, 'zero-token-fixture',
+                                   str(fixture.root), str(REPO / 'router/lib'), expected,
+                                   str(owned), str(locked)], env=fixture.env, input='continue\n',
+                                   started=ready, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, timeout=10)
+        self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(fixture.root), before)
+        self.assertEqual(fixture.mutation_calls(), [])
+
+    def test_valid_current_token_and_unbound_pid_only_are_readonly(self):
+        self.assert_token_case(accepted=True)
+        self.assert_token_case(owned=0, contents=None, accepted=True)
+
+    def test_foreign_hardlinked_or_weak_token_never_admits_cleanup(self):
+        for options in ({'contents': 'b' * 64 + '\n'}, {'variant': 'hardlink'},
+                        {'mode': 0o644}, {'variant': 'symlink'},
+                        {'contents': self.TOKEN}, {'contents': self.TOKEN + '\n\n'}):
+            with self.subTest(options=options):
+                self.assert_token_case(**options)
+
+    def test_owned_context_requires_token_lock_and_valid_expected_identity(self):
+        for options in ({'contents': None}, {'locked': 0}, {'owned': 0},
+                        {'expected': 'A' * 64, 'contents': 'A' * 64 + '\n'},
+                        {'expected': ''}, {'expected': 'a' * 63}):
+            with self.subTest(options=options):
+                self.assert_token_case(**options)
+
+    def test_foreign_lock_children_remain_refused(self):
+        for variant in ('foreign', 'reload'):
+            with self.subTest(variant=variant):
+                self.assert_token_case(variant=variant)
+
+
 class InstalledPackageTests(unittest.TestCase):
     def fresh_fixture(self):
         fixture = RouterFixture()
@@ -2122,6 +2202,7 @@ class InstalledPackageTests(unittest.TestCase):
                     # before returning to core or acknowledging zero-owned proof.
                     marker = fixture.root / "zero-owned-sync-ready.json"
                     wrapper = fixture.bin / "sync"
+                    wrapper.unlink()  # Never follow a fixture tool symlink into backend.py.
                     wrapper.write_text(f'''#!{sys.executable}
 import json, os, runpy, signal, sys
 from pathlib import Path
@@ -2132,6 +2213,10 @@ if status:
     raise SystemExit(status)
 root = Path(os.environ["CF_ROOT"])
 private = root / "etc/couvrefeu"
+# Owner/PREPARED publication now flushes before a core runtime owner exists.
+# Delegate those calls; stop only at the original zero-proof durability boundary.
+if sys.argv[2:] or not (private / "runtime/lock/pid").is_file():
+    raise SystemExit(0)
 assert (private / "runtime/firewall.preflight").is_file()
 assert not (private / "runtime/firewall.owned").exists()
 assert not (private / "backup/kernel-cleaned").exists()
@@ -2211,11 +2296,21 @@ os.kill(os.getpid(), signal.SIGSTOP)
                     # not encounter this deliberately stopped fixture wrapper.
                     wrapper.write_text("#!/bin/sh\nexec " + repr(sys.executable) + " "
                                        + repr(str(REPO / "tests/fixtures/backend.py")) + ' sync "$@"\n')
-                    # Existing reconciliation clears the dead core lock, then
-                    # the retained installer baseline fences all kernel effects.
+                    # New-format provenance fences runtime reconciliation before
+                    # it can retire this interrupted installer's runtime lock.
+                    held_raw = ZeroOwnedRuntimeTokenTests.snapshot(self, fixture.root)
                     reconcile = fixture.run("apply-fw")
-                    self.assertNotEqual(reconcile.returncode, 0)
-                    self.assertIn("preflight_baseline_requires_installer", reconcile.stdout)
+                    self.assertEqual(reconcile.returncode, 2, reconcile.stdout + reconcile.stderr)
+                    self.assertEqual(json.loads(reconcile.stdout),
+                                     {"ok": False, "errors": ["platform_admission_refused"]})
+                    self.assertIn("platform explicit_install_recovery_required", reconcile.stderr)
+                    self.assertEqual(ZeroOwnedRuntimeTokenTests.snapshot(self, fixture.root), held_raw)
+                    recovered = run_fixture_process(
+                        fixture.shell + [str(REPO / "router/cfctl"), "recover-install-lock"],
+                        env=fixture.env, timeout=60)
+                    self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+                    self.assertEqual(json.loads(recovered.stdout),
+                                     {"ok": True, "installLockRecovered": True, "uninstallRequired": True})
                 self.assertEqual(proof.read_bytes(), proof_bytes)
                 self.assertTrue((fixture.root / "usr/sbin/cfctl").exists())
                 self.assertFalse((fixture.root / "etc/couvrefeu/backup/kernel-cleaned").exists())

@@ -8,6 +8,15 @@ export PATH
 LC_ALL=C
 export LC_ALL
 umask 077
+CF_CALLBACK_GENERATION=
+if [ "${1:-}" = --installation-generation ]; then
+    if [ "$#" != 3 ] || [ -n "${CF_SERVICE_FORCED_COMMAND+x}" ]; then exit 2; fi
+    case "$2" in *[!0-9a-f]*|'') exit 2;; esac
+    [ "${#2}" = 64 ] || exit 2
+    case "$3" in expire|apply-fw) ;; *) exit 2;; esac
+    CF_CALLBACK_GENERATION=$2
+    shift 2
+fi
 CF_LOCAL_TEST=0
 if [ "${CF_TEST_MODE-}" = 1 ]; then
     case ${CF_ROOT-} in /tmp/couvre-feu-*) ;; *) printf '%s\n' '{"ok":false,"errors":["unsafe_test_root"]}'; exit 2;; esac
@@ -32,6 +41,9 @@ else
     fi
     CF_BASE=
     CF_LIB=/usr/lib/couvrefeu
+    if [ "${1:-}" = recover-install-lock ] || [ -n "$CF_CALLBACK_GENERATION" ]; then
+        CF_LIB=$(CDPATH='' cd -- "$(dirname -- "$0")/lib" && pwd -P) || exit 2
+    fi
     if [ "$(id -u)" != 0 ]; then printf '%s\n' '{"ok":false,"errors":["root_required"]}'; exit 2; fi
 fi
 if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_AWK-}" ]; then
@@ -58,7 +70,7 @@ case ${1-} in scope-preview|scope-add|scope-remove)
     [ -z "${CF_SERVICE_FORCED_COMMAND+x}" ] || cf_scope_early scope_forced_command_refused
     if [ "$1" != scope-preview ]; then
         # Argv shape is checked again in cfctl-scope and cf_scope_main: defence in depth, do not simplify.
-        [ "$#" = 4 ] && [ "$3" = --base ] || cf_scope_early invalid_command
+        if ! { [ "$#" = 4 ] && [ "$3" = --base ]; }; then cf_scope_early invalid_command; fi
         case $2 in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) cf_scope_early scope_mac_not_canonical;; esac
         case $4 in *[!0-9a-f]*) cf_scope_early scope_base_invalid;; esac
         [ "${#4}" = 64 ] || cf_scope_early scope_base_invalid
@@ -81,7 +93,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LC_ALL=C
 export PATH LC_ALL
 umask 077
-if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_TRANSACTION_DEFINITIONS_ONLY+x}${CF_TRANSACTION_LAUNCH_PID+x}${CF_TRANSACTION_PID+x}${CF_TRANSACTION_START+x}${CF_TRANSACTION_BOOT+x}${CF_TRANSACTION_RETIREMENT+x}${CF_TRANSACTION_RECOVER+x}${CF_TRANSACTION_FENCE+x}${CF_TRANSACTION_PREPARED+x}${CF_TRANSACTION_BASE+x}${CF_TRANSACTION_HELD+x}${CF_TRANSACTION_OWNED+x}${CF_TRANSACTION_TOKEN+x}${CF_TRANSACTION_PARENT+x}${CF_TRANSACTION_MUTEX+x}${CF_TRANSACTION_OWNER+x}${CF_TRANSACTION_DIGEST+x}${CF_TRANSACTION_STATE+x}${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
     printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
     cf_bootstrap_refuse
 fi
@@ -97,9 +109,9 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=c254b9b4364d5f6e252126f4e37d05312cf7cec18b81515a3004b37009ce5820
+CF_BOOTSTRAP_PIN=df05e38635f1e469fa80e737a5e818584744b9c1488dbf79f1dd565a6fff9770
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
-[ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || cf_bootstrap_refuse
+if ! { [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ]; }; then cf_bootstrap_refuse; fi
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
 [ "${platform_bootstrap_digest%% *}" = "$CF_BOOTSTRAP_PIN" ] || cf_bootstrap_refuse
 # shellcheck disable=SC1091
@@ -107,6 +119,37 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
+if [ -n "$CF_CALLBACK_GENERATION" ]; then
+    platform_verify_modules "$CF_LIB"
+    [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "${CF_LIB%/lib}"
+fi
+if [ "${1:-}" = recover-install-lock ]; then
+    if ! { [ "$#" = 1 ] && [ -z "${CF_SERVICE_FORCED_COMMAND+x}" ]; }; then cf_bootstrap_refuse; fi
+    platform_verify_modules "$CF_LIB"
+    platform_recovery_release=${CF_LIB%/lib}
+    [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$platform_recovery_release"
+    platform_choose runtime "$CF_BASE"
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then platform_recovery_owner=$CF_ROOT/.couvrefeu-transaction
+    else platform_recovery_owner=/etc/.couvrefeu-transaction; fi
+    if [ -e "$platform_recovery_owner" ] || [ -L "$platform_recovery_owner" ]; then
+        platform_regular "$platform_recovery_owner"
+        platform_private "$platform_recovery_owner" 600
+        platform_recovery_profile=$(sed -n '8p' "$platform_recovery_owner")
+        case "$platform_recovery_profile" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;;
+            *) cf_bootstrap_refuse;; esac
+        platform_choose "$platform_recovery_profile" "$CF_BASE"
+    fi
+    if platform_vendor_selected; then platform_bootstrap_vendor; platform_attest_vendor "$CF_LIB"; fi
+    CF_PLATFORM_ADMITTED=1
+    CF_PLATFORM_LIB=$CF_LIB
+    platform_profile_validate
+    platform_transaction_mutex
+    CF_TRANSACTION_RECOVER=1
+    set +f
+    . "$CF_LIB/install-common.sh"
+    recover_install_lock
+    exit 0
+fi
 platform_choose runtime "$CF_BASE"
 if platform_vendor_selected; then platform_bootstrap_vendor; fi
 if [ "$CF_LOCAL_TEST" != 1 ];then platform_private "$CF_LIB" 700; platform_private "$CF_LIB/platform-bootstrap.sh" 644; platform_verify_modules "$CF_LIB";fi
@@ -117,11 +160,23 @@ if [ "${1:-}" = recover-platform-lock ] && [ "$#" = 1 ]; then
     platform_vendor_selected || platform_fail vendor_recovery_only
     platform_attest_vendor "$CF_LIB"
     platform_profile_validate
+    platform_transaction_gate recover-platform-lock
     platform_lock_recover
     printf '%s\n' '{"ok":true,"platformLockRecovered":true}'
     exit 0
 fi
 platform_admit runtime "$CF_BASE" "$CF_LIB"
+if [ -n "$CF_CALLBACK_GENERATION" ]; then
+    platform_transaction_mutex
+    if ! { [ -e "$CF_TRANSACTION_OWNER" ] && [ ! -L "$CF_TRANSACTION_OWNER" ]; }; then platform_fail stale_installation_callback; fi
+    platform_transaction_read
+    [ "$CF_TRANSACTION_STATE" = complete ] || platform_fail inactive_installation_callback
+    cf_expected_generation=$(printf 'CFCALLBACK1\n%s\n' "$CF_TRANSACTION_TOKEN" | sha256sum | awk '{print $1}')
+    [ "$CF_CALLBACK_GENERATION" = "$cf_expected_generation" ] || platform_fail stale_installation_callback
+    platform_private "$CF_TRANSACTION_BASE/backup/complete" 600
+    printf '1\n' | cmp -s - "$CF_TRANSACTION_BASE/backup/complete" || platform_fail incomplete_installation_callback
+    platform_transaction_gate
+fi
 trap 'platform_lock_release' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT

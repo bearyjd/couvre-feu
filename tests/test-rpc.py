@@ -658,14 +658,32 @@ class RpcTests(RpcCommon, unittest.TestCase):
                 child.kill();child.communicate()
 
     def test_runtime_owner_blocks_uninstall_and_competing_rpc(self):
+        def raw_snapshot():
+            result = {}
+            for path in sorted(self.f.root.rglob('*')):
+                info = path.lstat()
+                data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
+                result[str(path.relative_to(self.f.root))] = (info.st_mode, info.st_uid, info.st_gid,
+                                                             info.st_ino, info.st_nlink, info.st_size,
+                                                             info.st_mtime_ns, data)
+            return result
+
         child = self.stopped(self.request(), 'before_write')
         try:
+            self.assertEqual(int((self.f.root / 'etc/couvrefeu/runtime/lock/pid').read_text()), child.pid)
+            held = os.stat(f'/proc/{child.pid}/fd/9')
+            mutex = (self.f.root / '.couvrefeu-mutex').stat()
+            self.assertEqual((held.st_dev, held.st_ino), (mutex.st_dev, mutex.st_ino))
+            held_raw = raw_snapshot()
             before = self.f.durable_snapshot()
             result = self.script('uninstall.sh')
             self.assertNotEqual(result.returncode, 0)
             result = self.f.run('rpc-sync', document=self.request('competitor'))
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('locked', json.loads(result.stdout)['errors'])
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {'ok': False, 'errors': ['platform_admission_refused']})
+            self.assertIn('platform transaction_contention', result.stderr)
+            self.assertEqual(raw_snapshot(), held_raw)
             self.assertEqual(self.f.durable_snapshot(), before)
             child.send_signal(signal.SIGCONT)
             stdout, stderr = child.communicate(timeout=60)

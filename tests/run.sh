@@ -16,7 +16,11 @@ is_shell() {
     return 1
 }
 printf '%s\n' 'Evidence: isolated fixtures only; packet and live-router gates pending.'
+python3 -B tests/test-install-recovery-primitives.py
 python3 tests/test-install.py
+python3 -B tests/test-install-recovery.py
+python3 -B tests/test-install-retirement-recovery.py
+python3 -B tests/test-install-legacy-recovery.py
 python3 tests/test-no-dev-stdin.py
 python3 tests/test-platform-integration.py
 python3 tests/test-os-trust.py

@@ -215,6 +215,7 @@ cf_runtime_prepare() {
     cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime; return 1; }
 }
 cf_install_gate() {
+    platform_transaction_gate "$1"
     CF_INSTALL_AUTH=0
     if [ "$CF_LOCAL_TEST" = 1 ];then
         cf_install_lock=$CF_BASE/.couvrefeu-install.lock
@@ -274,6 +275,7 @@ cf_lock() {
         mkdir -m 700 "$CF_RUNTIME/lock" || { cf_fail locked; return 1; }
     fi
     printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
+    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then printf '%s\n' "$CF_TRANSACTION_TOKEN" > "$CF_RUNTIME/lock/token" || return 1; fi
     CF_LOCKED=1
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT
@@ -284,7 +286,7 @@ cf_lock() {
 cf_unlock() {
     if [ "$CF_LOCKED" = 1 ]; then
         if [ "$(awk 'NR==1{print}' "$CF_RUNTIME/lock/pid" 2>/dev/null)" = "$$" ]; then
-            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload"
+            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" "$CF_RUNTIME/lock/token"
             rmdir "$CF_RUNTIME/lock" 2>/dev/null || :
         fi
         CF_LOCKED=0

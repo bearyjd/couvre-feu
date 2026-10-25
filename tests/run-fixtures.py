@@ -21,6 +21,7 @@ from harness import run_owned_process
 SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py', 'test-penn-pilot.py', 'test-penn-pilot-leg2.py', 'test-penn-pilot-leg2-guards.py', 'test-scope-admin.py', 'test-inventory.py')
 # Fixed public source paths bind the plan to fixtures and the entire release.
 SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.py', 'tests/fixtures/harness.py', 'tests/fixtures/backend.py',
+                'tests/test-live-rehearsal.py',
                 'router/release.sha256', 'router/install.sh', 'router/uninstall.sh',
                 'router/cfctl', 'router/cfctl-ssh', 'router/cfctl-scope', 'router/lib/platform-bootstrap.sh',
                 'router/lib/vendor-platform.sh', 'router/lib/install-common.sh',

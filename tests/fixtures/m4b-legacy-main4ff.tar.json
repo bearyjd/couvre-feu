@@ -1,0 +1,10 @@
+{
+  "commit": "4ff587f987fe4e74f818ad25fcf193296e372910",
+  "release_id": "28b3278555e61239471497b7e806b05c8f5eed82b7cabca7ad8264d22cf6e539",
+  "manifest_sha256": "71bd50c7ddde584404e738f349b95a8c0b5a828df34f491c8065f0c54070c463",
+  "bootstrap_sha256": "c254b9b4364d5f6e252126f4e37d05312cf7cec18b81515a3004b37009ce5820",
+  "archive_sha256": "d355296fbd2d020a30ea3a52d8b1496c0fac965f92de6c0feeabe518d9ee20da",
+  "archive_bytes": 90138,
+  "format": "gzip mtime0 of USTAR sorted paths; uid/gid/mtime0, blank user/group; original emitted modes",
+  "source": "git archive commit router tools/freeze-router-release.py tools/strip-test-mode.py; original freezer --emit; public router files only"
+}

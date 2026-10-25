@@ -247,7 +247,13 @@ class VendorRecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
-class ActivatedLegacyRecoveryTests(unittest.TestCase):
+class SyntheticLegacyDowngradeRefusalTests(unittest.TestCase):
+    """A new digest-bound install cannot be rewritten into a legacy journal.
+
+    Genuine historical byte restoration is covered separately by the pinned,
+    inert test-install-legacy-recovery.py fixture. These deliberately conflicting
+    states must preserve every byte and backend object on refusal.
+    """
     def setUp(self):
         sys.path.insert(0, str(REPO / 'tests/fixtures'))
         from harness import RouterFixture, PROTECTED
@@ -262,14 +268,22 @@ class ActivatedLegacyRecoveryTests(unittest.TestCase):
         self.current.chmod(0o700); (self.current/'lib').chmod(0o700)
         self.fixture.env['CF_TEST_INSTALL_KERNEL'] = '1'
         options=['--activate','--protect',PROTECTED]
-        if self._testMethodName == 'test_scoped_legacy_done2_survives_each_cleanup_delete':
+        if self._testMethodName == 'test_scoped_downgrade_refuses_before_cleanup':
             options += ['--rpc-allow','02:00:00:00:00:01']
         result = self.command('install.sh', *options)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertTrue(self.fixture.backend()['sets'], 'owned kernel objects must exist')
         crond = self.fixture.backend()['crond']
         self.assertTrue(crond['running'])
-        self.assertIn('* * * * * /usr/sbin/cfctl expire', crond['tables']['root'])
+        expiry_lines = [line for line in crond['tables']['root'].splitlines()
+                        if line.startswith('* * * * * ')]
+        self.assertEqual(len(expiry_lines), 1, crond['tables']['root'])
+        self.assertRegex(expiry_lines[0],
+                         r'^\* \* \* \* \* /etc/\.couvrefeu-release-[0-9a-f]{64}/cfctl '
+                         r'--installation-generation [0-9a-f]{64} expire$')
+        command = expiry_lines[0].split(' ', 5)[5]
+        self.assertEqual((self.root/'etc/firewall.couvrefeu').read_text(),
+                         '#!/bin/sh\nexec '+command.removesuffix(' expire')+' apply-fw\n')
         backup = private/'backup'
         archive = REPO/'tests/fixtures/legacy-router-5c45e3e.tar.gz'
         manifest = json.loads((REPO/'tests/fixtures/legacy-router-5c45e3e.json').read_text())
@@ -304,70 +318,40 @@ class ActivatedLegacyRecoveryTests(unittest.TestCase):
     def command(self, name, *args):
         return subprocess.run(SHELL+[str(self.current/name),*args], env=self.fixture.env, capture_output=True, text=True, timeout=90)
 
-    def test_activated_old_modules_restore_exactly_using_current_external_release(self):
-        result=self.command('uninstall.sh')
-        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-        self.assertEqual(fixtures.exact_signature(self.firewall),self.original)
-        self.assertEqual(self.fixture.backend()['sets'],{})
-        # The restored, originally absent crontab directory stops crond.
-        self.assertEqual(self.fixture.backend()['crond']['tables'],{})
-        self.assertFalse(self.fixture.backend()['crond']['running'])
-        self.assertFalse((self.root/'etc/couvrefeu').exists())
-        self.assertFalse((self.root/'usr/lib/couvrefeu').exists())
-        self.assertFalse((self.root/'.couvrefeu-recovery.done').exists())
-        self.assertTrue((self.current/'lib/core.sh').exists())
+    def assert_refused_without_changes(self, expected='missing manifest: usr/lib/couvrefeu/platform-bootstrap.sh'):
+        before = fixtures.full_snapshot(self.root)
+        result = self.command('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(expected, result.stderr)
+        self.assertEqual(fixtures.full_snapshot(self.root), before,
+                         'contradictory new-format provenance must remain entirely unchanged')
+        self.assertTrue((self.root / '.couvrefeu-prepared').is_dir())
+        self.assertTrue((self.root / '.couvrefeu-transaction').is_file())
+        self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
 
-    def test_scoped_legacy_done2_survives_each_cleanup_delete(self):
-        self.fixture.env['CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER']='1'
-        result=self.command('uninstall.sh')
-        self.assertNotEqual(result.returncode,0,result.stderr)
-        done=self.root/'.couvrefeu-recovery.done'
-        self.assertEqual(done.read_bytes(),b'2\n')
-        recovery=self.root/'.couvrefeu-recovery'
-        while recovery.exists() and list(recovery.iterdir()):
-            count=len(list(recovery.iterdir()))
-            result=self.command('uninstall.sh')
-            self.assertNotEqual(result.returncode,0,result.stderr)
-            self.assertLess(len(list(recovery.iterdir())),count,result.stderr)
-            self.assertEqual(done.read_bytes(),b'2\n')
-        self.fixture.env.pop('CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER')
-        result=self.command('uninstall.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(fixtures.exact_signature(self.firewall),self.original)
-        self.assertEqual(self.fixture.backend()['sets'],{})
-        self.assertFalse(done.exists())
-        self.assertFalse((self.root/'etc/couvrefeu').exists())
+    def test_removed_manifest_records_refuse_with_new_prepared_baseline(self):
+        self.assert_refused_without_changes()
 
-    def test_installed_old_module_drift_refuses_preserving_journal_and_kernel(self):
-        installed=self.root/'usr/lib/couvrefeu/core.sh'
-        installed.write_bytes(installed.read_bytes()+b'# drift\n')
-        before=self.fixture.backend()
-        result=self.command('uninstall.sh')
-        self.assertNotEqual(result.returncode,0)
-        self.assertEqual(self.fixture.backend(),before)
-        self.assertTrue((self.root/'etc/couvrefeu/backup/ready').exists())
+    def test_scoped_downgrade_refuses_before_cleanup(self):
+        self.fixture.env['CF_TEST_UNINSTALL_CLEANUP_FAIL_AFTER'] = '1'
+        self.assert_refused_without_changes()
 
-    def test_invalid_legacy_journal_refuses_before_owned_mutation(self):
-        record=self.root/'etc/couvrefeu/backup/usr_lib_couvrefeu_core.sh.after'
+    def test_downgrade_with_module_drift_preserves_all_evidence(self):
+        installed = self.root / 'usr/lib/couvrefeu/core.sh'
+        installed.write_bytes(installed.read_bytes() + b'# drift\n')
+        self.assert_refused_without_changes('drift at /usr/lib/couvrefeu/core.sh')
+
+    def test_downgrade_with_invalid_record_preserves_all_evidence(self):
+        record = self.root / 'etc/couvrefeu/backup/usr_lib_couvrefeu_core.sh.after'
         record.write_text('invalid\n')
-        before=self.fixture.backend()
-        result=self.command('uninstall.sh')
-        self.assertNotEqual(result.returncode,0)
-        self.assertEqual(self.fixture.backend(),before)
-        self.assertTrue((self.root/'etc/couvrefeu/backup/ready').exists())
+        self.assert_refused_without_changes('invalid signature record: usr/lib/couvrefeu/core.sh')
 
-    def test_foreign_owned_chain_content_refuses_preserving_evidence(self):
-        state=self.fixture.backend()
-        slot=self.fixture.slot()
-        state['tables']['iptables']['filter'][f'cf2_{slot}_f'].append(['-j','ACCEPT'])
+    def test_downgrade_with_foreign_chain_preserves_all_evidence(self):
+        state = self.fixture.backend()
+        slot = self.fixture.slot()
+        state['tables']['iptables']['filter'][f'cf2_{slot}_f'].append(['-j', 'ACCEPT'])
         self.fixture.update_backend(tables=state['tables'])
-        before=self.fixture.backend()
-        result=self.command('uninstall.sh')
-        self.assertNotEqual(result.returncode,0)
-        after=self.fixture.backend()
-        self.assertEqual(after['tables'],before['tables'])
-        self.assertEqual(after['sets'],before['sets'])
-        self.assertTrue((self.root/'etc/couvrefeu/backup/ready').exists())
+        self.assert_refused_without_changes()
 
 
 class VendorAdmissionTests(unittest.TestCase):
@@ -379,7 +363,9 @@ class VendorAdmissionTests(unittest.TestCase):
         shutil.copytree(REPO / 'router/lib', self.lib, dirs_exist_ok=True)
         (self.root / 'tmp').mkdir(mode=0o1777)
         (self.root / 'tmp').chmod(0o1777)
-        self.calls = self.root / 'calls'
+        calls_dir = tempfile.TemporaryDirectory(prefix='couvre-feu-admission-calls-')
+        self.addCleanup(calls_dir.cleanup)
+        self.calls = Path(calls_dir.name) / 'calls'
         self.adapter = self.root / 'independent-adapter.sh'
         source = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
         # Explicit fixture boundary changes are private to this copied adapter.
@@ -425,15 +411,17 @@ class VendorAdmissionTests(unittest.TestCase):
         self.assertFalse((self.root/'tmp/couvrefeu-platform.lock').exists())
         self.assertFalse((self.root/'.couvrefeu-install.lock').exists())
 
-    def test_contention_refuses_without_attestation_or_policy_mutation(self):
+    def test_contention_allows_readonly_attestation_without_policy_mutation(self):
         lock = self.root / 'tmp/couvrefeu-platform.lock'
         lock.mkdir(mode=0o700)
         (lock / 'pid').write_text(str(os.getpid())+'\n')
         (lock / 'pid').chmod(0o600)
+        before = fixtures.full_snapshot(self.root)
         result = self.run_shell(self.admit())
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.calls.exists())
-        self.assertTrue(lock.exists())
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('transaction_contention', result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ['complete-two-pass-boundary'])
+        self.assertEqual(fixtures.full_snapshot(self.root), before)
 
     def test_failed_attestation_releases_owned_lock(self):
         result = self.run_shell('platform_attest_vendor() { return 2; }; ' + self.admit())

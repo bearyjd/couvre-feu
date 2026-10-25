@@ -244,14 +244,14 @@ mkdir() {{ command mkdir "$@";fixture_tick=1400; }};cf_lock;printf unsafe'''
     def test_recovery_guard_after_slow_owner_validation_preserves_dead_lock(self):
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-dead-lock-') as folder:
             root=Path(folder);lock=root/'lock';lock.mkdir();(lock/'pid').write_text('999999999\n')
-            text=self.bootstrap.read_text();start=text.index('platform_lock_recover() {');stop=text.index('platform_profile_validate()',start)
+            text=self.bootstrap.read_text();start=text.index('platform_lock_recover() (');stop=text.index('platform_profile_validate()',start)
             fn=text[start:stop].replace('/tmp/couvrefeu-platform.lock',str(lock))
             body=f'''set -eu
 {fn}
 fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ fixture_tick=1400; }};
 platform_lock_recover;printf unsafe'''
-            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertIn('admission_deadline',r.stderr);self.assertNotIn('unsafe',r.stdout)
             self.assertEqual((lock/'pid').read_text(),'999999999\n')
     def test_internal_receipt_separates_kernel_proof_and_protected_attempt(self):
         for zero,started,ok in [(True,False,True),(True,True,True),(False,True,True),(False,False,False)]:
@@ -299,7 +299,7 @@ atomic_copy {src} {dst};printf unsafe'''
                     if existing:pending.write_text('validated receipt');pending.chmod(0o600)
                     body=f"""set -eu
 {fn}
-DONE={done};HERE=/unused;CF_RELEASE_ID=fixed;CF_PLATFORM_PROFILE={profile};CF_PLATFORM_INITIAL_WRITE={started};
+DONE={done};HERE=/unused;CF_RELEASE_ID=fixed;CF_PLATFORM_PROFILE={profile};CF_PLATFORM_INITIAL_WRITE={started};CF_PLATFORM_OWNER="$(id -u):$(id -g)";
 fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 platform_external_closure() {{ fixture_tick=1400; }};platform_valid_done() {{ fixture_tick=1400; }};
 sync() {{ :; }};platform_publish_done;printf complete"""
@@ -326,7 +326,7 @@ fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
                 self.assertEqual(marker.exists(),ok)
                 if not ok:self.assertIn('admission_deadline',r.stderr)
             # Production dispatch has the same immediate primitive boundary.
-            self.assertIn('else platform_initial_write; /etc/init.d/firewall reload; fi',fn)
+            self.assertIn('else platform_initial_write; env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /etc/init.d/firewall reload; fi',fn)
 
 class OperationalFlowTests(unittest.TestCase):
     def test_native_complete_flows_record_latency_without_target_claim(self):

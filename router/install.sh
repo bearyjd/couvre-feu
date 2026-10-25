@@ -2,6 +2,12 @@
 # shellcheck disable=SC2034,SC1090,SC1091
 # Default: validate/stage only. Installation requires explicit --activate.
 set -eu
+CF_ENTRY_SESSION_PID=
+if [ "${1:-}" = --cf-transaction-session ]; then
+    [ "$#" -ge 2 ] || exit 2
+    CF_ENTRY_SESSION_PID=$2
+    shift 2
+fi
 set -f
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 ACTIVATE=0
@@ -11,10 +17,11 @@ SOURCE=$HERE
 PLATFORM_SELECTION=strict
 PLATFORM_OPTION=0
 fail() { printf 'couvre-feu: %s\n' "$*" >&2; exit 2; }
+parse_install_options() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --platform-profile)
-            [ "$#" -ge 2 ] && [ "$PLATFORM_OPTION" = 0 ] || fail 'one --platform-profile required'
+            if ! { [ "$#" -ge 2 ] && [ "$PLATFORM_OPTION" = 0 ]; }; then fail 'one --platform-profile required'; fi
             case "$2" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;; *) fail 'unknown platform profile';; esac
             PLATFORM_SELECTION=$2; PLATFORM_OPTION=1; shift 2;;
         --activate) ACTIVATE=1; shift;;
@@ -25,7 +32,7 @@ while [ "$#" -gt 0 ]; do
             shift 2;;
         --rpc-allow)
             # Repeatable: one MAC per option; the staged scope is the sorted set.
-            [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--rpc-allow requires one canonical MAC'
+            if ! { [ "$#" -ge 2 ] && [ -n "$2" ]; }; then fail '--rpc-allow requires one canonical MAC'; fi
             case "$2" in *"
 "*) fail '--rpc-allow requires one canonical MAC';; esac
             RPC_ALLOW="$RPC_ALLOW$2
@@ -37,12 +44,14 @@ while [ "$#" -gt 0 ]; do
         *) fail 'usage: install.sh [--activate] [--protect aa:bb:cc:dd:ee:ff] [--rpc-allow aa:bb:cc:dd:ee:ff]... [--source-dir DIR]';;
     esac
 done
+}
+parse_install_options "$@"
 # BEGIN authenticated bootstrap boundary
 if [ "${CF_TEST_MODE:-0}" != 1 ]; then PATH=/usr/sbin:/usr/bin:/sbin:/bin; fi
 LC_ALL=C
 export PATH LC_ALL
 umask 077
-if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_TRANSACTION_DEFINITIONS_ONLY+x}${CF_TRANSACTION_LAUNCH_PID+x}${CF_TRANSACTION_PID+x}${CF_TRANSACTION_START+x}${CF_TRANSACTION_BOOT+x}${CF_TRANSACTION_RETIREMENT+x}${CF_TRANSACTION_RECOVER+x}${CF_TRANSACTION_FENCE+x}${CF_TRANSACTION_PREPARED+x}${CF_TRANSACTION_BASE+x}${CF_TRANSACTION_HELD+x}${CF_TRANSACTION_OWNED+x}${CF_TRANSACTION_TOKEN+x}${CF_TRANSACTION_PARENT+x}${CF_TRANSACTION_MUTEX+x}${CF_TRANSACTION_OWNER+x}${CF_TRANSACTION_DIGEST+x}${CF_TRANSACTION_STATE+x}${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
     printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
     exit 2
 fi
@@ -58,7 +67,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=c254b9b4364d5f6e252126f4e37d05312cf7cec18b81515a3004b37009ce5820
+CF_BOOTSTRAP_PIN=df05e38635f1e469fa80e737a5e818584744b9c1488dbf79f1dd565a6fff9770
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -68,14 +77,15 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
-platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
-[ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
+if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"; fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then
     case "$SOURCE" in "$CF_ROOT"/*|"$HERE") ;; *) fail 'fixture source outside isolated root';; esac
     [ "$(CDPATH='' cd -- "$SOURCE" && pwd -P)" = "$SOURCE" ] || fail 'fixture source must be canonical'
 else
     [ "$SOURCE" = "$HERE" ] || fail 'source must equal the verified release directory'
 fi
+platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
+[ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # shellcheck disable=SC1091
 . "$HERE/lib/install-common.sh"
 platform_deadline_check
@@ -140,7 +150,11 @@ fi
 
 platform_deadline_check
 # Build staging outside managed paths. In fixtures it stays under CF_ROOT.
-if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
+if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then
+    if [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$ROOT/.couvrefeu-stage.$CF_TRANSACTION_TOKEN
+    else STAGE=/tmp/couvrefeu-stage.$CF_TRANSACTION_TOKEN; fi
+    mkdir -m 700 "$STAGE" || fail 'owned stage collision'
+elif [ "${CF_TEST_MODE:-0}" = 1 ]; then STAGE=$(mktemp -d "$ROOT/.couvrefeu-stage.XXXXXX")
 else STAGE=$(mktemp -d /tmp/couvrefeu-stage.XXXXXX); fi
 JOURNAL_ROLLBACK=0
 ROLLBACK_BASE=absent
@@ -167,12 +181,16 @@ journal_rollback() {
 }
 cleanup() {
     journal_rollback
+    if [ "${CF_TRANSACTION_DIGEST:-none}" != none ] && [ ! -e "$BACKUP" ] && [ ! -L "$BACKUP" ]; then
+        printf '%s\n' 'couvre-feu: bound original baseline retained; recovery required; run ordinary uninstall before retrying installation' >&2
+    fi
     for file in cfctl cfctl-ssh cfctl-scope include protected state rpc-allowed rpc-allowed.live generation firewall sysupgrade cron platform-profile; do rm -f "$STAGE/$file"; done
     for rel in $FILES; do k=$(key "$rel"); rm -f "$STAGE/$k.before" "$STAGE/$k.mtime" "$STAGE/$k.size"; done
     for rel in $DIRS; do k=$(key "$rel"); rm -f "$STAGE/dir_$k"; done
     if [ -d "$STAGE/.delta" ]; then rmdir "$STAGE/.delta" 2>/dev/null || :; fi
     rmdir "$STAGE" 2>/dev/null || :
     unlock_install
+    platform_transaction_finish
     platform_lock_release
 }
 trap cleanup 0
@@ -189,7 +207,9 @@ cp "$SOURCE/cfctl" "$STAGE/cfctl"
 cp "$SOURCE/cfctl-ssh" "$STAGE/cfctl-ssh"
 cp "$SOURCE/cfctl-scope" "$STAGE/cfctl-scope"
 chmod 755 "$STAGE/cfctl" "$STAGE/cfctl-ssh" "$STAGE/cfctl-scope"
-printf '%s\n' '#!/bin/sh' 'exec /usr/sbin/cfctl apply-fw' > "$STAGE/include"
+CALLBACK_GENERATION=$(printf 'CFCALLBACK1\n%s\n' "${CF_TRANSACTION_TOKEN:-staging}" | sha256sum | awk '{print $1}')
+CALLBACK_ENTRY=/etc/.couvrefeu-release-$CF_RELEASE_ID/cfctl
+printf '%s\n' '#!/bin/sh' "exec $CALLBACK_ENTRY --installation-generation $CALLBACK_GENERATION apply-fw" > "$STAGE/include"
 chmod 755 "$STAGE/include"
 if [ -e "$BASE/state" ]; then cp -p "$BASE/state" "$STAGE/state"
 else printf 'V\t1\nR\t0\n' > "$STAGE/state"; fi
@@ -279,7 +299,7 @@ else
     printf '\nconfig include '\''couvrefeu'\''\n\toption type '\''script'\''\n\toption path '\''/etc/firewall.couvrefeu'\''\n\toption reload '\''1'\''\n' >> "$STAGE/firewall"
     printf '\n/etc/couvrefeu\n/usr/sbin/cfctl\n/usr/sbin/cfctl-ssh\n/usr/sbin/cfctl-scope\n/usr/lib/couvrefeu\n/etc/firewall.couvrefeu\n/etc/crontabs/root\n' >> "$STAGE/sysupgrade"
     printf '\n/etc/.couvrefeu-release-%s\n' "$CF_RELEASE_ID" >> "$STAGE/sysupgrade"
-    printf '\n* * * * * /usr/sbin/cfctl expire\n' >> "$STAGE/cron"
+    printf '\n* * * * * %s --installation-generation %s expire\n' "$CALLBACK_ENTRY" "$CALLBACK_GENERATION" >> "$STAGE/cron"
     chmod 600 "$STAGE/cron"
     if [ "$ACTIVATE" = 0 ]; then
         printf '%s\n' 'Sources and protected identities staged/validated. No installation or activation performed. Use --activate only with separate live authorization.'
@@ -316,7 +336,7 @@ preserve_original() {
     po_mtime=$(awk 'NR==1 {print; exit}' "$STAGE/$2.mtime")
     po_size=$(awk 'NR==1 {print; exit}' "$STAGE/$2.size")
     # Non-authoritative byte copy for manual recovery, read from the live path.
-    cp "$po_src" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; no installation made"
+    cp "$po_src" "$BACKUP/$2.copy" || fail "cannot copy original for manual recovery: $1; originals unchanged; bound baseline retained"
     [ "$(sha256sum "$BACKUP/$2.copy" | awk '{print $1}')" = "${po_before%%:*}" ] || fail "original recovery copy mismatch: $1; no installation made"
     # The live original must still be exactly what was recorded and copied.
     if ! { exact_file "$po_src" "$po_before" "$po_mtime" && [ "$(stat -c %s "$po_src")" = "$po_size" ]; }; then
@@ -352,6 +372,7 @@ if [ ! -e "$BACKUP" ]; then
         if [ -d "$ROOT/$rel" ]; then stat -c %a "$ROOT/$rel" > "$STAGE/dir_$k"
         else printf '%s\n' absent > "$STAGE/dir_$k"; fi
     done
+    prepared_publish
     ROLLBACK_BASE=$(awk 'NR==1 {print; exit}' "$STAGE/dir_etc_couvrefeu")
     ROLLBACK_ETC=$(awk 'NR==1 {print; exit}' "$STAGE/dir_etc")
     JOURNAL_ROLLBACK=1
@@ -391,9 +412,9 @@ if [ ! -e "$BACKUP" ]; then
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
     done
     # The ownership marker is durable before any release directory exists.
-    if [ "$RELEASE_ABSENT" = 1 ]; then printf '%s\n' 1 > "$BACKUP/release-absent"; fi
+    if [ "$RELEASE_ABSENT" = 1 ]; then phase release-absent; fi
     if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = linked ]; then kill -KILL "$$"; fi
-    printf '%s\n' 1 > "$BACKUP/ready"
+    phase ready
     set +f
     sync "$BACKUP"/* 2>/dev/null
     set -f
@@ -407,6 +428,10 @@ if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = ready ]; 
 preflight
 runtime_preflight
 platform_deadline_check
+# Includes, executables and cron are part of FILES: intent precedes all of them.
+phase activated
+platform_transaction_barrier intent
+if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = intent ]; then kill -KILL "$$"; fi
 COUNT=0
 for rel in $FILES; do
     k=$(key "$rel")
@@ -428,7 +453,7 @@ if [ -n "$RPC_ALLOW" ] && [ ! -e "$BASE/runtime" ];then
 fi
 # Record possible kernel mutation *before* invoking the backend, for recovery
 # even when apply fails or the process is interrupted.
-printf '%s\n' 1 > "$BACKUP/activated"
+# The durable intent above already covers any integration publication.
 # The crontab rename may share one second with crond's directory check. Make
 # crond load it now, and refuse success unless the cron instance is running.
 if live_tools; then
@@ -438,5 +463,8 @@ fi
 if live_tools; then
     installed_core apply-fw || fail 'apply failed; journal retained; use uninstall for recovery'
 fi
-printf '%s\n' 1 > "$BACKUP/complete"
+phase complete
+platform_transaction_complete
+platform_transaction_barrier complete-published
+if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = complete ]; then kill -KILL "$$"; fi
 printf '%s\n' 'Installation recorded. Live packet enforcement requires separate acceptance.'
