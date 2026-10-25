@@ -479,10 +479,23 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
         result = self.f.run('rpc-sync', raw=request)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_job_control_stops_are_ignored_before_any_scope_read(self):
+        # Structural (a behavioural stop of an orphaned session is discarded by the kernel):
+        # TSTP/TTIN/TTOU are ignored before the first cf_scope_load, so no terminal stop can
+        # land between reading the scope and taking or holding cf_lock.
+        body = (REPO / 'router/lib/core.sh').read_text()
+        run = body[body.index('cf_scope_run() {'):body.index('cf_scope_main() {')]
+        self.assertEqual(run.count("trap '' TSTP TTIN TTOU"), 1)
+        self.assertLess(run.index("trap '' TSTP TTIN TTOU"), run.index('cf_scope_load'))
+
     def test_two_admins_with_one_base_one_wins_other_is_stale(self):
         base = self.base()
         # scope_before_lock is after admission: the paused admin already holds the
         # transaction mutex, so a concurrent admin is refused and must retry.
+        # The old interleaving (second admin commits between the first's pre-lock read and
+        # its cf_lock) is impossible now that the mutex is held from admission. The CAS
+        # recheck under cf_lock in cf_scope_run (scope_base_conflict) is still exercised by
+        # the stale-base retry below and by test_stale_and_malformed_base.
         first = self.start(['scope-add', NEW, '--base', base], 'scope_before_lock', confirm=tail6(NEW),
                            env=dict(self.f.env, CF_SCOPE_ADMIN='alpha'))
         busy = self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta'))

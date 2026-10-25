@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -1446,6 +1447,55 @@ class CoreTests(unittest.TestCase):
                                                       str(self.fixture.root / "p1.json")],
                                 env=self.fixture.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.stdout.splitlines()[0], "0||1", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def stage_script_result(self, env, local_test="1"):
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = (f'set -f; CF_LOCAL_TEST={local_test}; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"')
+        return subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                    str(self.fixture.root / "p1.json")],
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_sync_stage_mktemp_name_mismatch_inside_parent_leaves_no_residue(self):
+        # mktemp creates a directory inside tmp/ but reports it under a name that fails the
+        # exact-pattern check: the stage refuses and the created directory is still removed.
+        real = shutil.which("mktemp")
+        env = self.stage_shims(mktemp=f'd=$({real} "$@") || exit 1; printf "%s\\n" "${{d%/*}}//${{d##*/}}"\n')
+        result = self.stage_script_result(env)
+        self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_foreign_path_is_never_cleaned(self):
+        # A reported path outside tmp/ is refused without touching it.
+        sentinel = self.fixture.root / "foreign" / "couvrefeu-input.abcdef"
+        sentinel.mkdir(parents=True)
+        (sentinel / "input").write_text("preserve")
+        env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(sentinel))}\n')
+        result = self.stage_script_result(env)
+        self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+        self.assertEqual((sentinel / "input").read_text(), "preserve")
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_requires_sticky_world_writable_owned_tmp_parent(self):
+        # The fixture tmp stands in for the router's 0:0:1777 /tmp (fixture owner in test mode).
+        tmp = self.fixture.root / "tmp"
+        try:
+            for mode in (0o777, 0o755, 0o1755, 0o1775):
+                with self.subTest(mode=oct(mode)):
+                    tmp.chmod(mode)
+                    result = self.stage_script_result(self.fixture.env)
+                    self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0",
+                                     result.stdout + result.stderr)
+                    self.assertEqual(self.input_residue(), [])
+        finally:
+            tmp.chmod(0o1777)
+        result = self.stage_script_result(self.fixture.env)
+        self.assertEqual(result.stdout.splitlines()[0], "0||1", result.stdout + result.stderr)
+        # Outside local-test mode only 0:0 is accepted: the same user-owned 1777 tmp is refused.
+        result = self.stage_script_result(self.fixture.env, local_test="0")
+        self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
         self.assertEqual(self.input_residue(), [])
 
     def test_persisted_recovery_phase_blocks_enforcement_recreation(self):

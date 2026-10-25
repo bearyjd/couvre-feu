@@ -571,10 +571,10 @@ cf_scope_run() {
         CF_SCOPE_ADMIN_NAME=$CF_SCOPE_ADMIN
     fi
     CF_RPC_REQUIRE_RUNTIME=1
+    trap '' TSTP TTIN TTOU
     cf_scope_load || { cf_scope_refuse;return 1; }
     if [ "$1" = scope-preview ];then cf_scope_preview || { cf_scope_refuse;return 1; };return 0;fi
     cf_rpc_checkpoint scope_before_lock
-    trap '' TSTP TTIN TTOU
     cf_lock || { cf_scope_refuse;return 1; }
     # Everything is re-read and re-checked under the lock: the CAS base, then every refusal and the guard.
     cf_scope_load || { cf_scope_refuse;return 1; }
@@ -708,6 +708,10 @@ cf_sync_stage() {
     cf_timeout_available || return 1
     cf_input_parent=$CF_BASE/tmp
     [ -d "$cf_input_parent" ] && [ ! -L "$cf_input_parent" ] && [ "$(CDPATH='' cd -- "$cf_input_parent" && pwd -P)" = "$cf_input_parent" ] || { cf_fail unsafe_input_directory;return 1; }
+    # Only a root-owned sticky 1777 parent (the router's /tmp; the fixture owner in local
+    # tests) stops another local user from renaming or removing the private stage.
+    if [ "$CF_LOCAL_TEST" = 1 ];then cf_input_parent_meta=$CF_OWNER:$(id -g):1777;else cf_input_parent_meta=0:0:1777;fi
+    [ "$(stat -c '%u:%g:%a' "$cf_input_parent" 2>/dev/null)" = "$cf_input_parent_meta" ] || { cf_fail unsafe_input_directory;return 1; }
     # Traps first, so a signal once the directory exists still removes it.
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release' 0
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 129' HUP
@@ -715,8 +719,15 @@ cf_sync_stage() {
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 143' TERM
     # Unpredictable name (mktemp, O_EXCL, 0700): no other local user can pre-create it
     # in the shared sticky tmp directory and so deny every sync.
-    CF_INPUT_DIR=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX") || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
-    case $CF_INPUT_DIR in "$cf_input_parent"/couvrefeu-input.??????) ;; *)CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1;;esac
+    CF_INPUT_DIR=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX" 2>/dev/null) || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
+    case $CF_INPUT_DIR in
+        "$cf_input_parent"/couvrefeu-input.??????) ;;
+        *)# Clean a mis-named result only once it is proven to be a real directory in the parent.
+          if [ -d "$CF_INPUT_DIR" ] && [ ! -L "$CF_INPUT_DIR" ] && [ "$(CDPATH='' cd -- "${CF_INPUT_DIR%/*}" 2>/dev/null && pwd -P)" = "$cf_input_parent" ];then
+              cf_input_fail unsafe_input_directory;return 1
+          fi
+          CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1;;
+    esac
     cf_private_dir "$CF_INPUT_DIR" || { cf_input_fail unsafe_input_directory;return 1; }
     cf_input_parser || { cf_input_fail invalid_parser_source;return 1; }
     platform_deadline_check

@@ -163,6 +163,7 @@ class RouterFixture:
         firewall.write_text("config defaults 'defaults'\n\toption input 'REJECT'\n")
         leases = self.root / "tmp/dhcp.leases"
         leases.parent.mkdir(parents=True)
+        leases.parent.chmod(0o1777)  # Stands in for the router's sticky 0:0:1777 /tmp.
         leases.write_text(f"0 {KID} 192.168.1.20 fixture *\n0 {OTHER_KID} 192.168.1.22 fixture2 *\n")
         self.env = dict(os.environ, CF_ROOT=str(self.root), CF_TEST_MODE="1",
                         CF_BACKEND_DIR=str(self.bin), CF_BACKEND_STATE=str(self.state),

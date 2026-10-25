@@ -183,13 +183,23 @@ class DeadlineTests(unittest.TestCase):
                 r=self.run_shell(body);self.assertNotEqual(r.returncode,0)
                 self.assertNotIn('unsafe',r.stdout);self.assertFalse(lock.exists());self.assertEqual(foreign.read_text(),'preserve')
     def test_slow_input_within_ten_seconds_still_checks_cumulative_deadline(self):
+        # Entry anchored 8s back (500-tick margin to the 1300-tick budget). The stage's input
+        # file appearing proves every pre-read deadline check passed; stdin then arrives
+        # after the margin but well inside dd's 10s bound, so only the post-read
+        # admission_deadline check can refuse (not an early one, not the dd deadline).
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-input-') as folder:
-            root=Path(folder);(root/'tmp').mkdir()
-            body=f'''CF_BASE={root};CF_LIB={REPO}/router/lib;CF_LOCAL_TEST=1;CF_TEST_TIMEOUT='{SHELL[0]} timeout';. "{REPO}/router/lib/core.sh";CF_PLATFORM_ENTRY_TICK=$(platform_clock_tick);CF_PLATFORM_ENTRY_TICK=$((CF_PLATFORM_ENTRY_TICK-1290));cf_sync_stage 0;printf unsafe'''
+            root=Path(folder);(root/'tmp').mkdir();(root/'tmp').chmod(0o1777)
+            body=f'''CF_BASE={root};CF_LIB={REPO}/router/lib;CF_LOCAL_TEST=1;CF_TEST_TIMEOUT='{SHELL[0]} timeout';. "{REPO}/router/lib/core.sh";CF_PLATFORM_ENTRY_TICK=$(platform_clock_tick);CF_PLATFORM_ENTRY_TICK=$((CF_PLATFORM_ENTRY_TICK-800));cf_sync_stage 0;printf unsafe'''
             child=subprocess.Popen(SHELL+['-c',self.setup+body],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:
-                time.sleep(.2);out,err=child.communicate('{}',timeout=5)
+                deadline=time.monotonic()+4
+                while not list((root/'tmp').glob('couvrefeu-input.*/input')):
+                    self.assertIsNone(child.poll(),'stage refused before its read began (early deadline check)')
+                    self.assertLess(time.monotonic(),deadline,'stage read never began within the margin')
+                    time.sleep(.01)
+                time.sleep(5.5);out,err=child.communicate('{}',timeout=30)
                 self.assertNotEqual(child.returncode,0);self.assertIn('admission_deadline',err);self.assertNotIn('unsafe',out)
+                self.assertNotIn('input_deadline_or_read_failure',out+err)
                 self.assertEqual(list((root/'tmp').iterdir()),[])
             finally:
                 if child.poll() is None:child.kill()
