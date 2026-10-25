@@ -722,10 +722,15 @@ cf_sync_stage() {
     CF_INPUT_DIR=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX" 2>/dev/null) || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
     case $CF_INPUT_DIR in
         "$cf_input_parent"/couvrefeu-input.??????) ;;
-        *)# Clean a mis-named result only once it is proven to be a real directory in the parent.
-          if [ -d "$CF_INPUT_DIR" ] && [ ! -L "$CF_INPUT_DIR" ] && [ "$(CDPATH='' cd -- "${CF_INPUT_DIR%/*}" 2>/dev/null && pwd -P)" = "$cf_input_parent" ];then
-              cf_input_fail unsafe_input_directory;return 1
-          fi
+        *)# Clean a mis-named result only via its physically resolved path, and only when that
+          # is a couvrefeu-input.* entry directly in the parent (no textual .. or symlink escape).
+          cf_input_resolved=
+          [ -L "$CF_INPUT_DIR" ] || cf_input_resolved=$(CDPATH='' cd -P -- "$CF_INPUT_DIR" 2>/dev/null && pwd -P)
+          case ${cf_input_resolved##*/} in
+              couvrefeu-input.*)if [ "${cf_input_resolved%/*}" = "$cf_input_parent" ];then
+                  CF_INPUT_DIR=$cf_input_resolved;cf_input_fail unsafe_input_directory;return 1
+              fi;;
+          esac
           CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1;;
     esac
     cf_private_dir "$CF_INPUT_DIR" || { cf_input_fail unsafe_input_directory;return 1; }

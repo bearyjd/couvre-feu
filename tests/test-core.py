@@ -1478,6 +1478,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((sentinel / "input").read_text(), "preserve")
         self.assertEqual(self.input_residue(), [])
 
+    def test_sync_stage_mktemp_dotdot_through_symlink_is_never_cleaned(self):
+        # tmp/sym/../victim collapses textually to tmp/victim but the kernel follows sym:
+        # the mismatch cleanup must resolve the directory itself and touch nothing outside tmp/.
+        foreign = self.fixture.root / "foreign"
+        (foreign / "sub").mkdir(parents=True)
+        (foreign / "victim").mkdir()
+        (foreign / "victim" / "input").write_text("preserve")
+        (self.fixture.root / "tmp" / "sym").symlink_to(foreign / "sub")
+        try:
+            reported = str(self.fixture.root / "tmp" / "sym" / ".." / "victim")
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(reported)}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((foreign / "victim" / "input").read_text(), "preserve")
+            self.assertTrue((foreign / "victim").is_dir())
+        finally:
+            (self.fixture.root / "tmp" / "sym").unlink()
+        self.assertEqual(self.input_residue(), [])
+
     def test_sync_stage_requires_sticky_world_writable_owned_tmp_parent(self):
         # The fixture tmp stands in for the router's 0:0:1777 /tmp (fixture owner in test mode).
         tmp = self.fixture.root / "tmp"
