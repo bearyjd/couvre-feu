@@ -562,3 +562,66 @@ if (state.offline) {
   showCachedStatus();
   announce(state.people ? 'Offline read-only snapshot. Sign-in and control requests are unavailable.' : 'Offline. No permitted status snapshot is available.');
 } else void refresh({ quiet: true });
+
+// ---------- Bottom tab bar ----------
+{
+// tab shows every section exactly as before; other tabs hide sections via CSS (data-tab on #status-view).
+const KEY = 'cf-tab';
+const view = document.querySelector('#status-view');
+const tabs = [...document.querySelectorAll('.tablist [role="tab"]')];
+const names = tabs.map((tab) => tab.dataset.tabTarget);
+
+function read(store) { try { return store(); } catch { return null; } }
+function stored() { return read(() => sessionStorage.getItem(KEY)); }
+function save(name) { try { sessionStorage.setItem(KEY, name); } catch { /* storage unavailable: tab simply is not remembered */ } }
+function fromHash() { const name = location.hash.slice(1); return names.includes(name) ? name : null; }
+
+function select(name, { focus = false, persist = true, scroll = true } = {}) {
+  if (!names.includes(name)) name = 'overview';
+  for (const tab of tabs) {
+    const on = tab.dataset.tabTarget === name;
+    tab.setAttribute('aria-selected', String(on));
+    tab.tabIndex = on ? 0 : -1;
+    if (on) { view.setAttribute('aria-labelledby', tab.id); if (focus) tab.focus(); }
+  }
+  view.dataset.tab = name;
+  if (persist) save(name);
+  if (scroll) window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+if (view && tabs.length) {
+  const start = fromHash() ?? stored();
+  if (start && names.includes(start) && start !== 'overview') select(start, { persist: false, scroll: false });
+  view.setAttribute('aria-labelledby', document.querySelector('[role="tab"][aria-selected="true"]').id);
+
+  for (const tab of tabs) tab.addEventListener('click', () => {
+    const name = tab.dataset.tabTarget;
+    select(name);
+    try { history.replaceState(null, '', name === 'overview' ? location.pathname + location.search : `#${name}`); } catch { /* ignore */ }
+  });
+  document.querySelector('.tablist').addEventListener('keydown', (event) => {
+    const at = tabs.indexOf(document.activeElement);
+    if (at < 0) return;
+    const last = tabs.length - 1;
+    const next = { ArrowRight: at === last ? 0 : at + 1, ArrowLeft: at === 0 ? last : at - 1, Home: 0, End: last }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    select(tabs[next].dataset.tabTarget, { focus: true, scroll: false });
+  });
+  window.addEventListener('hashchange', () => { const name = fromHash(); if (name) select(name); });
+
+  // Mirror the existing parent-alert count onto the Activity tab; the source badge is unchanged.
+  const source = document.querySelector('#alert-badge'), mirror = document.querySelector('#tab-badge-activity');
+  if (source && mirror) {
+    const sync = () => {
+      const count = source.hidden ? '' : source.textContent.trim();
+      mirror.hidden = !count || count === '0';
+      mirror.textContent = count;
+      const tab = mirror.closest('[role="tab"]');
+      tab.setAttribute('aria-label', mirror.hidden ? 'Activity' : `Activity, ${count} ${count === '1' ? 'alert' : 'alerts'}`);
+    };
+    new MutationObserver(sync).observe(source, { attributes: true, childList: true, characterData: true, subtree: true });
+    sync();
+  }
+}
+}

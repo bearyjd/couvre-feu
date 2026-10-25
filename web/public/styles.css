@@ -1414,3 +1414,75 @@ fieldset legend {
     }
   }
 }
+
+/* ---------- Bottom tab bar (narrow screens only; wide screens keep the full page) ---------- */
+.tabbar { display:none }
+@media(max-width:899.98px) {
+  .tabbar {
+    display:block;
+    position:fixed;
+    inset:auto 0 0 0;
+    z-index:40;
+    padding:0 var(--safe-r) var(--safe-b) var(--safe-l);
+    background:var(--glass);
+    -webkit-backdrop-filter:saturate(180%) blur(20px);
+    backdrop-filter:saturate(180%) blur(20px);
+    border-top:.5px solid var(--line)
+  }
+  .tablist { display:flex; height:49px; max-width:560px; margin:0 auto }
+  .tab {
+    position:relative;
+    flex:1 1 0;
+    min-width:44px;
+    min-height:44px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:1px;
+    padding:3px 0 2px;
+    border:0;
+    border-radius:10px;
+    background:none;
+    color:var(--muted);
+    font:inherit;
+    font-size:10px;
+    font-weight:500;
+    letter-spacing:.01em;
+    cursor:pointer;
+    -webkit-tap-highlight-color:transparent;
+    transition:color .18s var(--ease)
+  }
+  .tab svg { transition:transform .18s var(--ease) }
+  .tab[aria-selected="true"] { color:var(--blue) }
+  .tab[aria-selected="true"] svg { transform:translateY(-1px) }
+  .tab:active svg { transform:scale(.92) }
+  .tab:focus-visible { outline:2px solid var(--focus); outline-offset:-3px }
+  .tab-badge {
+    position:absolute;
+    top:2px;
+    left:calc(50% + 6px);
+    min-width:16px;
+    height:16px;
+    padding:0 4px;
+    border-radius:8px;
+    background:var(--red);
+    color:var(--on-accent);
+    font-size:11px;
+    font-weight:600;
+    line-height:16px;
+    text-align:center
+  }
+  .tab-badge[hidden] { display:none }
+  body:has(#status-view:not([hidden])) { padding-bottom:calc(49px + var(--safe-b)) }
+  body:has(#status-view:not([hidden])) .tabbar { display:block }
+  body:not(:has(#status-view:not([hidden]))) .tabbar { display:none }
+  #status-view[data-tab="schedules"] [data-tab-group]:not([data-tab-group="schedules"]) { display:none }
+  #status-view[data-tab="activity"] [data-tab-group]:not([data-tab-group="activity"]) { display:none }
+  #status-view[data-tab="requests"] [data-tab-group]:not([data-tab-group="requests"]) { display:none }
+  #status-view[data-tab="devices"] [data-tab-group]:not([data-tab-group="devices"]) { display:none }
+}
+@media(prefers-reduced-motion:reduce) {
+  .tab, .tab svg { transition:none }
+  .tab[aria-selected="true"] svg, .tab:active svg { transform:none }
+}
