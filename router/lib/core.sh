@@ -11,6 +11,17 @@ CF_SSH_CLIENT_FRESH=0
 CF_NOW_VALUE=
 CF_EXPIRY_NOW=
 CF_OWNER=$(id -u)
+# Internal stage state only; cfctl refuses these names from the environment.
+CF_SYNC_STAGED=0
+CF_SYNC_STAGE_MODE=
+CF_SYNC_STAGE_TRIED=0
+CF_INPUT_DIR=
+CF_STAGED_POLICY=
+CF_NEXT_DIGEST=
+CF_REQUEST_GENERATION=
+CF_REQUEST_ID=
+CF_BASE_REVISION=
+CF_BASE_DIGEST=
 
 cf_fail() { CF_ERROR=$1; return 1; }
 cf_backend_available() {
@@ -653,42 +664,74 @@ cf_input_deadline() {
 
 cf_input_cleanup() {
     if [ -n "${CF_INPUT_DIR-}" ];then
-        rm -f "$CF_INPUT_DIR/input"
+        rm -f "$CF_INPUT_DIR/input" "$CF_INPUT_DIR/json.awk"
         rmdir "$CF_INPUT_DIR" 2>/dev/null || :
         CF_INPUT_DIR=
     fi
 }
+cf_input_fail() { cf_input_cleanup;cf_fail "$1";return 1; }
+# Bounded private parser copy, authenticated against the compiled module pin before
+# any stdin wait; the installed parser path is never executed after that wait.
+cf_input_parser() {
+    cf_parser_pin=
+    for cf_parser_pair in $CF_RELEASE_MODULES;do
+        case $cf_parser_pair in json.awk:*)cf_parser_pin=${cf_parser_pair#json.awk:};;esac
+    done
+    case $cf_parser_pin in *[!0-9a-f]*|'')return 1;;esac
+    [ "${#cf_parser_pin}" = 64 ] || return 1
+    [ -f "$CF_LIB/json.awk" ] && [ ! -L "$CF_LIB/json.awk" ] || return 1
+    timeout -s KILL 6 dd if="$CF_LIB/json.awk" of="$CF_INPUT_DIR/json.awk" bs=4096 count=17 2>/dev/null || return 1
+    [ "$(wc -c < "$CF_INPUT_DIR/json.awk")" -le 65536 ] || return 1
+    cf_parser_digest=$(timeout -s KILL 6 sha256sum "$CF_INPUT_DIR/json.awk") || return 1
+    [ "${cf_parser_digest%% *}" = "$cf_parser_pin" ]
+}
 cf_sync_stage() {
+    cf_stage_mode=${1:-0}
+    case $cf_stage_mode in 0|1) ;; *)cf_fail invalid_command;return 1;;esac
+    # A completed stage is reused only for the same mode; stdin is never reread.
+    if [ "$CF_SYNC_STAGED" = 1 ];then
+        [ "$CF_SYNC_STAGE_MODE" = "$cf_stage_mode" ] || { cf_fail invalid_command;return 1; }
+        return 0
+    fi
+    [ "$CF_SYNC_STAGE_TRIED" = 0 ] || { cf_fail invalid_command;return 1; }
+    CF_SYNC_STAGE_TRIED=1;CF_SYNC_STAGE_MODE=;CF_STAGED_POLICY=;CF_NEXT_DIGEST=
+    CF_REQUEST_GENERATION=;CF_REQUEST_ID=;CF_BASE_REVISION=;CF_BASE_DIGEST=
     platform_deadline_check
     cf_timeout_available || return 1
     cf_input_parent=$CF_BASE/tmp
     [ -d "$cf_input_parent" ] && [ ! -L "$cf_input_parent" ] && [ "$(CDPATH='' cd -- "$cf_input_parent" && pwd -P)" = "$cf_input_parent" ] || { cf_fail unsafe_input_directory;return 1; }
     CF_INPUT_DIR=$cf_input_parent/couvrefeu-input.$$
     mkdir -m 700 "$CF_INPUT_DIR" || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
-    trap 'cf_input_cleanup; cf_unlock' 0
-    trap 'cf_input_cleanup; cf_unlock;exit 129' HUP
-    trap 'cf_input_cleanup; cf_unlock;exit 130' INT
-    trap 'cf_input_cleanup; cf_unlock;exit 143' TERM
-    # Deadline and byte bound apply before acquiring the policy mutation lock.
-    cf_input_deadline 10 dd bs=1 count=65537 of="$CF_INPUT_DIR/input" 2>/dev/null || { cf_input_cleanup;cf_fail input_deadline_or_read_failure;return 1; }
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release' 0
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 129' HUP
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 130' INT
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 143' TERM
+    cf_input_parser || { cf_input_fail invalid_parser_source;return 1; }
+    platform_deadline_check
+    # Deadline and byte bound apply before acquiring any platform or policy lock.
+    cf_input_deadline 10 dd bs=1 count=65537 of="$CF_INPUT_DIR/input" 2>/dev/null || { cf_input_fail input_deadline_or_read_failure;return 1; }
     platform_deadline_check
     cf_input_size=$(wc -c < "$CF_INPUT_DIR/input")
-    if [ "$cf_input_size" -gt 65536 ];then cf_input_cleanup;cf_fail policy_too_large;return 1;fi
+    if [ "$cf_input_size" -gt 65536 ];then cf_input_fail policy_too_large;return 1;fi
     cf_ascii_size=$(tr -cd '\11\12\15\40-\176' < "$CF_INPUT_DIR/input" | wc -c)
-    [ "$cf_ascii_size" = "$cf_input_size" ] || { cf_input_cleanup;cf_fail invalid_policy_bytes;return 1; }
-    cf_parsed=$(awk -v rpc="${1:-0}" -f "$CF_LIB/json.awk" "$CF_INPUT_DIR/input")
+    [ "$cf_ascii_size" = "$cf_input_size" ] || { cf_input_fail invalid_policy_bytes;return 1; }
+    cf_parsed=$(awk -v rpc="$cf_stage_mode" -f "$CF_INPUT_DIR/json.awk" "$CF_INPUT_DIR/input")
     cf_rc=$?
     cf_input_cleanup
     [ "$cf_rc" = 0 ] || { cf_fail invalid_policy;return 1; }
-    if [ "${1:-0}" = 1 ];then
+    if [ "$cf_stage_mode" = 1 ];then
         CF_REQUEST_GENERATION=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $2}')
         CF_REQUEST_ID=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $3}')
         CF_BASE_REVISION=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $4}')
         CF_BASE_DIGEST=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $5}')
         cf_parsed=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1!="Q"')
     fi
-    CF_STAGED_POLICY=$(printf '%s\n' "$cf_parsed" | cf_canonical)
-    CF_NEXT_DIGEST=$(printf '%s\n' "$CF_STAGED_POLICY" | sha256sum | awk '{print $1} ')
+    cf_staged=$(printf '%s\n' "$cf_parsed" | cf_canonical) || { cf_fail invalid_policy;return 1; }
+    cf_digest=$(printf '%s\n' "$cf_staged" | sha256sum) || { cf_fail invalid_policy;return 1; }
+    CF_STAGED_POLICY=$cf_staged
+    CF_NEXT_DIGEST=${cf_digest%% *}
+    CF_SYNC_STAGE_MODE=$cf_stage_mode
+    CF_SYNC_STAGED=1
 }
 cf_sync_read() {
     cf_new=$CF_STAGED_POLICY

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -1259,6 +1260,122 @@ class CoreTests(unittest.TestCase):
                 process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
+
+    def input_residue(self):
+        return sorted(path.name for path in (self.fixture.root / "tmp").iterdir()
+                      if path.name.startswith("couvrefeu-input."))
+
+    def test_sync_stage_parser_replacement_during_wait_is_never_executed(self):
+        self.sync()
+        release = self.fixture.root / "release"
+        shutil.copytree(REPO / "router", release)
+        for path in (release / "lib").iterdir():
+            path.chmod(0o644)
+        before = self.fixture.durable_snapshot()
+        calls = len(self.fixture.mutation_calls())
+        witness = self.fixture.root / "foreign-parser-ran"
+        process = subprocess.Popen(self.fixture.shell + [str(release / "cfctl"), "sync"], env=self.fixture.env,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        try:
+            payload = json.dumps(policy(2))
+            process.stdin.write(payload)
+            process.stdin.flush()
+            stage = self.fixture.root / "tmp" / f"couvrefeu-input.{process.pid}"
+            deadline = time.monotonic() + 20
+            while not (stage / "input").exists() or (stage / "input").stat().st_size != len(payload.encode()):
+                self.assertIsNone(process.poll(), "sync exited before reader readiness")
+                self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
+                time.sleep(0.01)
+            # The private copy was authenticated before the wait and holds pinned bytes.
+            self.assertEqual((stage / "json.awk").read_bytes(), (REPO / "router/lib/json.awk").read_bytes())
+            self.assertFalse((self.fixture.root / "etc/couvrefeu/runtime/lock").exists())
+            replacement = release / "lib/json.awk.new"
+            replacement.write_text('BEGIN { print "ran" > "%s"; exit 0 }\n' % witness)
+            replacement.chmod(0o644)
+            os.replace(replacement, release / "lib/json.awk")
+            stdout, stderr = process.communicate(input="", timeout=30)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertEqual(json.loads(stdout), {"ok": False, "errors": ["platform_admission_refused"]})
+        self.assertIn("hash_mismatch", stderr)
+        self.assertFalse(witness.exists(), "replaced parser was executed")
+        self.assertEqual(self.fixture.durable_snapshot(), before)
+        self.assertEqual(len(self.fixture.mutation_calls()), calls)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_injected_environment_refused(self):
+        self.sync()
+        for name in ("CF_SYNC_STAGED", "CF_SYNC_STAGE_MODE", "CF_SYNC_STAGE_TRIED", "CF_INPUT_DIR",
+                     "CF_STAGED_POLICY", "CF_NEXT_DIGEST", "CF_REQUEST_GENERATION", "CF_REQUEST_ID",
+                     "CF_BASE_REVISION", "CF_BASE_DIGEST"):
+            for value in ("", "1"):
+                with self.subTest(name=name, value=value):
+                    before = self.fixture.durable_snapshot()
+                    calls = len(self.fixture.mutation_calls())
+                    result = self.fixture.run("sync", document=policy(2), env=dict(self.fixture.env, **{name: value}))
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {"ok": False, "errors": ["platform_admission_refused"]})
+                    self.assertIn("injected stage environment refused", result.stderr)
+                    self.assertEqual(self.fixture.durable_snapshot(), before)
+                    self.assertEqual(len(self.fixture.mutation_calls()), calls)
+                    self.assertEqual(self.input_residue(), [])
+
+    def test_failed_input_before_admission_publishes_no_lock_or_residue(self):
+        # Fresh fixture: no mutex, runtime or owner record exists before the failed stage.
+        for command in ("sync", "rpc-sync"):
+            for raw in ("{", " " * 65537, "\x01" + json.dumps(policy())):
+                with self.subTest(command=command, raw=raw[:8]):
+                    before = self.fixture.durable_snapshot()
+                    result = self.fixture.run(command, raw=raw)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    document = json.loads(result.stdout)
+                    if command == "rpc-sync":
+                        self.assertEqual(list(document), ["rpc_version", "errors"])
+                    else:
+                        self.assertEqual(document["desiredRevision"], 0)
+                    self.assertEqual(self.fixture.durable_snapshot(), before)
+                    self.assertEqual(self.fixture.mutation_calls(), [])
+                    self.assertEqual(self.input_residue(), [])
+                    for record in (".couvrefeu-mutex", ".couvrefeu-transaction", "etc/couvrefeu/runtime"):
+                        self.assertFalse((self.fixture.root / record).exists(), record)
+
+    def test_sync_stage_reuse_requires_same_mode_and_success(self):
+        rpc = dict(rpc_version=1, generation="a" * 64, operation_id="op_1", expected_revision=0,
+                   expected_digest="b" * 64, policy=policy(1))
+        inputs = {"p1": json.dumps(policy(1)), "p2": json.dumps(policy(2)), "rpc": json.dumps(rpc), "bad": "{"}
+        for name, data in inputs.items():
+            (self.fixture.root / name).write_text(data)
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; r=$CF_ROOT; '
+                  'show() { printf "%s %s %s %s %s\\n" "$1" "$CF_SYNC_STAGED" "$CF_SYNC_STAGE_MODE" "$CF_ERROR" "$CF_NEXT_DIGEST"; }; '
+                  'case $2 in '
+                  'zero) cf_sync_stage 0 < "$r/p1"; show "$?"; cf_sync_stage 1 < "$r/rpc"; show "$?"; '
+                  'cf_sync_stage 0 < "$r/p2"; show "$?";; '
+                  'one) cf_sync_stage 1 < "$r/rpc"; show "$?"; cf_sync_stage 0 < "$r/p1"; show "$?"; '
+                  'cf_sync_stage 1 < "$r/p2"; show "$?";; '
+                  'failed) cf_sync_stage 0 < "$r/bad"; show "$?"; CF_ERROR=; cf_sync_stage 0 < "$r/p1"; show "$?";; '
+                  'esac')
+        for case in ("zero", "one", "failed"):
+            with self.subTest(case=case):
+                result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"), case],
+                                        env=self.fixture.env, capture_output=True, text=True, timeout=60)
+                lines = [line.split(" ") for line in result.stdout.splitlines()]
+                if case == "failed":
+                    self.assertEqual([line[:4] for line in lines], [["1", "0", "", "invalid_policy"],
+                                                                    ["1", "0", "", "invalid_command"]], result.stderr)
+                    self.assertEqual([line[4] for line in lines], ["", ""])
+                else:
+                    mode = "0" if case == "zero" else "1"
+                    self.assertEqual([line[:4] for line in lines], [["0", "1", mode, ""],
+                                                                    ["1", "1", mode, "invalid_command"],
+                                                                    ["0", "1", mode, "invalid_command"]], result.stderr)
+                    self.assertRegex(lines[0][4], "^[0-9a-f]{64}$")
+                    self.assertEqual({line[4] for line in lines}, {lines[0][4]})
+                self.assertEqual(self.input_residue(), [])
 
     def test_persisted_recovery_phase_blocks_enforcement_recreation(self):
         self.sync()

@@ -109,7 +109,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=df05e38635f1e469fa80e737a5e818584744b9c1488dbf79f1dd565a6fff9770
+CF_BOOTSTRAP_PIN=f124d011990ce776dd5e3e0a4a33881a5a101110f4c4bb4d0121ac0b8ee05517
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 if ! { [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ]; }; then cf_bootstrap_refuse; fi
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
@@ -118,6 +118,11 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 . "$platform_bootstrap_path"
 platform_deadline_check
 # END authenticated bootstrap boundary
+# Sync stage state is internal; any inherited value, even empty, is refused.
+if [ "${CF_SYNC_STAGED+x}${CF_SYNC_STAGE_MODE+x}${CF_SYNC_STAGE_TRIED+x}${CF_INPUT_DIR+x}${CF_STAGED_POLICY+x}${CF_NEXT_DIGEST+x}${CF_REQUEST_GENERATION+x}${CF_REQUEST_ID+x}${CF_BASE_REVISION+x}${CF_BASE_DIGEST+x}" != "" ]; then
+    printf '%s\n' 'couvre-feu: injected stage environment refused' >&2
+    cf_bootstrap_refuse
+fi
 platform_entry_root_validate
 if [ -n "$CF_CALLBACK_GENERATION" ]; then
     platform_verify_modules "$CF_LIB"
@@ -164,6 +169,19 @@ if [ "${1:-}" = recover-platform-lock ] && [ "$#" = 1 ]; then
     platform_lock_recover
     printf '%s\n' '{"ok":true,"platformLockRecovered":true}'
     exit 0
+fi
+# Exact sync/rpc-sync: authenticate modules, then finish bounded input staging before
+# platform admission and before ANY permanent or compatibility lock exists. Admission
+# and every core/RPC lock-held check below run afresh after the wait.
+if [ "$#" = 1 ] && { [ "$1" = sync ] || [ "$1" = rpc-sync ]; }; then
+    platform_verify_modules "$CF_LIB"
+    cf_stage_entry_mode=0
+    [ "$1" = sync ] || cf_stage_entry_mode=1
+    if ! cf_sync_stage "$cf_stage_entry_mode"; then
+        if [ "$cf_stage_entry_mode" = 1 ]; then printf '{"rpc_version":1,"errors":["%s"]}\n' "${CF_ERROR:-invalid_command}"
+        else cf_busy_result; fi
+        exit 1
+    fi
 fi
 platform_admit runtime "$CF_BASE" "$CF_LIB"
 if [ -n "$CF_CALLBACK_GENERATION" ]; then

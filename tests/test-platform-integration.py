@@ -423,6 +423,21 @@ class VendorAdmissionTests(unittest.TestCase):
         self.assertEqual(self.calls.read_text().splitlines(), ['complete-two-pass-boundary'])
         self.assertEqual(fixtures.full_snapshot(self.root), before)
 
+    def test_failed_input_stage_after_vendor_admission_releases_owned_lock(self):
+        # Fallback path only: cfctl stages sync/rpc-sync before platform_admit.
+        cfctl = (REPO / 'router/cfctl').read_text()
+        self.assertLess(cfctl.index('cf_sync_stage "$cf_stage_entry_mode"'), cfctl.index('platform_admit runtime'))
+        timeout = SHELL[0] + ' timeout'
+        for raw in ['{', ' ' * 65537]:
+            with self.subTest(raw=raw[:4]):
+                body = self.admit() + (f'CF_BASE="{self.root}"; CF_LOCAL_TEST=1; CF_LIB="{self.lib}"; '
+                                       f'CF_TEST_TIMEOUT="{timeout}"; . "{self.lib}/core.sh"; '
+                                       '[ -d "$CF_PLATFORM_LOCK" ] || exit 9; cf_sync_stage 0 || exit 1; exit 0')
+                result = subprocess.run(SHELL + ['-c', self.setup + body], input=raw, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertFalse((self.root / 'tmp/couvrefeu-platform.lock').exists())
+                self.assertEqual(sorted(p.name for p in (self.root / 'tmp').iterdir()), [])
+
     def test_failed_attestation_releases_owned_lock(self):
         result = self.run_shell('platform_attest_vendor() { return 2; }; ' + self.admit())
         self.assertNotEqual(result.returncode, 0)
