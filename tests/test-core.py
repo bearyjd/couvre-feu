@@ -1497,6 +1497,86 @@ class CoreTests(unittest.TestCase):
             (self.fixture.root / "tmp" / "sym").unlink()
         self.assertEqual(self.input_residue(), [])
 
+    def test_sync_stage_signal_after_misnamed_mktemp_never_cleans_raw_path(self):
+        # TERM lands right after mktemp reports tmp/sym/../victim: the traps must not clean
+        # that unvalidated text (the kernel would follow sym and reach foreign/victim).
+        foreign = self.fixture.root / "foreign"
+        (foreign / "sub").mkdir(parents=True)
+        (foreign / "victim").mkdir()
+        (foreign / "victim" / "input").write_text("preserve")
+        (self.fixture.root / "tmp" / "sym").symlink_to(foreign / "sub")
+        try:
+            reported = str(self.fixture.root / "tmp" / "sym" / ".." / "victim")
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(reported)}; '
+                                          'kill -TERM "$CF_TEST_STAGE_SHELL"; sleep 1; exit 0\n')
+            (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+            script = ('set -f; CF_TEST_STAGE_SHELL=$$; export CF_TEST_STAGE_SHELL; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; '
+                      'CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; . "$CF_LIB/core.sh"; '
+                      'cf_sync_stage 0 < "$2"; printf "reached\\n"')
+            result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                          str(self.fixture.root / "p1.json")],
+                                    env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("reached", result.stdout)
+            self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+            self.assertEqual((foreign / "victim" / "input").read_text(), "preserve")
+        finally:
+            (self.fixture.root / "tmp" / "sym").unlink()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_mismatch_only_rmdirs_resolved_stage(self):
+        # A mis-named report resolving to a couvrefeu-input.* entry in tmp/ is only rmdir'd:
+        # files in an existing (non-fresh) directory of that name are never deleted.
+        victim = self.fixture.root / "tmp" / "couvrefeu-input.victim"
+        victim.mkdir(mode=0o700)
+        (victim / "input").write_text("preserve")
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(victim.parent) + "//" + victim.name)}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((victim / "input").read_text(), "preserve")
+        finally:
+            (victim / "input").unlink(missing_ok=True)
+            victim.rmdir()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_relative_or_empty_report_is_never_resolved(self):
+        # A relative report must not be resolved against the shell's cwd (here tmp/ itself).
+        stage = self.fixture.root / "tmp" / "couvrefeu-input.rel000"
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; cd "$CF_ROOT/tmp" || exit 9; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"')
+        try:
+            for report in (stage.name, ""):
+                with self.subTest(report=report):
+                    stage.mkdir(mode=0o700, exist_ok=True)
+                    env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(report)}\n')
+                    result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                                  str(self.fixture.root / "p1.json")],
+                                            env=env, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0",
+                                     result.stdout + result.stderr)
+                    self.assertTrue(stage.is_dir())
+        finally:
+            if stage.is_dir():
+                stage.rmdir()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_trailing_newline_report_is_refused(self):
+        # $(...) strips trailing newlines: a report of "<valid name>\n\n" names a different
+        # directory than the one created, so it is refused and the named entry is untouched.
+        stage = self.fixture.root / "tmp" / "couvrefeu-input.nlnlnl"
+        stage.mkdir(mode=0o700)
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n\\n" {shlex.quote(str(stage))}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertTrue(stage.is_dir())
+            self.assertEqual(list(stage.iterdir()), [])
+        finally:
+            stage.rmdir()
+        self.assertEqual(self.input_residue(), [])
+
     def test_sync_stage_requires_sticky_world_writable_owned_tmp_parent(self):
         # The fixture tmp stands in for the router's 0:0:1777 /tmp (fixture owner in test mode).
         tmp = self.fixture.root / "tmp"

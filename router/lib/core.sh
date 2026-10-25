@@ -668,12 +668,37 @@ cf_input_deadline() {
     if [ "$CF_TIMEOUT_BUSYBOX" = 1 ];then "$CF_TIMEOUT" timeout "$@";else "$CF_TIMEOUT" "$@";fi
 }
 
+CF_NL='
+'
+# Strip one sentinel-protected trailing newline ("<text>\nx" -> "<text>"); refuse (empty)
+# text that lacks it or still contains a newline, since $(...) would hide trailing ones.
+cf_input_unwrap() {
+    cf_unwrap=${1%x}
+    case $cf_unwrap in *"$CF_NL") cf_unwrap=${cf_unwrap%"$CF_NL"};; *) cf_unwrap=;; esac
+    case $cf_unwrap in *"$CF_NL"*) cf_unwrap=;; esac
+}
+# Discard an unvalidated mktemp report: only rmdir (a fresh stage is empty; rmdir never
+# follows a symlink), only an absolute report, and only when it physically resolves to a
+# couvrefeu-input.* entry directly in the staging parent.
+cf_input_discard() {
+    cf_input_unwrap "$1"
+    case $cf_unwrap in /*) ;; *) return 0;; esac
+    [ ! -L "$cf_unwrap" ] || return 0
+    cf_input_unwrap "$(CDPATH='' cd -P -- "$cf_unwrap" 2>/dev/null && pwd -P && printf x)"
+    case ${cf_unwrap#"$cf_input_parent"/} in
+        "$cf_unwrap"|*/*) ;;
+        couvrefeu-input.*) rmdir -- "$cf_unwrap" 2>/dev/null || :;;
+    esac
+}
 cf_input_cleanup() {
     if [ -n "${CF_INPUT_DIR-}" ];then
         rm -f "$CF_INPUT_DIR/input" "$CF_INPUT_DIR/json.awk"
         rmdir "$CF_INPUT_DIR" 2>/dev/null || :
         CF_INPUT_DIR=
+    elif [ -n "${cf_input_made-}" ];then
+        cf_input_discard "$cf_input_made"
     fi
+    cf_input_made=
 }
 cf_input_fail() { cf_input_cleanup;cf_fail "$1";return 1; }
 # Bounded private parser copy, authenticated against the compiled module pin before
@@ -718,20 +743,16 @@ cf_sync_stage() {
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 130' INT
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 143' TERM
     # Unpredictable name (mktemp, O_EXCL, 0700): no other local user can pre-create it
-    # in the shared sticky tmp directory and so deny every sync.
-    CF_INPUT_DIR=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX" 2>/dev/null) || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
-    case $CF_INPUT_DIR in
-        "$cf_input_parent"/couvrefeu-input.??????) ;;
-        *)# Clean a mis-named result only via its physically resolved path, and only when that
-          # is a couvrefeu-input.* entry directly in the parent (no textual .. or symlink escape).
-          cf_input_resolved=
-          [ -L "$CF_INPUT_DIR" ] || cf_input_resolved=$(CDPATH='' cd -P -- "$CF_INPUT_DIR" 2>/dev/null && pwd -P)
-          case ${cf_input_resolved##*/} in
-              couvrefeu-input.*)if [ "${cf_input_resolved%/*}" = "$cf_input_parent" ];then
-                  CF_INPUT_DIR=$cf_input_resolved;cf_input_fail unsafe_input_directory;return 1
-              fi;;
-          esac
-          CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1;;
+    # in the shared sticky tmp directory and so deny every sync. The raw report stays in
+    # cf_input_made (signal traps only ever cf_input_discard it) and reaches CF_INPUT_DIR,
+    # and so the full cleanup, only after it matched the exact name in the parent.
+    cf_input_made=
+    cf_input_made=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX" 2>/dev/null && printf x) || { cf_input_cleanup;cf_fail unsafe_input_directory;return 1; }
+    cf_input_unwrap "$cf_input_made"
+    case $cf_unwrap in
+        "$cf_input_parent"/couvrefeu-input.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9])
+            CF_INPUT_DIR=$cf_unwrap;cf_input_made=;;
+        *)cf_input_cleanup;cf_fail unsafe_input_directory;return 1;;
     esac
     cf_private_dir "$CF_INPUT_DIR" || { cf_input_fail unsafe_input_directory;return 1; }
     cf_input_parser || { cf_input_fail invalid_parser_source;return 1; }
