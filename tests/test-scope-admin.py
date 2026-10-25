@@ -456,9 +456,13 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
         base = self.base()
         child = self.start(['rpc-sync'], 'before_write', stdin=self.sync_request())
         before = self.f.durable_snapshot()
+        # Both verbs mutate, so the paused rpc-sync already holds the permanent transaction
+        # mutex from admission (platform_transaction_gate): the second admin is refused there
+        # with transaction_contention, before core's cf_lock ('locked') is ever reached.
         result = self.add(NEW, base)
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(last_json(result.stdout)['errors'], ['locked'])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('transaction_contention', result.stderr)
+        self.assertEqual(last_json(result.stdout)['errors'], ['platform_admission_refused'])
         self.assertEqual(self.f.durable_snapshot(), before)
         child.send_signal(signal.SIGCONT)
         stdout, stderr = child.communicate(timeout=120)
@@ -469,9 +473,14 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
     def test_rpc_sync_waits_for_scope_add_lock(self):
         request = self.sync_request()  # read before the lock is taken; scope-add never changes policy
         child = self.start(['scope-add', NEW, '--base', self.base()], 'scope_before_write', confirm=tail6(NEW))
+        before = self.f.durable_snapshot()
+        # The paused scope-add holds the transaction mutex from admission, so rpc-sync is
+        # refused at its own admission (transaction_contention), not later by cf_lock.
         result = self.f.run('rpc-sync', raw=request)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('locked', json.loads(result.stdout)['errors'])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('transaction_contention', result.stderr)
+        self.assertEqual(json.loads(result.stdout)['errors'], ['platform_admission_refused'])
+        self.assertEqual(self.f.durable_snapshot(), before)
         child.send_signal(signal.SIGCONT)
         stdout, stderr = child.communicate(timeout=120)
         self.assertEqual(child.returncode, 0, stdout + stderr)
