@@ -220,3 +220,10 @@ test('touch targets: every bulk control is at least 44px tall', async ({ page, i
   await panel.getByRole('button', { name: 'Block all kids' }).click();
   for (const button of await panel.getByRole('button').all()) expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
 });
+
+test('block-all carries data-risk="destructive"; unblock-all does not', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  const panel = page.locator('#bulk-panel');
+  await expect(panel.locator('[data-action="pause_all"]')).toHaveAttribute('data-risk', 'destructive');
+  await expect(panel.locator('[data-action="resume_all"]')).not.toHaveAttribute('data-risk', /.*/);
+});

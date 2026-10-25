@@ -393,23 +393,23 @@ main {
 }
 
 /* Risky or irreversible actions read as red, never as the default blue. */
-.button[aria-label^="Remove"],.button[aria-label^="Disable"],.button[data-action="pause_all"] {
+.button[data-risk="destructive"],.button[aria-label^="Remove"],.button[aria-label^="Disable"],.button[data-action="pause_all"] {
   color:var(--red);
   background:var(--red-soft)
 }
 
-.button[data-action="pause_all"] {
+.button[data-risk="destructive"][data-action="pause_all"],.button[data-action="pause_all"] {
   background:var(--red);
   color:#fff
 }
 
 @media(prefers-color-scheme:dark) {
-  .button[data-action="pause_all"] {
+  .button[data-risk="destructive"][data-action="pause_all"],.button[data-action="pause_all"] {
     color:#1a0507
   }
 }
 
-.button[aria-label^="Remove"]:hover:not(:disabled),.button[aria-label^="Disable"]:hover:not(:disabled) {
+.button[data-risk="destructive"]:hover:not(:disabled),.button[aria-label^="Remove"]:hover:not(:disabled),.button[aria-label^="Disable"]:hover:not(:disabled) {
   filter:brightness(.96)
 }
 
@@ -1417,6 +1417,7 @@ fieldset legend {
 
 /* ---------- Bottom tab bar (narrow screens only; wide screens keep the full page) ---------- */
 .tabbar { display:none }
+.tab-empty { display:none }
 @media(max-width:899.98px) {
   .tabbar {
     display:block;
@@ -1474,7 +1475,10 @@ fieldset legend {
     text-align:center
   }
   .tab-badge[hidden] { display:none }
+  /* Reserve the bar plus the safe area once; the footer drops its own safe-area padding (no double gap). */
   body:has(#status-view:not([hidden])) { padding-bottom:calc(49px + var(--safe-b)) }
+  body:has(#status-view:not([hidden])) footer { padding-bottom:28px }
+  .tab-empty:not([hidden]) { display:block; margin:32px 16px; padding:28px 16px; text-align:center; color:var(--muted); font-size:15px }
   body:has(#status-view:not([hidden])) .tabbar { display:block }
   body:not(:has(#status-view:not([hidden]))) .tabbar { display:none }
   #status-view[data-tab="schedules"] [data-tab-group]:not([data-tab-group="schedules"]) { display:none }

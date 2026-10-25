@@ -140,6 +140,7 @@ async function completePendingLogout() {
   } catch (error) { if (!(error instanceof APIError && error.status === 401)) throw error; }
   state.logoutRequired = false;
   setServerLogoutNeeded(false);
+  window.dispatchEvent(new Event('cf:signed-out'));
 }
 
 async function refresh({ quiet = false } = {}) {
@@ -239,6 +240,7 @@ async function logout() {
   setServerLogoutNeeded(true);
   broadcastLogout();
   resetView();
+  window.dispatchEvent(new Event('cf:signed-out'));
   announce('Local status cleared. Signing out of the server…');
   if (offline) {
     announce('Local status cleared. You are offline; server sign-out is still required and will run when the connection returns.');
@@ -544,6 +546,7 @@ window.addEventListener('storage', (event) => {
   }
   if (event.key === LOGOUT_EVENT) {
     state.logoutRequired = needsServerLogout(); resetView();
+    window.dispatchEvent(new Event('cf:signed-out'));
     announce('Signed out in another tab. Local status has been cleared.');
   } else if (event.key === SCOPE_EVENT && actor() && event.newValue !== actorScope(actor())) {
     resetView();
@@ -570,11 +573,21 @@ const KEY = 'cf-tab';
 const view = document.querySelector('#status-view');
 const tabs = [...document.querySelectorAll('.tablist [role="tab"]')];
 const names = tabs.map((tab) => tab.dataset.tabTarget);
+const panel = document.querySelector('#tab-panel');
+const empty = document.querySelector('#tab-empty');
 
 function read(store) { try { return store(); } catch { return null; } }
 function stored() { return read(() => sessionStorage.getItem(KEY)); }
 function save(name) { try { sessionStorage.setItem(KEY, name); } catch { /* storage unavailable: tab simply is not remembered */ } }
 function fromHash() { const name = location.hash.slice(1); return names.includes(name) ? name : null; }
+
+// Empty state: a narrow-screen tab whose sections are all hidden shows a short message instead of a blank page.
+function syncEmpty() {
+  const name = view.dataset.tab;
+  const any = name === 'overview' || [...panel.querySelectorAll(`[data-tab-group="${name}"]`)].some((node) => !node.hidden);
+  if (empty.hidden === any) return; // assigning an unchanged value would re-trigger the observer forever
+  empty.hidden = any;
+}
 
 function select(name, { focus = false, persist = true, scroll = true } = {}) {
   if (!names.includes(name)) name = 'overview';
@@ -582,17 +595,26 @@ function select(name, { focus = false, persist = true, scroll = true } = {}) {
     const on = tab.dataset.tabTarget === name;
     tab.setAttribute('aria-selected', String(on));
     tab.tabIndex = on ? 0 : -1;
-    if (on) { view.setAttribute('aria-labelledby', tab.id); if (focus) tab.focus(); }
+    if (on) { panel.setAttribute('aria-labelledby', tab.id); if (focus) tab.focus(); }
   }
   view.dataset.tab = name;
+  syncEmpty();
   if (persist) save(name);
   if (scroll) window.scrollTo({ top: 0, behavior: 'auto' });
 }
 
-if (view && tabs.length) {
+if (view && tabs.length && panel && empty) {
   const start = fromHash() ?? stored();
   if (start && names.includes(start) && start !== 'overview') select(start, { persist: false, scroll: false });
-  view.setAttribute('aria-labelledby', document.querySelector('[role="tab"][aria-selected="true"]').id);
+  panel.setAttribute('aria-labelledby', document.querySelector('[role="tab"][aria-selected="true"]').id);
+  new MutationObserver(syncEmpty).observe(panel, { attributes: true, attributeFilter: ['hidden'], subtree: true });
+  syncEmpty();
+  // Signing out forgets the remembered tab so the next account starts on Overview.
+  window.addEventListener('cf:signed-out', () => {
+    try { sessionStorage.removeItem(KEY); } catch { /* storage unavailable */ }
+    select('overview', { persist: false, scroll: false });
+    try { history.replaceState(null, '', location.pathname + location.search); } catch { /* ignore */ }
+  });
 
   for (const tab of tabs) tab.addEventListener('click', () => {
     const name = tab.dataset.tabTarget;
