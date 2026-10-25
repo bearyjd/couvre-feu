@@ -22,6 +22,7 @@ CF_REQUEST_GENERATION=
 CF_REQUEST_ID=
 CF_BASE_REVISION=
 CF_BASE_DIGEST=
+CF_RPC_REQUIRE_RUNTIME=0
 
 cf_fail() { CF_ERROR=$1; return 1; }
 cf_backend_available() {
@@ -181,7 +182,12 @@ cf_protected_valid() {
     cf_safe_file "$CF_PROTECTED" && [ -s "$CF_PROTECTED" ] || { cf_fail unsafe_protected_file; return 1; }
     awk 'length($0)!=17 {exit 1} {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00" || seen[$0]++)exit 1}' "$CF_PROTECTED" || { cf_fail invalid_protected_mac; return 1; }
 }
-cf_canonical() { sort | awk -F '\t' '$1=="V"{v=$0;next}$1=="R"{r=$0;next}{a[++n]=$0}END{print v;print r;for(i=1;i<=n;i++)print a[i]}'; }
+# sort's status is captured (no pipefail in ash): a failed sort that still printed a prefix
+# yields no output and nonzero status, so callers fail closed instead of using a truncated policy.
+cf_canonical() {
+    cf_canonical_sorted=$(sort) || return 1
+    printf '%s\n' "$cf_canonical_sorted" | awk -F '\t' '$1=="V"{v=$0;next}$1=="R"{r=$0;next}{a[++n]=$0}END{print v;print r;for(i=1;i<=n;i++)print a[i]}'
+}
 cf_state_json() {
     awk -F '\t' '
     function bad(){exit 2}
@@ -632,14 +638,14 @@ cf_pause_edit() {
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
     # An explicit local pause is an emergency block: it also clears the person's allowance.
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&($2"")==(p""){next}{print}END{print "A",p,u}' | cf_canonical)
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&($2"")==(p""){next}{print}END{print "A",p,u}' | cf_canonical) || { cf_fail invalid_policy; return 1; }
 }
 cf_resume_edit() {
     cf_person=$1
     cf_id_valid "$cf_person" && cf_person_exists "$cf_person" || { cf_fail unknown_person; return 1; }
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&($2"")==(p""){next}{print}' | cf_canonical)
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&($2"")==(p""){next}{print}' | cf_canonical) || { cf_fail invalid_policy; return 1; }
 }
 cf_timeout_available() {
     if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_TIMEOUT-}" ];then
@@ -680,9 +686,11 @@ cf_input_parser() {
     case $cf_parser_pin in *[!0-9a-f]*|'')return 1;;esac
     [ "${#cf_parser_pin}" = 64 ] || return 1
     [ -f "$CF_LIB/json.awk" ] && [ ! -L "$CF_LIB/json.awk" ] || return 1
-    timeout -s KILL 6 dd if="$CF_LIB/json.awk" of="$CF_INPUT_DIR/json.awk" bs=4096 count=17 2>/dev/null || return 1
+    # dd copies at most 17*4096 = 69632 bytes, one block past the 65536 cap, so an
+    # oversized parser is truncated to a still-detectable >65536 size and refused below.
+    cf_input_deadline -s KILL 6 dd if="$CF_LIB/json.awk" of="$CF_INPUT_DIR/json.awk" bs=4096 count=17 2>/dev/null || return 1
     [ "$(wc -c < "$CF_INPUT_DIR/json.awk")" -le 65536 ] || return 1
-    cf_parser_digest=$(timeout -s KILL 6 sha256sum "$CF_INPUT_DIR/json.awk") || return 1
+    cf_parser_digest=$(cf_input_deadline -s KILL 6 sha256sum "$CF_INPUT_DIR/json.awk") || return 1
     [ "${cf_parser_digest%% *}" = "$cf_parser_pin" ]
 }
 cf_sync_stage() {
@@ -700,12 +708,16 @@ cf_sync_stage() {
     cf_timeout_available || return 1
     cf_input_parent=$CF_BASE/tmp
     [ -d "$cf_input_parent" ] && [ ! -L "$cf_input_parent" ] && [ "$(CDPATH='' cd -- "$cf_input_parent" && pwd -P)" = "$cf_input_parent" ] || { cf_fail unsafe_input_directory;return 1; }
-    CF_INPUT_DIR=$cf_input_parent/couvrefeu-input.$$
-    mkdir -m 700 "$CF_INPUT_DIR" || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
+    # Traps first, so a signal once the directory exists still removes it.
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release' 0
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 129' HUP
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 130' INT
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 143' TERM
+    # Unpredictable name (mktemp, O_EXCL, 0700): no other local user can pre-create it
+    # in the shared sticky tmp directory and so deny every sync.
+    CF_INPUT_DIR=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX") || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
+    case $CF_INPUT_DIR in "$cf_input_parent"/couvrefeu-input.??????) ;; *)CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1;;esac
+    cf_private_dir "$CF_INPUT_DIR" || { cf_input_fail unsafe_input_directory;return 1; }
     cf_input_parser || { cf_input_fail invalid_parser_source;return 1; }
     platform_deadline_check
     # Deadline and byte bound apply before acquiring any platform or policy lock.
@@ -744,7 +756,7 @@ cf_sync_read() {
 cf_check() {
     cf_missing=
     cf_timeout_available || cf_missing=timeout
-    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mv rm rmdir wc cmp cp tr id dirname env sync cat; do
+    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mktemp mv rm rmdir wc cmp cp tr id dirname env sync cat; do
         command -v "$cf_dep" >/dev/null 2>&1 || cf_missing="$cf_missing $cf_dep"
     done
     for cf_dep in iptables ip6tables ipset uci conntrack ip fw3 sync; do

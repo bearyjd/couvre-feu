@@ -645,7 +645,7 @@ class RpcTests(RpcCommon, unittest.TestCase):
         child = self.stopped(request, 'before_lock')
         try:
             # Premise: stdin is fully staged and the paused request holds no transaction mutex.
-            self.assertFalse((self.f.root / f'tmp/couvrefeu-input.{child.pid}').exists())
+            self.assertEqual([p.name for p in (self.f.root / 'tmp').iterdir() if p.name.startswith('couvrefeu-input.')], [])
             mutex = (self.f.root / '.couvrefeu-mutex').stat()
             try:
                 held = os.stat(f'/proc/{child.pid}/fd/9')
@@ -672,7 +672,7 @@ class RpcTests(RpcCommon, unittest.TestCase):
                 info = path.lstat()
                 data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
                 name = str(path.relative_to(self.f.root))
-                # A refused competitor stages stdin in a private tmp/couvrefeu-input.PID entry
+                # A refused competitor stages stdin in a private mktemp tmp/couvrefeu-input.XXXXXX entry
                 # before admission and removes it; only the shared tmp directory's own mtime
                 # may change. Any leftover/created/removed entry still differs by key below.
                 mtime = None if name == 'tmp' else info.st_mtime_ns

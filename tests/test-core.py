@@ -1211,9 +1211,9 @@ class CoreTests(unittest.TestCase):
             process.stdin.flush()  # Intentionally keep a complete JSON document's stream open.
             # Synchronize on the reader consuming this document, rather than
             # guessing how long shell startup takes on a shared CI runner.
-            input_file = self.fixture.root / "tmp" / f"couvrefeu-input.{process.pid}" / "input"
             deadline = time.monotonic() + 20
-            while not input_file.exists() or input_file.stat().st_size != len(payload.encode()):
+            input_file = self.staged_input(process, deadline)
+            while input_file.stat().st_size != len(payload.encode()):
                 self.assertIsNone(process.poll(), "open stdin sync exited before reader readiness")
                 self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
                 time.sleep(0.01)
@@ -1261,6 +1261,17 @@ class CoreTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
 
+    def staged_input(self, process, deadline):
+        # The private stage has an unpredictable mktemp name; exactly one must exist.
+        while True:
+            stages = [self.fixture.root / "tmp" / name for name in self.input_residue()]
+            self.assertLessEqual(len(stages), 1, stages)
+            if stages and (stages[0] / "input").exists():
+                return stages[0] / "input"
+            self.assertIsNone(process.poll(), "sync exited before reader readiness")
+            self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
+            time.sleep(0.01)
+
     def input_residue(self):
         return sorted(path.name for path in (self.fixture.root / "tmp").iterdir()
                       if path.name.startswith("couvrefeu-input."))
@@ -1281,9 +1292,9 @@ class CoreTests(unittest.TestCase):
             payload = json.dumps(policy(2))
             process.stdin.write(payload)
             process.stdin.flush()
-            stage = self.fixture.root / "tmp" / f"couvrefeu-input.{process.pid}"
             deadline = time.monotonic() + 20
-            while not (stage / "input").exists() or (stage / "input").stat().st_size != len(payload.encode()):
+            stage = self.staged_input(process, deadline).parent
+            while (stage / "input").stat().st_size != len(payload.encode()):
                 self.assertIsNone(process.poll(), "sync exited before reader readiness")
                 self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
                 time.sleep(0.01)
@@ -1311,7 +1322,7 @@ class CoreTests(unittest.TestCase):
         self.sync()
         for name in ("CF_SYNC_STAGED", "CF_SYNC_STAGE_MODE", "CF_SYNC_STAGE_TRIED", "CF_INPUT_DIR",
                      "CF_STAGED_POLICY", "CF_NEXT_DIGEST", "CF_REQUEST_GENERATION", "CF_REQUEST_ID",
-                     "CF_BASE_REVISION", "CF_BASE_DIGEST"):
+                     "CF_BASE_REVISION", "CF_BASE_DIGEST", "CF_RPC_REQUIRE_RUNTIME"):
             for value in ("", "1"):
                 with self.subTest(name=name, value=value):
                     before = self.fixture.durable_snapshot()
@@ -1376,6 +1387,66 @@ class CoreTests(unittest.TestCase):
                     self.assertRegex(lines[0][4], "^[0-9a-f]{64}$")
                     self.assertEqual({line[4] for line in lines}, {lines[0][4]})
                 self.assertEqual(self.input_residue(), [])
+
+    def stage_shims(self, **bodies):
+        shims = self.fixture.root / "stage-shims"
+        shims.mkdir(mode=0o700, exist_ok=True)
+        for name, body in bodies.items():
+            (shims / name).write_text("#!/bin/sh\n" + body)
+            (shims / name).chmod(0o700)
+        return dict(self.fixture.env, PATH=str(shims) + os.pathsep + self.fixture.env["PATH"])
+
+    def test_sync_stage_sort_failure_refuses_truncated_policy(self):
+        # A failing sort that still emits a plausible prefix (V/R kept, one row dropped)
+        # must not stage a truncated policy.
+        real = shutil.which("sort")
+        env = self.stage_shims(sort=(
+            't=$(mktemp) || exit 2; cat > "$t"\n'
+            f'if grep -q trunc "$t"; then {real} "$@" < "$t" | grep -v trunc; rm -f "$t"; exit 1; fi\n'
+            f'{real} "$@" < "$t"; s=$?; rm -f "$t"; exit $s\n'))
+        document = policy(2)
+        document["schedules"] = [{"person": "alice", "id": "trunc", "weekdays": ["Mon"],
+                                  "start": "22:00", "stop": "06:30"}]
+        (self.fixture.root / "trunc.json").write_text(json.dumps(document))
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"; printf "%s\\n" "$CF_STAGED_POLICY"')
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                      str(self.fixture.root / "trunc.json")],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.splitlines()[0], "1|invalid_policy|0", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_signal_during_directory_creation_leaves_no_residue(self):
+        # TERM delivered the instant the private input directory exists must still clean it up.
+        kill = ('s=$?; case "$*" in *couvrefeu-input*) kill -TERM "$CF_TEST_STAGE_SHELL"; sleep 1;; esac; exit $s\n')
+        env = self.stage_shims(mkdir=f'{shutil.which("mkdir")} "$@"; ' + kill,
+                               mktemp=f'{shutil.which("mktemp")} "$@"; ' + kill)
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = ('set -f; CF_TEST_STAGE_SHELL=$$; export CF_TEST_STAGE_SHELL; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; '
+                  'CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; . "$CF_LIB/core.sh"; '
+                  'cf_sync_stage 0 < "$2"; printf "reached\\n"')
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                      str(self.fixture.root / "p1.json")],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertNotIn("reached", result.stdout)
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_precreated_predictable_directory_cannot_deny_staging(self):
+        # A local user who pre-creates the old predictable tmp/couvrefeu-input.PID name
+        # (or a symlink there) must not be able to deny the stage.
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; mkdir -m 777 "$CF_ROOT/tmp/couvrefeu-input.$$" || exit 9; '
+                  'ln -s / "$CF_ROOT/tmp/couvrefeu-input.$$/x"; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"; rm -f "$CF_ROOT/tmp/couvrefeu-input.$$/x"; '
+                  'rmdir "$CF_ROOT/tmp/couvrefeu-input.$$"')
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                      str(self.fixture.root / "p1.json")],
+                                env=self.fixture.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.splitlines()[0], "0||1", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
 
     def test_persisted_recovery_phase_blocks_enforcement_recreation(self):
         self.sync()
