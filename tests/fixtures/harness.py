@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = Path(__file__).resolve().parents[2]
 PROTECTED = "02:00:00:00:00:aa"
@@ -92,6 +93,62 @@ def run_owned_process(command, *, timeout, input=None, interrupt_on_timeout=Fals
         if _pending_lane_shutdown:
             raise KeyboardInterrupt("fixture lane shutdown")
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def start_with_full_stdout(command, env, stdin=None, seconds=90):
+    """Start `command` with its stdout on an already full pipe, as a client that stopped reading.
+
+    Returns (process, read_end) once the shell itself is blocked writing (wchan pipe_write). The
+    caller owns read_end and the process (kill its group on failure); drain with drain_full_stdout.
+    """
+    read_end, write_end = os.pipe()
+    filler = os.open("/proc/self/fd/%d" % write_end, os.O_WRONLY | os.O_NONBLOCK)  # own description
+    try:
+        while True:
+            os.write(filler, b"#" * 4096)
+    except BlockingIOError:
+        pass
+    finally:
+        os.close(filler)
+    try:
+        process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                                   stdout=write_end, stderr=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        os.close(write_end)
+    if stdin is not None:
+        process.stdin.write(stdin.encode())
+        process.stdin.close()
+        process.stdin = None
+    wchan = Path("/proc/%d/wchan" % process.pid)
+    deadline = time.monotonic() + seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        try:
+            if "pipe_write" in wchan.read_text():
+                return process, read_end
+        except OSError:
+            pass
+        time.sleep(.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    os.close(read_end)
+    raise AssertionError("%s never blocked writing its output (exit %s)" % (command[-2:], process.returncode))
+
+
+def drain_full_stdout(process, read_end, timeout=60):
+    """Read the filled pipe to EOF and reap the process; returns (exit status, stdout without filler)."""
+    chunks = []
+    try:
+        while True:
+            data = os.read(read_end, 65536)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        os.close(read_end)
+    return process.wait(timeout=timeout), b"".join(chunks).decode().replace("#", "")
 
 
 def policy(revision=1):

@@ -31,7 +31,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
-from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy  # noqa: E402
+from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, drain_full_stdout, policy, start_with_full_stdout  # noqa: E402
 
 NEW = '02:00:00:00:00:03'
 NEW2 = '02:00:00:00:00:04'
@@ -346,8 +346,24 @@ class ScopeRefusalTests(ScopeCommon, unittest.TestCase):
                 self.assert_refused(self.add(NEW, env=dict(self.f.env, CF_SCOPE_ADMIN=admin)), 'scope_admin_invalid')
 
     def test_incomplete_installation(self):
-        complete = self.f.root / 'etc/couvrefeu/backup/complete'
+        # M4b: a journal that is `ready` without `complete` is an interrupted installation. The
+        # transaction gate (platform_transaction_gate, incomplete_installation) refuses every
+        # non-owned admitted command at admission, before core's generation check is reached;
+        # recovery is the explicit recover-install-lock flow. Premise: ready present, owner complete.
+        backup = self.f.root / 'etc/couvrefeu/backup'
+        complete = backup / 'complete'
+        self.assertEqual((backup / 'ready').read_text(), '1\n')
+        self.assertEqual((self.f.root / '.couvrefeu-transaction').read_text().splitlines()[1], 'complete')
         complete.unlink()
+        self.before = self.f.durable_snapshot()
+        for result in (self.add(NEW, SHA_ZERO), self.scope('scope-preview', NEW)):
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn('platform incomplete_installation', result.stderr)
+            self.assert_refused(result, 'platform_admission_refused')
+        # The core ready+complete guard stays live behind the gate: a present but wrong `complete`
+        # passes the gate's existence test and is refused by core as inactive_generation.
+        complete.write_text('0\n')
+        complete.chmod(0o600)
         self.before = self.f.durable_snapshot()
         self.assert_refused(self.add(NEW, SHA_ZERO), 'inactive_generation')
         self.assert_refused(self.scope('scope-preview', NEW), 'inactive_generation')
@@ -1076,6 +1092,60 @@ class ScopeStaticTests(unittest.TestCase):
                     result = subprocess.run(runtime + [copy + ' {print mac($0)?1:0}'], input=''.join(s + '\n' for s in samples),
                                             capture_output=True, text=True, timeout=30)
                     self.assertEqual(result.stdout.split(), expected, result.stderr)
+
+
+class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
+    """A client that stops reading stdout must never keep ANY lock: the permanent transaction mutex
+    (fd 9 flock), cf_lock or the platform lock. Each command blocks on an already full stdout pipe;
+    `expire` (which needs the mutex and cf_lock) must then still succeed, and the blocked command
+    must finish normally once the pipe is drained. The vendor-profile variant is in test-os-trust.py."""
+
+    def document(self):
+        current = self.status()
+        document = policy(current['acceptedPolicy']['revision'] + 1)
+        document['people'][0]['macs'] = [KID]
+        return json.dumps(document, separators=(',', ':'))
+
+    def assert_blocked_output_holds_no_lock(self, args, stdin=None, errors=()):
+        child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), *args], self.f.env, stdin)
+        self.addCleanup(lambda: child.poll() is None and (os.killpg(child.pid, signal.SIGKILL), child.wait()))
+        probe = self.f.run('expire', timeout=120)
+        self.assertEqual(probe.returncode, 0, (args, probe.stdout, probe.stderr))
+        self.assertIsNone(child.poll(), 'the blocked command must still be writing')
+        status, stdout = drain_full_stdout(child, read_end)
+        self.assertEqual(status, 0, stdout)
+        reply = last_json(stdout)
+        if errors is not None:
+            self.assertEqual(reply.get('errors'), list(errors), stdout)
+        return reply
+
+    def test_sync(self):
+        self.assert_blocked_output_holds_no_lock(('sync',), self.document())
+        self.assertEqual(self.status()['acceptedPolicy']['revision'], 1)
+
+    def test_rpc_sync(self):
+        self.assert_blocked_output_holds_no_lock(('rpc-sync',), ScopeConcurrencyTests.sync_request(self))
+        self.assertEqual(self.status()['acceptedPolicy']['revision'], 1)
+
+    def test_pause_and_resume(self):
+        self.assertEqual(self.f.run('sync', raw=self.document()).returncode, 0)
+        self.assert_blocked_output_holds_no_lock(('pause', 'alice'))
+        self.assert_blocked_output_holds_no_lock(('resume', 'alice'))
+
+    def test_expire(self):
+        self.assert_blocked_output_holds_no_lock(('expire',))
+
+    def test_rpc_status(self):
+        # rpc-status takes no transaction mutex but does take cf_lock.
+        self.assert_blocked_output_holds_no_lock(('rpc-status', '--json'))
+
+    def test_scope_preview(self):
+        self.assert_blocked_output_holds_no_lock(('scope-preview', NEW))
+
+    def test_status_control(self):
+        # Control: strict-profile status takes no lock at all, so it was never affected. Before any
+        # apply this fixture reports observed-set errors; only the complete status object matters here.
+        self.assertIn('drift', self.assert_blocked_output_holds_no_lock(('status', '--json'), errors=None))
 
 
 class StrippedScopeWrapperTests(unittest.TestCase):
