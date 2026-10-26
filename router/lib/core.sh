@@ -287,6 +287,22 @@ cf_lock_unpublished() (
     done
     platform_transaction_mutex_check >/dev/null 2>&1
 )
+# Exclusive record create, then its write. 0: published; 1: refused, either
+# another writer claimed the name (locked) or a create/write error (unsafe_lock,
+# never masked as contention); a record we created but could not write is removed.
+cf_lock_record() {
+    cf_lr_path=$CF_RUNTIME/lock/$1
+    if ! (set -C; : > "$cf_lr_path") 2>/dev/null; then
+        if [ -e "$cf_lr_path" ] || [ -L "$cf_lr_path" ]; then cf_fail locked; else cf_fail unsafe_lock; fi
+        return 1
+    fi
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_FAULT:-}" = "$1" ]; then cf_lr_target=/dev/full; else cf_lr_target=$cf_lr_path; fi
+    if ! printf '%s\n' "$2" > "$cf_lr_target"; then
+        rm -f "$cf_lr_path" || :
+        cf_fail unsafe_lock
+        return 1
+    fi
+}
 cf_lock() {
     platform_deadline_check
     if [ "${CF_RPC_REQUIRE_RUNTIME:-0}" = 1 ];then
@@ -315,8 +331,20 @@ cf_lock() {
     # Owned token precedes the PID: a kill inside publication leaves only states
     # (empty, token, token+PID prefix) that explicit recovery proves owned.
     # Exclusive creates: exactly one writer can claim a directory.
-    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then (set -C; printf '%s\n' "$CF_TRANSACTION_TOKEN" > "$CF_RUNTIME/lock/token") 2>/dev/null || { cf_fail locked; return 1; }; fi
-    (set -C; printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid") 2>/dev/null || { cf_fail locked; return 1; }
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = runtime-mkdir ]; then kill -KILL 0; fi
+    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then
+        cf_lock_record token "$CF_TRANSACTION_TOKEN" || return 1
+        if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = runtime-token ]; then kill -KILL 0; fi
+    fi
+    if ! cf_lock_record pid "$$"; then
+        # Never leave OUR token behind as a token-only lock.
+        if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then
+            rm -f "$CF_RUNTIME/lock/token" || :
+            rmdir "$CF_RUNTIME/lock" 2>/dev/null || :
+        fi
+        return 1
+    fi
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = runtime-pid ]; then kill -KILL 0; fi
     CF_LOCKED=1
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT
