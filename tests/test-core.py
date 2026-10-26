@@ -1927,6 +1927,21 @@ cf_transition_inventory_check
         self.assertTrue(lock.is_dir())
         lock.rmdir()
 
+    def test_lock_record_write_error_is_unsafe_lock_and_leaves_no_record(self):
+        # ENOSPC/EIO on the PID write is not contention: report unsafe_lock and
+        # remove the record this process created.
+        self.sync()
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        result = self.fixture.run("expire", env=dict(self.fixture.env, CF_TEST_LOCK_FAULT="pid"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe_lock", result.stdout + result.stderr)
+        self.assertNotIn('"locked"', result.stdout)
+        self.assertFalse((lock / "pid").exists())
+        if lock.exists():
+            self.assertEqual(list(lock.iterdir()), [])
+        self.success(self.fixture.run("expire"))
+        self.assertFalse(lock.exists())
+
 
 class AddressBindingTests(unittest.TestCase):
     """Binding trust is independent of recent IPv6 reachability, not future ownership."""

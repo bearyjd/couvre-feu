@@ -328,6 +328,313 @@ class VendorRecoveryTests(unittest.TestCase):
         result = self.run_entry(args=['--platform-profile', PROFILE, '--protect', '02:00:00:00:00:01', '--activate'])
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    # Real SIGKILLs of the actual vendor-profile installer, then the documented
+    # single recovery command and ordinary uninstall (subclasses rerun these
+    # under the OS-trust profile). The root starts with one exact original.
+    PROFILE_KEY = 'etc_couvrefeu_platform-profile'
+    PLATFORM_LOCK = 'tmp/couvrefeu-platform.lock'
+    RUNTIME_LOCK = 'etc/couvrefeu/runtime/lock'
+
+    def vendor_args(self):
+        return ['--platform-profile', self.expected_profile, '--protect', '02:00:00:00:00:01', '--activate']
+
+    def restoration_snapshot(self):
+        result = {}
+        for path in sorted(self.root.rglob('*')):
+            rel = path.relative_to(self.root)
+            if rel.parts[0] in ('release', 'backend', 'tmp', '.couvrefeu-mutex', '.couvrefeu-transaction'):
+                continue
+            info = path.lstat()
+            data = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+            mtime = None if path.is_dir() and not path.is_symlink() else info.st_mtime_ns
+            result[str(rel)] = (info.st_mode, info.st_uid, info.st_gid, mtime, data)
+        return result
+
+    def evidence(self):
+        return {str(p.relative_to(self.root)): (p.lstat().st_mode, p.read_bytes() if p.is_file() and not p.is_symlink() else os.readlink(p) if p.is_symlink() else None)
+                for p in sorted(self.root.rglob('*')) if p.relative_to(self.root).parts[0] not in ('release', 'backend')}
+
+    def killed_vendor(self, crash, value):
+        original = self.root / 'etc/sysupgrade.conf'
+        if not original.exists():
+            original.parent.mkdir(mode=0o755, exist_ok=True)
+            original.write_bytes(b'# exact vendor original\n')
+            original.chmod(0o644)
+        before = self.restoration_snapshot()
+        result = self.run_entry(args=self.vendor_args(), env=dict(self.env, **{crash: value}))
+        self.assertEqual(result.returncode, -signal.SIGKILL, result.stdout + result.stderr)
+        owner = (self.root / '.couvrefeu-transaction').read_text().splitlines()
+        self.assertEqual(owner[7], self.expected_profile)
+        return before
+
+    def vendor_recover(self):
+        return self.run_entry('cfctl', args=['recover-install-lock'])
+
+    def vendor_recover_and_uninstall(self, before):
+        recovered = self.vendor_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        removed = self.run_entry('uninstall.sh')
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertEqual(self.restoration_snapshot(), before)
+        for rel in (self.PLATFORM_LOCK, '.couvrefeu-prepared', '.couvrefeu-recovery-required', '.couvrefeu-recovery.done'):
+            self.assertFalse((self.root / rel).exists(), rel)
+
+    def vendor_refused_without_changes(self, operation, message):
+        before = self.evidence()
+        result = operation()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(message, result.stdout + result.stderr)
+        self.assertEqual(self.evidence(), before, 'refusal changed recovery evidence')
+        return result
+
+    def vendor_pre_ready(self, point):
+        self.vendor_recover_and_uninstall(self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', point))
+
+    def test_vendor_kill_after_backup_mkdir_before_chmod_restores(self):
+        self.vendor_pre_ready('journal-backup-created')
+
+    def test_vendor_kill_after_backup_mkdir_restores(self):
+        self.vendor_pre_ready('journal-backup')
+
+    def test_vendor_kill_after_profile_before_record_restores(self):
+        self.vendor_pre_ready(f'journal-{self.PROFILE_KEY}.before')
+
+    def test_vendor_kill_after_profile_mtime_record_restores(self):
+        self.vendor_pre_ready(f'journal-{self.PROFILE_KEY}.mtime')
+
+    def test_vendor_kill_after_profile_staged_record_restores(self):
+        self.vendor_pre_ready(f'journal-{self.PROFILE_KEY}.staged')
+
+    def test_vendor_kill_after_profile_after_record_restores(self):
+        self.vendor_pre_ready(f'journal-{self.PROFILE_KEY}.after')
+
+    def test_vendor_kill_between_lib_copy_and_chmod_restores(self):
+        self.vendor_pre_ready('journal-usr_lib_couvrefeu_platform-bootstrap.sh.copied')
+
+    def test_vendor_kill_at_linked_restores(self):
+        self.vendor_pre_ready('linked')
+
+    def test_vendor_kill_after_prepared_restores(self):
+        self.vendor_pre_ready('prepared')
+
+    def test_vendor_torn_profile_staged_restores(self):
+        before = self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', f'journal-{self.PROFILE_KEY}.mtime')
+        staged = self.root / f'etc/couvrefeu/backup/{self.PROFILE_KEY}.staged'
+        self.assertFalse(staged.exists())
+        staged.write_bytes(self.expected_profile.encode()[:9])
+        staged.chmod(0o600)
+        self.vendor_recover_and_uninstall(before)
+
+    def test_vendor_unsafe_torn_profile_staged_refuses(self):
+        self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', f'journal-{self.PROFILE_KEY}.mtime')
+        staged = self.root / f'etc/couvrefeu/backup/{self.PROFILE_KEY}.staged'
+        target = self.root / 'foreign-profile'
+        target.write_bytes(b''); target.chmod(0o600)
+        for variant in ('symlink', 'mode', 'foreign'):
+            with self.subTest(variant=variant):
+                if variant == 'symlink':
+                    staged.symlink_to(target)
+                elif variant == 'mode':
+                    staged.write_bytes(b''); staged.chmod(0o644)
+                else:
+                    staged.write_bytes(b'gl-xe3000-4.8.3-unknown'); staged.chmod(0o600)
+                message = {'symlink': 'regular_file', 'mode': 'private_metadata', 'foreign': 'unknown_profile'}[variant]
+                try:
+                    self.vendor_refused_without_changes(self.vendor_recover, message)
+                    self.vendor_refused_without_changes(lambda: self.run_entry('uninstall.sh'), message)
+                finally:
+                    staged.unlink()
+
+    def vendor_materialize_crash(self, point):
+        before = self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'prepared')
+        recovered = self.vendor_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        killed = self.run_entry('uninstall.sh', env=dict(self.env, CF_TEST_UNINSTALL_CRASH_AT=point))
+        self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stdout + killed.stderr)
+        self.assertFalse((self.root / 'etc/couvrefeu/backup/ready').exists())
+        self.vendor_recover_and_uninstall(before)
+
+    def test_vendor_kill_after_materialize_clears_profile_restores(self):
+        self.vendor_materialize_crash(f'materialize-{self.PROFILE_KEY}.cleared')
+
+    def test_vendor_kill_after_materialized_profile_staged_restores(self):
+        self.vendor_materialize_crash(f'materialize-{self.PROFILE_KEY}.staged')
+
+    def assert_lock_window(self, rel, records):
+        lock = self.root / rel
+        self.assertEqual(lock.stat().st_mode & 0o7777, 0o700)
+        self.assertEqual(sorted(p.name for p in lock.iterdir()), sorted(records))
+        for name, expected in records.items():
+            record = lock / name
+            self.assertEqual(record.stat().st_mode & 0o7777, 0o600, name)
+            self.assertEqual(record.read_text(), expected + '\n', name)
+
+    def owner_line(self, index):
+        return (self.root / '.couvrefeu-transaction').read_text().splitlines()[index]
+
+    def test_vendor_runtime_lock_publication_windows_restore(self):
+        # The stub backend never reaches an owned cf_lock (no live tools), so
+        # these are the states cf_lock leaves, with its real modes; the real
+        # kills run under the modeled kernel in OwnedRuntimeLockKillTests.
+        for files in ([], [('token', 0)], [('token', 31)], [('token', None)],
+                      [('token', None), ('pid', 0)], [('token', None), ('pid', -1)], [('token', None), ('pid', None)]):
+            with self.subTest(files=[(n, l) for n, l in files]):
+                if files:
+                    self.tearDown(); self.setUp()
+                before = self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'intent')
+                values = {'token': self.owner_line(5) + '\n', 'pid': self.owner_line(3) + '\n'}
+                runtime = self.root / 'etc/couvrefeu/runtime'
+                if not runtime.exists():
+                    runtime.mkdir(mode=0o700)
+                lock = runtime / 'lock'
+                lock.mkdir(mode=0o700)
+                for name, length in files:
+                    data = values[name] if length is None else values[name][:length] if length >= 0 else values[name][:-2]
+                    (lock / name).write_text(data)
+                    (lock / name).chmod(0o600)
+                self.vendor_recover_and_uninstall(before)
+
+    def test_vendor_real_kill_platform_lock_publication_windows_restore(self):
+        for point in ('platform-mkdir', 'platform-pid', 'platform-token'):
+            with self.subTest(point=point):
+                if point != 'platform-mkdir':
+                    self.tearDown(); self.setUp()
+                before = self.killed_vendor('CF_TEST_LOCK_CRASH_AT', point)
+                records = {'platform-mkdir': {}, 'platform-pid': {'pid': self.owner_line(3)},
+                           'platform-token': {'pid': self.owner_line(3), 'token': self.owner_line(5)}}[point]
+                self.assert_lock_window(self.PLATFORM_LOCK, records)
+                self.vendor_recover_and_uninstall(before)
+
+    def platform_lock_state(self, records):
+        """Replace the killed installer's platform lock records with `records`."""
+        lock = self.root / self.PLATFORM_LOCK
+        for name in [p.name for p in lock.iterdir()]:
+            (lock / name).unlink()
+        for name, data in records:
+            (lock / name).write_bytes(data)
+            (lock / name).chmod(0o600)
+
+    def test_vendor_torn_platform_lock_records_restore(self):
+        for torn in ('pid', 'token'):
+            with self.subTest(torn=torn):
+                if torn == 'token':
+                    self.tearDown(); self.setUp()
+                before = self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'prepared')
+                pid, token = self.owner_line(3), self.owner_line(5)
+                if torn == 'pid':
+                    self.platform_lock_state([('pid', pid.encode()[:-1])])
+                else:
+                    self.platform_lock_state([('pid', (pid + '\n').encode()), ('token', token.encode()[:20])])
+                self.vendor_recover_and_uninstall(before)
+
+    def test_vendor_decimal_prefix_platform_lock_pid_refuses(self):
+        self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'prepared')
+        self.platform_lock_state([('pid', (self.owner_line(3)[:-1] + '\n').encode())])
+        self.vendor_refused_without_changes(self.vendor_recover, 'recovery lock owner mismatch')
+
+    def test_vendor_live_platform_lock_holder_is_preserved(self):
+        self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'prepared')
+        holder = subprocess.Popen(['sleep', '60'])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.platform_lock_state([('pid', f'{holder.pid}\n'.encode())])
+        self.vendor_refused_without_changes(self.vendor_recover, 'live recovery lock holder')
+
+    def test_vendor_owner_profile_selects_uninstall_after_pre_profile_kill(self):
+        # The owner record is the sole profile evidence before the profile
+        # journal record; a conflicting staged record still refuses.
+        self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', f'journal-{self.PROFILE_KEY}.staged')
+        recovered = self.vendor_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        staged = self.root / f'etc/couvrefeu/backup/{self.PROFILE_KEY}.staged'
+        staged.write_text('strict\n')
+        self.vendor_refused_without_changes(lambda: self.run_entry('uninstall.sh'), 'changed_profile')
+
+    def test_vendor_legacy_pre_ready_journal_cannot_select_vendor_profile(self):
+        self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'journal-backup')
+        owner = self.root / '.couvrefeu-transaction'
+        lines = owner.read_text().splitlines()
+        lines[8] = 'none'
+        owner.write_text('\n'.join(lines) + '\n')
+        shutil.rmtree(self.root / '.couvrefeu-prepared')
+        self.vendor_refused_without_changes(self.vendor_recover, 'legacy journal cannot select vendor profile')
+
+
+class OwnedRuntimeLockKillTests(unittest.TestCase):
+    """Real SIGKILLs inside an installation-owned cf_lock publication.
+
+    Strict profile, modeled kernel backend (CF_TEST_INSTALL_KERNEL), so install
+    reaches `installed_core apply-fw` under its own transaction. The kill takes
+    the installer's whole session, as a power cut would. Vendor recovery of the
+    same states is covered by VendorRecoveryTests with the real modes.
+    """
+    def setUp(self):
+        sys.path.insert(0, str(REPO / 'tests/fixtures'))
+        from harness import RouterFixture, PROTECTED
+        self.fixture = RouterFixture()
+        self.root = self.fixture.root
+        self.protected = PROTECTED
+        private = self.root / 'etc/couvrefeu'
+        (private / 'state').unlink(); (private / 'protected').unlink(); private.rmdir()
+        self.current = self.root / 'immutable-current-release'
+        shutil.copytree(REPO / 'router', self.current)
+        self.current.chmod(0o700); (self.current / 'lib').chmod(0o700)
+        self.fixture.env['CF_TEST_INSTALL_KERNEL'] = '1'
+
+    def tearDown(self):
+        self.fixture.close()
+
+    def command(self, name, *args, **extra):
+        return subprocess.run(SHELL + [str(self.current / name), *args], env=dict(self.fixture.env, **extra),
+                              capture_output=True, text=True, timeout=90)
+
+    def originals(self):
+        result = {}
+        for top in ('etc', 'usr'):
+            for path in sorted((self.root / top).rglob('*')):
+                info = path.lstat()
+                if path.is_dir() and not path.is_symlink():
+                    result[str(path.relative_to(self.root))] = ('directory', info.st_mode)
+                else:
+                    result[str(path.relative_to(self.root))] = (info.st_mode, info.st_mtime_ns, path.read_bytes())
+        return result
+
+    def owner(self):
+        return (self.root / '.couvrefeu-transaction').read_text().splitlines()
+
+    def test_real_kill_owned_runtime_lock_publication_windows_restore(self):
+        for point in ('runtime-mkdir', 'runtime-token', 'runtime-pid'):
+            with self.subTest(point=point):
+                if point != 'runtime-mkdir':
+                    self.tearDown(); self.setUp()
+                before = self.originals()
+                killed = self.command('install.sh', '--activate', '--protect', self.protected, CF_TEST_LOCK_CRASH_AT=point)
+                self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stdout + killed.stderr)
+                owner = self.owner()
+                self.assertEqual(owner[1], 'active')
+                lock = self.root / 'etc/couvrefeu/runtime/lock'
+                self.assertEqual(lock.stat().st_mode & 0o7777, 0o700)
+                expected = {'runtime-mkdir': [], 'runtime-token': ['token'], 'runtime-pid': ['pid', 'token']}[point]
+                self.assertEqual(sorted(p.name for p in lock.iterdir()), expected)
+                for name in expected:
+                    self.assertEqual((lock / name).stat().st_mode & 0o7777, 0o600, name)
+                if expected:
+                    self.assertEqual((lock / 'token').read_text(), owner[5] + '\n')
+                if point == 'runtime-pid':
+                    self.assertRegex((lock / 'pid').read_text(), r'^[1-9][0-9]*\n$')
+                recovered = self.command('cfctl', 'recover-install-lock')
+                self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+                removed = self.command('uninstall.sh')
+                self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+                self.assertEqual(self.originals(), before)
+
+    def test_owned_lock_pid_write_error_leaves_no_token_only_lock(self):
+        result = self.command('install.sh', '--activate', '--protect', self.protected, CF_TEST_LOCK_FAULT='pid')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unsafe_lock', result.stdout + result.stderr)
+        lock = self.root / 'etc/couvrefeu/runtime/lock'
+        self.assertFalse(lock.exists(), sorted(p.name for p in lock.iterdir()) if lock.exists() else '')
+
 
 class SyntheticLegacyDowngradeRefusalTests(unittest.TestCase):
     """A new digest-bound install cannot be rewritten into a legacy journal.

@@ -4,6 +4,7 @@
 Successful recovery always proceeds through the ordinary uninstall. These tests
 never repair a fixture by deleting a lock, and establish no packet/live evidence.
 """
+import hashlib
 import importlib.util
 import contextlib
 import json
@@ -723,6 +724,75 @@ class InstallRecoveryTests(unittest.TestCase):
         self.killed_runtime_lock([("foreign", None)])
         result = self.assert_refused_without_changes(self.recover)
         self.assertIn("foreign recovery lock entry", result.stderr)
+
+    def test_decimal_prefix_pid_with_newline_refuses_without_changes(self):
+        # A complete record is never a prefix: owner 1234 never matches '123\n'.
+        self.killed_runtime_lock([])
+        owner = (self.root / ".couvrefeu-transaction").read_text().splitlines()
+        lock = self.root / "etc/couvrefeu/runtime/lock"
+        for files in ([("token", owner[5] + "\n"), ("pid", owner[3][:-1] + "\n")],
+                      [("pid", owner[3][:-1] + "\n")]):
+            with self.subTest(files=[name for name, _ in files]):
+                for name, data in files:
+                    (lock / name).write_text(data)
+                    (lock / name).chmod(0o600)
+                result = self.assert_refused_without_changes(self.recover)
+                self.assertIn("recovery lock owner mismatch", result.stderr)
+                for name, _ in files:
+                    (lock / name).unlink()
+
+    def test_decimal_prefix_token_with_newline_refuses_without_changes(self):
+        self.killed_runtime_lock([])
+        owner = (self.root / ".couvrefeu-transaction").read_text().splitlines()
+        token = self.root / "etc/couvrefeu/runtime/lock/token"
+        token.write_text(owner[5][:40] + "\n")
+        token.chmod(0o600)
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("recovery lock token mismatch", result.stderr)
+
+    def test_torn_pid_prefix_without_newline_after_token_recovers(self):
+        before = self.killed_runtime_lock([("token", None)])
+        owner_pid = (self.root / ".couvrefeu-transaction").read_text().splitlines()[3]
+        pid = self.root / "etc/couvrefeu/runtime/lock/pid"
+        pid.write_text(owner_pid[:-1])
+        pid.chmod(0o600)
+        self.recover_and_uninstall(before)
+
+    def test_torn_runtime_records_out_of_publication_order_refuse(self):
+        # token-then-PID: a torn PID alone, or any PID after a torn token, was
+        # never written by the owner's publication sequence.
+        self.killed_runtime_lock([])
+        owner = (self.root / ".couvrefeu-transaction").read_text().splitlines()
+        lock = self.root / "etc/couvrefeu/runtime/lock"
+        for files in ([("pid", owner[3][:-1])],
+                      [("token", owner[5][:10]), ("pid", owner[3] + "\n")]):
+            with self.subTest(files=[name for name, _ in files]):
+                for name, data in files:
+                    (lock / name).write_text(data)
+                    (lock / name).chmod(0o600)
+                result = self.assert_refused_without_changes(self.recover)
+                self.assertIn("out of publication order", result.stderr)
+                for name, _ in files:
+                    (lock / name).unlink()
+
+    def test_published_cron_record_carries_live_boot_and_daemon_identity(self):
+        # A stale candidate (other boot, restarted daemon) is validated only;
+        # the record then published must carry the LIVE identity.
+        before, _ = self.stale_cron_candidate(reboot=True, restart=True)
+        self.assertEqual(self.recover().returncode, 0)
+        self.env["CF_TEST_UNINSTALL_CRASH_AT"] = "cron-quiescing"
+        try:
+            killed = self.run_script("uninstall.sh")
+        finally:
+            self.env.pop("CF_TEST_UNINSTALL_CRASH_AT")
+        self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stderr)
+        record = (self.root / ".couvrefeu-recovery/cron-quiescing").read_text().splitlines()
+        live_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        table = (self.root / "crond-table").read_bytes()
+        self.assertEqual(record[1], live_boot)
+        self.assertNotEqual(record[1].encode(), self.OTHER_BOOT)
+        self.assertEqual(record[2], "fixture:" + hashlib.sha256(table).hexdigest())
+        self.recover_and_uninstall(before)
 
     PROFILE_KEY = "etc_couvrefeu_platform-profile"
 
