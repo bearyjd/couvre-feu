@@ -109,7 +109,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=d72a0510a513440eecdeb33f88bbc8d53bdd4841d1b32dd600a5a0ed3bc09965
+CF_BOOTSTRAP_PIN=b7c1c01fb7a731e0abe415fee17332fc2bf812e522824e595cac8d8ba6815a9a
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 if ! { [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ]; }; then cf_bootstrap_refuse; fi
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
@@ -205,11 +205,6 @@ trap 'exit 143' TERM
 platform_deadline_check
 # No lock may be held while output blocks: buffer stdout, release every lock, then write (core.sh).
 CF_OUTPUT_WANTED=1
-if [ "$CF_PLATFORM_LOCKED" = 1 ] || [ "${CF_TRANSACTION_HELD:-0}" = 1 ]; then
-    if ! cf_output_begin; then
-        platform_lock_release;platform_transaction_release
-        printf '%s\n' '{"ok":false,"errors":["unsafe_output_buffer"]}';exit 1
-    fi
-fi
+if [ "$CF_PLATFORM_LOCKED" = 1 ] || [ "${CF_TRANSACTION_HELD:-0}" = 1 ]; then cf_output_begin; fi
 cf_main "$@"
 cf_output_release

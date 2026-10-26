@@ -349,7 +349,7 @@ Terminal and lock hazard (review S-M1): a write to a stopped or flow-controlled 
 stderr) are buffered and written only after both locks are released. M4b generalizes this for EVERY `cfctl` command (`sync`,
 `rpc-*`, `pause`/`resume`, `expire`, `apply-fw`, `status`, scope verbs): from the first held lock (vendor admission's platform
 lock, otherwise the passed transaction gate) stdout goes to an unlinked private file under the root-owned sticky `/tmp`
-(`unsafe_output_buffer` if that cannot be made), and only after `cf_lock`, the platform lock and the permanent transaction mutex
+(if it cannot be made, a stderr warning and the pre-M4b direct output: never a refusal), and only after `cf_lock`, the platform lock and the permanent transaction mutex
 (fd 9, closed, never `LOCK_UN`) are released is it written; every EXIT trap does the same, so later refusals and `platform_fail`
 JSON lines are also written lock-free. Nothing is created before a lock is held, so a refusal at admission leaves `/tmp` untouched. Install/uninstall output legitimately stays inside their
 transaction fence. Job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
@@ -360,7 +360,7 @@ not buffered, and a refusal by admission or by the transaction gate itself (befo
 `explicit_install_recovery_required`) still writes
 its one short stdout/stderr line while that lock is held (the trap
 releases it right after; with `-ixon` and under 4 KiB of prior output this cannot block); (c) buffered stdout is lost if the process
-is killed, or if releasing the platform lock itself fails (`lock_owner_changed`/`lock_cleanup`). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
+is killed, if the tmp buffer write fails (ENOSPC), or if releasing the platform lock itself fails (`lock_owner_changed`/`lock_cleanup`). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
 stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. A stopped or dead recorded PID does not authorize lock removal. Interrupted-install recovery uses a complete authenticated external
 `cfctl recover-install-lock`, then that source's single ordinary `uninstall.sh`, after separately approved inspection; see
 [recovery](../runbooks/live-first-rehearsal.md#stale-install-lock-recovery). Live workers or ambiguous/legacy ownership refuse. A "stopped owner counts as dead" lock watchdog was evaluated and

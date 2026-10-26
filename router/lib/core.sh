@@ -235,7 +235,7 @@ cf_runtime_prepare() {
 }
 cf_install_gate() {
     platform_transaction_gate "$1"
-    cf_output_begin || { cf_fail unsafe_output_buffer;return 1; }
+    cf_output_begin
     CF_INSTALL_AUTH=0
     if [ "$CF_LOCAL_TEST" = 1 ];then
         cf_install_lock=$CF_BASE/.couvrefeu-install.lock
@@ -372,8 +372,14 @@ cf_unlock() {
 # EXIT trap ends here, so later refusals and platform_fail lines are released first too. Nothing is
 # created before a lock is held: a refusal at admission leaves the fixture tree untouched. Residuals
 # (stderr, admission-time refusal lines): docs/contracts/tier1-rpc.md section 9.
+# Never a new dependency of enforcement: if the buffer cannot be made, warn and write directly.
 cf_output_begin() {
     [ "$CF_OUTPUT_WANTED" = 1 ] && [ "$CF_OUTPUT_HELD" != 1 ] || return 0
+    cf_output_open && return 0
+    CF_OUTPUT_WANTED=0
+    printf '%s\n' 'couvre-feu: warning: output buffer unavailable; writing output directly' >&2
+}
+cf_output_open() {
     cf_ob_parent=$CF_BASE/tmp
     if [ "$CF_LOCAL_TEST" = 1 ];then cf_ob_meta=$CF_OWNER:$(id -g):1777;else cf_ob_meta=0:0:1777;fi
     [ -d "$cf_ob_parent" ] && [ ! -L "$cf_ob_parent" ] && [ "$(stat -c '%u:%g:%a' "$cf_ob_parent" 2>/dev/null)" = "$cf_ob_meta" ] || return 1
