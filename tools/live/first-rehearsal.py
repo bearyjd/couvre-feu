@@ -34,6 +34,7 @@ SOURCE_PATHS = SOURCE_DIRS + (STRIPPER_PATH,)
 # Same module order as tools/freeze-router-release.py (a test compares the two).
 RELEASE_MODULES = ('core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'state.awk', 'rules.awk', 'json.awk',
                    'vendor-platform.sh', 'activity.sh')
+IDENTITY_FORMAT = 'couvrefeu-router-release-v2'
 BOUNDARY_PIN_FILES = ('install.sh', 'uninstall.sh', 'cfctl')
 # The router accepts exactly these manifest entries (platform-bootstrap.sh platform_external_closure).
 MANIFEST_FILES = ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope', 'lib/platform-bootstrap.sh',
@@ -311,37 +312,63 @@ def emitted_tree_sha256(tree):
                                   for rel, (mode, data) in sorted(tree.items())).encode()).hexdigest()
 
 
+def normalize_generated_field(data, path, field, value_pattern):
+    """Require a canonical assignment and forbid export/readonly declaration lines.
+
+    This is a generated-field declaration policy, not an arbitrary shell evaluator.
+    """
+    key = field.encode()
+    assignments = re.findall(rb'^[ \t]*' + key + rb'[ \t]*=.*$', data, flags=re.M)
+    declarations = re.findall(rb'^[ \t]*(?:export|readonly)[ \t]+[^\r\n]*\b' + key + rb'\b[^\r\n]*$', data, flags=re.M)
+    valid = re.findall(rb'^' + key + rb'=(' + value_pattern + rb')$', data, flags=re.M)
+    if len(assignments) != 1 or len(valid) != 1 or declarations:
+        raise Refusal(path + ': exactly one well-formed ' + field + ' assignment required')
+    return re.sub(rb'^' + key + rb'=.*$', key + b'=', data, flags=re.M)
+
+
 def verify_release_identity(shipped):
-    """Recompute CF_RELEASE_ID from the shipped bytes (same formula as tools/freeze-router-release.py) and the pins."""
+    """Independently verify version 2 identity and pins. Legacy identities cannot ship in new plans.
+
+    This host policy does not change router restoration of existing complete journals.
+    """
     try:
         pairs = [name + ':' + hashlib.sha256(shipped['router/lib/' + name]).hexdigest() for name in RELEASE_MODULES]
         bootstrap = shipped['router/lib/platform-bootstrap.sh']
-        cfctl = shipped['router/cfctl']
-        wrappers = [name + ':' + hashlib.sha256(shipped['router/' + name]).hexdigest() for name in ('cfctl-ssh', 'cfctl-scope')]
+        normalized = {name: normalize_generated_field(shipped['router/' + name], 'router/' + name,
+                      'CF_BOOTSTRAP_PIN', rb'[0-9a-f]{64}') for name in BOUNDARY_PIN_FILES}
+        blanked = normalize_generated_field(bootstrap, 'router/lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
+        module_pattern = b"'" + b' '.join(re.escape(name.encode()) + rb':[0-9a-f]{64}' for name in RELEASE_MODULES) + b"'"
+        normalized['lib/platform-bootstrap.sh'] = normalize_generated_field(
+            blanked, 'router/lib/platform-bootstrap.sh', 'CF_RELEASE_MODULES', module_pattern)
+        paths = ['lib/' + name for name in RELEASE_MODULES] + [
+            'cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh']
+        lines = [IDENTITY_FORMAT] + [name + ':' + hashlib.sha256(
+            normalized[name] if name in normalized else shipped['router/' + name]
+        ).hexdigest() for name in paths]
     except KeyError as error:
         raise Refusal(f'release identity input missing: {error.args[0]}') from None
-    if len(re.findall(rb'^CF_BOOTSTRAP_PIN=[0-9a-f]{64}$', cfctl, flags=re.M)) != 1 or cfctl.count(b'CF_BOOTSTRAP_PIN=') != 1:
-        raise Refusal('router/cfctl: exactly one well-formed CF_BOOTSTRAP_PIN line required')
-    blanked = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', cfctl, flags=re.M)
-    identity = hashlib.sha256(('\n'.join(pairs + ['cfctl:' + hashlib.sha256(blanked).hexdigest()] + wrappers)
-                               + '\n').encode()).hexdigest()
-    if identity != release_id(shipped):
-        raise Refusal('release id: CF_RELEASE_ID does not equal the id recomputed from the shipped bytes')
-    modules = re.findall(r"^CF_RELEASE_MODULES='([^']*)'$", bootstrap.decode('utf-8'), flags=re.M)
-    if modules != [' '.join(pairs)]:
-        raise Refusal('platform-bootstrap.sh: CF_RELEASE_MODULES does not match the shipped modules')
     pin = hashlib.sha256(bootstrap).hexdigest().encode()
     for name in BOUNDARY_PIN_FILES:
         if re.findall(rb'^CF_BOOTSTRAP_PIN=([0-9a-f]{64})$', shipped['router/' + name], flags=re.M) != [pin]:
             raise Refusal(f'router/{name}: CF_BOOTSTRAP_PIN does not equal the shipped platform-bootstrap.sh hash')
+    identity = hashlib.sha256(('\n'.join(lines) + '\n').encode()).hexdigest()
+    declared = release_id(shipped)
+    if identity != declared:
+        legacy_lines = pairs + ['cfctl:' + hashlib.sha256(normalized['cfctl']).hexdigest()] + [
+            name + ':' + hashlib.sha256(shipped['router/' + name]).hexdigest() for name in ('cfctl-ssh', 'cfctl-scope')]
+        legacy = hashlib.sha256(('\n'.join(legacy_lines) + '\n').encode()).hexdigest()
+        if declared == legacy:
+            raise Refusal('release id: legacy identity format refused for new live payloads; freeze with version 2')
+        raise Refusal('release id: CF_RELEASE_ID does not equal the version 2 id recomputed from the shipped bytes')
+    modules = re.findall(rb"^CF_RELEASE_MODULES='([^']*)'$", bootstrap, flags=re.M)
+    if modules != [' '.join(pairs).encode()]:
+        raise Refusal('platform-bootstrap.sh: CF_RELEASE_MODULES does not match the shipped modules')
 
 
 def release_id(blobs):
-    text = blobs['router/lib/platform-bootstrap.sh'].decode('utf-8')
-    found = re.findall(r'^CF_RELEASE_ID=([0-9a-f]{64})$', text, flags=re.M)
-    if len(found) != 1:
-        raise Refusal('release identity not found in platform-bootstrap.sh')
-    return found[0]
+    data = blobs['router/lib/platform-bootstrap.sh']
+    normalize_generated_field(data, 'router/lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
+    return re.search(rb'^CF_RELEASE_ID=([0-9a-f]{64})$', data, flags=re.M)[1].decode('ascii')
 
 
 def payload_mode(rel):

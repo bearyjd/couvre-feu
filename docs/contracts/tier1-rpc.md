@@ -346,23 +346,57 @@ old or the new complete file; a leftover candidate is swept under `cf_lock` and 
 Terminal and lock hazard (review S-M1): a write to a stopped or flow-controlled terminal blocks, and a write under a lock would hold
 `cf_lock` and the platform lock (and so every `rpc-sync`, cron `expire` and fw3-include `apply-fw`, which then fail with
 `locked`/`transaction_contention`). Solved: preview and commit output (and refusals under the lock, and the commit-audit warning on
-stderr) are buffered and written only after both locks are released; job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
+stderr) are buffered and written only after both locks are released. M4b generalizes this for EVERY `cfctl` command (`sync`,
+`rpc-*`, `pause`/`resume`, `expire`, `apply-fw`, `status`, scope verbs): from the first held lock (vendor admission's platform
+lock, otherwise the passed transaction gate, i.e. `cf_install_gate` before `cf_lock`; `router/cfctl:208`, `router/lib/core.sh:236-238`)
+stdout goes to an unlinked private file under the root-owned sticky `$CF_BASE/tmp` (`/tmp` on the device; `cf_output_open`, `core.sh:381-395`)
+(if it cannot be made, a stderr warning and the pre-M4b direct output: never a refusal), and only after `cf_lock`, the platform lock and the permanent transaction mutex
+(fd 9, closed, never `LOCK_UN`) are released is it written. Release order is `cf_lock`, then the platform lock, then the mutex
+(`cf_output_release`, `core.sh:398-402`); acquisition order is platform lock, mutex, `cf_lock`, so release is not the exact reverse (the same
+order as the pre-existing exit path). Every EXIT trap does the same, so later refusals and `platform_fail`
+JSON lines are also written lock-free. Nothing is created before admission and the transaction gate, so a refusal at admission leaves
+`$CF_BASE/tmp` untouched; under the strict profile the buffer is created right after the gate, before `cf_lock` (harmless: it holds no
+lock of its own). Install/uninstall output legitimately stays inside their
+transaction fence. Job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
 early block to exit; XON/XOFF is switched off on an output TTY (`stty` presence in the GL BusyBox build is UNVERIFIED-on-device; absence
 is tolerated). Residual, documented, not solved: (a) SIGSTOP cannot be ignored: only another root process can send it to this
-process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) a
-`platform_fail`/admission-deadline exit still writes one short line to stdout/stderr while a lock is held (the trap releases it right
-after; with `-ixon` and under 4 KiB of prior output this cannot block). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
-stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. Recovery for a wedged owner: kill the PID in `/etc/couvrefeu/runtime/lock/pid`; on a
-vendor profile, `cfctl recover-platform-lock` once that PID is gone. A "stopped owner counts as dead" lock watchdog was evaluated and
+process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) stderr is
+not buffered, and a refusal by admission or by the transaction gate itself (before the buffer exists, e.g. `transaction_contention`,
+`explicit_install_recovery_required`) still writes
+its one short stdout/stderr line while that lock is held (the trap
+releases it right after; with `-ixon` and under 4 KiB of prior output this cannot block). `recover-install-lock`
+(`router/cfctl:132-155`, line via `recover_install_lock`, `install-common.sh:~514`) and `recover-platform-lock` (`cfctl:164-170`) also print
+one line while holding the transaction mutex and are not routed through the buffer; they run inside the fence by design;
+(c) buffered stdout is lost if the process
+is killed, if the tmp buffer write fails (ENOSPC), or if releasing the platform lock itself fails (`lock_owner_changed`/`lock_cleanup`). A failed
+read of the buffer (`cf_or_text=.` on `cat` failure, `core.sh:404-405`) or ENOSPC on the buffer file can yield a truncated or empty reply while
+the command still exits with its own status (0 on success; `cf_output_release` returns the saved status). For `sync`/`rpc-sync` the policy is
+already committed by then. No stderr warning or nonzero exit is emitted today; adding one is a tracked follow-up;
+(d) BusyBox `timeout` is reported (not verified on the device) to leave a detached watcher grandchild that inherits fds above 2, including
+fd 9. `timeout -s KILL` calls made under the mutex (`platform_stat`, `platform-bootstrap.sh:506`; `vendor-platform.sh:8,83,145,272`) can then keep the
+flock alive up to about 1 s after fd 9 is closed, so a cron `expire` landing in that second can get `transaction_contention` (`flock -n`
+does not wait). The same window existed at process exit. Closing fd 9 for those children is a tracked follow-up and a device-verification item;
+(e) `CF_SCOPE_WARN` is written to stderr (`core.sh:703`) after `cf_lock` and the platform lock are released but while fd 9 is still held;
+a short line, unlikely to block, and stderr is not buffered. Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
+stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. A stopped or dead recorded PID does not authorize lock removal. Interrupted-install recovery uses a complete authenticated external
+`cfctl recover-install-lock`, then that source's single ordinary `uninstall.sh`, after separately approved inspection; see
+[recovery](../runbooks/live-first-rehearsal.md#stale-install-lock-recovery). Live workers or ambiguous/legacy ownership refuse. A "stopped owner counts as dead" lock watchdog was evaluated and
 rejected: it would break mutual exclusion when the owner is continued (two writers) and the fixture checkpoints that deliberately hold
 the lock stopped.
+
+Tracked follow-ups (output buffering, not yet done):
+- Full-pipe tests for `apply-fw`, `remove-fw`, `scope-add`/`scope-remove`, `rpc-activity` and `rpc-inventory`, a refusal under a lock, and a
+  HUP/TERM while blocked on output.
+- Close fd 9 for `timeout` children (residual d).
+- A stderr warning (and nonzero exit) on buffer read failure (residual c).
+- fd cleanup on early failure in `cf_output_open`; BusyBox ash `command exec` redirection-error behaviour is UNVERIFIED on the device.
 
 Exit status: 2 for `invalid_command`, 1 for every other refusal, on both the early (`cfctl`, pre-admission) and the core path.
 
 Refusal codes (JSON `{"ok":false,"errors":[code]}`): `invalid_command`, `scope_mac_not_canonical` (only lowercase colon form),
 `scope_mac_invalid` (multicast/zero), `scope_forced_command_refused` (`CF_SERVICE_FORCED_COMMAND` set; `cfctl-ssh` now exports it to its
 child), `scope_base_invalid`, `scope_tty_required`, `scope_confirmation_mismatch`, `scope_confirmation_required`, `scope_admin_invalid`,
-`scope_unscoped_install`, `inactive_generation` (not ready+complete), `installation_in_progress`, `locked`, `scope_base_conflict` (stale
+`scope_unscoped_install`, `inactive_generation` (not ready+complete; a `ready` journal with no `complete` is an interrupted installation and is refused earlier by the M4b transaction gate as `platform_admission_refused`, stderr `incomplete_installation`), `installation_in_progress`, `locked`, `scope_base_conflict` (stale
 `--base`), `scope_mac_is_ssh_client`, `scope_mac_protected`, `scope_no_evidence` (add only; remove works for an absent/rotated MAC),
 `scope_mac_present`, `scope_full` (256), `scope_mac_absent`, `scope_mac_in_floor` (needs a fresh install + rebind), `scope_mac_in_use` (a
 person record uses it), `scope_audit_unavailable`, `scope_mac_is_router_interface` (equals one of the router's own interface MACs,
@@ -408,3 +442,18 @@ the device)? Record the answer; until then the router audit line is UNVERIFIED-o
 leave IXON off for the session; (c) Ctrl-Z / Ctrl-S during `scope-preview` and during the confirmation prompt leave `rpc-status` usable.
 (d) every `/sys/class/net/*/address` on the GL device is readable and one line (a tunnel or cellular interface that is not
 would make every scope-add refuse with `scope_router_interfaces_unreadable`, fail closed).
+
+## Administrator install recovery boundary
+
+`cfctl recover-install-lock` is administrator-only and rejects service forced-command
+context. It is absent from the `cfctl-ssh` allow-list; M4b adds no service RPC verb,
+argument grammar, shell privilege or scope-administration capability. It must run
+from a complete independently authenticated external source, with fresh vendor
+attestation where selected, even when the installed recovery copy is absent/partial.
+It validates permanent kernel exclusion, boot/PID/starttime/token/mutex binding and
+immutable PREPARED before publishing the durable recovery-required fence. Runtime
+and fresh installation remain fenced until the single ordinary uninstaller retires
+owned transaction state; the permanent mutex inode remains. Cron/firewall callbacks
+use immutable generation-bound sources and reject stale generations. Ambiguous or
+production legacy state refuses; historical fixture recovery is data-only. Operator
+password login, full administrator shell/edit rights and PTY access remain available.

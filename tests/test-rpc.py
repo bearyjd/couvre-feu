@@ -640,10 +640,43 @@ class RpcTests(RpcCommon, unittest.TestCase):
                     self.assertIsNone(self.observe(request['operation_id'])['receipt'])
                     self.assertEqual(self.observe()['acceptedPolicy']['revision'], 0)
 
+    def _process_fd_targets(self, child):
+        pid = child.pid
+        # Every fd of every process in the paused command's session (the STOPped shell need
+        # not be pid itself); only a per-fd race is tolerated, a vanished command is not.
+        if not Path(f'/proc/{pid}').exists():
+            self.fail('paused request vanished before the mutex premise was checked')
+        sid = os.getsid(pid)
+        targets = set()
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                if os.getsid(int(proc.name)) != sid:
+                    continue
+                fds = list((proc / 'fd').iterdir())
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    info = fd.stat()
+                except OSError:
+                    continue
+                targets.add((info.st_dev, info.st_ino))
+        # Non-vacuous: the scan must see the command's own stdout pipe.
+        own = os.fstat(child.stdout.fileno())
+        self.assertIn((own.st_dev, own.st_ino), targets, 'fd scan saw none of the paused command')
+        return targets
+
     def test_delayed_prelock_request_cannot_apply_after_reinstall(self):
         request = self.request()
         child = self.stopped(request, 'before_lock')
         try:
+            # Premise: stdin is fully staged and the paused request holds no transaction mutex.
+            self.assertEqual([p.name for p in (self.f.root / 'tmp').iterdir() if p.name.startswith('couvrefeu-input.')], [])
+            mutex = (self.f.root / '.couvrefeu-mutex').stat()
+            held = self._process_fd_targets(child)
+            self.assertNotIn((mutex.st_dev, mutex.st_ino), held, 'paused pre-lock request holds the mutex')
             self.assertEqual(self.script('uninstall.sh').returncode, 0)
             self.install()
             before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
@@ -658,14 +691,36 @@ class RpcTests(RpcCommon, unittest.TestCase):
                 child.kill();child.communicate()
 
     def test_runtime_owner_blocks_uninstall_and_competing_rpc(self):
+        def raw_snapshot():
+            result = {}
+            for path in sorted(self.f.root.rglob('*')):
+                info = path.lstat()
+                data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
+                name = str(path.relative_to(self.f.root))
+                # A refused competitor stages stdin in a private mktemp tmp/couvrefeu-input.XXXXXX entry
+                # before admission and removes it; only the shared tmp directory's own mtime
+                # may change. Any leftover/created/removed entry still differs by key below.
+                mtime = None if name == 'tmp' else info.st_mtime_ns
+                result[name] = (info.st_mode, info.st_uid, info.st_gid,
+                                info.st_ino, info.st_nlink, info.st_size, mtime, data)
+            return result
+
         child = self.stopped(self.request(), 'before_write')
         try:
+            self.assertEqual(int((self.f.root / 'etc/couvrefeu/runtime/lock/pid').read_text()), child.pid)
+            held = os.stat(f'/proc/{child.pid}/fd/9')
+            mutex = (self.f.root / '.couvrefeu-mutex').stat()
+            self.assertEqual((held.st_dev, held.st_ino), (mutex.st_dev, mutex.st_ino))
+            held_raw = raw_snapshot()
             before = self.f.durable_snapshot()
             result = self.script('uninstall.sh')
             self.assertNotEqual(result.returncode, 0)
             result = self.f.run('rpc-sync', document=self.request('competitor'))
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('locked', json.loads(result.stdout)['errors'])
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {'ok': False, 'errors': ['platform_admission_refused']})
+            self.assertIn('platform transaction_contention', result.stderr)
+            self.assertEqual(raw_snapshot(), held_raw)
             self.assertEqual(self.f.durable_snapshot(), before)
             child.send_signal(signal.SIGCONT)
             stdout, stderr = child.communicate(timeout=60)

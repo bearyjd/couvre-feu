@@ -317,12 +317,15 @@ class EmittedReleaseTreeTests(unittest.TestCase):
         modules = re.search(r"^CF_RELEASE_MODULES='(.*)'$", text, re.M).group(1).split()
         self.assertTrue(all(pair.split(':')[0].endswith(('.sh', '.awk')) for pair in modules), modules)
         self.assertEqual(self.result.stdout.strip(), release_id)
-        # The id is the digest of the module pins plus cfctl (pin line blanked), cfctl-ssh and cfctl-scope as emitted.
-        entries = list(modules)
-        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope'):
+        # Independent version 2 oracle: explicit domain and path order, normalized generated fields.
+        entries = ['couvrefeu-router-release-v2'] + ['lib/' + pair for pair in modules]
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
             data = (self.out / name).read_bytes()
-            if name == 'cfctl':
+            if name in ('cfctl', 'install.sh', 'uninstall.sh'):
                 data = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data, flags=re.M)
+            elif name == 'lib/platform-bootstrap.sh':
+                data = re.sub(rb'^CF_RELEASE_ID=.*$', b'CF_RELEASE_ID=', data, flags=re.M)
+                data = re.sub(rb'^CF_RELEASE_MODULES=.*$', b'CF_RELEASE_MODULES=', data, flags=re.M)
             entries.append(name + ':' + hashlib.sha256(data).hexdigest())
         self.assertEqual(hashlib.sha256(('\n'.join(entries) + '\n').encode()).hexdigest(), release_id)
 
@@ -446,12 +449,80 @@ class FreezeScriptRefusalTests(unittest.TestCase):
 
     def test_cfctl_needs_exactly_one_bootstrap_pin_line(self):
         for label, edit in (('duplicate', lambda s: s.append('router/cfctl', 'CF_BOOTSTRAP_PIN=' + '0' * 64 + '\n')),
-                            ('malformed', lambda s: s.replace('router/cfctl', b'CF_BOOTSTRAP_PIN=c', b'CF_BOOTSTRAP_PIN=Z')),
+                            ('malformed', lambda s: s.replace('router/cfctl', b'CF_BOOTSTRAP_PIN=', b'CF_BOOTSTRAP_PIN=Z')),
                             ('missing', lambda s: s.replace('router/cfctl', b'\nCF_BOOTSTRAP_PIN=', b'\nCF_BOOTSTRAP_PINX='))):
             with self.subTest(label), ScratchRepo() as scratch:
                 edit(scratch)
                 out = scratch.tmp_path() / 'tree'
                 self.assert_refused(scratch.run('--emit', str(out)), 'CF_BOOTSTRAP_PIN', out)
+
+
+class VersionedReleaseIdentityTests(unittest.TestCase):
+    def test_valid_generated_values_are_normalized_and_freezing_is_idempotent(self):
+        with ScratchRepo() as scratch:
+            first = scratch.run()
+            self.assertEqual(first.returncode, 0, first.stderr)
+            frozen = {str(p): p.read_bytes() for p in (scratch.root / 'router').rglob('*') if p.is_file()}
+            for rel in ('install.sh', 'uninstall.sh', 'cfctl'):
+                path = scratch.root / 'router' / rel
+                path.write_bytes(re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=' + b'0' * 64, path.read_bytes()))
+            path = scratch.root / 'router/lib/platform-bootstrap.sh'
+            data = re.sub(rb'(?m)^CF_RELEASE_ID=.*$', b'CF_RELEASE_ID=' + b'1' * 64, path.read_bytes())
+            data = re.sub(rb'(?<=:)[0-9a-f]{64}', b'2' * 64, data, count=9)
+            path.write_bytes(data)
+            second = scratch.run()
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(second.stdout, first.stdout)
+            self.assertEqual(frozen, {str(p): p.read_bytes() for p in (scratch.root / 'router').rglob('*') if p.is_file()})
+            self.assertEqual(scratch.run('--check').returncode, 0)
+
+    def test_every_shipped_source_changes_identity(self):
+        with ScratchRepo() as scratch:
+            first = scratch.run()
+            self.assertEqual(first.returncode, 0, first.stderr)
+            baseline = first.stdout.strip()
+            paths = ['install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope']
+            paths += [str(path.relative_to(scratch.root / 'router'))
+                      for path in sorted((scratch.root / 'router/lib').iterdir()) if path.is_file()]
+            for rel in paths:
+                with self.subTest(rel=rel):
+                    scratch.append('router/' + rel, '# identity perturbation\n')
+                    changed = scratch.run()
+                    self.assertEqual(changed.returncode, 0, changed.stderr)
+                    self.assertNotEqual(changed.stdout.strip(), baseline, rel)
+                    scratch.restore('router/' + rel)
+                    self.assertEqual(scratch.run().stdout.strip(), baseline)
+
+    def test_generated_fields_are_strict_before_any_write(self):
+        fields = [(name, 'CF_BOOTSTRAP_PIN') for name in ('install.sh', 'uninstall.sh', 'cfctl')]
+        fields += [('lib/platform-bootstrap.sh', field) for field in ('CF_RELEASE_ID', 'CF_RELEASE_MODULES')]
+        for rel, field in fields:
+            for defect in ('duplicate', 'missing', 'malformed', 'malformed-duplicate',
+                           'readonly ', 'export ', 'readonly -- ', 'export -- ',
+                           'readonly OTHER=value ', 'export OTHER=value ', 'readonly "', "export '"):
+                with self.subTest(rel=rel, field=field, defect=defect), ScratchRepo() as scratch:
+                    path = scratch.root / 'router' / rel
+                    original = path.read_bytes()
+                    match = re.search(rb'(?m)^' + field.encode() + rb'=.*$', original)
+                    self.assertIsNotNone(match)
+                    if defect == 'duplicate':
+                        changed = original + match[0] + b'\n'
+                    elif defect == 'missing':
+                        changed = original[:match.start()] + original[match.end() + 1:]
+                    elif defect == 'malformed':
+                        changed = original.replace(match[0], field.encode() + b'=invalid', 1)
+                    elif defect == 'malformed-duplicate':
+                        changed = original + field.encode() + b'=invalid\n'
+                    else:
+                        suffix = defect[-1] if defect[-1] in ('"', "'") else ''
+                        changed = original + (defect + field + '=invalid' + suffix + '\n').encode()
+                    path.write_bytes(changed)
+                    before = {str(p): p.read_bytes() for p in (scratch.root / 'router').rglob('*') if p.is_file()}
+                    result = scratch.run()
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn('refused:', result.stderr)
+                    self.assertIn(field, result.stderr)
+                    self.assertEqual(before, {str(p): p.read_bytes() for p in (scratch.root / 'router').rglob('*') if p.is_file()})
 
 
 if __name__ == '__main__':

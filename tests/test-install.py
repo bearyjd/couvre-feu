@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Filesystem recovery fixtures; never invokes router/system backends."""
 import atexit
+import contextlib
 import hashlib
 import os
+import re
+import selectors
 from pathlib import Path
 import shutil
 import shlex
@@ -54,6 +57,19 @@ def exact_signature(path):
     return f'{signature(path)}:{mtime(path)}'
 
 
+def fixture_move_command():
+    """Actual utility behind PATH fault interceptors; never bypass the interceptor."""
+    configured = shlex.split(os.environ.get('CF_TEST_MV', ''))
+    if configured:
+        if len(configured) != 2 or configured[1] != 'mv' or not Path(configured[0]).is_absolute():
+            raise ValueError('CF_TEST_MV must select an absolute BusyBox binary and mv')
+        return ' '.join(map(shlex.quote, configured))
+    shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+    if len(shell) == 2 and shell[1] == 'ash':
+        return shlex.quote(shutil.which(shell[0]) or shell[0]) + ' mv'
+    return shlex.quote(shutil.which('mv'))
+
+
 # Nonzero sub-microsecond digits: second and microsecond truncation both lose data.
 FRACTIONAL = 1_234_567_890_123_456_789
 EXISTING_ORIGINALS = {'etc/config/firewall': b"config zone 'wan'\n option input 'DROP'\n",
@@ -61,12 +77,59 @@ EXISTING_ORIGINALS = {'etc/config/firewall': b"config zone 'wan'\n option input 
                       'etc/crontabs/root': b'5 * * * * vendor-check\n'}
 
 
-def full_snapshot(root):
+def completed_owner_snapshot(path):
+    """Only orderly complete->complete provenance may change on refusal.
+
+    Recovery/adversarial callers use full_snapshot's raw default. Token,
+    release, profile, baseline and mutex binding are always part of the oracle.
+    """
+    guards = (path.parent / '.couvrefeu-install.lock', path.parent / '.couvrefeu-platform.lock',
+              path.parent / 'tmp/couvrefeu-platform.lock')
+    if any(guard.exists() or guard.is_symlink() for guard in guards):
+        return None
+    if path.is_symlink() or not path.is_file():
+        return None
+    info = path.stat()
+    if (info.st_mode & 0o7777, info.st_uid, info.st_gid, info.st_nlink) != (0o600, os.getuid(), os.getgid(), 1):
+        return None
+    try:
+        content = path.read_text()
+    except (OSError, UnicodeError):
+        return None
+    fields = content.splitlines()
+    if len(fields) != 10 or content != '\n'.join(fields) + '\n':
+        return None
+    if fields[:2] != ['CFTRANSACTION 1', 'complete']:
+        return None
+    if not re.fullmatch(r'[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', fields[2]):
+        return None
+    if not re.fullmatch(r'[1-9][0-9]{0,9}', fields[3]) or int(fields[3]) <= 1:
+        return None
+    if not re.fullmatch(r'[0-9]{1,20}', fields[4]):
+        return None
+    if any(not re.fullmatch(r'[0-9a-f]{64}', fields[i]) for i in (5, 6)):
+        return None
+    if fields[7] not in ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1'):
+        return None
+    if fields[8] != 'none' and not re.fullmatch(r'[0-9a-f]{64}', fields[8]):
+        return None
+    if not re.fullmatch(r'[0-9]{1,20}:[0-9]{1,20}', fields[9]):
+        return None
+    return ('complete-provenance', tuple(fields[i] for i in (0, 1, 5, 6, 7, 8, 9)),
+            info.st_mode & 0o7777, info.st_uid, info.st_gid, info.st_nlink)
+
+
+def full_snapshot(root, *, completed_provenance=False):
     """Every path, with file bytes, exact metadata and inode; directories by mode/owner."""
     result = {}
     for p in sorted(root.rglob('*')):
         st = p.lstat()
         rel = str(p.relative_to(root))
+        if completed_provenance and rel == '.couvrefeu-transaction':
+            owner = completed_owner_snapshot(p)
+            if owner is not None:
+                result[rel] = owner
+                continue
         if p.is_symlink():
             result[rel] = ('symlink', os.readlink(p), st.st_uid, st.st_gid)
         elif p.is_dir():
@@ -80,6 +143,8 @@ class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-install-')
         self.root = Path(self.tmp.name)
+        # Permanent exclusion infrastructure survives ordinary uninstall.
+        (self.root / '.couvrefeu-mutex').touch(mode=0o600)
         self.env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root))
         self.env.pop('SSH_CONNECTION', None)
         self.env.pop('SSH_CLIENT', None)
@@ -94,6 +159,13 @@ class RecoveryTests(unittest.TestCase):
     def snapshot(self):
         result = {}
         for p in self.root.rglob('*'):
+            if p == self.root / '.couvrefeu-mutex':
+                continue
+            if p == self.root / '.couvrefeu-transaction':
+                owner = completed_owner_snapshot(p)
+                if owner is not None:
+                    result[str(p.relative_to(self.root))] = owner
+                    continue
             if p.is_symlink():
                 st = p.lstat()
                 result[str(p.relative_to(self.root))] = (
@@ -164,7 +236,7 @@ class RecoveryTests(unittest.TestCase):
         self.make_journal(absent=True)
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(list(self.root.iterdir()), [self.root / '.couvrefeu-mutex'])
 
     def test_interrupted_install_restored(self):
         original = self.make_journal(partial=True)
@@ -271,7 +343,7 @@ class LiveScopeRecoveryTests(unittest.TestCase):
         self.set_live(self.FLOOR + '02:00:00:00:00:02\n')
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(list(self.root.iterdir()), [self.root / '.couvrefeu-mutex'])
 
     def test_stray_scope_snapshot_is_owned_runtime_and_removed(self):
         self.journal(absent=True)
@@ -279,7 +351,7 @@ class LiveScopeRecoveryTests(unittest.TestCase):
         self.runtime_file('.scope.123')
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(list(self.root.iterdir()), [self.root / '.couvrefeu-mutex'])
 
     def test_non_numeric_scope_snapshot_name_is_still_unowned(self):
         self.journal(absent=True)
@@ -324,10 +396,11 @@ NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvref
 
 class InstallerTests(unittest.TestCase):
     """Complete staged/install/resume/uninstall transactions with fake sources."""
+    PATH_MV_FAULTS = True
     def run_script(self, name, *args):
         if name == 'lib/install-common.sh':
             lib = REPO / 'router/lib'
-            script = f'. "{lib}/platform-bootstrap.sh"; CF_PLATFORM_ADMITTED=1; . "{lib}/install-common.sh"'
+            script = f'. "{lib}/platform-bootstrap.sh"; CF_PLATFORM_ADMITTED=1; CF_PLATFORM_LIB="{lib}"; . "{lib}/install-common.sh"'
             return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), '-c', script, 'fixture-journal', *args], env=self.env, capture_output=True, text=True)
         return RecoveryTests.run_script(self, name, *args)
     snapshot = RecoveryTests.snapshot
@@ -335,6 +408,11 @@ class InstallerTests(unittest.TestCase):
 
     def setUp(self):
         RecoveryTests.setUp(self)
+        # This suite injects faults through PATH. Its wrappers still dispatch
+        # to the configured actual BusyBox applet, without a shell mv function
+        # intercepting the operation before the wrapper can observe it.
+        if getattr(self, 'PATH_MV_FAULTS', False):
+            self.env.pop('CF_TEST_MV', None)
         logs = tempfile.TemporaryDirectory(prefix='couvre-feu-cp-log-')
         self.addCleanup(logs.cleanup)
         self.cp_log = Path(logs.name) / 'cp-p.log'
@@ -538,24 +616,40 @@ esac
         result = self.install('--activate')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(message, result.stderr)
-        self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assertFalse(release.exists())
         self.assertFalse((self.root / 'etc/couvrefeu/backup').exists())
         self.assertFalse((self.root / '.couvrefeu-install.lock').exists())
         self.assertEqual(list(self.root.glob('.couvrefeu-stage.*')), [])
         return result
 
-    def test_preserve_failure_leaves_root_identical(self):
+    def test_preserve_failure_retains_bound_proof_then_uninstalls(self):
         release = self.enable_release()
-        self.write_originals()
+        originals = self.write_originals()
         (self.root / 'etc/couvrefeu').mkdir(mode=0o750)
         (self.root / 'etc/couvrefeu').chmod(0o750)
-        # Fail on the last existing original: earlier recovery copies are rolled back.
+        # Recovery copies roll back; immutable bound provenance remains visible.
         self.copy_fail_tool('etc_crontabs_root.copy')
-        before = full_snapshot(self.root)
-        result = self.assert_refused_identically(before, release, 'cannot copy original for manual recovery: etc/crontabs/root; no installation made')
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('cannot copy original for manual recovery: etc/crontabs/root', result.stderr)
+        self.assertIn('recovery required', result.stderr)
         self.assertIn('No space left on device', result.stderr)
         self.assertTrue(self.cp_log.read_text().strip())
+        self.assertEqual(self.originals_state(), originals)
+        self.assertEqual((self.root / 'etc/couvrefeu').stat().st_mode & 0o7777, 0o750)
+        self.assertFalse(release.exists())
+        self.assertFalse((self.root / 'etc/couvrefeu/backup').exists())
+        self.assertTrue((self.root / '.couvrefeu-prepared/manifest').is_file())
+        owner = (self.root / '.couvrefeu-transaction').read_text().splitlines()
+        self.assertNotEqual(owner[8], 'none')
+        (self.root / 'bin/cp').unlink()
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.originals_state(), originals)
+        self.assertEqual((self.root / 'etc/couvrefeu').stat().st_mode & 0o7777, 0o750)
+        self.assertFalse((self.root / '.couvrefeu-prepared').exists())
+        self.assertFalse((self.root / '.couvrefeu-transaction').exists())
 
     def test_truncating_touch_is_never_invoked(self):
         # The live refusal (BusyBox 1.33.2 touch -r truncates) is irrelevant:
@@ -611,13 +705,13 @@ esac
                     path.write_text(tool[1])
                     path.chmod(0o700)
                 self.env.update(env)
-                before = full_snapshot(self.root)
+                before = full_snapshot(self.root, completed_provenance=True)
                 self.assert_refused_identically(before, release, message)
                 if temp:
                     result = self.run_script('uninstall.sh')
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('No recorded installation; no changes made.', result.stdout)
-                    self.assertEqual(full_snapshot(self.root), before)
+                    self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
                     temp.unlink()
                 for variable in env:
                     self.env.pop(variable)
@@ -646,14 +740,14 @@ esac
         self.assertFalse((backup / 'complete').exists())
         self.assertEqual(target.stat().st_ino, inode)
         self.assertEqual(target.read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'] + b'# in-place append\n')
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         for rel, content in EXISTING_ORIGINALS.items():
             self.assertEqual((backup / (rel.replace('/', '_') + '.copy')).read_bytes(), content)
         for retry in ('install.sh', 'uninstall.sh'):
             with self.subTest(retry=retry):
                 result = self.install('--activate') if retry == 'install.sh' else self.run_script(retry)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(full_snapshot(self.root), before)
+                self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assertEqual((backup / 'etc_config_firewall.copy').read_bytes(), EXISTING_ORIGINALS['etc/config/firewall'])
 
     def test_in_place_append_while_copying_original_refuses_before_ready(self):
@@ -691,12 +785,12 @@ esac
         self.assertFalse((recovery / 'etc_config_firewall.original').exists())
         with target.open('ab') as stream:
             stream.write(b'# in-place append\n')
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         for _ in range(2):
             result = self.run_script('uninstall.sh')
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('drift at /etc/config/firewall', result.stderr)
-            self.assertEqual(full_snapshot(self.root), before)
+            self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
         for rel, content in EXISTING_ORIGINALS.items():
             self.assertEqual((recovery / (rel.replace('/', '_') + '.copy')).read_bytes(), content)
@@ -724,13 +818,13 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         recorded = self.root / 'etc/couvrefeu/backup/etc_config_firewall.original'
         self.substitute_original(recorded.stat().st_mtime_ns // 1000 * 1000)
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         for script in ('uninstall.sh', 'install.sh'):
             with self.subTest(script=script):
                 result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('corrupt original backup mtime: etc/config/firewall', result.stderr)
-                self.assertEqual(full_snapshot(self.root), before)
+                self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assertEqual((self.root / 'etc/couvrefeu/backup/etc_config_firewall.copy').read_bytes(),
                          EXISTING_ORIGINALS['etc/config/firewall'])
 
@@ -743,7 +837,7 @@ esac
         wrapper.write_text('#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = "%d %m" ]; then shift 2; for p do echo "19 ?"; done; exit 0; fi\n'
                            f'exec {shlex.quote(shutil.which("stat"))} "$@"\n')
         wrapper.chmod(0o700)
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         self.assert_refused_identically(
             before, release, 'original, journal and recovery journal are not on one filesystem: /etc/config/firewall; no installation made')
         self.assert_no_touch()
@@ -756,7 +850,7 @@ esac
         flag = self.root / 'tamper-once'
         flag.touch()
         wrapper = self.root / 'bin/mv'
-        wrapper.write_text(f'#!/bin/sh\n{shlex.quote(shutil.which("mv"))} "$@" || exit\n'
+        wrapper.write_text(f'#!/bin/sh\n{fixture_move_command()} "$@" || exit\n'
                            f'case "$*" in *.couvrefeu-tmp" "{target}) ;; *) exit 0;; esac\n'
                            f'if [ -f {shlex.quote(str(flag))} ]; then rm -f {shlex.quote(str(flag))}; printf "#\\n" >> {shlex.quote(str(target))}; fi\n')
         wrapper.chmod(0o700)
@@ -767,11 +861,11 @@ esac
         self.assertFalse((backup / 'complete').exists())
         self.assertEqual(exact_signature(backup / 'etc_config_firewall.original'), originals['etc/config/firewall'])
         # The changed path is drift: uninstall refuses and keeps everything.
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('drift at /etc/config/firewall', result.stderr)
-        self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assert_no_touch()
 
     def test_inexact_journal_original_after_rename_refuses_and_rolls_back(self):
@@ -786,7 +880,7 @@ esac
                 alter = ({'mtime': f'{shlex.quote(shutil.which("touch"))} -m -d @1234567890 "$2"',
                           'bytes': 'printf x >> "$2"'})[change]
                 wrapper = self.root / 'bin/mv'
-                wrapper.write_text(f'#!/bin/sh\n{shlex.quote(shutil.which("mv"))} "$@" || exit\n'
+                wrapper.write_text(f'#!/bin/sh\n{fixture_move_command()} "$@" || exit\n'
                                    f'case "$1" in {target}) case "$2" in *.original) {alter};; esac;; esac\n')
                 wrapper.chmod(0o700)
                 result = self.install('--activate')
@@ -811,13 +905,13 @@ esac
         original.write_bytes(b"config zone 'wan'\n option input 'ACCEPT'\n")
         os.utime(original, ns=(stamp, stamp))
         installed = exact_signature(self.root / 'etc/config/firewall')
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         for script in ('uninstall.sh', 'install.sh'):
             with self.subTest(script=script):
                 result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('corrupt original backup: etc/config/firewall', result.stderr)
-                self.assertEqual(full_snapshot(self.root), before)
+                self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assertEqual(exact_signature(self.root / 'etc/config/firewall'), installed)
         self.assertEqual((self.root / 'etc/couvrefeu/backup/etc_config_firewall.copy').read_bytes(),
                          EXISTING_ORIGINALS['etc/config/firewall'])
@@ -837,10 +931,11 @@ esac
         self.assertEqual(self.originals_state(), originals)
 
     def kill_lock(self):
-        # A SIGKILLed transaction cannot run its trap; production /tmp is cleared on reboot.
-        shutil.rmtree(self.root / '.couvrefeu-install.lock')
+        # Historical helper name: recovery now uses only the public interface.
+        result = self.run_script('cfctl', 'recover-install-lock')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_crash_after_link_before_ready_refuses_with_originals_in_place(self):
+    def test_crash_after_link_before_ready_recovers_with_originals_in_place(self):
         originals = self.write_originals()
         self.env['CF_TEST_INSTALL_CRASH_AT'] = 'linked'
         result = self.install('--activate')
@@ -850,11 +945,11 @@ esac
         backup = self.root / 'etc/couvrefeu/backup'
         self.assertFalse((backup / 'ready').exists())
         self.assertEqual(self.originals_state(), originals)
-        for script in ('install.sh', 'uninstall.sh'):
-            result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('incomplete backup', result.stderr)
-            self.assertEqual(self.originals_state(), originals)
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.originals_state(), originals)
 
     def test_crash_after_ready_before_install_rename_recovers(self):
         for resume in (False, True):
@@ -866,13 +961,11 @@ esac
                 self.assertNotEqual(result.returncode, 0)
                 self.env.pop('CF_TEST_INSTALL_CRASH_AT')
                 self.kill_lock()
-                for stage in self.root.glob('.couvrefeu-stage.*'):
-                    shutil.rmtree(stage)
                 # Targets were never renamed: they still are the journal links.
                 self.assertEqual(self.originals_state(), originals)
                 if resume:
                     result = self.install('--activate')
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
                 result = self.run_script('uninstall.sh')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.snapshot(), before)
@@ -907,11 +1000,11 @@ esac
         target = self.root / 'etc/config/firewall'
         with target.open('ab') as stream:
             stream.write(b'# drift\n')
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('drift at /etc/config/firewall', result.stderr)
-        self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         original = self.root / 'etc/couvrefeu/backup/etc_config_firewall.original'
         self.assertEqual(exact_signature(original), originals['etc/config/firewall'])
 
@@ -930,7 +1023,7 @@ esac
         target.write_bytes(b'replacement\n')
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('original backup is not restored at /etc/config/firewall', result.stderr)
+        self.assertIn('retirement original drift: etc/config/firewall; preserved', result.stderr)
         # The original was renamed back by the completed restore; the journal
         # and its manual recovery copy are kept.
         recovery = self.root / '.couvrefeu-recovery'
@@ -951,7 +1044,7 @@ esac
         # A rename that cannot happen (as EXDEV would) restores nothing.
         wrapper = self.root / 'bin/mv'
         wrapper.write_text('#!/bin/sh\ncase "$*" in *.original" "*) printf "mv: Invalid cross-device link\\n" >&2; exit 1;; esac\n'
-                           f'exec {shlex.quote(shutil.which("mv"))} "$@"\n')
+                           f'exec {fixture_move_command()} "$@"\n')
         wrapper.chmod(0o700)
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
@@ -1284,8 +1377,252 @@ exec ''' + shlex.quote(real_hash) + ''' "$@"
             process.communicate()
 
 
+class SourceClosureBeforeAdmissionTests(unittest.TestCase):
+    def test_complete_entry_closure_precedes_persistent_admission(self):
+        for entry in ('install.sh', 'uninstall.sh'):
+            for tamper in (None, entry, 'release.sha256'):
+                with self.subTest(entry=entry, tamper=tamper), tempfile.TemporaryDirectory(prefix='couvre-feu-source-closure-') as tmp:
+                    root = Path(tmp)
+                    tree = root / 'release'
+                    shutil.copytree(emitted_router(), tree)
+                    if tamper is not None:
+                        (tree / tamper).write_bytes((tree / tamper).read_bytes() + b'# changed closure\n')
+                    marker = root / 'persistent-admission-entered'
+                    # This isolated function harness stubs the FIRST persistent
+                    # write, so it never runs a production transaction on /etc.
+                    script = (f'. {shlex.quote(str(tree / "lib/platform-bootstrap.sh"))}; '
+                              f'ACTIVATE=1; CF_PLATFORM_OWNER={os.getuid()}:{os.getgid()}; '
+                              'platform_service_sources() { :; }; '
+                              'platform_transaction_begin() { printf entered > '
+                              + shlex.quote(str(marker)) + '; exit 99; }; '
+                              + 'platform_admit strict ' + shlex.quote(str(root)) + ' '
+                              + shlex.quote(str(tree / 'lib')))
+                    environment = dict(os.environ, CF_TEST_MODE='0')
+                    environment.pop('CF_ROOT', None)
+                    result = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')),
+                                             '-c', script, str(root / entry)], env=environment,
+                                            capture_output=True, text=True, timeout=15)
+                    if tamper is None:
+                        self.assertTrue(marker.exists(), result.stdout + result.stderr)
+                        self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
+                    else:
+                        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class TransactionEntropyTests(unittest.TestCase):
+    setUp = InstallerTests.setUp
+    tearDown = InstallerTests.tearDown
+    run_script = InstallerTests.run_script
+    install = InstallerTests.install
+    write_originals = InstallerTests.write_originals
+    originals_state = InstallerTests.originals_state
+
+    def entropy_reader(self, output, status):
+        original = shutil.which('od')
+        wrapper = self.root / 'bin/od'
+        wrapper.write_text('#!/bin/sh\n'
+                           + 'if [ "$*" = "-An -N32 -tx1 -v /dev/urandom" ]; then\n'
+                           + 'printf od > "$CF_ROOT/entropy-reader-called"\n'
+                           + 'printf "%s\\n" ' + shlex.quote(output) + '\n'
+                           + 'exit ' + str(status) + '\nfi\n'
+                           + 'exec ' + shlex.quote(original) + ' "$@"\n')
+        wrapper.chmod(0o700)
+        original_dd = shutil.which('dd')
+        dd_wrapper = self.root / 'bin/dd'
+        dd_wrapper.write_text('#!/bin/sh\n'
+                              + 'case "$*" in "if=/dev/urandom bs=32 count=1")\n'
+                              + 'printf dd > "$CF_ROOT/entropy-reader-called"\n'
+                              + 'printf "%s" ' + shlex.quote('x' * (len(output) // 2)) + '\n'
+                              + 'exit ' + str(status) + ';;\nesac\n'
+                              + 'exec ' + shlex.quote(original_dd) + ' "$@"\n')
+        dd_wrapper.chmod(0o700)
+
+    def assert_entropy_refusal(self, output, status):
+        originals = self.write_originals()
+        self.entropy_reader(output, status)
+        result = self.install('--activate')
+        self.assertTrue((self.root / 'entropy-reader-called').is_file())
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('entropy', result.stderr)
+        self.assertEqual(self.originals_state(), originals)
+        for name in ('.couvrefeu-transaction', '.couvrefeu-prepared', 'etc/couvrefeu/backup'):
+            self.assertFalse((self.root / name).exists(), name)
+
+    def test_failed_entropy_reader_is_refused_even_with_full_output(self):
+        self.assert_entropy_refusal('ab' * 32, 7)
+
+    def test_short_entropy_reader_is_refused_even_with_success_status(self):
+        self.assert_entropy_refusal('ab' * 31, 0)
+
+    def test_empty_entropy_reader_is_refused(self):
+        self.assert_entropy_refusal('', 0)
+
+    def test_nonhex_entropy_reader_is_refused(self):
+        self.assert_entropy_refusal('zz' * 32, 0)
+
+    def test_actual_busybox_32_byte_entropy_encoding_succeeds(self):
+        busybox = shutil.which('busybox')
+        self.assertIsNotNone(busybox, 'BusyBox is a mandatory recovery primitive')
+        wrapper = self.root / 'bin/od'
+        wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(busybox) + ' od "$@"\n')
+        wrapper.chmod(0o700)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        token = (self.root / '.couvrefeu-transaction').read_text().splitlines()[5]
+        self.assertRegex(token, r'^[0-9a-f]{64}$')
+
+
+class CompletedOwnerOracleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-owner-oracle-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.owner = self.root / '.couvrefeu-transaction'
+        self.fields = ['CFTRANSACTION 1', 'complete', '01234567-0123-0123-0123-0123456789ab',
+                       '123', '456', 'a' * 64, 'b' * 64, 'strict', 'c' * 64, '1:42']
+        self.write_owner(self.fields)
+
+    def write_owner(self, fields):
+        self.owner.write_text('\n'.join(fields) + '\n')
+        self.owner.chmod(0o600)
+
+    def test_only_complete_provenance_identity_is_normalized(self):
+        before = full_snapshot(self.root, completed_provenance=True)
+        raw = full_snapshot(self.root)
+        changed = self.fields.copy()
+        changed[2:5] = ['abcdef01-abcd-abcd-abcd-abcdef012345', '456', '789']
+        self.write_owner(changed)
+        self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
+        self.assertNotEqual(full_snapshot(self.root), raw)
+
+    def test_binding_fence_and_journal_mutations_remain_visible(self):
+        for field in (5, 6, 8, 9):
+            with self.subTest(field=field):
+                self.write_owner(self.fields)
+                before = full_snapshot(self.root, completed_provenance=True)
+                changed = self.fields.copy()
+                changed[field] = '2:43' if field == 9 else 'd' * 64
+                self.write_owner(changed)
+                self.assertNotEqual(full_snapshot(self.root, completed_provenance=True), before)
+        self.write_owner(self.fields)
+        journal = self.root / 'journal'
+        journal.mkdir()
+        ready = journal / 'ready'
+        ready.write_text('1\n')
+        before = full_snapshot(self.root, completed_provenance=True)
+        ready.write_text('0\n')
+        self.assertNotEqual(full_snapshot(self.root, completed_provenance=True), before)
+        before = full_snapshot(self.root, completed_provenance=True)
+        (self.root / '.couvrefeu-recovery-required').write_text('a' * 64 + '\n')
+        self.assertNotEqual(full_snapshot(self.root, completed_provenance=True), before)
+
+    def test_active_recovered_and_foreign_owner_identity_remain_raw(self):
+        for state in ('active', 'recovered', 'foreign'):
+            with self.subTest(state=state):
+                changed = self.fields.copy()
+                changed[1] = state
+                self.write_owner(changed)
+                self.assertIsNone(completed_owner_snapshot(self.owner))
+                before = full_snapshot(self.root, completed_provenance=True)
+                changed[3] = '987'
+                self.write_owner(changed)
+                self.assertNotEqual(full_snapshot(self.root, completed_provenance=True), before)
+
+    def test_complete_owner_with_surviving_compatibility_guard_remains_raw(self):
+        for name in ('.couvrefeu-install.lock', '.couvrefeu-platform.lock', 'tmp/couvrefeu-platform.lock'):
+            with self.subTest(guard=name):
+                guard = self.root / name
+                guard.parent.mkdir(exist_ok=True)
+                guard.mkdir()
+                self.write_owner(self.fields)
+                self.assertIsNone(completed_owner_snapshot(self.owner))
+                before = full_snapshot(self.root, completed_provenance=True)
+                changed = self.fields.copy()
+                changed[3] = '987'
+                self.write_owner(changed)
+                self.assertNotEqual(full_snapshot(self.root, completed_provenance=True), before)
+                guard.rmdir()
+
+
+class KilledInstallRecoveryTests(unittest.TestCase):
+    """Public administrator recovery, without deleting locks or stage evidence."""
+    setUp = InstallerTests.setUp
+    tearDown = InstallerTests.tearDown
+    run_script = InstallerTests.run_script
+    install = InstallerTests.install
+    write_originals = InstallerTests.write_originals
+    originals_state = InstallerTests.originals_state
+
+    def killed_install(self, boundary):
+        originals = self.write_originals()
+        directories = {str(p.relative_to(self.root)): p.stat().st_mode & 0o7777
+                       for p in self.root.rglob('*') if p.is_dir()}
+        self.env['CF_TEST_INSTALL_CRASH_AT'] = boundary
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, -9, result.stdout + result.stderr)
+        self.env.pop('CF_TEST_INSTALL_CRASH_AT')
+        if boundary != 'complete':
+            self.assertEqual(self.originals_state(), originals)
+        return originals, directories
+
+    def recover_and_uninstall(self, originals, directories):
+        # Only the verified external administrator entry may retire ownership.
+        result = self.run_script('cfctl', 'recover-install-lock')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Recovery establishes a durable fence: reinstall cannot race uninstall.
+        refused = self.install('--activate')
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.originals_state(), originals)
+        for rel, mode in directories.items():
+            self.assertEqual((self.root / rel).stat().st_mode & 0o7777, mode, rel)
+        for rel in ('.couvrefeu-install.lock', 'etc/couvrefeu/backup',
+                    '.couvrefeu-recovery', '.couvrefeu-recovery.done'):
+            self.assertFalse((self.root / rel).exists(), rel)
+
+    def test_pre_ready_crash_recovers_through_public_admin_entry(self):
+        self.recover_and_uninstall(*self.killed_install('linked'))
+
+    def test_ready_crash_recovers_through_public_admin_entry(self):
+        self.recover_and_uninstall(*self.killed_install('ready'))
+
+    def test_complete_publication_keeps_original_owner_until_explicit_recovery(self):
+        before = self.killed_install('complete')
+        evidence = full_snapshot(self.root)
+        refused = self.run_script('uninstall.sh')
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertEqual(full_snapshot(self.root), evidence)
+        self.recover_and_uninstall(*before)
+
+    def crash_marker_publication(self, marker):
+        originals = self.write_originals()
+        directories = {str(p.relative_to(self.root)): p.stat().st_mode & 0o7777
+                       for p in self.root.rglob('*') if p.is_dir()}
+        self.env['CF_TEST_RELEASE_DIR'] = '1'
+        self.env['CF_TEST_INSTALL_CRASH_AT'] = 'marker-' + marker
+        killed = self.install('--activate')
+        self.assertEqual(killed.returncode, -9, killed.stdout + killed.stderr)
+        self.env.pop('CF_TEST_INSTALL_CRASH_AT')
+        self.recover_and_uninstall(originals, directories)
+
+    def test_ready_candidate_killed_before_publication_is_recoverable(self):
+        self.crash_marker_publication('ready')
+
+    def test_release_absence_candidate_killed_before_publication_is_recoverable(self):
+        self.crash_marker_publication('release-absent')
+
+    def test_empty_ready_candidate_after_acquisition_is_recoverable(self):
+        self.crash_marker_publication('empty-ready')
+
+    def test_empty_release_absence_candidate_after_acquisition_is_recoverable(self):
+        self.crash_marker_publication('empty-release-absent')
+
+
 class InterruptedRecoveryTests(unittest.TestCase):
     """Real transaction paths, with local, explicitly marked tool boundaries."""
+    PATH_MV_FAULTS = True
     setUp = InstallerTests.setUp
     tearDown = InstallerTests.tearDown
     run_script = InstallerTests.run_script
@@ -1293,11 +1630,11 @@ class InterruptedRecoveryTests(unittest.TestCase):
     install = InstallerTests.install
 
     def tool_failure(self, tool, destination):
-        real_tool = shutil.which(tool)
+        real_tool = fixture_move_command() if tool == 'mv' else shlex.quote(shutil.which(tool))
         wrapper = self.root / 'bin' / tool
         wrapper.write_text("#!/bin/sh\nfor argument do destination=$argument; done\n"
                            'if [ "$destination" = "$CF_TEST_FAIL_TARGET" ] && [ -f "$CF_ROOT/fail-tool" ]; then exit 73; fi\n'
-                           + 'exec ' + shlex.quote(real_tool) + ' "$@"\n')
+                           + 'exec ' + real_tool + ' "$@"\n')
         wrapper.chmod(0o700)
         self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
         self.env['CF_TEST_FAIL_TARGET'] = str(destination)
@@ -1541,9 +1878,11 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
                 result = self.run_script('uninstall.sh')
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_originals_retained(self.root / '.couvrefeu-recovery')
+                before_refusal = full_snapshot(self.root)
                 result = self.install('--activate')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn('recovery is pending', result.stderr)
+                self.assertIn('recovery required; run ordinary uninstall', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before_refusal)
                 self.env.pop('CF_TEST_UNINSTALL_FAIL_AFTER')
                 result = self.run_script('uninstall.sh')
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1621,7 +1960,7 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
     def mv_shim(self, script):
         """`mv` wrapper: $script runs with the operands in "$@"; it may exit or fall through to the real mv."""
         wrapper = self.root / 'bin/mv'
-        wrapper.write_text('#!/bin/sh\n' + script + '\nexec ' + shlex.quote(shutil.which('mv')) + ' "$@"\n')
+        wrapper.write_text('#!/bin/sh\n' + script + '\nexec ' + fixture_move_command() + ' "$@"\n')
         wrapper.chmod(0o700)
         self.env['PATH'] = str(self.root / 'bin') + ':' + os.environ['PATH']
 
@@ -1690,8 +2029,8 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
             target = self.root / 'etc/config/firewall'
             flag = self.root / 'signal-once'
             flag.touch()
-            self.mv_shim(f'case "$*" in *{target}" "*.original) ;; *) exec {shlex.quote(shutil.which("mv"))} "$@";; esac\n'
-                         f'{shlex.quote(shutil.which("mv"))} "$@" || exit\n'
+            self.mv_shim(f'case "$*" in *{target}" "*.original) ;; *) exec {fixture_move_command()} "$@";; esac\n'
+                         f'{fixture_move_command()} "$@" || exit\n'
                          f'if [ -f {shlex.quote(str(flag))} ]; then rm -f {shlex.quote(str(flag))}\n'
                          '    main=$(awk \'{print $4}\' /proc/$PPID/stat)\n'
                          '    for sig in HUP INT TERM; do kill -s $sig $PPID $main; done\nfi\nexit 0')
@@ -1712,13 +2051,13 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
         (self.root / 'etc/config/firewall').unlink()
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         for script in ('uninstall.sh', 'install.sh'):
             with self.subTest(script=script):
                 result = self.install('--activate') if script == 'install.sh' else self.run_script(script)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('drift at /etc/config/firewall', result.stderr)
-                self.assertEqual(full_snapshot(self.root), before)
+                self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
         self.assertEqual(exact_signature(self.root / 'etc/couvrefeu/backup/etc_config_firewall.original'), originals['etc/config/firewall'])
 
     def test_restore_rename_failure_resumes_owned_original(self):
@@ -1896,7 +2235,9 @@ class ReleaseRetirementTests(unittest.TestCase):
                 self.assertFalse(release.exists())
                 self.assertEqual(self.snapshot(), before)
 
-    def hold_runtime_lock(self):
+    def legacy_runtime_lock(self):
+        # A PID-only directory without a held permanent mutex is orphan evidence,
+        # not a current mutator. Never use it to simulate modern concurrency.
         lock = self.root / 'etc/couvrefeu/runtime/lock'
         lock.mkdir(parents=True, mode=0o700)
         lock.parent.chmod(0o700)
@@ -1904,38 +2245,107 @@ class ReleaseRetirementTests(unittest.TestCase):
         (lock / 'pid').chmod(0o600)
         return lock
 
-    def test_uninstall_waits_for_concurrent_core_lock(self):
-        before = self.snapshot()
-        self.assertEqual(self.install('--activate').returncode, 0)
-        lock = self.hold_runtime_lock()
-        command = [*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(REPO / 'router/uninstall.sh')]
-        started = time.monotonic()
-        process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            time.sleep(2)
-            self.assertIsNone(process.poll(), 'uninstall did not wait for the runtime lock')
-            (lock / 'pid').unlink()
-            lock.rmdir()
-            _, stderr = process.communicate(timeout=30)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.communicate()
-        self.assertEqual(process.returncode, 0, stderr)
-        self.assertGreaterEqual(time.monotonic() - started, 2)
-        self.assertEqual(self.snapshot(), before)
+    def test_uninstall_refuses_real_core_mutex_then_succeeds_after_worker_finishes(self):
+        from harness import PROTECTED, RouterFixture, run_owned_process
+        shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        tree = emitted_router()
+        with tempfile.TemporaryDirectory(prefix='cf-real-core-lock-') as folder, \
+                contextlib.closing(RouterFixture()) as fixture, contextlib.ExitStack() as stack:
+            control = Path(folder)
+            env = dict(fixture.env, CF_LOCK_PROBE=str(control), CF_TEST_INSTALL_KERNEL='1')
+            managed = (*NEW_FILES, 'usr/sbin/cfctl-scope', 'etc/couvrefeu/rpc-allowed')
+            originals = {rel: exact_signature(fixture.root / rel) for rel in managed}
+            kernel_before = fixture.backend()
+            directories = {rel: (path.stat().st_mode & 0o7777, path.stat().st_uid, path.stat().st_gid)
+                           if (path := fixture.root / rel).exists() else None for rel in DIRS}
+            installed = subprocess.run([*shell, str(tree / 'install.sh'), '--activate', '--protect', PROTECTED],
+                                       env=env, capture_output=True, text=True, timeout=90)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            wrapper = fixture.bin / 'uci'
+            original_wrapper = wrapper.read_text()
+            # Block the real backend only after cfctl has created its own runtime
+            # lock. Control FIFOs/logs live outside the entirely raw root snapshot.
+            wrapper.write_text('#!/bin/sh\n'
+                               'if [ -f "$CF_ROOT/etc/couvrefeu/runtime/lock/pid" ] && '
+                               '[ ! -e "$CF_LOCK_PROBE/entered-once" ]; then\n'
+                               ' : > "$CF_LOCK_PROBE/entered-once"\n'
+                               ' cat "$CF_ROOT/etc/couvrefeu/runtime/lock/pid" > "$CF_LOCK_PROBE/entered"\n'
+                               ' read -r action < "$CF_LOCK_PROBE/release" || exit 96\n'
+                               ' [ "$action" = continue ] || exit 97\n'
+                               'fi\n' + original_wrapper.split('\n', 1)[1])
+            streams = []
+            for name in ('entered', 'release'):
+                fifo = control / name
+                os.mkfifo(fifo, 0o600)
+                streams.append(stack.enter_context(os.fdopen(
+                    os.open(fifo, os.O_RDWR | os.O_NONBLOCK), 'r+b', buffering=0)))
 
-    def test_uninstall_lock_wait_is_bounded(self):
+            def assert_exclusion(process, _):
+                with selectors.DefaultSelector() as selector:
+                    selector.register(streams[0], selectors.EVENT_READ)
+                    self.assertTrue(selector.select(30), 'actual core did not reach its backend barrier')
+                self.assertEqual(int(streams[0].read(256).strip()), process.pid)
+                mutex = fixture.root / '.couvrefeu-mutex'
+                held = os.stat(f'/proc/{process.pid}/fd/9')
+                current = mutex.stat()
+                self.assertEqual((held.st_dev, held.st_ino), (current.st_dev, current.st_ino))
+                before = full_snapshot(fixture.root)
+                refused = subprocess.run([*shell, str(tree / 'uninstall.sh')], env=env,
+                                         capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                self.assertIn('transaction_contention', refused.stderr)
+                self.assertEqual(full_snapshot(fixture.root), before)
+                streams[1].write(b'continue\n')
+
+            worker = run_owned_process([*shell, str(tree / 'cfctl'), 'expire'], env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       timeout=90, started=assert_exclusion)
+            self.assertEqual(worker.returncode, 0, worker.stdout + worker.stderr)
+            wrapper.write_text(original_wrapper)
+            removed = subprocess.run([*shell, str(tree / 'uninstall.sh')], env=env,
+                                     capture_output=True, text=True, timeout=90)
+            self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+            self.assertEqual({rel: exact_signature(fixture.root / rel) for rel in managed}, originals)
+            for rel, expected in directories.items():
+                path = fixture.root / rel
+                if expected is None:
+                    self.assertFalse(path.exists(), rel)
+                else:
+                    info = path.stat()
+                    self.assertEqual((info.st_mode & 0o7777, info.st_uid, info.st_gid), expected, rel)
+            # Match the established transition-suite owned-kernel oracle, and
+            # retain every pre-existing foreign chain rather than emptying tables.
+            state = fixture.backend()
+            owned_chains = {(family, table, chain): rules
+                            for family, tables in state['tables'].items()
+                            for table, chains in tables.items() for chain, rules in chains.items()
+                            if chain.startswith(('cf_', 'cf2_'))}
+            owned_sets = {name: value for name, value in state['sets'].items()
+                          if name.startswith(('cf_', 'cf2_'))}
+            self.assertEqual((owned_chains, owned_sets), ({}, {}))
+            for family, tables in state['tables'].items():
+                for table, chains in tables.items():
+                    for rules in chains.values():
+                        self.assertFalse(any(token.startswith(('cf_', 'cf2_'))
+                                             for rule in rules for token in rule))
+            self.assertFalse(any(key.startswith('firewall.cf_sched_') for key in state['uci']))
+            self.assertEqual(state['sets'], kernel_before['sets'])
+            for family, tables in kernel_before['tables'].items():
+                for table, chains in tables.items():
+                    for chain, rules in chains.items():
+                        self.assertEqual(state['tables'][family][table][chain], rules)
+            self.assertFalse((fixture.root / 'etc/couvrefeu/runtime').exists())
+
+    def test_orphan_runtime_lock_refuses_without_changes(self):
         self.assertEqual(self.install('--activate').returncode, 0)
-        self.hold_runtime_lock()
-        expected = self.snapshot()
-        started = time.monotonic()
-        result = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), str(REPO / 'router/uninstall.sh')],
-                                env=self.env, capture_output=True, text=True, timeout=60)
+        self.legacy_runtime_lock()
+        before = full_snapshot(self.root)
+        result = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')),
+                                 str(REPO / 'router/uninstall.sh')], env=self.env,
+                                capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('core operation is running', result.stderr)
-        self.assertGreaterEqual(time.monotonic() - started, 19)
-        self.assertEqual(self.snapshot(), expected)
+        self.assertIn('runtime lock present', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
 
 
 class OverlayIdentityTests(unittest.TestCase):
@@ -1944,6 +2354,7 @@ class OverlayIdentityTests(unittest.TestCase):
     The live refusal at 7676637 install.sh:296 is reproduced for every copied-up
     or lower-only original; this code installs and restores exactly in every state.
     """
+    PATH_MV_FAULTS = True
     run_script = InstallerTests.run_script
     snapshot = RecoveryTests.snapshot
     tearDown = RecoveryTests.tearDown
@@ -2009,7 +2420,17 @@ class OverlayIdentityTests(unittest.TestCase):
                 # the install rename moves it into the journal; nothing earlier
                 # writes it and nothing queries overlay-unstable file identity.
                 self.assertEqual(self.copy_ups(), self.rename_copy_ups(states))
-                self.assertNotIn('stat ', self.overlay_log.read_text())
+                identity_queries = [line.split() for line in self.overlay_log.read_text().splitlines()
+                                    if line.startswith('stat ')]
+                mutex = self.root / '.couvrefeu-mutex'
+                mutex_info = mutex.stat()
+                self.assertEqual(mutex_info.st_nlink, 1)
+                self.assertEqual(mutex_info.st_size, 0)
+                self.assertEqual(mutex_info.st_mode & 0o7777, 0o600)
+                self.assertTrue(identity_queries, 'permanent mutex identity must be checked')
+                for query in identity_queries:
+                    self.assertEqual(query, ['stat', str(mutex),
+                                             f'{mutex_info.st_dev}:{mutex_info.st_ino}'])
                 # Renames were preceded by directory filesystem proofs.
                 self.assertIn('mount ', self.overlay_log.read_text())
                 self.assert_no_touch()
@@ -2028,7 +2449,7 @@ class OverlayIdentityTests(unittest.TestCase):
                 self.setUp()
                 release = self.enable_release()
                 self.model(dict(self.LIVE_LAYOUT, **{'etc/sysupgrade.conf': state}))
-                before = full_snapshot(self.root)
+                before = full_snapshot(self.root, completed_provenance=True)
                 if old:
                     self.assert_refused_identically(
                         before, release, 'original hard link identity mismatch: etc/sysupgrade.conf; no installation made')
@@ -2041,7 +2462,7 @@ class OverlayIdentityTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     result = self.run_script('uninstall.sh')
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    after = full_snapshot(self.root)
+                    after = full_snapshot(self.root, completed_provenance=True)
                     # Exact bytes, mode, owner and ns mtime; a fresh inode by design.
                     strip = lambda snap: {k: v[:3] if v[0] == 'file' else v for k, v in snap.items()}  # noqa: E731
                     self.assertEqual(strip(after), strip(before))
@@ -2063,7 +2484,7 @@ class OverlayIdentityTests(unittest.TestCase):
                 (self.root / 'etc/couvrefeu').mkdir(mode=0o750)
                 (self.root / 'etc/couvrefeu').chmod(0o750)
                 self.model(lower, {str(self.root / subtree): (20, '/' + name)})
-                before = full_snapshot(self.root)
+                before = full_snapshot(self.root, completed_provenance=True)
                 self.assert_refused_identically(
                     before, release, f'original, journal and recovery journal are not on one filesystem: /{first}; no installation made')
                 self.assertEqual(self.copy_ups(), [])
@@ -2087,7 +2508,7 @@ class OverlayIdentityTests(unittest.TestCase):
                 mountinfo.write_text('\n'.join(rows) + '\n')
                 if name == 'single':
                     continue
-                before = full_snapshot(self.root)
+                before = full_snapshot(self.root, completed_provenance=True)
                 message = ('original, journal and recovery journal are not on one filesystem: /'
                            + ('etc/crontabs/root' if name == 'bind' else 'etc/config/firewall') + '; no installation made')
                 self.assert_refused_identically(before, release, message)
@@ -2106,11 +2527,11 @@ class OverlayIdentityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         with (self.root / 'bin/overlay.mounts').open('a') as table:
             table.write(f'{self.root / "etc/config"} 20 /split\n')
-        before = full_snapshot(self.root)
+        before = full_snapshot(self.root, completed_provenance=True)
         result = self.run_script('uninstall.sh')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('journal original and /etc/config/firewall are not on one filesystem; no changes made', result.stderr)
-        self.assertEqual(full_snapshot(self.root), before)
+        self.assertEqual(full_snapshot(self.root, completed_provenance=True), before)
     assert_no_touch = InstallerTests.assert_no_touch
 
 
@@ -2125,14 +2546,18 @@ class CrondPickupTests(unittest.TestCase):
     kill_lock = InstallerTests.kill_lock
     production_tools = InterruptedRecoveryTests.production_tools
     LOGS = ('tool-log', 'cron-log', 'crond-table')
-    EXPIRE = '* * * * * /usr/sbin/cfctl expire'
+    @property
+    def EXPIRE(self):
+        owner = (self.root / '.couvrefeu-transaction').read_text().splitlines()
+        generation = hashlib.sha256(f'CFCALLBACK1\n{owner[5]}\n'.encode()).hexdigest()
+        return f'* * * * * /etc/.couvrefeu-release-{owner[6]}/cfctl --installation-generation {generation} expire'
 
     def restorable(self):
         return {k: v for k, v in self.snapshot().items() if k not in self.LOGS}
 
     def cron_log(self):
         log = self.root / 'cron-log'
-        return log.read_text().splitlines() if log.exists() else []
+        return [entry for entry in log.read_text().splitlines() if entry != 'ubus'] if log.exists() else []
 
     def crond_table(self):
         table = self.root / 'crond-table'
@@ -2143,13 +2568,13 @@ class CrondPickupTests(unittest.TestCase):
         before = self.restorable()
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started'])
         self.assertIn(self.EXPIRE, self.crond_table())
         self.assertEqual((self.root / 'etc/crontabs/root').read_text(), self.crond_table())
         self.assertEqual((self.root / 'tool-log').read_text().splitlines(), ['apply-fw'])
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload', 'stopped'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'reload', 'stopped'])
         self.assertIsNone(self.crond_table())
         self.assertFalse((self.root / 'etc').exists())
         self.assertEqual(self.restorable(), before)
@@ -2166,7 +2591,7 @@ class CrondPickupTests(unittest.TestCase):
         self.assertIn(self.EXPIRE, self.crond_table())
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload', 'started'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'reload', 'started'])
         self.assertEqual(self.crond_table(), vendor)
         self.assertEqual(self.restorable(), before)
 
@@ -2180,12 +2605,12 @@ class CrondPickupTests(unittest.TestCase):
         self.env.pop('CF_TEST_INSTALL_FAIL_AFTER')
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['enabled', 'enabled', 'reload', 'started', 'ubus'])
+        self.assertEqual(self.cron_log(), ['enabled', 'enabled', 'reload', 'started'])
         self.assertIn(self.EXPIRE, self.crond_table())
         # A recorded reinstall renames again and re-signals; unchanged tables do not restart crond.
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['enabled', 'enabled', 'reload', 'started', 'ubus', 'enabled', 'reload', 'ubus'])
+        self.assertEqual(self.cron_log(), ['enabled', 'enabled', 'reload', 'started', 'enabled', 'reload'])
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.crond_table())
@@ -2214,21 +2639,22 @@ class CrondPickupTests(unittest.TestCase):
                 for name in self.LOGS:
                     (self.root / name).unlink(missing_ok=True)
 
-    def test_uninstall_signalling_failure_warns_and_completes_exact_restoration(self):
+    def test_uninstall_signalling_failure_fences_executable_restoration_until_retry(self):
         self.production_tools()
         self.write_originals()
         before = self.restorable()
         result = self.install('--activate')
         self.assertEqual(result.returncode, 0, result.stderr)
+        installed = exact_signature(self.root / 'usr/sbin/cfctl')
         self.env['CF_TEST_CRON_FAIL'] = 'reload'
         result = self.run_script('uninstall.sh')
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('executable restoration fenced', result.stderr)
+        self.assertEqual(exact_signature(self.root / 'usr/sbin/cfctl'), installed)
+        self.assertTrue((self.root / '.couvrefeu-recovery/cron-quiescing').is_file())
+        self.env.pop('CF_TEST_CRON_FAIL')
+        result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('warning: cron reload failed', result.stderr)
-        self.assertIn('/etc/init.d/cron restart', result.stderr)
-        self.assertIn('Original files restored', result.stdout)
-        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload'])
-        self.assertFalse((self.root / '.couvrefeu-recovery').exists())
-        self.assertFalse((self.root / '.couvrefeu-recovery.done').exists())
         self.assertEqual(self.restorable(), before)
 
     def test_uninstall_retry_after_crash_signals_crond(self):
@@ -2243,11 +2669,11 @@ class CrondPickupTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.env.pop('CF_TEST_UNINSTALL_CRASH_AT')
         self.kill_lock()
-        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus'])
-        self.assertIn(self.EXPIRE, self.crond_table())
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'reload', 'started'])
+        self.assertEqual(self.crond_table(), vendor)
         result = self.run_script('uninstall.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'ubus', 'reload', 'started'])
+        self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'reload', 'started'])
         self.assertEqual(self.crond_table(), vendor)
         self.assertEqual(self.restorable(), before)
 

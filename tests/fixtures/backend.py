@@ -5,6 +5,7 @@ All subprocess arguments are recorded as arrays, never evaluated as shell code.
 State and failure injection live entirely below CF_BACKEND_STATE.
 """
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -121,7 +122,10 @@ def dispatch(command, args, state):
         if args != ["call", "service", "list", '{"name":"cron"}']:
             raise ValueError("unsupported ubus call")
         running = state.get("crond", {}).get("running", False)
-        return 0, json.dumps({"cron": {"instances": {"instance1": {"running": running}}}} if running else {"cron": {}}, indent="\t")
+        generation = hashlib.sha256(json.dumps(state.get("crond", {}).get("tables", {}),
+                                              sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return 0, json.dumps({"cron": {"instances": {"instance1": {
+            "running": running, "fixtureGeneration": generation}}}} if running else {"cron": {}}, indent="\t")
     if command in ("fw3", "firewall"):
         state.setdefault("firewall_calls", []).append(args)
         if args == ["-q", "zone", "wan"]:
@@ -605,7 +609,19 @@ def jsonfilter(args):
     parts = re.findall(r"\.([A-Za-z_][A-Za-z_0-9]*)|\[([0-9]+|\*)\]", expression.removeprefix("@"))
     nodes = [document]
     for key, index in parts:
-        nodes = [child for node in nodes for child in ((list(node.values()) if isinstance(node, dict) else node) if index == "*" else [node[key] if key else node[int(index)]])]
+        children = []
+        for node in nodes:
+            if key:
+                if isinstance(node, dict) and key in node:
+                    children.append(node[key])
+            elif index == "*":
+                if isinstance(node, dict):
+                    children.extend(node.values())
+                elif isinstance(node, list):
+                    children.extend(node)
+            elif isinstance(node, list) and int(index) < len(node):
+                children.append(node[int(index)])
+        nodes = children
     def encode(node):
         if isinstance(node, bool):
             return "true" if node else "false"

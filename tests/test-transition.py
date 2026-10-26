@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -185,21 +187,48 @@ class TransitionTests(unittest.TestCase):
 
     def test_initial_ownership_journal_failure_uninstalls_without_kernel_mutation(self):
         self.f.env['CF_TEST_INSTALL_KERNEL'] = '1'
-        self.f.update_backend(failures=[{'command': 'sync', 'skip': 5, 'remaining': 1}])
-        result = subprocess.run(self.f.shell + [str(REPO / 'router/install.sh'), '--activate', '--protect', PROTECTED],
-                                env=self.f.env, capture_output=True, text=True, timeout=90)
-        self.assertNotEqual(result.returncode, 0)
-        runtime = self.f.root / 'etc/couvrefeu/runtime'
-        self.assertTrue((runtime / 'firewall.intent').exists())
-        self.assertFalse((runtime / 'firewall.owned').exists())
-        self.assertEqual(self.f.mutation_calls(), [])
-        before = self.f.backend()
-        result = self.uninstall()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.f.backend()['tables'], before['tables'])
-        self.assertEqual(self.f.backend()['sets'], before['sets'])
-        self.assertEqual(self.f.mutation_calls(), [])
-        self.assertFalse((self.f.root / 'usr/sbin/cfctl').exists())
+        busybox = shutil.which('busybox')
+        self.assertIsNotNone(busybox, 'actual BusyBox sync is required for this durability fixture')
+        with tempfile.TemporaryDirectory(prefix='cf-initial-owned-fault-') as folder:
+            fired = Path(folder) / 'fired'
+            wrapper = self.f.bin / 'sync'
+            delegate = self.f.bin / 'sync-original'
+            delegate.write_text(wrapper.read_text()); delegate.chmod(0o700)
+            # Never write through a future fixture symlink into backend.py.
+            wrapper.unlink()
+            wrapper.write_text('#!/bin/sh\n'
+                               'runtime="$CF_ROOT/etc/couvrefeu/runtime"\n'
+                               'if [ "$#" = 0 ] && [ -f "$runtime/firewall.intent" ] && '
+                               '[ ! -e "$runtime/firewall.owned" ] && [ ! -e ' + shlex.quote(str(fired)) + ' ]; then\n'
+                               ' for candidate in "$runtime"/.intent.*; do\n'
+                               '  [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue\n'
+                               '  if printf "couvrefeu-owned-v2\\na\\n" | cmp -s - "$candidate" || '
+                               'printf "couvrefeu-owned-v2\\nb\\n" | cmp -s - "$candidate"; then\n'
+                               '   printf "%s\\n" "$candidate" > ' + shlex.quote(str(fired)) + '\n'
+                               '   printf "injected initial ownership durability failure\\n" >&2; exit 73\n'
+                               '  fi\n done\nfi\n' + shlex.quote(busybox) + ' sync "$@" || exit $?\n'
+                               'exec ' + ' '.join(map(shlex.quote, [*self.f.shell, str(delegate)])) + ' "$@"\n')
+            wrapper.chmod(0o700)
+            result = subprocess.run(self.f.shell + [str(REPO / 'router/install.sh'), '--activate', '--protect', PROTECTED],
+                                    env=self.f.env, capture_output=True, text=True, timeout=90)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(fired.exists(), result.stdout + result.stderr)
+            self.assertIn('transition_journal_failed', result.stdout + result.stderr)
+            runtime = self.f.root / 'etc/couvrefeu/runtime'
+            candidate = Path(fired.read_text().strip())
+            self.assertEqual(candidate.parent, runtime)
+            self.assertRegex(candidate.name, r'^\.intent\.[0-9]+$')
+            self.assertIn(candidate.read_bytes(), (b'couvrefeu-owned-v2\na\n', b'couvrefeu-owned-v2\nb\n'))
+            self.assertTrue((runtime / 'firewall.intent').exists())
+            self.assertFalse((runtime / 'firewall.owned').exists())
+            self.assertEqual(self.f.mutation_calls(), [])
+            before = self.f.backend()
+            result = self.uninstall()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.f.backend()['tables'], before['tables'])
+            self.assertEqual(self.f.backend()['sets'], before['sets'])
+            self.assertEqual(self.f.mutation_calls(), [])
+            self.assertFalse((self.f.root / 'usr/sbin/cfctl').exists())
 
     def test_initial_descriptor_only_process_crash_removes_exact_journal(self):
         self.stop_at('after_initial_intent', ['cfctl', 'sync'], json.dumps(self.paused_policy()))

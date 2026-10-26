@@ -1134,6 +1134,13 @@ cf_zero_owned_kernel() {
 cf_zero_owned_runtime() (
     # Globbing is scoped to enumeration; rule argument splitting stays noglob.
     set +f
+    cf_zr_token_seen=0
+    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ];then
+        [ "${CF_LOCKED:-0}" = 1 ] || return 1
+        cf_zr_token=${CF_TRANSACTION_TOKEN:-}
+        case "$cf_zr_token" in ''|*[!0-9a-f]*)return 1;;esac
+        [ "${#cf_zr_token}" = 64 ] || return 1
+    fi
     for cf_zr_file in "$CF_RUNTIME"/* "$CF_RUNTIME"/.[!.]* "$CF_RUNTIME"/..?*;do
         [ -e "$cf_zr_file" ] || [ -L "$cf_zr_file" ] || continue
         case ${cf_zr_file##*/} in
@@ -1164,11 +1171,20 @@ $CF_SLOT" ] || return 1
                 cf_private_dir "$cf_zr_file" && cf_safe_file "$cf_zr_file/pid" && [ "$(awk 'NR==1{print}' "$cf_zr_file/pid")" = "$$" ] || return 1
                 for cf_zr_child in "$cf_zr_file"/* "$cf_zr_file"/.[!.]* "$cf_zr_file"/..?*;do
                     [ -e "$cf_zr_child" ] || [ -L "$cf_zr_child" ] || continue
-                    [ "${cf_zr_child##*/}" = pid ] || return 1
+                    case ${cf_zr_child##*/} in
+                        pid) ;;
+                        token)
+                            [ "${CF_TRANSACTION_OWNED:-0}" = 1 ] && cf_safe_file "$cf_zr_child" &&
+                                [ "$(stat -c '%h:%s' "$cf_zr_child")" = 1:65 ] &&
+                                printf '%s\n' "$cf_zr_token" | cmp -s - "$cf_zr_child" || return 1
+                            cf_zr_token_seen=1;;
+                        *)return 1;;
+                    esac
                 done;;
             *)return 1;;
         esac
     done
+    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ];then [ "$cf_zr_token_seen" = 1 ] || return 1;fi
 )
 cf_remove_fw() {
     CF_ZERO_OWNED=false

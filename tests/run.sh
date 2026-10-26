@@ -5,10 +5,41 @@ PYTHONDONTWRITEBYTECODE=1
 export PYTHONDONTWRITEBYTECODE
 REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPO"
+# Single source of truth for the heavy-fixture preflight suites, in run order.
+# CI runs them as parallel matrix entries and fails if the matrix drifts from
+# this list (see --list-preflight-suites in .github/workflows/ci.yml).
+preflight_suites() {
+    printf '%s\n' \
+        test-install-recovery-primitives.py \
+        test-install.py \
+        test-install-recovery.py \
+        test-install-retirement-recovery.py \
+        test-install-legacy-recovery.py \
+        test-no-dev-stdin.py \
+        test-platform-integration.py \
+        test-os-trust.py \
+        test-client-probe.py \
+        test-live-rehearsal.py \
+        test-deploy-units.py \
+        test-service-key-entry.py
+}
+run_preflight_suite() {
+    preflight_suites | grep -Fqx -- "$1" || { printf 'unknown preflight suite: %s\n' "$1" >&2; exit 2; }
+    python3 -B "tests/$1"
+}
+USAGE='usage: tests/run.sh [--preflight-only | --static-only | --list-preflight-suites | --preflight-suite NAME...]'
+mode=full
 case "${1:-}" in
-    '') [ "$#" = 0 ] || { printf 'usage: tests/run.sh [--preflight-only]\n' >&2; exit 2; }; preflight_only=0;;
-    --preflight-only) [ "$#" = 1 ] || { printf 'usage: tests/run.sh [--preflight-only]\n' >&2; exit 2; }; preflight_only=1;;
-    *) printf 'usage: tests/run.sh [--preflight-only]\n' >&2; exit 2;;
+    '') [ "$#" = 0 ] || { printf '%s\n' "$USAGE" >&2; exit 2; };;
+    --preflight-only) [ "$#" = 1 ] || { printf '%s\n' "$USAGE" >&2; exit 2; }; mode=preflight;;
+    --static-only) [ "$#" = 1 ] || { printf '%s\n' "$USAGE" >&2; exit 2; }; mode=static;;
+    --list-preflight-suites) [ "$#" = 1 ] || { printf '%s\n' "$USAGE" >&2; exit 2; }; preflight_suites; exit 0;;
+    --preflight-suite)
+        [ "$#" -ge 2 ] || { printf '%s\n' "$USAGE" >&2; exit 2; }
+        shift
+        for suite in "$@"; do run_preflight_suite "$suite"; done
+        exit 0;;
+    *) printf '%s\n' "$USAGE" >&2; exit 2;;
 esac
 is_shell() {
     case "$1" in *.sh) return 0;; esac
@@ -16,14 +47,9 @@ is_shell() {
     return 1
 }
 printf '%s\n' 'Evidence: isolated fixtures only; packet and live-router gates pending.'
-python3 tests/test-install.py
-python3 tests/test-no-dev-stdin.py
-python3 tests/test-platform-integration.py
-python3 tests/test-os-trust.py
-python3 tests/test-client-probe.py
-python3 tests/test-live-rehearsal.py
-python3 tests/test-deploy-units.py
-python3 tests/test-service-key-entry.py
+if [ "$mode" != static ]; then
+    for suite in $(preflight_suites); do run_preflight_suite "$suite"; done
+fi
 
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck --version
@@ -56,7 +82,7 @@ find router tests tools -type f | {
 if ! command -v busybox >/dev/null 2>&1; then
     printf '%s\n' 'PENDING: BusyBox ash runtime; host sh syntax alone is not ash proof.'
 fi
-if [ "$preflight_only" = 1 ]; then
+if [ "$mode" != full ]; then
     printf '%s\n' 'PASS: installer recovery, adapter, probe and static preflight; runtime shards follow.'
     exit 0
 fi

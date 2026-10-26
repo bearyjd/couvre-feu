@@ -6,6 +6,8 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -1210,9 +1212,9 @@ class CoreTests(unittest.TestCase):
             process.stdin.flush()  # Intentionally keep a complete JSON document's stream open.
             # Synchronize on the reader consuming this document, rather than
             # guessing how long shell startup takes on a shared CI runner.
-            input_file = self.fixture.root / "tmp" / f"couvrefeu-input.{process.pid}" / "input"
             deadline = time.monotonic() + 20
-            while not input_file.exists() or input_file.stat().st_size != len(payload.encode()):
+            input_file = self.staged_input(process, deadline)
+            while input_file.stat().st_size != len(payload.encode()):
                 self.assertIsNone(process.poll(), "open stdin sync exited before reader readiness")
                 self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
                 time.sleep(0.01)
@@ -1259,6 +1261,389 @@ class CoreTests(unittest.TestCase):
                 process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
+
+    def staged_input(self, process, deadline):
+        # The private stage has an unpredictable mktemp name; exactly one must exist.
+        while True:
+            stages = [self.fixture.root / "tmp" / name for name in self.input_residue()]
+            self.assertLessEqual(len(stages), 1, stages)
+            if stages and (stages[0] / "input").exists():
+                return stages[0] / "input"
+            self.assertIsNone(process.poll(), "sync exited before reader readiness")
+            self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
+            time.sleep(0.01)
+
+    def input_residue(self):
+        return sorted(path.name for path in (self.fixture.root / "tmp").iterdir()
+                      if path.name.startswith("couvrefeu-input."))
+
+    def test_sync_stage_parser_replacement_during_wait_is_never_executed(self):
+        self.sync()
+        release = self.fixture.root / "release"
+        shutil.copytree(REPO / "router", release)
+        for path in (release / "lib").iterdir():
+            path.chmod(0o644)
+        before = self.fixture.durable_snapshot()
+        calls = len(self.fixture.mutation_calls())
+        witness = self.fixture.root / "foreign-parser-ran"
+        process = subprocess.Popen(self.fixture.shell + [str(release / "cfctl"), "sync"], env=self.fixture.env,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        try:
+            payload = json.dumps(policy(2))
+            process.stdin.write(payload)
+            process.stdin.flush()
+            deadline = time.monotonic() + 20
+            stage = self.staged_input(process, deadline).parent
+            while (stage / "input").stat().st_size != len(payload.encode()):
+                self.assertIsNone(process.poll(), "sync exited before reader readiness")
+                self.assertLess(time.monotonic(), deadline, "bounded stdin reader never became ready")
+                time.sleep(0.01)
+            # The private copy was authenticated before the wait and holds pinned bytes.
+            self.assertEqual((stage / "json.awk").read_bytes(), (REPO / "router/lib/json.awk").read_bytes())
+            self.assertFalse((self.fixture.root / "etc/couvrefeu/runtime/lock").exists())
+            replacement = release / "lib/json.awk.new"
+            replacement.write_text('BEGIN { print "ran" > "%s"; exit 0 }\n' % witness)
+            replacement.chmod(0o644)
+            os.replace(replacement, release / "lib/json.awk")
+            stdout, stderr = process.communicate(input="", timeout=30)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertEqual(json.loads(stdout), {"ok": False, "errors": ["platform_admission_refused"]})
+        self.assertIn("hash_mismatch", stderr)
+        self.assertFalse(witness.exists(), "replaced parser was executed")
+        self.assertEqual(self.fixture.durable_snapshot(), before)
+        self.assertEqual(len(self.fixture.mutation_calls()), calls)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_injected_environment_refused(self):
+        self.sync()
+        for name in ("CF_SYNC_STAGED", "CF_SYNC_STAGE_MODE", "CF_SYNC_STAGE_TRIED", "CF_INPUT_DIR",
+                     "CF_STAGED_POLICY", "CF_NEXT_DIGEST", "CF_REQUEST_GENERATION", "CF_REQUEST_ID",
+                     "CF_BASE_REVISION", "CF_BASE_DIGEST", "CF_RPC_REQUIRE_RUNTIME"):
+            for value in ("", "1"):
+                with self.subTest(name=name, value=value):
+                    before = self.fixture.durable_snapshot()
+                    calls = len(self.fixture.mutation_calls())
+                    result = self.fixture.run("sync", document=policy(2), env=dict(self.fixture.env, **{name: value}))
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {"ok": False, "errors": ["platform_admission_refused"]})
+                    self.assertIn("injected stage environment refused", result.stderr)
+                    self.assertEqual(self.fixture.durable_snapshot(), before)
+                    self.assertEqual(len(self.fixture.mutation_calls()), calls)
+                    self.assertEqual(self.input_residue(), [])
+
+    def test_failed_input_before_admission_publishes_no_lock_or_residue(self):
+        # Fresh fixture: no mutex, runtime or owner record exists before the failed stage.
+        for command in ("sync", "rpc-sync"):
+            for raw in ("{", " " * 65537, "\x01" + json.dumps(policy())):
+                with self.subTest(command=command, raw=raw[:8]):
+                    before = self.fixture.durable_snapshot()
+                    result = self.fixture.run(command, raw=raw)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    document = json.loads(result.stdout)
+                    if command == "rpc-sync":
+                        self.assertEqual(list(document), ["rpc_version", "errors"])
+                    else:
+                        self.assertEqual(document["desiredRevision"], 0)
+                    self.assertEqual(self.fixture.durable_snapshot(), before)
+                    self.assertEqual(self.fixture.mutation_calls(), [])
+                    self.assertEqual(self.input_residue(), [])
+                    for record in (".couvrefeu-mutex", ".couvrefeu-transaction", "etc/couvrefeu/runtime"):
+                        self.assertFalse((self.fixture.root / record).exists(), record)
+
+    def test_sync_stage_reuse_requires_same_mode_and_success(self):
+        rpc = dict(rpc_version=1, generation="a" * 64, operation_id="op_1", expected_revision=0,
+                   expected_digest="b" * 64, policy=policy(1))
+        inputs = {"p1": json.dumps(policy(1)), "p2": json.dumps(policy(2)), "rpc": json.dumps(rpc), "bad": "{"}
+        for name, data in inputs.items():
+            (self.fixture.root / name).write_text(data)
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; r=$CF_ROOT; '
+                  'show() { printf "%s %s %s %s %s\\n" "$1" "$CF_SYNC_STAGED" "$CF_SYNC_STAGE_MODE" "$CF_ERROR" "$CF_NEXT_DIGEST"; }; '
+                  'case $2 in '
+                  'zero) cf_sync_stage 0 < "$r/p1"; show "$?"; cf_sync_stage 1 < "$r/rpc"; show "$?"; '
+                  'cf_sync_stage 0 < "$r/p2"; show "$?";; '
+                  'one) cf_sync_stage 1 < "$r/rpc"; show "$?"; cf_sync_stage 0 < "$r/p1"; show "$?"; '
+                  'cf_sync_stage 1 < "$r/p2"; show "$?";; '
+                  'failed) cf_sync_stage 0 < "$r/bad"; show "$?"; CF_ERROR=; cf_sync_stage 0 < "$r/p1"; show "$?";; '
+                  'esac')
+        for case in ("zero", "one", "failed"):
+            with self.subTest(case=case):
+                result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"), case],
+                                        env=self.fixture.env, capture_output=True, text=True, timeout=60)
+                lines = [line.split(" ") for line in result.stdout.splitlines()]
+                if case == "failed":
+                    self.assertEqual([line[:4] for line in lines], [["1", "0", "", "invalid_policy"],
+                                                                    ["1", "0", "", "invalid_command"]], result.stderr)
+                    self.assertEqual([line[4] for line in lines], ["", ""])
+                else:
+                    mode = "0" if case == "zero" else "1"
+                    self.assertEqual([line[:4] for line in lines], [["0", "1", mode, ""],
+                                                                    ["1", "1", mode, "invalid_command"],
+                                                                    ["0", "1", mode, "invalid_command"]], result.stderr)
+                    self.assertRegex(lines[0][4], "^[0-9a-f]{64}$")
+                    self.assertEqual({line[4] for line in lines}, {lines[0][4]})
+                self.assertEqual(self.input_residue(), [])
+
+    def stage_shims(self, **bodies):
+        shims = self.fixture.root / "stage-shims"
+        shims.mkdir(mode=0o700, exist_ok=True)
+        for name, body in bodies.items():
+            (shims / name).write_text("#!/bin/sh\n" + body)
+            (shims / name).chmod(0o700)
+        return dict(self.fixture.env, PATH=str(shims) + os.pathsep + self.fixture.env["PATH"])
+
+    def test_sync_stage_sort_failure_refuses_truncated_policy(self):
+        # A failing sort that still emits a plausible prefix (V/R kept, one row dropped)
+        # must not stage a truncated policy.
+        real = shutil.which("sort")
+        env = self.stage_shims(sort=(
+            't=$(mktemp) || exit 2; cat > "$t"\n'
+            f'if grep -q trunc "$t"; then {real} "$@" < "$t" | grep -v trunc; rm -f "$t"; exit 1; fi\n'
+            f'{real} "$@" < "$t"; s=$?; rm -f "$t"; exit $s\n'))
+        document = policy(2)
+        document["schedules"] = [{"person": "alice", "id": "trunc", "weekdays": ["Mon"],
+                                  "start": "22:00", "stop": "06:30"}]
+        (self.fixture.root / "trunc.json").write_text(json.dumps(document))
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"; printf "%s\\n" "$CF_STAGED_POLICY"')
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                      str(self.fixture.root / "trunc.json")],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.splitlines()[0], "1|invalid_policy|0", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_signal_during_directory_creation_leaves_no_residue(self):
+        # TERM delivered the instant the private input directory exists must still clean it up.
+        kill = ('s=$?; case "$*" in *couvrefeu-input*) kill -TERM "$CF_TEST_STAGE_SHELL"; sleep 1;; esac; exit $s\n')
+        env = self.stage_shims(mkdir=f'{shutil.which("mkdir")} "$@"; ' + kill,
+                               mktemp=f'{shutil.which("mktemp")} "$@"; ' + kill)
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = ('set -f; CF_TEST_STAGE_SHELL=$$; export CF_TEST_STAGE_SHELL; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; '
+                  'CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; . "$CF_LIB/core.sh"; '
+                  'cf_sync_stage 0 < "$2"; printf "reached\\n"')
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                      str(self.fixture.root / "p1.json")],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertNotIn("reached", result.stdout)
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_precreated_predictable_directory_cannot_deny_staging(self):
+        # A local user who pre-creates the old predictable tmp/couvrefeu-input.PID name
+        # (or a symlink there) must not be able to deny the stage.
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; mkdir -m 777 "$CF_ROOT/tmp/couvrefeu-input.$$" || exit 9; '
+                  'ln -s / "$CF_ROOT/tmp/couvrefeu-input.$$/x"; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"; rm -f "$CF_ROOT/tmp/couvrefeu-input.$$/x"; '
+                  'rmdir "$CF_ROOT/tmp/couvrefeu-input.$$"')
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                      str(self.fixture.root / "p1.json")],
+                                env=self.fixture.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.splitlines()[0], "0||1", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def stage_script_result(self, env, local_test="1"):
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = (f'set -f; CF_LOCAL_TEST={local_test}; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"')
+        return subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                    str(self.fixture.root / "p1.json")],
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_sync_stage_mktemp_name_mismatch_inside_parent_leaves_no_residue(self):
+        # mktemp creates a directory inside tmp/ but reports it under a name that fails the
+        # exact-pattern check: the stage refuses and the created directory is still removed.
+        real = shutil.which("mktemp")
+        env = self.stage_shims(mktemp=f'd=$({real} "$@") || exit 1; printf "%s\\n" "${{d%/*}}//${{d##*/}}"\n')
+        result = self.stage_script_result(env)
+        self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_foreign_path_is_never_cleaned(self):
+        # A reported path outside tmp/ is refused without touching it.
+        sentinel = self.fixture.root / "foreign" / "couvrefeu-input.abcdef"
+        sentinel.mkdir(parents=True)
+        (sentinel / "input").write_text("preserve")
+        env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(sentinel))}\n')
+        result = self.stage_script_result(env)
+        self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+        self.assertEqual((sentinel / "input").read_text(), "preserve")
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_dotdot_through_symlink_is_never_cleaned(self):
+        # tmp/sym/../victim collapses textually to tmp/victim but the kernel follows sym:
+        # the mismatch cleanup must resolve the directory itself and touch nothing outside tmp/.
+        foreign = self.fixture.root / "foreign"
+        (foreign / "sub").mkdir(parents=True)
+        (foreign / "victim").mkdir()
+        (foreign / "victim" / "input").write_text("preserve")
+        (self.fixture.root / "tmp" / "sym").symlink_to(foreign / "sub")
+        try:
+            reported = str(self.fixture.root / "tmp" / "sym" / ".." / "victim")
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(reported)}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((foreign / "victim" / "input").read_text(), "preserve")
+            self.assertTrue((foreign / "victim").is_dir())
+        finally:
+            (self.fixture.root / "tmp" / "sym").unlink()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_signal_after_misnamed_mktemp_never_cleans_raw_path(self):
+        # TERM lands right after mktemp reports tmp/sym/../victim: the traps must not clean
+        # that unvalidated text (the kernel would follow sym and reach foreign/victim).
+        foreign = self.fixture.root / "foreign"
+        (foreign / "sub").mkdir(parents=True)
+        (foreign / "victim").mkdir()
+        (foreign / "victim" / "input").write_text("preserve")
+        (self.fixture.root / "tmp" / "sym").symlink_to(foreign / "sub")
+        try:
+            reported = str(self.fixture.root / "tmp" / "sym" / ".." / "victim")
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(reported)}; '
+                                          'kill -TERM "$CF_TEST_STAGE_SHELL"; sleep 1; exit 0\n')
+            (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+            script = ('set -f; CF_TEST_STAGE_SHELL=$$; export CF_TEST_STAGE_SHELL; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; '
+                      'CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; . "$CF_LIB/core.sh"; '
+                      'cf_sync_stage 0 < "$2"; printf "reached\\n"')
+            result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                          str(self.fixture.root / "p1.json")],
+                                    env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("reached", result.stdout)
+            self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+            self.assertEqual((foreign / "victim" / "input").read_text(), "preserve")
+        finally:
+            (self.fixture.root / "tmp" / "sym").unlink()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_mismatch_only_rmdirs_resolved_stage(self):
+        # A mis-named report resolving to a couvrefeu-input.* entry in tmp/ is only rmdir'd:
+        # files in an existing (non-fresh) directory of that name are never deleted.
+        victim = self.fixture.root / "tmp" / "couvrefeu-input.victim"
+        victim.mkdir(mode=0o700)
+        (victim / "input").write_text("preserve")
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(victim.parent) + "//" + victim.name)}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((victim / "input").read_text(), "preserve")
+        finally:
+            (victim / "input").unlink(missing_ok=True)
+            victim.rmdir()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_relative_or_empty_report_is_never_resolved(self):
+        # A relative report must not be resolved against the shell's cwd (here tmp/ itself).
+        stage = self.fixture.root / "tmp" / "couvrefeu-input.rel000"
+        (self.fixture.root / "p1.json").write_text(json.dumps(policy(2)))
+        script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
+                  '. "$CF_LIB/core.sh"; cd "$CF_ROOT/tmp" || exit 9; cf_sync_stage 0 < "$2"; '
+                  'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"')
+        try:
+            for report in (stage.name, ""):
+                with self.subTest(report=report):
+                    stage.mkdir(mode=0o700, exist_ok=True)
+                    env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(report)}\n')
+                    result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                                                                  str(self.fixture.root / "p1.json")],
+                                            env=env, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0",
+                                     result.stdout + result.stderr)
+                    self.assertTrue(stage.is_dir())
+        finally:
+            if stage.is_dir():
+                stage.rmdir()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_suffix_with_slash_is_refused(self):
+        # "a/../b" is six characters: a "??????" suffix check would accept tmp/couvrefeu-input.a/../b
+        # and stage (then clean) inside tmp/b. Only an alphanumeric six-character suffix is accepted.
+        tmp = self.fixture.root / "tmp"
+        (tmp / "couvrefeu-input.a").mkdir(mode=0o700)
+        (tmp / "b").mkdir(mode=0o700)
+        (tmp / "b" / "input").write_text("preserve")
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(tmp) + "/couvrefeu-input.a/../b")}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((tmp / "b" / "input").read_text(), "preserve")
+        finally:
+            shutil.rmtree(tmp / "b")
+            if (tmp / "couvrefeu-input.a").is_dir():
+                (tmp / "couvrefeu-input.a").rmdir()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_trailing_newline_report_is_refused(self):
+        # $(...) strips trailing newlines: a report of "<valid name>\n\n" names a different
+        # directory than the one created, so it is refused and the named entry is untouched.
+        stage = self.fixture.root / "tmp" / "couvrefeu-input.nlnlnl"
+        stage.mkdir(mode=0o700)
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n\\n" {shlex.quote(str(stage))}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertTrue(stage.is_dir())
+            self.assertEqual(list(stage.iterdir()), [])
+        finally:
+            stage.rmdir()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_mktemp_exact_name_symlink_is_never_cleaned_through(self):
+        # mktemp creates nothing but reports an exactly-named entry that is a symlink to a
+        # foreign directory: the private-directory refusal must only rmdir-discard it, never
+        # rm -f input/json.awk through the link.
+        victim = self.fixture.root / "foreign" / "victim"
+        victim.mkdir(parents=True)
+        (victim / "input").write_text("preserve")
+        (victim / "json.awk").write_text("preserve")
+        link = self.fixture.root / "tmp" / "couvrefeu-input.symlnk"
+        link.symlink_to(victim)
+        try:
+            env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(str(link))}\n')
+            result = self.stage_script_result(env)
+            self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+            self.assertEqual((victim / "input").read_text(), "preserve")
+            self.assertEqual((victim / "json.awk").read_text(), "preserve")
+        finally:
+            link.unlink()
+        self.assertEqual(self.input_residue(), [])
+
+    def test_sync_stage_resets_inherited_input_report_before_traps(self):
+        # An inherited cf_input_made (cfctl does not refuse lowercase names) must never reach
+        # cf_input_discard: a signal between trap installation and the reset would discard it.
+        # The window is builtins only, so assert source order inside cf_sync_stage.
+        src = (REPO / "router/lib/core.sh").read_text()
+        body = src[src.index("cf_sync_stage() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("cf_input_made=\n", body)
+        self.assertLess(body.index("cf_input_made=\n"), body.index("trap '"))
+
+    def test_sync_stage_requires_sticky_world_writable_owned_tmp_parent(self):
+        # The fixture tmp stands in for the router's 0:0:1777 /tmp (fixture owner in test mode).
+        tmp = self.fixture.root / "tmp"
+        try:
+            for mode in (0o777, 0o755, 0o1755, 0o1775):
+                with self.subTest(mode=oct(mode)):
+                    tmp.chmod(mode)
+                    result = self.stage_script_result(self.fixture.env)
+                    self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0",
+                                     result.stdout + result.stderr)
+                    self.assertEqual(self.input_residue(), [])
+        finally:
+            tmp.chmod(0o1777)
+        result = self.stage_script_result(self.fixture.env)
+        self.assertEqual(result.stdout.splitlines()[0], "0||1", result.stdout + result.stderr)
+        # Outside local-test mode only 0:0 is accepted: the same user-owned 1777 tmp is refused.
+        result = self.stage_script_result(self.fixture.env, local_test="0")
+        self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0", result.stdout + result.stderr)
+        self.assertEqual(self.input_residue(), [])
 
     def test_persisted_recovery_phase_blocks_enforcement_recreation(self):
         self.sync()
@@ -1514,6 +1899,48 @@ cf_transition_inventory_check
                 process.wait(timeout=5)
             process.stdout.close()
             process.stderr.close()
+
+    def test_expire_killed_before_pid_publication_does_not_wedge_later_expiry(self):
+        # A cron expire SIGKILLed between mkdir and its pid create leaves an empty
+        # private lock directory; under the transaction mutex its creator is dead.
+        self.sync()
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        lock.mkdir(mode=0o700)
+        self.success(self.fixture.run("expire"))
+        self.assertFalse(lock.exists())
+        self.success(self.fixture.run("expire"))
+
+    def test_unpublished_lock_with_a_record_is_never_stolen_by_expire(self):
+        self.sync()
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        for name in ("token", "reload", "foreign"):
+            with self.subTest(name=name):
+                lock.mkdir(mode=0o700)
+                (lock / name).write_text("a" * 64 + "\n")
+                (lock / name).chmod(0o600)
+                self.assertNotEqual(self.fixture.run("expire").returncode, 0)
+                self.assertEqual(sorted(p.name for p in lock.iterdir()), [name])
+                (lock / name).unlink()
+                lock.rmdir()
+        lock.mkdir(mode=0o755)
+        self.assertNotEqual(self.fixture.run("expire").returncode, 0)
+        self.assertTrue(lock.is_dir())
+        lock.rmdir()
+
+    def test_lock_record_write_error_is_unsafe_lock_and_leaves_no_record(self):
+        # ENOSPC/EIO on the PID write is not contention: report unsafe_lock and
+        # remove the record this process created.
+        self.sync()
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        result = self.fixture.run("expire", env=dict(self.fixture.env, CF_TEST_LOCK_FAULT="pid"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe_lock", result.stdout + result.stderr)
+        self.assertNotIn('"locked"', result.stdout)
+        self.assertFalse((lock / "pid").exists())
+        if lock.exists():
+            self.assertEqual(list(lock.iterdir()), [])
+        self.success(self.fixture.run("expire"))
+        self.assertFalse(lock.exists())
 
 
 class AddressBindingTests(unittest.TestCase):
@@ -1989,6 +2416,86 @@ class ActivityTests(unittest.TestCase):
                 self.assertEqual(result.stdout, expected, result.stderr)
 
 
+class ZeroOwnedRuntimeTokenTests(unittest.TestCase):
+    TOKEN = 'a' * 64
+
+    def snapshot(self, root):
+        result = {}
+        for path in sorted(root.rglob('*')):
+            info = path.lstat()
+            data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
+            result[str(path.relative_to(root))] = (info.st_dev, info.st_ino, info.st_mode,
+                                                   info.st_uid, info.st_gid, info.st_nlink,
+                                                   info.st_size, info.st_mtime_ns, data)
+        return result
+
+    def assert_token_case(self, *, expected=TOKEN, contents=TOKEN + '\n', owned=1,
+                          locked=1, mode=0o600, variant=None, accepted=False):
+        fixture = RouterFixture()
+        self.addCleanup(fixture.close)
+        runtime = fixture.root / 'etc/couvrefeu/runtime'
+        lock = runtime / 'lock'
+        lock.mkdir(parents=True, mode=0o700)
+        runtime.chmod(0o700)
+        token = lock / 'token'
+        if contents is not None:
+            token.write_text(contents)
+            token.chmod(mode)
+        if variant == 'hardlink':
+            os.link(token, fixture.root / 'token-alias')
+        elif variant == 'symlink':
+            target = fixture.root / 'token-target'
+            token.rename(target)
+            token.symlink_to(target)
+        elif variant in ('foreign', 'reload'):
+            child = lock / variant
+            child.write_text('foreign evidence\n'); child.chmod(0o600)
+        before = None
+
+        def ready(process, raw):
+            nonlocal before
+            pid = lock / 'pid'
+            pid.write_text(f'{process.pid}\n'); pid.chmod(0o600)
+            before = self.snapshot(fixture.root)
+            return raw
+
+        script = ('read -r ready || exit 98; CF_BASE=$1; CF_LIB=$2; CF_LOCAL_TEST=1; '
+                  '. "$CF_LIB/core.sh"; . "$CF_LIB/firewall.sh"; '
+                  'CF_TRANSACTION_TOKEN=$3; CF_TRANSACTION_OWNED=$4; CF_LOCKED=$5; '
+                  'cf_zero_owned_runtime')
+        result = run_owned_process(fixture.shell + ['-c', script, 'zero-token-fixture',
+                                   str(fixture.root), str(REPO / 'router/lib'), expected,
+                                   str(owned), str(locked)], env=fixture.env, input='continue\n',
+                                   started=ready, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, timeout=10)
+        self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(fixture.root), before)
+        self.assertEqual(fixture.mutation_calls(), [])
+
+    def test_valid_current_token_and_unbound_pid_only_are_readonly(self):
+        self.assert_token_case(accepted=True)
+        self.assert_token_case(owned=0, contents=None, accepted=True)
+
+    def test_foreign_hardlinked_or_weak_token_never_admits_cleanup(self):
+        for options in ({'contents': 'b' * 64 + '\n'}, {'variant': 'hardlink'},
+                        {'mode': 0o644}, {'variant': 'symlink'},
+                        {'contents': self.TOKEN}, {'contents': self.TOKEN + '\n\n'}):
+            with self.subTest(options=options):
+                self.assert_token_case(**options)
+
+    def test_owned_context_requires_token_lock_and_valid_expected_identity(self):
+        for options in ({'contents': None}, {'locked': 0}, {'owned': 0},
+                        {'expected': 'A' * 64, 'contents': 'A' * 64 + '\n'},
+                        {'expected': ''}, {'expected': 'a' * 63}):
+            with self.subTest(options=options):
+                self.assert_token_case(**options)
+
+    def test_foreign_lock_children_remain_refused(self):
+        for variant in ('foreign', 'reload'):
+            with self.subTest(variant=variant):
+                self.assert_token_case(variant=variant)
+
+
 class InstalledPackageTests(unittest.TestCase):
     def fresh_fixture(self):
         fixture = RouterFixture()
@@ -2122,6 +2629,7 @@ class InstalledPackageTests(unittest.TestCase):
                     # before returning to core or acknowledging zero-owned proof.
                     marker = fixture.root / "zero-owned-sync-ready.json"
                     wrapper = fixture.bin / "sync"
+                    wrapper.unlink()  # Never follow a fixture tool symlink into backend.py.
                     wrapper.write_text(f'''#!{sys.executable}
 import json, os, runpy, signal, sys
 from pathlib import Path
@@ -2132,6 +2640,10 @@ if status:
     raise SystemExit(status)
 root = Path(os.environ["CF_ROOT"])
 private = root / "etc/couvrefeu"
+# Owner/PREPARED publication now flushes before a core runtime owner exists.
+# Delegate those calls; stop only at the original zero-proof durability boundary.
+if sys.argv[2:] or not (private / "runtime/lock/pid").is_file():
+    raise SystemExit(0)
 assert (private / "runtime/firewall.preflight").is_file()
 assert not (private / "runtime/firewall.owned").exists()
 assert not (private / "backup/kernel-cleaned").exists()
@@ -2211,11 +2723,21 @@ os.kill(os.getpid(), signal.SIGSTOP)
                     # not encounter this deliberately stopped fixture wrapper.
                     wrapper.write_text("#!/bin/sh\nexec " + repr(sys.executable) + " "
                                        + repr(str(REPO / "tests/fixtures/backend.py")) + ' sync "$@"\n')
-                    # Existing reconciliation clears the dead core lock, then
-                    # the retained installer baseline fences all kernel effects.
+                    # New-format provenance fences runtime reconciliation before
+                    # it can retire this interrupted installer's runtime lock.
+                    held_raw = ZeroOwnedRuntimeTokenTests.snapshot(self, fixture.root)
                     reconcile = fixture.run("apply-fw")
-                    self.assertNotEqual(reconcile.returncode, 0)
-                    self.assertIn("preflight_baseline_requires_installer", reconcile.stdout)
+                    self.assertEqual(reconcile.returncode, 2, reconcile.stdout + reconcile.stderr)
+                    self.assertEqual(json.loads(reconcile.stdout),
+                                     {"ok": False, "errors": ["platform_admission_refused"]})
+                    self.assertIn("platform explicit_install_recovery_required", reconcile.stderr)
+                    self.assertEqual(ZeroOwnedRuntimeTokenTests.snapshot(self, fixture.root), held_raw)
+                    recovered = run_fixture_process(
+                        fixture.shell + [str(REPO / "router/cfctl"), "recover-install-lock"],
+                        env=fixture.env, timeout=60)
+                    self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+                    self.assertEqual(json.loads(recovered.stdout),
+                                     {"ok": True, "installLockRecovered": True, "uninstallRequired": True})
                 self.assertEqual(proof.read_bytes(), proof_bytes)
                 self.assertTrue((fixture.root / "usr/sbin/cfctl").exists())
                 self.assertFalse((fixture.root / "etc/couvrefeu/backup/kernel-cleaned").exists())
