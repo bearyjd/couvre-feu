@@ -274,7 +274,7 @@ main {
 
 .auth-layout {
   display:grid;
-  grid-template-columns:1fr;
+  grid-template-columns:minmax(0,1fr);
   gap:24px;
   align-items:start;
   padding-top:12px
@@ -584,6 +584,7 @@ input[type="checkbox"],input[type="radio"] {
 
 .person-top {
   display:flex;
+  flex-wrap:wrap;
   justify-content:space-between;
   align-items:flex-start;
   gap:12px
@@ -652,7 +653,7 @@ input[type="checkbox"],input[type="radio"] {
 /* Facts as an inset grouped list */
 .reasons {
   display:grid;
-  grid-template-columns:1fr;
+  grid-template-columns:minmax(0,1fr);
   margin:18px 0 16px;
   background:var(--surface-2);
   border-radius:var(--radius-sm);
@@ -712,7 +713,7 @@ input[type="checkbox"],input[type="radio"] {
 
 .quick-pauses {
   display:grid;
-  grid-template-columns:repeat(3,1fr);
+  grid-template-columns:repeat(3,minmax(0,1fr));
   gap:8px;
   margin:0 0 14px
 }
@@ -722,7 +723,7 @@ input[type="checkbox"],input[type="radio"] {
   color:var(--blue);
   padding:10px 4px;
   font-size:14px;
-  white-space:nowrap
+  white-space:normal
 }
 
 .quick-pauses .button:hover:not(:disabled) {
@@ -751,7 +752,7 @@ input[type="checkbox"],input[type="radio"] {
 
 .person-controls {
   display:grid;
-  grid-template-columns:1fr 1fr;
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr);
   gap:10px;
   align-items:end
 }
@@ -957,7 +958,7 @@ input[type="checkbox"],input[type="radio"] {
   margin-top:20px;
   padding:20px;
   display:grid;
-  grid-template-columns:1fr;
+  grid-template-columns:minmax(0,1fr);
   gap:16px
 }
 
@@ -967,7 +968,7 @@ input[type="checkbox"],input[type="radio"] {
 
 .unavailable dl {
   display:grid;
-  grid-template-columns:repeat(3,1fr);
+  grid-template-columns:repeat(3,minmax(0,1fr));
   gap:8px;
   margin:0
 }
@@ -1041,7 +1042,7 @@ footer {
 
 .activity-day {
   display:grid;
-  grid-template-columns:92px 1fr;
+  grid-template-columns:92px minmax(0,1fr);
   gap:2px 12px;
   align-items:center;
   padding:12px 0;
@@ -1255,7 +1256,7 @@ fieldset legend {
 }
 
 .bulk-confirm .person-controls {
-  grid-template-columns:1fr 1fr
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr)
 }
 
 .move-controls select {
@@ -1335,14 +1336,14 @@ fieldset legend {
     padding-right:24px
   }
   .reasons {
-    grid-template-columns:1fr 1fr
+    grid-template-columns:minmax(0,1fr) minmax(0,1fr)
   }
   .reasons>div+div {
     border-top:0;
     border-left:.5px solid var(--line)
   }
   .person-controls {
-    grid-template-columns:minmax(150px,1.2fr) 1fr 1fr
+    grid-template-columns:minmax(150px,1.2fr) minmax(0,1fr) minmax(0,1fr)
   }
   .duration-field {
     grid-column:auto
@@ -1364,10 +1365,10 @@ fieldset legend {
     display:none
   }
   .unavailable dl {
-    grid-template-columns:1fr
+    grid-template-columns:minmax(0,1fr)
   }
   .activity-day {
-    grid-template-columns:1fr
+    grid-template-columns:minmax(0,1fr)
   }
   .activity-figures,.activity-notes {
     grid-column:1
@@ -1475,8 +1476,8 @@ fieldset legend {
     text-align:center
   }
   .tab-badge[hidden] { display:none }
-  /* Reserve the bar plus the safe area once; the footer drops its own safe-area padding (no double gap). */
-  body:has(#status-view:not([hidden])) { padding-bottom:calc(49px + var(--safe-b)) }
+  /* Reserve the bar (49px + hairline, with sub-pixel slack for any font) plus the safe area once; the footer drops its own safe-area padding (no double gap). */
+  body:has(#status-view:not([hidden])) { padding-bottom:calc(53px + var(--safe-b)) }
   body:has(#status-view:not([hidden])) footer { padding-bottom:28px }
   .tab-empty:not([hidden]) { display:block; margin:32px 16px; padding:28px 16px; text-align:center; color:var(--muted); font-size:15px }
   body:has(#status-view:not([hidden])) .tabbar { display:block }
@@ -1490,3 +1491,11 @@ fieldset legend {
   .tab, .tab svg { transition:none }
   .tab[aria-selected="true"] svg, .tab:active svg { transform:none }
 }
+
+/* ---------- Font-metric robustness: any system fallback (wide DejaVu-class faces included) must never push the page sideways ---------- */
+body { overflow-wrap:anywhere }
+main > *,main :where(section,article,div,ul,ol,li,dl,dd,dt,p,form,fieldset,details,label,span,h1,h2,h3) { min-width:0 }
+main :where(img,svg,video,canvas,input,select,textarea,button,table) { max-width:100% }
+.badge { max-width:100%; white-space:normal; text-align:left }
+.button { max-width:100%; min-width:0 }
+.tab-label { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
