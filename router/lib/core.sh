@@ -7,6 +7,7 @@ CF_PROTECTED=$CF_DIR/protected
 CF_RUNTIME=$CF_DIR/runtime
 CF_ERROR=
 CF_LOCKED=0
+CF_OUTPUT_WANTED=0
 CF_OUTPUT_HELD=0
 CF_SSH_CLIENT_FRESH=0
 CF_NOW_VALUE=
@@ -234,6 +235,7 @@ cf_runtime_prepare() {
 }
 cf_install_gate() {
     platform_transaction_gate "$1"
+    cf_output_begin || { cf_fail unsafe_output_buffer;return 1; }
     CF_INSTALL_AUTH=0
     if [ "$CF_LOCAL_TEST" = 1 ];then
         cf_install_lock=$CF_BASE/.couvrefeu-install.lock
@@ -363,12 +365,15 @@ cf_unlock() {
     fi
 }
 # Output backpressure: a client that stops reading (stopped terminal, full SSH window) blocks a write,
-# and a write under a lock would hold it, fencing cron expire, fw3 apply-fw and uninstall. cfctl sends
-# the command's stdout to an unlinked private file under the root-owned sticky tmp; cf_output_release
-# drops cf_lock, the platform lock and the transaction mutex, and only then writes it with a builtin.
-# Every EXIT trap ends here, so refusals and platform_fail lines are released first too. stderr is
-# not buffered (residual: docs/contracts/tier1-rpc.md section 9).
+# and a write under a lock would hold it, fencing cron expire, fw3 apply-fw and uninstall. For cfctl
+# (CF_OUTPUT_WANTED), from the first held lock on (vendor admission, else the passed transaction gate)
+# stdout goes to an unlinked private file under the root-owned sticky tmp; cf_output_release drops
+# cf_lock, the platform lock and the transaction mutex, and only then writes it with a builtin. Every
+# EXIT trap ends here, so later refusals and platform_fail lines are released first too. Nothing is
+# created before a lock is held: a refusal at admission leaves the fixture tree untouched. Residuals
+# (stderr, admission-time refusal lines): docs/contracts/tier1-rpc.md section 9.
 cf_output_begin() {
+    [ "$CF_OUTPUT_WANTED" = 1 ] && [ "$CF_OUTPUT_HELD" != 1 ] || return 0
     cf_ob_parent=$CF_BASE/tmp
     if [ "$CF_LOCAL_TEST" = 1 ];then cf_ob_meta=$CF_OWNER:$(id -g):1777;else cf_ob_meta=0:0:1777;fi
     [ -d "$cf_ob_parent" ] && [ ! -L "$cf_ob_parent" ] && [ "$(stat -c '%u:%g:%a' "$cf_ob_parent" 2>/dev/null)" = "$cf_ob_meta" ] || return 1
@@ -383,7 +388,8 @@ cf_output_begin() {
 }
 cf_output_release() {
     cf_or_status=$?
-    [ "${CF_OUTPUT_HELD:-0}" = 1 ] || return "$cf_or_status"
+    CF_OUTPUT_WANTED=0
+    [ "$CF_OUTPUT_HELD" = 1 ] || return "$cf_or_status"
     CF_OUTPUT_HELD=0
     cf_unlock
     platform_lock_release

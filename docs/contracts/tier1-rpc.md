@@ -347,15 +347,18 @@ Terminal and lock hazard (review S-M1): a write to a stopped or flow-controlled 
 `cf_lock` and the platform lock (and so every `rpc-sync`, cron `expire` and fw3-include `apply-fw`, which then fail with
 `locked`/`transaction_contention`). Solved: preview and commit output (and refusals under the lock, and the commit-audit warning on
 stderr) are buffered and written only after both locks are released. M4b generalizes this for EVERY `cfctl` command (`sync`,
-`rpc-*`, `pause`/`resume`, `expire`, `apply-fw`, `status`, scope verbs): stdout goes to an unlinked private file under the
-root-owned sticky `/tmp` (`unsafe_output_buffer` if that cannot be made), and only after `cf_lock`, the platform lock and the
-permanent transaction mutex (fd 9, closed, never `LOCK_UN`) are released is it written; every EXIT trap does the same, so
-refusals and `platform_fail` JSON lines are also written lock-free. Install/uninstall output legitimately stays inside their
+`rpc-*`, `pause`/`resume`, `expire`, `apply-fw`, `status`, scope verbs): from the first held lock (vendor admission's platform
+lock, otherwise the passed transaction gate) stdout goes to an unlinked private file under the root-owned sticky `/tmp`
+(`unsafe_output_buffer` if that cannot be made), and only after `cf_lock`, the platform lock and the permanent transaction mutex
+(fd 9, closed, never `LOCK_UN`) are released is it written; every EXIT trap does the same, so later refusals and `platform_fail`
+JSON lines are also written lock-free. Nothing is created before a lock is held, so a refusal at admission leaves `/tmp` untouched. Install/uninstall output legitimately stays inside their
 transaction fence. Job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
 early block to exit; XON/XOFF is switched off on an output TTY (`stty` presence in the GL BusyBox build is UNVERIFIED-on-device; absence
 is tolerated). Residual, documented, not solved: (a) SIGSTOP cannot be ignored: only another root process can send it to this
 process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) stderr is
-not buffered: a `platform_fail`/admission-deadline exit still writes its one short stderr diagnostic while a lock is held (the trap
+not buffered, and a refusal by admission or by the transaction gate itself (before the buffer exists, e.g. `transaction_contention`,
+`explicit_install_recovery_required`) still writes
+its one short stdout/stderr line while that lock is held (the trap
 releases it right after; with `-ixon` and under 4 KiB of prior output this cannot block); (c) buffered stdout is lost if the process
 is killed, or if releasing the platform lock itself fails (`lock_owner_changed`/`lock_cleanup`). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
 stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. A stopped or dead recorded PID does not authorize lock removal. Interrupted-install recovery uses a complete authenticated external
