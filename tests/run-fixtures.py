@@ -30,6 +30,52 @@ SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.
                 'router/lib/activity.sh')
 
 
+# Measured seconds, per suite, for the cases that dominate its runtime; every
+# other case weighs DEFAULT_WEIGHT. Used only to spread cases over the four
+# partitions so no shard approaches the lane budget: a stale or missing entry
+# makes the split less even but never changes which cases run (coverage is
+# proven in discovery_plan). Refresh: take the 'TIMING: __main__.<Class>.<test>
+# <n>s' lines from a CI run's shard logs (emitted per case by
+# tests/fixtures/harness.py, relayed by main()) and keep entries of roughly
+# 30 s or more as {'<Class>.<test>': seconds}.
+DEFAULT_WEIGHT = 10
+CASE_WEIGHTS = {
+    'test-transition.py': {
+        'FailClosedReconstructionTests.test_failure_at_each_staging_step_keeps_old_generation_dispatched': 145,
+        'FailClosedReconstructionTests.test_interrupted_transition_address_change_repairs_with_iptables_delete_order': 130,
+        'FailClosedReconstructionTests.test_child_address_change_repairs_stale_selector_with_iptables_delete_order': 125,
+        'FailClosedReconstructionTests.test_router_sort_order_enrolled_transition_and_uninstall': 112,
+        'FailClosedReconstructionTests.test_failure_after_complete_shadow_build_rolls_back_slot_and_intent': 106,
+        'FailClosedReconstructionTests.test_status_after_refused_command_never_rewrites_shadow_intent': 102,
+        'FailClosedReconstructionTests.test_crashed_staging_leftover_generation_is_removed_on_next_run': 90,
+        'FailClosedReconstructionTests.test_schedule_and_resolver_change_blocks_child_in_every_observed_state': 84,
+        'FailClosedReconstructionTests.test_rollback_failing_after_partial_deletes_keeps_journal_and_uninstall_recovers': 84,
+        'FailClosedReconstructionTests.test_uninstall_refuses_referenced_staging_slot_without_mutation': 78,
+        'FailClosedReconstructionTests.test_uninstall_from_drifted_staging_intent_restores_exactly': 74,
+        'FailClosedReconstructionTests.test_uninstall_after_crashed_staging_refuses_until_stale_lock_recovery': 74,
+        'FailClosedReconstructionTests.test_failed_set_read_never_drops_journal_and_uninstall_recovers': 74,
+        'FailClosedReconstructionTests.test_first_dispatcher_switch_failure_keeps_old_generation_dispatched': 72,
+        'FailClosedReconstructionTests.test_uninstall_removes_failed_shadow_generation': 65,
+        'FailClosedReconstructionTests.test_router_order_stored_snapshot_is_accepted': 59,
+        'FailClosedReconstructionTests.test_added_child_is_guarded_before_switch_and_drained': 59,
+        'FailClosedReconstructionTests.test_drift_repair_blocks_child_in_every_observed_state': 58,
+        'FailClosedReconstructionTests.test_removed_child_stays_blocked_until_switch_completes': 57,
+        'FailClosedReconstructionTests.test_swapped_child_mac_keeps_union_blocked_through_switch': 53,
+    },
+}
+
+
+def partition_cases(names, weights=None, count=4):
+    """Greedy longest-first split; deterministic for a given name list and table."""
+    weights = weights or {}
+    loads, groups = [0] * count, [[] for _ in range(count)]
+    for name in sorted(names, key=lambda item: (-weights.get(item, DEFAULT_WEIGHT), item)):
+        target = min(range(count), key=lambda index: (loads[index], len(groups[index]), index))
+        loads[target] += weights.get(name, DEFAULT_WEIGHT)
+        groups[target].append(name)
+    return [sorted(group) for group in groups]
+
+
 def cases(suite):
     for case in suite:
         if isinstance(case, unittest.TestSuite):
@@ -90,7 +136,7 @@ def discovery_plan():
         names = sorted(cases(unittest.defaultTestLoader.loadTestsFromModule(module)))
         if not names or len(names) != len(set(names)):
             raise ValueError(f'empty or duplicate discovery: {filename}')
-        partitions = [names[index::4] for index in range(4)]
+        partitions = partition_cases(names, CASE_WEIGHTS.get(filename))
         union = [case for group in partitions for case in group]
         if not all(partitions) or sorted(union) != names or len(union) != len(set(union)):
             raise ValueError(f'incomplete or duplicate partition coverage: {filename}')
@@ -218,7 +264,7 @@ def main(argv=()):
     directory.chmod(0o700)
 
     failed = False
-    # Partitions remain four per suite; this only bounds concurrent lane execution.
+    # Partitions remain four per suite (see partition_cases); this only bounds concurrent lane execution.
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for future in as_completed([pool.submit(run_lane, job, directory) for job in jobs]):
             filename, index, count, status, log = future.result()

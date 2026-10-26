@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 PROTECTED = "02:00:00:00:00:aa"
@@ -29,6 +30,19 @@ def _interrupt_lane(signum, frame):
 
 if os.environ.get("CF_TEST_LANE") == "1":
     signal.signal(signal.SIGTERM, _interrupt_lane)
+
+    # Report every case's wall time; run-fixtures.py relays these lines so the
+    # CASE_WEIGHTS table there can be refreshed from any CI run's logs.
+    _run_case = unittest.TestCase.run
+
+    def _timed_run(self, result=None):
+        started = time.monotonic()
+        try:
+            return _run_case(self, result)
+        finally:
+            print(f'TIMING: {self.id()} {time.monotonic() - started:.1f}s', file=sys.stderr, flush=True)
+
+    unittest.TestCase.run = _timed_run
 
 
 def _terminate_owned_process(process):

@@ -445,6 +445,24 @@ finally:
                 self.assertEqual(runner.main(), 2)
                 launch.assert_not_called()
 
+    def test_weighted_partitions_cover_every_real_case_deterministically_and_evenly(self):
+        with patch.object(runner, 'source_revision', return_value='f' * 40):
+            plan = runner.discovery_plan()
+            self.assertEqual(runner.plan_digest(plan), runner.plan_digest(runner.discovery_plan()))
+        for suite in runner.SUITES:
+            weights = runner.CASE_WEIGHTS.get(suite, {})
+            groups = [shard['cases'] for shard in plan['shards'] if shard['suite'] == suite]
+            names = [case for group in groups for case in group]
+            self.assertEqual(len(groups), 4, suite)
+            self.assertTrue(all(groups), suite)
+            self.assertEqual(len(names), len(set(names)), suite)
+            self.assertEqual(groups, runner.partition_cases(sorted(names), weights), suite)
+            for stale in set(weights) - set(names):
+                self.fail(f'{suite}: weight for unknown case {stale}')
+            loads = [sum(weights.get(case, runner.DEFAULT_WEIGHT) for case in group) for group in groups]
+            # Greedy longest-first guarantees the spread is at most the heaviest case.
+            self.assertLessEqual(max(loads) - min(loads), max([runner.DEFAULT_WEIGHT, *weights.values()]), (suite, loads))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
