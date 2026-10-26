@@ -7,12 +7,17 @@ permissions:
 jobs:
   fixture_preflight:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
-      - name: Installer recovery, adapter, probe and static checks first
+      - name: Require every preflight suite in the preflight_suites matrix
+        run: |
+          sh tests/run.sh --list-preflight-suites | sort > "$RUNNER_TEMP/suites-run-sh.txt"
+          sed -n "s/^ *- suites: '\(.*\)'$/\1/p" .github/workflows/ci.yml | tr ' ' '\n' | sort > "$RUNNER_TEMP/suites-matrix.txt"
+          diff -u "$RUNNER_TEMP/suites-run-sh.txt" "$RUNNER_TEMP/suites-matrix.txt"
+      - name: Static checks and acceptance preflight
         env:
           CF_TEST_SHELL: busybox ash
           CF_TEST_AWK: busybox awk
@@ -20,7 +25,7 @@ jobs:
         run: |
           busybox 2>&1 | awk 'NR == 1 { print }'
           python3 tools/freeze-router-release.py --check
-          sh tests/run.sh --preflight-only
+          sh tests/run.sh --static-only
           sh tests/acceptance.sh --preflight
           python3 tests/run-fixtures.py --write-plan "$RUNNER_TEMP/couvre-feu-plan.json"
       - name: Publish complete source-bound partition plan
@@ -29,8 +34,32 @@ jobs:
           name: fixture-plan
           path: ${{ runner.temp }}/couvre-feu-plan.json
           if-no-files-found: error
+  preflight_suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suites: 'test-install.py'
+          - suites: 'test-install-recovery.py'
+          - suites: 'test-platform-integration.py'
+          - suites: 'test-os-trust.py'
+          - suites: 'test-install-recovery-primitives.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CI-only ash and lint tools
+        run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
+      - name: Run the named preflight suites
+        env:
+          CF_TEST_SHELL: busybox ash
+          CF_TEST_AWK: busybox awk
+          CF_TEST_TIMEOUT: busybox timeout
+        run: |
+          busybox 2>&1 | awk 'NR == 1 { print }'
+          sh tests/run.sh --preflight-suite ${{ matrix.suites }}
   fixture_shards:
-    needs: fixture_preflight
+    needs: [fixture_preflight, preflight_suites]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -63,7 +92,7 @@ jobs:
           path: ${{ runner.temp }}/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json
           if-no-files-found: error
   fixtures:
-    needs: [fixture_preflight, fixture_shards]
+    needs: [fixture_preflight, preflight_suites, fixture_shards]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -72,8 +101,9 @@ jobs:
       - name: Require successful preflight and every matrix job
         env:
           PREFLIGHT_RESULT: ${{ needs.fixture_preflight.result }}
+          SUITES_RESULT: ${{ needs.preflight_suites.result }}
           MATRIX_RESULT: ${{ needs.fixture_shards.result }}
-        run: test "$PREFLIGHT_RESULT" = success && test "$MATRIX_RESULT" = success
+        run: test "$PREFLIGHT_RESULT" = success && test "$SUITES_RESULT" = success && test "$MATRIX_RESULT" = success
       - name: Install CI-only ash for identical discovery
         run: sudo apt-get update && sudo apt-get install -y busybox
       - uses: actions/download-artifact@v5
