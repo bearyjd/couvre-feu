@@ -69,9 +69,12 @@ fi
 PROFILE_INVENTORY=0
 if [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; then PROFILE_INVENTORY=1
 elif [ -e "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then PROFILE_INVENTORY=1
-# A pre-ready journal killed before its profile signature is still modern:
-# PREPARED (digest-bound) supplies its inventory before any record is used.
-elif [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ] && [ ! -e "$BACKUP/ready" ] && [ ! -L "$BACKUP/ready" ]; then PROFILE_INVENTORY=1
+# A pre-ready journal killed before its profile signature is still modern
+# only beside its PREPARED baseline (published before BACKUP is created, and
+# digest-bound by prepared_recovery_check before any record is used). An
+# old-format pre-ready journal has none and keeps its legacy inventory.
+elif [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ] && [ ! -e "$BACKUP/ready" ] && [ ! -L "$BACKUP/ready" ] &&
+    [ -n "${CF_TRANSACTION_PREPARED:-}" ] && [ -d "$CF_TRANSACTION_PREPARED" ] && [ ! -L "$CF_TRANSACTION_PREPARED" ]; then PROFILE_INVENTORY=1
 elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1; fi
 if [ "$PROFILE_INVENTORY" = 1 ]; then
     FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
@@ -355,6 +358,19 @@ prepared_resume_publication() {
     fi
     prepared_validate "$CF_TRANSACTION_PREPARED"
 }
+# Exact record read (cmp, never command substitution): 0 = complete record
+# equal to $2 plus LF; 1 = torn write, a newline-free prefix of that value
+# (empty included); 2 = anything else. A complete record is never a prefix.
+recover_lock_record() {
+    recovery_record_size=$(stat -c %s "$1") || return 2
+    if printf '%s\n' "$2" | cmp -s - "$1"; then return 0; fi
+    if [ "$recovery_record_size" -le "${#2}" ] &&
+        printf '%s' "$2" | dd bs=1 count="$recovery_record_size" 2>/dev/null | cmp -s - "$1"; then return 1; fi
+    return 2
+}
+# $2 is the owner's publication order: token-pid (core.sh cf_lock) or
+# pid-token (install lock, platform_lock_acquire). Only the LAST record a
+# kill interrupted may be torn; every earlier record must be complete.
 recover_owned_lock_check() (
     set +f
     recovery_lock=$1
@@ -369,21 +385,41 @@ recover_owned_lock_check() (
         platform_private "$recovery_entry" 600
         [ "$(stat -c '%h:%s' "$recovery_entry" | awk -F: '$1==1&&$2<=128{print "ok"}')" = ok ] || fail 'unsafe recovery lock record'
     done
-    # New ownership precedes directory creation, so an absent/partial PID or
+    # A complete PID record naming a live process other than the retained
+    # (already proven dead) installer is a live holder: never remove it.
+    if [ -f "$recovery_lock/pid" ]; then
+        recovery_live=$(awk 'NR==1&&$0~/^[1-9][0-9]*$/&&length($0)<=10{p=$0;next}{p="";exit}END{print p}' "$recovery_lock/pid")
+        if [ -n "$recovery_live" ] && [ "$recovery_live" != "$CF_TRANSACTION_PID" ] &&
+            printf '%s\n' "$recovery_live" | cmp -s - "$recovery_lock/pid" &&
+            { kill -0 "$recovery_live" 2>/dev/null || [ -e "/proc/$recovery_live" ]; }; then
+            fail 'live recovery lock holder; preserved'
+        fi
+    fi
+    # New ownership precedes directory creation, so an absent or torn PID or
     # token is owned only under this intact durable transaction and mutex.
+    recovery_token_state=absent
     if [ -f "$recovery_lock/token" ]; then
-        recovery_token=$(cat "$recovery_lock/token")
-        case "$CF_TRANSACTION_TOKEN" in "$recovery_token"*) ;;
+        recovery_token_state=complete
+        recover_lock_record "$recovery_lock/token" "$CF_TRANSACTION_TOKEN" || case $? in
+            1) recovery_token_state=torn;;
             *) fail 'recovery lock token mismatch; preserved';; esac
     fi
+    recovery_pid_state=absent
     if [ -f "$recovery_lock/pid" ]; then
-        recovery_pid=$(cat "$recovery_lock/pid")
-        case "$CF_TRANSACTION_PID" in "$recovery_pid"*) ;;
+        recovery_pid_state=complete
+        recover_lock_record "$recovery_lock/pid" "$CF_TRANSACTION_PID" || case $? in
+            1) recovery_pid_state=torn;;
             *) fail 'recovery lock owner mismatch; preserved';; esac
     fi
+    case "$2:$recovery_token_state:$recovery_pid_state" in
+        # token-pid: a PID-only lock is a non-owned writer's; it must be exact.
+        token-pid:*:absent|token-pid:complete:*|token-pid:absent:complete) ;;
+        pid-token:absent:*|pid-token:*:complete) ;;
+        *) fail 'recovery lock records out of publication order; preserved';;
+    esac
 )
 recover_owned_lock() {
-    recover_owned_lock_check "$1"
+    recover_owned_lock_check "$1" "$2"
     [ -e "$1" ] || return 0
     rm -f "$1/pid" "$1/token" "$1/reload"
     rmdir "$1" || fail 'recovery lock cleanup failed'
@@ -414,15 +450,18 @@ recover_install_preflight() {
             if ! { [ -r /proc/self/stat ] && ! kill -0 "$CF_TRANSACTION_PID" 2>/dev/null; }; then fail 'unknown transaction owner visibility; preserved'; fi
         fi
     fi
-    recover_owned_lock_check "$LOCK"
-    if [ "${CF_TEST_MODE:-0}" != 1 ]; then
-        if [ "$RECOVERY_NEEDS_OWNER" = 1 ] && { [ -e /tmp/couvrefeu-platform.lock ] || [ -L /tmp/couvrefeu-platform.lock ]; }; then fail 'orphan platform lock alongside retirement receipt; preserved'; fi
-        recover_owned_lock_check /tmp/couvrefeu-platform.lock
+    recover_owned_lock_check "$LOCK" pid-token
+    # Strict fixtures share the host /tmp; vendor fixtures relocate this path
+    # (platform_lock_path is set by platform-bootstrap.sh).
+    # shellcheck disable=SC2154
+    if [ "${CF_TEST_MODE:-0}" != 1 ] || platform_vendor_selected; then
+        if [ "$RECOVERY_NEEDS_OWNER" = 1 ] && { [ -e "$platform_lock_path" ] || [ -L "$platform_lock_path" ]; }; then fail 'orphan platform lock alongside retirement receipt; preserved'; fi
+        recover_owned_lock_check "$platform_lock_path" pid-token
     fi
     # Runtime publication is mkdir, token, PID (core.sh cf_lock), all under
     # the transaction mutex this recovery now holds: an empty directory or a
     # token/PID prefix of this owner's records is that dead owner's kill window.
-    if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then recover_owned_lock_check "$BASE/runtime/lock"; fi
+    if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then recover_owned_lock_check "$BASE/runtime/lock" token-pid; fi
     if ! retirement_present; then
         prepared_recovery_check
         if [ "$CF_TRANSACTION_DIGEST" != none ]; then
@@ -461,9 +500,9 @@ recover_install_lock() {
     fi
     if ! retirement_present; then prepared_resume_publication; fi
     recover_private_scratch
-    recover_owned_lock "$LOCK"
-    if [ "${CF_TEST_MODE:-0}" != 1 ]; then recover_owned_lock /tmp/couvrefeu-platform.lock; fi
-    if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then recover_owned_lock "$BASE/runtime/lock"; fi
+    recover_owned_lock "$LOCK" pid-token
+    if [ "${CF_TEST_MODE:-0}" != 1 ] || platform_vendor_selected; then recover_owned_lock "$platform_lock_path" pid-token; fi
+    if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then recover_owned_lock "$BASE/runtime/lock" token-pid; fi
     if [ "$RECOVERY_NEEDS_OWNER" = 1 ]; then
         CF_TRANSACTION_PID=$$
         CF_TRANSACTION_BOOT=$(cat /proc/sys/kernel/random/boot_id)
@@ -540,6 +579,8 @@ recover_private_scratch() (
         rmdir "$recovery_stage" || fail 'owned stage cleanup failed'
     fi
 )
+# Callers run this as a plain command under `set -e` (uninstall.sh), so any
+# failed mkdir/cp/chmod below stops before `ready` with the journal retained.
 prepared_materialize() {
     prepared_materialize_noglob=0
     case $- in *f*) prepared_materialize_noglob=1;; esac
@@ -1425,10 +1466,14 @@ cron_quiescence_preflight() (
         service_source_gate
         cron_quiescence_capture
         cron_pending_size=$(stat -c %s "$cron_pending")
+        # Coarse bound before tr/sed scan the file; the exact bound (the live
+        # record's length, cron_pending_limit) needs the parsed lines below.
         [ "$cron_pending_size" -le 512 ] || fail 'oversized cron quiescence candidate'
         # Boot and daemon lines record the killed writer's moment. A later boot
         # or daemon only means that old daemon is gone (as cron_old_gone): check
-        # their shape, then bind header, live mode and token byte for byte.
+        # their shape, then bind header, live mode and token byte for byte. This
+        # subshell only validates; cron_restore_barrier re-captures LIVE boot and
+        # daemon identity before it publishes the record.
         cron_pending_lines=$(tr -dc '\n' < "$cron_pending" | wc -c)
         cron_boot=$(sed -n '2p' "$cron_pending")
         cron_old=$(sed -n '3p' "$cron_pending")
@@ -1504,7 +1549,7 @@ runtime_preflight() (
     fi
     if ! { [ ! -e "$runtime/lock" ] && [ ! -L "$runtime/lock" ]; }; then
         [ "${1:-}" = recover-owned-lock ] || fail 'runtime lock present; installation/recovery stopped'
-        recover_owned_lock_check "$runtime/lock"
+        recover_owned_lock_check "$runtime/lock" token-pid
     fi
     expected_owner=$(stat -c '%u:%g' "$BACKUP/etc_couvrefeu_state.staged")
     [ "$(metadata "$runtime")" = "700:$expected_owner" ] || fail 'runtime directory metadata drift'

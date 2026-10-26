@@ -30,7 +30,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=b676f2a1768237bcc26f4b8a98519bf83b375e689738034dca376665032e1567
+CF_BOOTSTRAP_PIN=83cb58763bed3543d86cb9c6c9682243f75deb133eb005911c602d799ffa7eac
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -41,7 +41,21 @@ platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
 platform_transaction_session "$@"
-platform_admit runtime "${CF_ROOT:-}" "$HERE/lib"
+# The durable transaction owner names the profile it was admitted under, as
+# for `cfctl recover-install-lock`: a kill before the profile journal record
+# leaves no other evidence. Explicit selection still refuses any staged,
+# completion, retirement or installed profile that disagrees with it.
+platform_uninstall_selection=runtime
+if [ "${CF_TEST_MODE:-0}" = 1 ]; then platform_uninstall_owner=${CF_ROOT:-}/.couvrefeu-transaction
+else platform_uninstall_owner=/etc/.couvrefeu-transaction; fi
+if [ -e "$platform_uninstall_owner" ] || [ -L "$platform_uninstall_owner" ]; then
+    platform_regular "$platform_uninstall_owner"
+    platform_private "$platform_uninstall_owner" 600
+    platform_uninstall_selection=$(sed -n '8p' "$platform_uninstall_owner")
+    case "$platform_uninstall_selection" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;;
+        *) platform_fail transaction_owner_profile;; esac
+fi
+platform_admit "$platform_uninstall_selection" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # Any complete authenticated external release is usable after a partial install.
 # shellcheck disable=SC1091

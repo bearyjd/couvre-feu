@@ -9,11 +9,13 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=9bd2acf7b55cfaf01a337b1f385b4416aa20c97a7ca62bef2ae95d4786b7f889
+CF_RELEASE_ID=ee307688f521ef99f58a885668e1e93844c959eeaba801558bc4ce4c2c39bac9
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-CF_RELEASE_MODULES='core.sh:e2943b7a707c9d97f6a8b1b9fe39e9cde2c215bc88ea3fc19e3533956846f708 rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:1be748b9730bb88a12e2e7efdc98fd1903d313f006154162d9ade3b5c7defd64 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+# Explicit recovery (install-common.sh) names the platform lock through this.
+platform_lock_path=/tmp/couvrefeu-platform.lock
+CF_RELEASE_MODULES='core.sh:e2943b7a707c9d97f6a8b1b9fe39e9cde2c215bc88ea3fc19e3533956846f708 rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:4881b3b9d44fc95d22158048feeb91435f8dc1b0f74b605424fed77dfbc1c200 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -381,6 +383,25 @@ platform_read_profile() {
     printf '%s\n' "$platform_read_value" | timeout -s KILL 4 cmp -s - "$1" || platform_fail profile_bytes
     printf '%s\n' "$platform_read_value"
 }
+# Pre-ready profile journal record. A kill inside its write may leave it empty
+# or a newline-free byte prefix of a profile ($2.., default all three): that
+# prints nothing. Shape, owner and mode failures, and any other bytes, stay
+# fatal; call as `v=$(platform_read_torn_profile f) || exit 2`.
+platform_read_torn_profile() {
+    platform_torn_record=$1
+    shift
+    [ "$#" -gt 0 ] || set -- strict gl-xe3000-4.8.3-logd-011-v1 gl-xe3000-4.8.3-os-trust-v1
+    platform_regular "$platform_torn_record"
+    platform_private "$platform_torn_record" 600
+    platform_torn_size=$(platform_stat -c %s "$platform_torn_record") || platform_fail profile_read
+    for platform_torn_profile in "$@"; do
+        if [ "$platform_torn_size" -le "${#platform_torn_profile}" ] &&
+            printf '%s' "$platform_torn_profile" | timeout -s KILL 4 dd bs=1 count="$platform_torn_size" 2>/dev/null | timeout -s KILL 4 cmp -s - "$platform_torn_record"; then
+            return 0
+        fi
+    done
+    platform_read_profile "$platform_torn_record"
+}
 platform_done_legacy() {
     platform_regular "$1"
     printf '2\n' | timeout -s KILL 4 cmp -s - "$1"
@@ -423,8 +444,8 @@ platform_choose() {
             [ -z "$platform_stage_profile" ] || platform_fail ambiguous_journals
             if platform_journal_provisional "$platform_journal"; then
                 # A kill inside the pre-ready journal write can leave this
-                # record empty or partial: only a complete profile is evidence.
-                platform_stage_profile=$(platform_read_profile "$platform_journal/etc_couvrefeu_platform-profile.staged" 2>/dev/null) || platform_stage_profile=
+                # record empty or torn: only a complete profile is evidence.
+                platform_stage_profile=$(platform_read_torn_profile "$platform_journal/etc_couvrefeu_platform-profile.staged") || exit 2
             else
                 platform_stage_profile=$(platform_read_profile "$platform_journal/etc_couvrefeu_platform-profile.staged") || exit 2
             fi
@@ -540,9 +561,12 @@ platform_lock_acquire() {
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = platform-mkdir ]; then kill -KILL "$$"; fi
     (set -C; printf '%s\n' "$$" > "$CF_PLATFORM_LOCK/pid") || platform_fail lock_record
+    if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = platform-pid ]; then kill -KILL "$$"; fi
     if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then
         (set -C; printf '%s\n' "$CF_TRANSACTION_TOKEN" > "$CF_PLATFORM_LOCK/token") || platform_fail lock_record
+        if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = platform-token ]; then kill -KILL "$$"; fi
     fi
     platform_private "$CF_PLATFORM_LOCK" 700
     platform_private "$CF_PLATFORM_LOCK/pid" 600
@@ -604,8 +628,9 @@ platform_profile_validate() {
             fi
             if [ "$platform_stage_complete" = 1 ]; then
                 [ "$(platform_read_profile "$platform_stage")" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
-            elif platform_stage_value=$(platform_read_profile "$platform_stage" 2>/dev/null); then
-                [ "$platform_stage_value" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
+            else
+                platform_stage_value=$(platform_read_torn_profile "$platform_stage" "$CF_PLATFORM_PROFILE") || exit 2
+                [ -z "$platform_stage_value" ] || [ "$platform_stage_value" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
             fi
         fi
     done

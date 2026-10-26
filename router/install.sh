@@ -67,7 +67,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=b676f2a1768237bcc26f4b8a98519bf83b375e689738034dca376665032e1567
+CF_BOOTSTRAP_PIN=83cb58763bed3543d86cb9c6c9682243f75deb133eb005911c602d799ffa7eac
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -380,6 +380,7 @@ if [ ! -e "$BACKUP" ]; then
     JOURNAL_ROLLBACK=1
     platform_initial_write
     mkdir -p "$BACKUP"
+    journal_crash backup-created
     chmod 700 "$BACKUP"
     journal_crash backup
     for rel in $FILES; do
@@ -412,7 +413,7 @@ if [ ! -e "$BACKUP" ]; then
             etc/sysupgrade.conf) staged=sysupgrade;; etc/crontabs/root) staged=cron;;
             etc/couvrefeu/protected) staged=protected;; etc/couvrefeu/state) staged=state;;
         esac
-        case "$staged" in lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; chmod 644 "$BACKUP/$k.staged";;
+        case "$staged" in lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 644 "$BACKUP/$k.staged";;
             *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
         journal_crash "$k.staged"
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
