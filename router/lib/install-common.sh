@@ -551,8 +551,10 @@ prepared_materialize() {
         k=$(key "$rel")
         cp "$CF_TRANSACTION_PREPARED/$k.before" "$CF_TRANSACTION_PREPARED/$k.mtime" "$BACKUP/"
         rm -f "$BACKUP/$k.staged"
+        if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CRASH_AT:-}" = "materialize-$k.cleared" ]; then kill -KILL "$$"; fi
         if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.staged"
         else : > "$BACKUP/$k.staged"; chmod 600 "$BACKUP/$k.staged"; fi
+        if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CRASH_AT:-}" = "materialize-$k.staged" ]; then kill -KILL "$$"; fi
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
     done
     for rel in $DIRS; do k=$(key "$rel"); cp "$CF_TRANSACTION_PREPARED/dir_$k" "$BACKUP/"; done

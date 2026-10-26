@@ -67,7 +67,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=af2a9fa2b7c98be1cf8ace201c6161393bc5732fadbf1a950921bf8741078d4d
+CF_BOOTSTRAP_PIN=fdac96605e41bdbaa46846901185108f0e364c1bf8f7fc7f10858ee9ca2138ae
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -343,6 +343,8 @@ preserve_original() {
         fail "original changed while preserving: /$1; installation refused, journal removed"
     fi
 }
+# Fixture-only SIGKILL at each pre-ready journal record boundary.
+journal_crash() { if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_INSTALL_CRASH_AT:-}" = "journal-$1" ]; then kill -KILL "$$"; fi; }
 if [ ! -e "$BACKUP" ]; then
     # Every refusal gate precedes the first managed write. Without a journal no
     # rename source is installation owned, so any existing one is foreign.
@@ -379,16 +381,19 @@ if [ ! -e "$BACKUP" ]; then
     platform_initial_write
     mkdir -p "$BACKUP"
     chmod 700 "$BACKUP"
+    journal_crash backup
     for rel in $FILES; do
         k=$(key "$rel")
-        if [ -e "$ROOT/$rel" ]; then preserve_original "$rel" "$k"; fi
+        if [ -e "$ROOT/$rel" ]; then preserve_original "$rel" "$k"; journal_crash "$k.copy"; fi
     done
     chmod 700 "$BASE"
-    for rel in $DIRS; do k=$(key "$rel"); cp "$STAGE/dir_$k" "$BACKUP/dir_$k"; done
+    for rel in $DIRS; do k=$(key "$rel"); cp "$STAGE/dir_$k" "$BACKUP/dir_$k"; journal_crash "dir_$k"; done
     for rel in $FILES; do
         k=$(key "$rel")
         cp "$STAGE/$k.before" "$BACKUP/$k.before"
+        journal_crash "$k.before"
         cp "$STAGE/$k.mtime" "$BACKUP/$k.mtime"
+        journal_crash "$k.mtime"
         case "$rel" in
             usr/lib/couvrefeu/platform-bootstrap.sh) staged=lib/platform-bootstrap.sh;;
             usr/lib/couvrefeu/vendor-platform.sh) staged=lib/vendor-platform.sh;;
@@ -409,7 +414,9 @@ if [ ! -e "$BACKUP" ]; then
         esac
         case "$staged" in lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; chmod 644 "$BACKUP/$k.staged";;
             *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
+        journal_crash "$k.staged"
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
+        journal_crash "$k.after"
     done
     # The ownership marker is durable before any release directory exists.
     if [ "$RELEASE_ABSENT" = 1 ]; then phase release-absent; fi

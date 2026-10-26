@@ -384,6 +384,75 @@ class InstallRecoveryTests(unittest.TestCase):
         pending.write_bytes(b"foreign candidate\n")
         self.assert_refused_without_changes(self.recover)
 
+    OTHER_BOOT = b"00000000-1111-2222-3333-444444444444"
+
+    def stale_cron_candidate(self, reboot=False, restart=False, keep=None):
+        """A complete candidate killed before publication, then the world moved on.
+
+        `reboot` stands the candidate's boot line for a boot that is no longer
+        current; `restart` replaces the fixture daemon's loaded table so its
+        live identity differs; `keep` truncates the candidate to that prefix.
+        """
+        before, journal = self.interrupted_cron_reconciliation(
+            "marker-cron-quiescing", installed=False, candidate=True)
+        pending, = journal.glob("cron-quiescing.pending.*")
+        lines = pending.read_bytes().split(b"\n")
+        self.assertEqual(lines[0], b"CFCRON 2")
+        self.assertEqual(lines[4], pending.name.rsplit(".", 1)[1].encode())
+        if reboot:
+            self.assertNotEqual(lines[1], self.OTHER_BOOT)
+            lines[1] = self.OTHER_BOOT
+        data = b"\n".join(lines)
+        pending.write_bytes(data if keep is None else data[:keep])
+        if restart:
+            table = self.root / "crond-table"
+            table.write_bytes(table.read_bytes() + b"# restarted daemon\n")
+        return before, pending
+
+    def test_unpublished_cron_candidate_after_reboot_recovers(self):
+        before, _ = self.stale_cron_candidate(reboot=True)
+        self.recover_and_uninstall(before)
+
+    def test_unpublished_cron_candidate_after_daemon_restart_recovers(self):
+        before, _ = self.stale_cron_candidate(restart=True)
+        self.recover_and_uninstall(before)
+
+    def test_unpublished_cron_candidate_after_reboot_and_restart_recovers(self):
+        before, _ = self.stale_cron_candidate(reboot=True, restart=True)
+        self.recover_and_uninstall(before)
+
+    def test_truncated_cron_candidates_after_reboot_recover(self):
+        # Inside the boot line, inside the daemon line, inside the mode line, inside the token.
+        for keep in (12, 46, 50, 120, 150):
+            with self.subTest(keep=keep):
+                if keep != 12:
+                    self.tearDown()
+                    self.setUp()
+                before, _ = self.stale_cron_candidate(reboot=True, restart=True, keep=keep)
+                self.recover_and_uninstall(before)
+
+    def test_cron_candidate_with_foreign_token_refuses_without_handover(self):
+        _, pending = self.stale_cron_candidate(reboot=True)
+        lines = pending.read_bytes().split(b"\n")
+        lines[4] = b"f" * 64
+        pending.write_bytes(b"\n".join(lines))
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("cron quiescence candidate", result.stderr)
+
+    def test_cron_candidate_with_foreign_mode_refuses_without_handover(self):
+        _, pending = self.stale_cron_candidate(reboot=True)
+        pending.write_bytes(pending.read_bytes().replace(b"\nunpublished\n", b"\nreplace\n"))
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("cron quiescence candidate", result.stderr)
+
+    def test_cron_candidate_with_malformed_boot_refuses_without_handover(self):
+        _, pending = self.stale_cron_candidate()
+        lines = pending.read_bytes().split(b"\n")
+        lines[1] = b"not-a-boot-identity-zzzzzzzzzzzzzzzz"
+        pending.write_bytes(b"\n".join(lines))
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("cron quiescence candidate", result.stderr)
+
     def test_malformed_cron_quiescence_mode_refuses_without_handover(self):
         _, journal = self.interrupted_cron_reconciliation("cron-table-restored")
         record = journal / "cron-quiescing"
@@ -584,6 +653,169 @@ class InstallRecoveryTests(unittest.TestCase):
         token = self.root / ".couvrefeu-install.lock/token"
         token.rename(self.root / "original-install-token")
         self.recover_and_uninstall(before)
+
+    def killed_runtime_lock(self, files, point="intent"):
+        """Stage the runtime lock a SIGKILL leaves inside cf_lock publication.
+
+        Owned publication is mkdir, token, pid: every prefix of that sequence
+        (and of each record's bytes) is a state a kill can leave behind.
+        """
+        before = self.killed_install(point)
+        owner = (self.root / ".couvrefeu-transaction").read_text().splitlines()
+        values = {"pid": owner[3] + "\n", "token": owner[5] + "\n"}
+        runtime = self.root / "etc/couvrefeu/runtime"
+        if not runtime.exists():
+            runtime.mkdir(mode=0o700)
+        lock = runtime / "lock"
+        lock.mkdir(mode=0o700)
+        for name, length in files:
+            record = lock / name
+            data = values.get(name, name)
+            record.write_text(data if length is None else data[:length])
+            record.chmod(0o600)
+        self.assertEqual(sorted(p.name for p in lock.iterdir()), sorted(name for name, _ in files))
+        return before
+
+    def test_empty_runtime_lock_after_kill_recovers_then_uninstall_restores(self):
+        self.recover_and_uninstall(self.killed_runtime_lock([]))
+
+    def test_empty_token_runtime_lock_after_kill_recovers(self):
+        self.recover_and_uninstall(self.killed_runtime_lock([("token", 0)]))
+
+    def test_partial_token_runtime_lock_after_kill_recovers(self):
+        self.recover_and_uninstall(self.killed_runtime_lock([("token", 31)]))
+
+    def test_token_only_runtime_lock_after_kill_recovers(self):
+        self.recover_and_uninstall(self.killed_runtime_lock([("token", None)]))
+
+    def test_token_and_partial_pid_runtime_lock_after_kill_recovers(self):
+        self.recover_and_uninstall(self.killed_runtime_lock([("token", None), ("pid", 0)]))
+
+    def test_owner_pid_only_runtime_lock_after_kill_recovers(self):
+        self.recover_and_uninstall(self.killed_runtime_lock([("pid", None)]))
+
+    def test_empty_runtime_lock_after_killed_uninstall_recovers(self):
+        before, _ = self.interrupted_cron_reconciliation("cron-quiescing")
+        lock = self.root / "etc/couvrefeu/runtime/lock"
+        self.assertFalse(lock.exists())
+        if not lock.parent.exists():
+            lock.parent.mkdir(mode=0o700)  # cf_runtime_prepare precedes the lock mkdir.
+        lock.mkdir(mode=0o700)
+        self.recover_and_uninstall(before)
+
+    def test_foreign_pid_only_runtime_lock_refuses_without_changes(self):
+        self.killed_runtime_lock([])
+        pid = self.root / "etc/couvrefeu/runtime/lock/pid"
+        pid.write_text(f"{os.getpid()}\n")
+        pid.chmod(0o600)
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("recovery lock owner mismatch", result.stderr)
+
+    def test_foreign_token_runtime_lock_refuses_without_changes(self):
+        self.killed_runtime_lock([])
+        token = self.root / "etc/couvrefeu/runtime/lock/token"
+        token.write_text("f" * 64 + "\n")
+        token.chmod(0o600)
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("recovery lock token mismatch", result.stderr)
+
+    def test_foreign_runtime_lock_entry_refuses_without_changes(self):
+        self.killed_runtime_lock([("foreign", None)])
+        result = self.assert_refused_without_changes(self.recover)
+        self.assertIn("foreign recovery lock entry", result.stderr)
+
+    PROFILE_KEY = "etc_couvrefeu_platform-profile"
+
+    def killed_journal(self, record, empty=None):
+        """SIGKILL install right after the pre-ready journal wrote `record`.
+
+        `empty` names the next record, created zero-length as a kill between
+        its open/truncate and its first write leaves it.
+        """
+        before = self.killed_install("journal-" + record)
+        backup = self.root / "etc/couvrefeu/backup"
+        self.assertTrue(backup.is_dir())
+        self.assertFalse((backup / "ready").exists())
+        if record != "backup":
+            self.assertTrue((backup / record).is_file(), record)
+        if empty is not None:
+            self.assertFalse((backup / empty).exists(), empty)
+            (backup / empty).write_bytes(b"")
+            (backup / empty).chmod(0o600)
+        return before
+
+    def test_profile_staged_without_after_recovers_then_uninstall_restores(self):
+        before = self.killed_journal(self.PROFILE_KEY + ".staged")
+        self.assertFalse((self.root / f"etc/couvrefeu/backup/{self.PROFILE_KEY}.after").exists())
+        self.recover_and_uninstall(before)
+
+    def test_profile_staged_with_empty_after_recovers(self):
+        self.recover_and_uninstall(self.killed_journal(self.PROFILE_KEY + ".staged", self.PROFILE_KEY + ".after"))
+
+    def test_empty_profile_staged_recovers(self):
+        self.recover_and_uninstall(self.killed_journal(self.PROFILE_KEY + ".mtime", self.PROFILE_KEY + ".staged"))
+
+    def test_foreign_profile_after_refuses_without_changes(self):
+        self.killed_journal(self.PROFILE_KEY + ".after")
+        after = self.root / f"etc/couvrefeu/backup/{self.PROFILE_KEY}.after"
+        after.write_text("0" * 64 + f":600:{os.getuid()}:{os.getgid()}\n")
+        self.assert_refused_without_changes(self.recover)
+
+    def test_pre_ready_staged_profile_conflicting_with_owner_refuses(self):
+        self.killed_journal(self.PROFILE_KEY + ".staged")
+        owner = (self.root / ".couvrefeu-transaction").read_text().splitlines()
+        other = ("gl-xe3000-4.8.3-logd-011-v1" if owner[7] == "strict" else "strict") + "\n"
+        (self.root / f"etc/couvrefeu/backup/{self.PROFILE_KEY}.staged").write_text(other)
+        self.assert_refused_without_changes(self.recover)
+
+    def materialize_crash(self, point, empty=False):
+        before = self.killed_install("prepared")
+        self.assertEqual(self.recover().returncode, 0)
+        self.env["CF_TEST_UNINSTALL_CRASH_AT"] = point
+        try:
+            killed = self.run_script("uninstall.sh")
+        finally:
+            self.env.pop("CF_TEST_UNINSTALL_CRASH_AT")
+        self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stdout + killed.stderr)
+        backup = self.root / "etc/couvrefeu/backup"
+        self.assertFalse((backup / "ready").exists())
+        record = backup / (point.split("-", 1)[1].rsplit(".", 1)[0] + ".staged")
+        self.assertEqual(record.exists(), point.endswith(".staged"))
+        if empty:
+            record.write_bytes(b"")
+            record.chmod(0o600)
+        self.recover_and_uninstall(before)
+
+    def test_kill_after_materialize_clears_profile_staged_recovers(self):
+        self.materialize_crash(f"materialize-{self.PROFILE_KEY}.cleared")
+
+    def test_kill_with_empty_materialized_profile_staged_recovers(self):
+        self.materialize_crash(f"materialize-{self.PROFILE_KEY}.cleared", empty=True)
+
+    def test_kill_after_materialized_profile_staged_recovers(self):
+        self.materialize_crash(f"materialize-{self.PROFILE_KEY}.staged")
+
+    def test_kill_after_first_materialized_staged_recovers(self):
+        self.materialize_crash("materialize-usr_lib_couvrefeu_core.sh.staged")
+
+    def test_failed_uninstall_after_materialize_retries_and_restores(self):
+        for present in (True, False):
+            with self.subTest(present=present):
+                if not present:
+                    self.tearDown()
+                    self.setUp()
+                before = self.killed_install("prepared", present=present)
+                self.assertEqual(self.recover().returncode, 0)
+                self.env["CF_TEST_UNINSTALL_FAIL_AFTER"] = "1"
+                try:
+                    failed = self.run_script("uninstall.sh")
+                finally:
+                    self.env.pop("CF_TEST_UNINSTALL_FAIL_AFTER")
+                self.assertIn("injected partial restoration", failed.stderr)
+                self.assertTrue((self.root / ".couvrefeu-recovery/ready").is_file())
+                removed = self.run_script("uninstall.sh")
+                self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+                self.assert_restored(*before)
 
     def test_symlink_new_owner_refuses_without_touching_foreign_target(self):
         self.killed_install("linked")
@@ -880,6 +1112,31 @@ class InstallRecoveryTests(unittest.TestCase):
             removed = invoke("uninstall.sh")
             self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
             self.assertEqual(support.exact_signature(original), original_signature)
+
+
+# Every pre-ready journal record boundary of the platform-profile file, plus the
+# representative first/last of each other record class (copies, directories,
+# first and last managed file), each killed for real between `mkdir BACKUP` and `linked`.
+JOURNAL_KILL_POINTS = (
+    "backup",
+    "etc_config_firewall.copy", "etc_crontabs_root.copy",
+    "dir_etc", "dir_etc_couvrefeu",
+    "usr_lib_couvrefeu_core.sh.before", "usr_lib_couvrefeu_core.sh.after",
+    InstallRecoveryTests.PROFILE_KEY + ".before", InstallRecoveryTests.PROFILE_KEY + ".mtime",
+    InstallRecoveryTests.PROFILE_KEY + ".after",
+    "usr_lib_couvrefeu_activity.sh.staged", "usr_lib_couvrefeu_activity.sh.after",
+)
+
+
+def _journal_kill_case(record):
+    def test(self):
+        self.recover_and_uninstall(self.killed_journal(record))
+    return test
+
+
+for _record in JOURNAL_KILL_POINTS:
+    setattr(InstallRecoveryTests, "test_journal_kill_after_" + _record.replace(".", "_").replace("-", "_"),
+            _journal_kill_case(_record))
 
 
 if __name__ == "__main__":

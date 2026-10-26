@@ -524,12 +524,44 @@ class VendorAdmissionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root/'tmp/couvrefeu-platform.lock').exists())
 
-    def test_dead_owner_recovery_and_foreign_partial_refusal(self):
+    def test_empty_lock_left_by_kill_before_pid_publication_is_recovered(self):
+        # mkdir succeeded, then KILL before the exclusive pid create: no record claims it.
         lock = self.root / 'tmp/couvrefeu-platform.lock'
         lock.mkdir(mode=0o700)
         result = self.run_shell('platform_lock_recover')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(lock.exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(lock.exists())
+        # The next vendor admission then proceeds and releases normally.
+        result = self.run_shell(self.admit() + 'platform_lock_release')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_partial_or_foreign_unpublished_lock_still_refuses_recovery(self):
+        lock = self.root / 'tmp/couvrefeu-platform.lock'
+        for name, content in [('pid', ''), ('token', 'a' * 64 + '\n'), ('foreign', '')]:
+            with self.subTest(name=name, content=content):
+                lock.mkdir(mode=0o700)
+                record = lock / name
+                record.write_text(content); record.chmod(0o600)
+                result = self.run_shell('platform_lock_recover')
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(record.read_text(), content)
+                record.unlink(); lock.rmdir()
+        lock.mkdir(mode=0o755)
+        self.assertNotEqual(self.run_shell('platform_lock_recover').returncode, 0)
+        self.assertTrue(lock.is_dir())
+
+    def test_term_after_mkdir_before_pid_releases_owned_empty_lock(self):
+        lock = self.root / 'tmp/couvrefeu-platform.lock'
+        body = (f'CF_PLATFORM_LOCK="{lock}"; trap "platform_lock_release" 0; trap "exit 143" TERM; '
+                'mkdir -m 700 "$CF_PLATFORM_LOCK"; CF_PLATFORM_LOCKED=1; kill -TERM $$; exit 7')
+        result = self.run_shell(body)
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_dead_owner_recovery_and_foreign_partial_refusal(self):
+        lock = self.root / 'tmp/couvrefeu-platform.lock'
+        lock.mkdir(mode=0o700)
         (lock / 'pid').write_text('2147483647\n'); (lock / 'pid').chmod(0o600)
         (lock / 'foreign').touch()
         self.assertNotEqual(self.run_shell('platform_lock_recover').returncode, 0)

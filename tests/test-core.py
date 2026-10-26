@@ -1900,6 +1900,33 @@ cf_transition_inventory_check
             process.stdout.close()
             process.stderr.close()
 
+    def test_expire_killed_before_pid_publication_does_not_wedge_later_expiry(self):
+        # A cron expire SIGKILLed between mkdir and its pid create leaves an empty
+        # private lock directory; under the transaction mutex its creator is dead.
+        self.sync()
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        lock.mkdir(mode=0o700)
+        self.success(self.fixture.run("expire"))
+        self.assertFalse(lock.exists())
+        self.success(self.fixture.run("expire"))
+
+    def test_unpublished_lock_with_a_record_is_never_stolen_by_expire(self):
+        self.sync()
+        lock = self.fixture.root / "etc/couvrefeu/runtime/lock"
+        for name in ("token", "reload", "foreign"):
+            with self.subTest(name=name):
+                lock.mkdir(mode=0o700)
+                (lock / name).write_text("a" * 64 + "\n")
+                (lock / name).chmod(0o600)
+                self.assertNotEqual(self.fixture.run("expire").returncode, 0)
+                self.assertEqual(sorted(p.name for p in lock.iterdir()), [name])
+                (lock / name).unlink()
+                lock.rmdir()
+        lock.mkdir(mode=0o755)
+        self.assertNotEqual(self.fixture.run("expire").returncode, 0)
+        self.assertTrue(lock.is_dir())
+        lock.rmdir()
+
 
 class AddressBindingTests(unittest.TestCase):
     """Binding trust is independent of recent IPv6 reachability, not future ownership."""
