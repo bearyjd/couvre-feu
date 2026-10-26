@@ -100,6 +100,22 @@ def policy(revision=1):
             "pauses": [], "schedules": [], "doh": {"ipv4": [], "ipv6": []}}
 
 
+def dead_prefix(pid):
+    """Longest proper decimal prefix of pid that names no live process, or None."""
+    for k in range(len(pid) - 1, 0, -1):
+        candidate = pid[:k]
+        if candidate.startswith("0"):
+            continue
+        try:
+            os.kill(int(candidate), 0)
+        except ProcessLookupError:
+            if not os.path.exists(f"/proc/{candidate}"):
+                return candidate
+        except PermissionError:
+            continue
+    return None
+
+
 class RouterFixture:
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="couvre-feu-core-", dir="/tmp")

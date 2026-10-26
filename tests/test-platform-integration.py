@@ -529,7 +529,11 @@ class VendorRecoveryTests(unittest.TestCase):
 
     def test_vendor_decimal_prefix_platform_lock_pid_refuses(self):
         self.killed_vendor('CF_TEST_INSTALL_CRASH_AT', 'prepared')
-        self.platform_lock_state([('pid', (self.owner_line(3)[:-1] + '\n').encode())])
+        from harness import dead_prefix
+        prefix = dead_prefix(self.owner_line(3))
+        if prefix is None:
+            self.skipTest('no dead proper decimal prefix of the owner pid')
+        self.platform_lock_state([('pid', (prefix + '\n').encode())])
         self.vendor_refused_without_changes(self.vendor_recover, 'recovery lock owner mismatch')
 
     def test_vendor_live_platform_lock_holder_is_preserved(self):

@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("install_fixture_support", REPO / "tests/test-install.py")
 support = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(support)
-from harness import KID, PROTECTED, RouterFixture
+from harness import KID, PROTECTED, RouterFixture, dead_prefix
 primitive_spec = importlib.util.spec_from_file_location(
     "recovery_primitive_support", REPO / "tests/test-install-recovery-primitives.py")
 primitives = importlib.util.module_from_spec(primitive_spec)
@@ -737,8 +737,11 @@ class InstallRecoveryTests(unittest.TestCase):
         self.killed_runtime_lock([])
         owner = (self.root / ".couvrefeu-transaction").read_text().splitlines()
         lock = self.root / "etc/couvrefeu/runtime/lock"
-        for files in ([("token", owner[5] + "\n"), ("pid", owner[3][:-1] + "\n")],
-                      [("pid", owner[3][:-1] + "\n")]):
+        prefix = dead_prefix(owner[3])
+        if prefix is None:
+            self.skipTest("no dead proper decimal prefix of the owner pid")
+        for files in ([("token", owner[5] + "\n"), ("pid", prefix + "\n")],
+                      [("pid", prefix + "\n")]):
             with self.subTest(files=[name for name, _ in files]):
                 for name, data in files:
                     (lock / name).write_text(data)
