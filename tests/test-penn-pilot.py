@@ -136,6 +136,9 @@ class PilotBase(unittest.TestCase):
     model_fresh_router = TLR.LiveRehearsalTests.model_fresh_router
     truncating_cp = TLR.LiveRehearsalTests.truncating_cp
     write_agent = TLR.LiveRehearsalTests.write_agent
+    provision_mutex = TLR.LiveRehearsalTests.provision_mutex
+    mutex_metadata = TLR.LiveRehearsalTests.mutex_metadata
+    assert_mutex_continuity = TLR.LiveRehearsalTests.assert_mutex_continuity
     router_snapshot = TLR.LiveRehearsalTests.router_snapshot
 
     def setUp(self):
@@ -151,6 +154,7 @@ class PilotBase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.evidence_root, True)
         (self.evidence_root / 'evidence').mkdir(mode=0o700)
         self.model_fresh_router()
+        self.provision_mutex()
         self.cp_log = self.work / 'cp-p.log'
         self.truncating_cp('s')
         self.fake_tools()

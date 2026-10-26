@@ -88,6 +88,9 @@ Router code runs on BusyBox 1.33 ash and awk (OpenWrt).
 - BusyBox sort places `SET` rows before `SETDEF` rows; see the snapshot ordering in `router/lib/firewall.sh` and [router-transition-design](router-transition-design.md).
 - Release pins are frozen. After any change under `router/` that is covered by the manifest, run `python3 tools/freeze-router-release.py` and commit the result. CI runs it with `--check` and fails on `not frozen: router/<file>`.
 - Never change dnsmasq configuration or the WAN zone. Owned schedule rules use the `cf_sched_*` prefix.
+- Preserve the permanent transaction mutex inode and immutable digest-bound PREPARED baseline. Never recover by lock age or manual unlink. Recovery uses a complete authenticated external `cfctl recover-install-lock`, then the ordinary single `uninstall.sh`; ambiguity preserves evidence. See [recovery](runbooks/vendor-platform-admission.md).
+- Keep generated cron/firewall callbacks bound to their immutable release and installation generation. Production async-source admission is exact-hash allowlisted; unknown sources refuse before managed writes and target support remains UNVERIFIED.
+- Run the install recovery, primitive, retirement and historical-data fixture suites registered in `tests/run.sh`. Historical main4ff fixture bytes are not production legacy drain proof: production legacy automatic restoration refuses pending the compatibility scope decision and separate maintenance recovery work. Version-2 release identity must change with install/uninstall/bootstrap source changes.
 
 ## Pull request checklist
 

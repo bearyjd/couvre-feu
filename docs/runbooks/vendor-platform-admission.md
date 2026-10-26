@@ -23,37 +23,69 @@ self-authenticate their own bytes. Never supply a replacement manifest, source
 or hash through the environment. A production source release has canonical
 root-owned700 release/lib directories,755 entries,644 modules and600 manifest.
 
-Vendor entry acquires `/tmp/couvrefeu-platform.lock` under verified root-owned
-sticky1777 `/tmp`, then performs one full fresh012 two-pass attestation before
-private policy reads, ordinary locks or mutation. Lock contention refuses.
+Mutating transaction admission validates the permanent `/etc/.couvrefeu-mutex`
+inode and acquires its kernel exclusion; direct transaction workers retain the
+descriptor. Fresh vendor attestation and profile validation precede persistent
+control-record creation. Vendor entry also acquires `/tmp/couvrefeu-platform.lock`
+under verified root-owned sticky1777 `/tmp` before private policy reads, ordinary
+locks or mutation. Lock contention refuses. The mutex is never unlinked; a dead
+PID or elapsed time cannot authorize takeover.
 Nested core and firewall-journal calls run in isolated verified subshells;
 independent executable invocations always initialize admission again. Only the
 existing exact live-owner/private reload token can return read-only deferred
-JSON before admission. It never admits a transaction. The explicit
-`cfctl recover-platform-lock` operation validates metadata and fresh vendor
-attestation, then removes only a recorded demonstrably dead owner. Missing or
-foreign records remain for separately reviewed recovery.
+JSON before admission. It never admits a transaction. For an interrupted installation, use the
+administrator-only external-source
+`cfctl recover-install-lock` flow below. `cfctl recover-platform-lock` retains
+fresh vendor attestation and transaction admission; it is not a substitute for
+install recovery. Missing, foreign or legacy ownership remains for separately
+reviewed recovery.
 
 Activation retains an external immutable private release at
-`/etc/.couvrefeu-release-<compiled-module-closure-id>` and preserves it in
+`/etc/.couvrefeu-release-<release-id>` and preserves it in
 sysupgrade configuration. Recovery must execute the uninstaller from that
 verified closure. ID collisions, changed manifests and incomplete copies
 refuse; they are never overwritten or removed automatically. Keep this closure
 through recovery even after installed/staged helpers have been restored or
 removed. Original bytes, modes, owners and exact mtimes remain journaled.
-Legacy journals derive inventory from their original records and retain strict
-version2 completion behavior. Activated legacy cleanup executes the verified
-current immutable external release, including its AWK/module dependencies;
-installed-file drift still checks the validated original journal. Older unpinned
-installed programs are never executed. The committed deterministic fixture
-archive contains genuine pre-adapter public source bytes, not router captures.
+New-format PREPARED is complete, immutable and digest-bound before managed
+writes. Ownership binds boot/PID/starttime/token, profile/release, baseline and
+permanent mutex identity. Integration intent precedes executable/include/cron
+publication. Cron and firewall callbacks invoke the immutable versioned source
+with an installation generation; a stale callback refuses after retirement or a
+later installation of the same release. Recovery reconciles the audited service
+state; daemon exit alone is not a job-drain proof or whole-system quiescence.
+Production admission requires exact audited cron init, `rc.common`, `procd.sh`
+and firewall init hashes plus the admitted procd image binding. Unknown sources
+refuse before managed writes. Target source bytes, flock/setsid and service
+behavior remain UNVERIFIED; this narrows eligibility, not a hardware admission.
 
-After exact restoration succeeds, version3 DONE binds the exact profile and
-compiled module closure ID. It survives each staged record deletion, journal
-removal and owned-lock release. Cleanup disarms traps before deleting DONE as
-its final filesystem operation. A DONE-only retry still verifies the external
-closure and performs a fresh vendor attestation. The external release remains
-as recovery evidence after completion; retiring it is a separate operation.
+An administrator uses a complete independently authenticated external release:
+`<AUTHENTICATED_RELEASE>/cfctl recover-install-lock`, then
+`<AUTHENTICATED_RELEASE>/uninstall.sh` once, without arguments. Another complete
+authenticated source may replace an absent/partial installed recovery copy;
+partial or old helpers and environment-selected targets are refused. Fresh vendor
+attestation remains required. Recovery validates ownership, worker exclusion and
+baseline, then keeps a durable recovery-required fence until the single
+uninstaller finishes. Never delete locks or the journal manually. Password login,
+full administrator shell/edit rights and PTY access remain available; no service
+SSH grammar is added.
+
+The durable `CFRETIREMENT 2` receipt binds the authenticated SOURCE separately
+from the owned TARGET release, target inventory and validated restoration
+baseline. It survives retirement of journal, PREPARED, owned target release,
+compatibility locks, owner, recovery fence and DONE, and is unlinked last under
+the permanent mutex. A further interruption uses authenticated recovery again;
+ambiguity preserves evidence. A pre-existing release remains unchanged. Only the
+permanent mutex is intentional new residue; all owned transaction transients
+must retire. SIGKILL fixtures do not establish power-loss or reboot durability.
+
+Production legacy journals, DONE and retirement state without new-format binding
+refuse automatic restoration: old generic callbacks cannot be proven quiescent.
+Complete-legacy compatibility therefore remains an outstanding scope decision,
+with a separately approved maintenance/reboot recovery design required. The
+pinned historical main4ff source fixture exercises isolated byte/metadata restore,
+authentication and receipt parsing only; it is data, not production legacy proof.
+No old helper is executed by current recovery.
 
 Do not remove prerequisite stat/od while any installation, recovery, DONE,
 publication-temporary, owned lock or external release path remains. The frozen
@@ -120,7 +152,8 @@ drift/collision refusal and exact restoration remain mandatory. WAN, dnsmasq,
 offload and firmware are unchanged.
 
 Focused fixtures exercise native ash admission call counts, source and profile
-refusals, cleanup interruptions and exact strict/legacy restoration. Vendor
+refusals, cleanup interruptions and exact new-format restoration; historical legacy
+restoration runs only in inert data fixtures. Vendor
 payload/attestation boundaries are explicit inert stand-ins in adapter tests;
 the unchanged helper has its separate135 native cases and the unchanged private
 prerequisite wrapper49 cases. No fixture proves live packet behavior or router

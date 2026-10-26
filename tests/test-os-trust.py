@@ -183,13 +183,23 @@ class DeadlineTests(unittest.TestCase):
                 r=self.run_shell(body);self.assertNotEqual(r.returncode,0)
                 self.assertNotIn('unsafe',r.stdout);self.assertFalse(lock.exists());self.assertEqual(foreign.read_text(),'preserve')
     def test_slow_input_within_ten_seconds_still_checks_cumulative_deadline(self):
+        # Entry anchored 8s back (500-tick margin to the 1300-tick budget). The stage's input
+        # file appearing proves every pre-read deadline check passed; stdin then arrives
+        # after the margin but well inside dd's 10s bound, so only the post-read
+        # admission_deadline check can refuse (not an early one, not the dd deadline).
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-input-') as folder:
-            root=Path(folder);(root/'tmp').mkdir()
-            body=f'''CF_BASE={root};CF_LOCAL_TEST=1;CF_TEST_TIMEOUT='{SHELL[0]} timeout';. "{REPO}/router/lib/core.sh";CF_PLATFORM_ENTRY_TICK=$(platform_clock_tick);CF_PLATFORM_ENTRY_TICK=$((CF_PLATFORM_ENTRY_TICK-1290));cf_sync_stage 0;printf unsafe'''
+            root=Path(folder);(root/'tmp').mkdir();(root/'tmp').chmod(0o1777)
+            body=f'''CF_BASE={root};CF_LIB={REPO}/router/lib;CF_LOCAL_TEST=1;CF_TEST_TIMEOUT='{SHELL[0]} timeout';. "{REPO}/router/lib/core.sh";CF_PLATFORM_ENTRY_TICK=$(platform_clock_tick);CF_PLATFORM_ENTRY_TICK=$((CF_PLATFORM_ENTRY_TICK-800));cf_sync_stage 0;printf unsafe'''
             child=subprocess.Popen(SHELL+['-c',self.setup+body],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:
-                time.sleep(.2);out,err=child.communicate('{}',timeout=5)
+                deadline=time.monotonic()+4
+                while not list((root/'tmp').glob('couvrefeu-input.*/input')):
+                    self.assertIsNone(child.poll(),'stage refused before its read began (early deadline check)')
+                    self.assertLess(time.monotonic(),deadline,'stage read never began within the margin')
+                    time.sleep(.01)
+                time.sleep(5.5);out,err=child.communicate('{}',timeout=30)
                 self.assertNotEqual(child.returncode,0);self.assertIn('admission_deadline',err);self.assertNotIn('unsafe',out)
+                self.assertNotIn('input_deadline_or_read_failure',out+err)
                 self.assertEqual(list((root/'tmp').iterdir()),[])
             finally:
                 if child.poll() is None:child.kill()
@@ -244,14 +254,14 @@ mkdir() {{ command mkdir "$@";fixture_tick=1400; }};cf_lock;printf unsafe'''
     def test_recovery_guard_after_slow_owner_validation_preserves_dead_lock(self):
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-dead-lock-') as folder:
             root=Path(folder);lock=root/'lock';lock.mkdir();(lock/'pid').write_text('999999999\n')
-            text=self.bootstrap.read_text();start=text.index('platform_lock_recover() {');stop=text.index('platform_profile_validate()',start)
+            text=self.bootstrap.read_text();start=text.index('platform_lock_recover() (');stop=text.index('platform_profile_validate()',start)
             fn=text[start:stop].replace('/tmp/couvrefeu-platform.lock',str(lock))
             body=f'''set -eu
 {fn}
 fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ fixture_tick=1400; }};
 platform_lock_recover;printf unsafe'''
-            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertNotIn('unsafe',r.stdout)
+            r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertIn('admission_deadline',r.stderr);self.assertNotIn('unsafe',r.stdout)
             self.assertEqual((lock/'pid').read_text(),'999999999\n')
     def test_internal_receipt_separates_kernel_proof_and_protected_attempt(self):
         for zero,started,ok in [(True,False,True),(True,True,True),(False,True,True),(False,False,False)]:
@@ -299,7 +309,7 @@ atomic_copy {src} {dst};printf unsafe'''
                     if existing:pending.write_text('validated receipt');pending.chmod(0o600)
                     body=f"""set -eu
 {fn}
-DONE={done};HERE=/unused;CF_RELEASE_ID=fixed;CF_PLATFORM_PROFILE={profile};CF_PLATFORM_INITIAL_WRITE={started};
+DONE={done};HERE=/unused;CF_RELEASE_ID=fixed;CF_PLATFORM_PROFILE={profile};CF_PLATFORM_INITIAL_WRITE={started};CF_PLATFORM_OWNER="$(id -u):$(id -g)";
 fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 platform_external_closure() {{ fixture_tick=1400; }};platform_valid_done() {{ fixture_tick=1400; }};
 sync() {{ :; }};platform_publish_done;printf complete"""
@@ -326,27 +336,31 @@ fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
                 self.assertEqual(marker.exists(),ok)
                 if not ok:self.assertIn('admission_deadline',r.stderr)
             # Production dispatch has the same immediate primitive boundary.
-            self.assertIn('else platform_initial_write; /etc/init.d/firewall reload; fi',fn)
+            self.assertIn('else platform_initial_write; env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /etc/init.d/firewall reload; fi',fn)
 
 class OperationalFlowTests(unittest.TestCase):
-    def test_native_complete_flows_record_latency_without_target_claim(self):
+    def os_trust_release(self,f):
         # The genuine ash/router code uses the isolated JSON backend. Hardware
         # admission is the same explicit inert adapter as recovery fixtures.
+        (f.root/'tmp').chmod(0o1777)
+        release=f.root/'release';shutil.copytree(REPO/'router',release)
+        bootstrap=release/'lib/platform-bootstrap.sh';text=bootstrap.read_text()
+        start=text.index('platform_bootstrap_vendor() {');stop=text.index('platform_verify_modules()',start)
+        text=text[:start]+'platform_bootstrap_vendor() { :; }\n'+text[stop:]
+        text=text.replace('/tmp/couvrefeu-platform.lock',str(f.root/'tmp/couvrefeu-platform.lock'))
+        text=text.replace("'%u:%g:%a' /tmp)","'%u:%g:%a' "+str(f.root/'tmp')+')').replace('0:0:1777',f'{os.getuid()}:{os.getgid()}:1777')
+        text=text.replace('        vp_transaction_check >/dev/null','        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
+        bootstrap.write_text(text)
+        compiler=(REPO/'tools/freeze-router-release.py').read_text().replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'",'router = Path('+repr(str(release))+')')
+        subprocess.run(['python3','-c',compiler],capture_output=True,check=True)
+        return release
+
+    def test_native_complete_flows_record_latency_without_target_claim(self):
         sys.path.insert(0,str(REPO/'tests/fixtures'))
         from harness import RouterFixture,PROTECTED,KID,policy
         f=RouterFixture()
         try:
-            (f.root/'tmp').chmod(0o1777)
-            release=f.root/'release';shutil.copytree(REPO/'router',release)
-            bootstrap=release/'lib/platform-bootstrap.sh';text=bootstrap.read_text()
-            start=text.index('platform_bootstrap_vendor() {');stop=text.index('platform_verify_modules()',start)
-            text=text[:start]+'platform_bootstrap_vendor() { :; }\n'+text[stop:]
-            text=text.replace('/tmp/couvrefeu-platform.lock',str(f.root/'tmp/couvrefeu-platform.lock'))
-            text=text.replace("'%u:%g:%a' /tmp)","'%u:%g:%a' "+str(f.root/'tmp')+')').replace('0:0:1777',f'{os.getuid()}:{os.getgid()}:1777')
-            text=text.replace('        vp_transaction_check >/dev/null','        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
-            bootstrap.write_text(text)
-            compiler=(REPO/'tools/freeze-router-release.py').read_text().replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'",'router = Path('+repr(str(release))+')')
-            subprocess.run(['python3','-c',compiler],capture_output=True,check=True)
+            release=self.os_trust_release(f)
             env=dict(f.env,CF_TEST_INSTALL_KERNEL='1');rows=[]
             def run(label,argv,raw=None):
                 started=time.monotonic()
@@ -366,6 +380,46 @@ class OperationalFlowTests(unittest.TestCase):
             run('nested-journal-reload',[entry,'apply-fw'])
             run('restoration',[str(release/'uninstall.sh')])
             print('OS_TRUST_FIXTURE_LATENCY '+json.dumps(rows),file=__import__('sys').stderr)
+        finally:f.close()
+
+    def test_blocked_output_holds_no_lock(self):
+        # Vendor entry holds the platform lock (and mutating verbs the transaction mutex) from
+        # admission; a client that stops reading stdout must keep neither. Even `status`, which
+        # takes no runtime lock, holds the platform lock under this profile.
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import RouterFixture,PROTECTED,KID,policy,start_with_full_stdout,drain_full_stdout
+        f=RouterFixture()
+        try:
+            release=self.os_trust_release(f)
+            env=dict(f.env,CF_TEST_INSTALL_KERNEL='1')
+            installed=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,'--activate','--protect',PROTECTED,'--rpc-allow',KID],
+                                     env=env,capture_output=True,text=True,timeout=120)
+            self.assertEqual(installed.returncode,0,installed.stderr+installed.stdout)
+            entry=str(f.root/'usr/sbin/cfctl')
+            def cfctl(*args,raw=None):
+                return subprocess.run(f.shell+[entry,*args],env=env,input=raw,capture_output=True,text=True,timeout=120)
+            def document():
+                current=json.loads(cfctl('rpc-status','--json').stdout)
+                data=policy(current['acceptedPolicy']['revision']+1);data['people'][0]['macs']=[KID]
+                return current,data
+            def rpc_request():
+                current,data=document()
+                return json.dumps(dict(rpc_version=1,generation=current['generation'],operation_id='op_blocked',
+                                       expected_revision=current['acceptedPolicy']['revision'],expected_digest=current['policyDigest'],policy=data))
+            cases=(('status',('status','--json'),None),('sync',('sync',),lambda:json.dumps(document()[1])),
+                   ('rpc-sync',('rpc-sync',),rpc_request),('pause',('pause','alice'),None),('resume',('resume','alice'),None),
+                   ('expire',('expire',),None),('rpc-status',('rpc-status','--json'),None))
+            for label,args,stdin in cases:
+                with self.subTest(command=label):
+                    child,read_end=start_with_full_stdout(f.shell+[entry,*args],env,stdin() if stdin else None)
+                    try:
+                        probe=cfctl('expire')
+                        self.assertEqual(probe.returncode,0,(label,probe.stdout,probe.stderr))
+                        self.assertIsNone(child.poll(),'the blocked command must still be writing')
+                    finally:
+                        status,stdout=drain_full_stdout(child,read_end)
+                    self.assertEqual(status,0,stdout)
+                    self.assertTrue(stdout.rstrip().endswith('}'),stdout)
         finally:f.close()
 
 if __name__=='__main__':unittest.main()
