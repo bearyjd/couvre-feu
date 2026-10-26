@@ -1142,6 +1142,18 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
     def test_scope_preview(self):
         self.assert_blocked_output_holds_no_lock(('scope-preview', NEW))
 
+    def test_unusable_buffer_parent_never_refuses_enforcement(self):
+        # The buffer is a convenience for the client, never a new dependency of enforcement:
+        # a tmp that is not sticky 1777 falls back to direct (pre-M4b) output with a warning.
+        tmp = self.f.root / 'tmp'
+        tmp.chmod(0o755)
+        for args in (('apply-fw',), ('expire',), ('rpc-status', '--json')):
+            with self.subTest(args=args):
+                result = self.f.run(*args, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(last_json(result.stdout).get('errors'), [], result.stdout)
+                self.assertIn('output buffer unavailable', result.stderr)
+
     def test_status_control(self):
         # Control: strict-profile status takes no lock at all, so it was never affected. Before any
         # apply this fixture reports observed-set errors; only the complete status object matters here.
