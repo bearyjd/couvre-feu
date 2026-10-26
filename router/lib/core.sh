@@ -7,6 +7,7 @@ CF_PROTECTED=$CF_DIR/protected
 CF_RUNTIME=$CF_DIR/runtime
 CF_ERROR=
 CF_LOCKED=0
+CF_OUTPUT_HELD=0
 CF_SSH_CLIENT_FRESH=0
 CF_NOW_VALUE=
 CF_EXPIRY_NOW=
@@ -349,7 +350,7 @@ cf_lock() {
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT
     trap 'cf_unlock; platform_lock_release; exit 143' TERM
-    trap 'cf_unlock; platform_lock_release' 0
+    trap 'cf_unlock; platform_lock_release; cf_output_release' 0
     platform_deadline_check
 }
 cf_unlock() {
@@ -360,6 +361,38 @@ cf_unlock() {
         fi
         CF_LOCKED=0
     fi
+}
+# Output backpressure: a client that stops reading (stopped terminal, full SSH window) blocks a write,
+# and a write under a lock would hold it, fencing cron expire, fw3 apply-fw and uninstall. cfctl sends
+# the command's stdout to an unlinked private file under the root-owned sticky tmp; cf_output_release
+# drops cf_lock, the platform lock and the transaction mutex, and only then writes it with a builtin.
+# Every EXIT trap ends here, so refusals and platform_fail lines are released first too. stderr is
+# not buffered (residual: docs/contracts/tier1-rpc.md section 9).
+cf_output_begin() {
+    cf_ob_parent=$CF_BASE/tmp
+    if [ "$CF_LOCAL_TEST" = 1 ];then cf_ob_meta=$CF_OWNER:$(id -g):1777;else cf_ob_meta=0:0:1777;fi
+    [ -d "$cf_ob_parent" ] && [ ! -L "$cf_ob_parent" ] && [ "$(stat -c '%u:%g:%a' "$cf_ob_parent" 2>/dev/null)" = "$cf_ob_meta" ] || return 1
+    cf_ob_file=$(mktemp "$cf_ob_parent/couvrefeu-output.XXXXXX" 2>/dev/null) || return 1
+    case $cf_ob_file in "$cf_ob_parent"/couvrefeu-output.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) return 1;; esac
+    # One write and one independent read description of the same private file, by design.
+    # shellcheck disable=SC2094
+    cf_safe_file "$cf_ob_file" && command exec 7>"$cf_ob_file" 8<"$cf_ob_file" || { rm -f "$cf_ob_file";return 1; }
+    rm -f "$cf_ob_file" || return 1
+    command exec 6>&1 1>&7 || return 1
+    CF_OUTPUT_HELD=1
+}
+cf_output_release() {
+    cf_or_status=$?
+    [ "${CF_OUTPUT_HELD:-0}" = 1 ] || return "$cf_or_status"
+    CF_OUTPUT_HELD=0
+    cf_unlock
+    platform_lock_release
+    platform_transaction_release
+    exec 1>&6 6>&- 7>&-
+    cf_or_text=$(cat <&8 && printf .) || cf_or_text=.
+    exec 8<&-
+    printf '%s' "${cf_or_text%.}"
+    return "$cf_or_status"
 }
 cf_reentrant_include() {
     [ -n "${CF_RELOAD_TOKEN-}" ] || return 1
@@ -792,7 +825,7 @@ cf_sync_stage() {
     # Reset before the traps: an inherited value must never reach cf_input_discard.
     cf_input_made=
     # Traps first, so a signal once the directory exists still removes it.
-    trap 'cf_input_cleanup; cf_unlock; platform_lock_release' 0
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release; cf_output_release' 0
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 129' HUP
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 130' INT
     trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 143' TERM

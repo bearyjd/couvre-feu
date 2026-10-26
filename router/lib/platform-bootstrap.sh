@@ -9,13 +9,13 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=ee307688f521ef99f58a885668e1e93844c959eeaba801558bc4ce4c2c39bac9
+CF_RELEASE_ID=9f4e32efb811e23c927fe5fb658c360e8343b356395e2246ba66a18417e6e15d
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
 # Explicit recovery (install-common.sh) names the platform lock through this.
 platform_lock_path=/tmp/couvrefeu-platform.lock
-CF_RELEASE_MODULES='core.sh:e2943b7a707c9d97f6a8b1b9fe39e9cde2c215bc88ea3fc19e3533956846f708 rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:4881b3b9d44fc95d22158048feeb91435f8dc1b0f74b605424fed77dfbc1c200 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+CF_RELEASE_MODULES='core.sh:531c0cfd2a42627b3a562f3f2dfc3ad2713f91a53a2d7ea3f30c840e3e68d31a rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:4881b3b9d44fc95d22158048feeb91435f8dc1b0f74b605424fed77dfbc1c200 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -168,6 +168,15 @@ platform_transaction_mutex() {
     flock -n 9 || platform_fail transaction_contention
     platform_transaction_mutex_check
     CF_TRANSACTION_HELD=1
+}
+# Ordinary commands drop the mutex before writing their buffered output, so a
+# client that stops reading cannot fence expiry or uninstall. Close only (see
+# above); a transaction owner keeps its fence until it exits.
+platform_transaction_release() {
+    [ "${CF_TRANSACTION_HELD:-0}" = 1 ] || return 0
+    [ "${CF_TRANSACTION_OWNED:-0}" != 1 ] || return 0
+    exec 9>&-
+    CF_TRANSACTION_HELD=0
 }
 platform_transaction_orphan_check() {
     if [ -e "$CF_TRANSACTION_OWNER" ] || [ -L "$CF_TRANSACTION_OWNER" ]; then

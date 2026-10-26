@@ -30,7 +30,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=83cb58763bed3543d86cb9c6c9682243f75deb133eb005911c602d799ffa7eac
+CF_BOOTSTRAP_PIN=52ea8c5e885efc16cf0c05a00f3e381eba7dd710bb633d853391dc5e9aa7e98a
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2

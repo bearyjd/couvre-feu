@@ -109,7 +109,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=83cb58763bed3543d86cb9c6c9682243f75deb133eb005911c602d799ffa7eac
+CF_BOOTSTRAP_PIN=52ea8c5e885efc16cf0c05a00f3e381eba7dd710bb633d853391dc5e9aa7e98a
 platform_bootstrap_path=$CF_LIB/platform-bootstrap.sh
 if ! { [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ]; }; then cf_bootstrap_refuse; fi
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || cf_bootstrap_refuse
@@ -195,7 +195,7 @@ if [ -n "$CF_CALLBACK_GENERATION" ]; then
     printf '1\n' | cmp -s - "$CF_TRANSACTION_BASE/backup/complete" || platform_fail incomplete_installation_callback
     platform_transaction_gate
 fi
-trap 'platform_lock_release' 0
+trap 'platform_lock_release; cf_output_release' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -203,4 +203,10 @@ trap 'exit 143' TERM
 . "$CF_LIB/firewall.sh"
 . "$CF_LIB/activity.sh"
 platform_deadline_check
+# No lock may be held while output blocks: buffer stdout, release every lock, then write (core.sh).
+if ! cf_output_begin; then
+    platform_lock_release;platform_transaction_release
+    printf '%s\n' '{"ok":false,"errors":["unsafe_output_buffer"]}';exit 1
+fi
 cf_main "$@"
+cf_output_release

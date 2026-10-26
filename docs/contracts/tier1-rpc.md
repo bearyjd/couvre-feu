@@ -346,12 +346,18 @@ old or the new complete file; a leftover candidate is swept under `cf_lock` and 
 Terminal and lock hazard (review S-M1): a write to a stopped or flow-controlled terminal blocks, and a write under a lock would hold
 `cf_lock` and the platform lock (and so every `rpc-sync`, cron `expire` and fw3-include `apply-fw`, which then fail with
 `locked`/`transaction_contention`). Solved: preview and commit output (and refusals under the lock, and the commit-audit warning on
-stderr) are buffered and written only after both locks are released; job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
+stderr) are buffered and written only after both locks are released. M4b generalizes this for EVERY `cfctl` command (`sync`,
+`rpc-*`, `pause`/`resume`, `expire`, `apply-fw`, `status`, scope verbs): stdout goes to an unlinked private file under the
+root-owned sticky `/tmp` (`unsafe_output_buffer` if that cannot be made), and only after `cf_lock`, the platform lock and the
+permanent transaction mutex (fd 9, closed, never `LOCK_UN`) are released is it written; every EXIT trap does the same, so
+refusals and `platform_fail` JSON lines are also written lock-free. Install/uninstall output legitimately stays inside their
+transaction fence. Job-control stops (Ctrl-Z, TTIN, TTOU) are ignored from the
 early block to exit; XON/XOFF is switched off on an output TTY (`stty` presence in the GL BusyBox build is UNVERIFIED-on-device; absence
 is tolerated). Residual, documented, not solved: (a) SIGSTOP cannot be ignored: only another root process can send it to this
-process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) a
-`platform_fail`/admission-deadline exit still writes one short line to stdout/stderr while a lock is held (the trap releases it right
-after; with `-ixon` and under 4 KiB of prior output this cannot block). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
+process (the admin's forced-command session cannot); it then holds whatever lock it holds until continued or killed; (b) stderr is
+not buffered: a `platform_fail`/admission-deadline exit still writes its one short stderr diagnostic while a lock is held (the trap
+releases it right after; with `-ixon` and under 4 KiB of prior output this cannot block); (c) buffered stdout is lost if the process
+is killed, or if releasing the platform lock itself fails (`lock_owner_changed`/`lock_cleanup`). Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
 stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. A stopped or dead recorded PID does not authorize lock removal. Interrupted-install recovery uses a complete authenticated external
 `cfctl recover-install-lock`, then that source's single ordinary `uninstall.sh`, after separately approved inspection; see
 [recovery](../runbooks/live-first-rehearsal.md#stale-install-lock-recovery). Live workers or ambiguous/legacy ownership refuse. A "stopped owner counts as dead" lock watchdog was evaluated and
@@ -363,7 +369,7 @@ Exit status: 2 for `invalid_command`, 1 for every other refusal, on both the ear
 Refusal codes (JSON `{"ok":false,"errors":[code]}`): `invalid_command`, `scope_mac_not_canonical` (only lowercase colon form),
 `scope_mac_invalid` (multicast/zero), `scope_forced_command_refused` (`CF_SERVICE_FORCED_COMMAND` set; `cfctl-ssh` now exports it to its
 child), `scope_base_invalid`, `scope_tty_required`, `scope_confirmation_mismatch`, `scope_confirmation_required`, `scope_admin_invalid`,
-`scope_unscoped_install`, `inactive_generation` (not ready+complete), `installation_in_progress`, `locked`, `scope_base_conflict` (stale
+`scope_unscoped_install`, `inactive_generation` (not ready+complete; a `ready` journal with no `complete` is an interrupted installation and is refused earlier by the M4b transaction gate as `platform_admission_refused`, stderr `incomplete_installation`), `installation_in_progress`, `locked`, `scope_base_conflict` (stale
 `--base`), `scope_mac_is_ssh_client`, `scope_mac_protected`, `scope_no_evidence` (add only; remove works for an absent/rotated MAC),
 `scope_mac_present`, `scope_full` (256), `scope_mac_absent`, `scope_mac_in_floor` (needs a fresh install + rebind), `scope_mac_in_use` (a
 person record uses it), `scope_audit_unavailable`, `scope_mac_is_router_interface` (equals one of the router's own interface MACs,
