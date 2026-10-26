@@ -9,7 +9,7 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=ddb9d115517477e26644d93b2ab831c6f2f1582a0d21408250fc5059963ceda4
+CF_RELEASE_ID=69a58c51cc062c72a69f8674b246a8d9c92f3480e52f92088f2aa63e86605054
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
@@ -504,11 +504,17 @@ platform_lock_release() {
         platform_cleanup_saved=$CF_PLATFORM_INITIAL_WRITE
         CF_PLATFORM_INITIAL_WRITE=1
         platform_private "$CF_PLATFORM_LOCK" 700
-        platform_private "$CF_PLATFORM_LOCK/pid" 600
-        printf '%s\n' "$$" | cmp -s - "$CF_PLATFORM_LOCK/pid" || platform_fail lock_owner_changed
-        rm -f "$CF_PLATFORM_LOCK/pid" || platform_fail lock_cleanup
-        if [ -f "$CF_PLATFORM_LOCK/token" ]; then rm -f "$CF_PLATFORM_LOCK/token"; fi
-        rmdir "$CF_PLATFORM_LOCK" || platform_fail lock_cleanup
+        if [ ! -e "$CF_PLATFORM_LOCK/pid" ] && [ ! -L "$CF_PLATFORM_LOCK/pid" ]; then
+            # Signalled after our mkdir, before our exclusive PID create: only
+            # an empty directory is ours to retire; rmdir refuses anything else.
+            rmdir "$CF_PLATFORM_LOCK" || platform_fail lock_cleanup
+        else
+            platform_private "$CF_PLATFORM_LOCK/pid" 600
+            printf '%s\n' "$$" | cmp -s - "$CF_PLATFORM_LOCK/pid" || platform_fail lock_owner_changed
+            rm -f "$CF_PLATFORM_LOCK/pid" || platform_fail lock_cleanup
+            if [ -f "$CF_PLATFORM_LOCK/token" ]; then rm -f "$CF_PLATFORM_LOCK/token"; fi
+            rmdir "$CF_PLATFORM_LOCK" || platform_fail lock_cleanup
+        fi
         CF_PLATFORM_LOCKED=0
         CF_PLATFORM_INITIAL_WRITE=$platform_cleanup_saved
     fi
@@ -535,6 +541,18 @@ platform_lock_recover() (
     CF_PLATFORM_LOCK=/tmp/couvrefeu-platform.lock
     if ! { [ -d /tmp ] && [ ! -L /tmp ] && [ "$(platform_stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ]; }; then platform_fail tmp_metadata; fi
     platform_private "$CF_PLATFORM_LOCK" 700
+    # A KILL after mkdir, before the exclusive PID create, leaves a directory
+    # with no record: nothing claims it. rmdir refuses if a record appeared
+    # meanwhile, and a racing creator's exclusive PID create then fails closed.
+    platform_unpublished=1
+    for platform_record in "$CF_PLATFORM_LOCK"/* "$CF_PLATFORM_LOCK"/.[!.]* "$CF_PLATFORM_LOCK"/..?*; do
+        if [ -e "$platform_record" ] || [ -L "$platform_record" ]; then platform_unpublished=0; fi
+    done
+    if [ "$platform_unpublished" = 1 ]; then
+        platform_initial_write
+        rmdir "$CF_PLATFORM_LOCK" || platform_fail lock_cleanup
+        exit 0
+    fi
     platform_private "$CF_PLATFORM_LOCK/pid" 600
     platform_dead_pid=$(awk 'NR==1&&$0~/^[0-9]+$/{p=$0;next}{bad=1}END{if(bad||NR!=1||p<=1)exit 2;print p}' "$CF_PLATFORM_LOCK/pid") || platform_fail lock_owner
     if ! { ! kill -0 "$platform_dead_pid" 2>/dev/null && [ ! -e "/proc/$platform_dead_pid" ]; }; then platform_fail live_lock; fi
