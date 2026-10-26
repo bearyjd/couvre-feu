@@ -9,11 +9,11 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=69a58c51cc062c72a69f8674b246a8d9c92f3480e52f92088f2aa63e86605054
+CF_RELEASE_ID=6deac732523c628b492ba06850fa576373bd643dededb6b4401f40525d1ba155
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-CF_RELEASE_MODULES='core.sh:ca79eb1f2a3fa37d58e4b1a317b554f3296aa9ba9495b478943dac6a96f69df5 rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:cf7f8cd41686c3f404bed4f87ffdf3c41f41bab067c6f946fe5dd22d0ba8e09f state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+CF_RELEASE_MODULES='core.sh:ca79eb1f2a3fa37d58e4b1a317b554f3296aa9ba9495b478943dac6a96f69df5 rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:25479f2edc7360b87e5ffb35cf719455ff9c1d263a1843fef761ce7a33ca2036 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -402,6 +402,12 @@ platform_done_profile() {
     done
     platform_fail completion_binding
 }
+# The installation journal before `ready` is provisional: its PREPARED
+# baseline is digest-bound, and every admitted path that may act on it runs
+# prepared_partial_journal_check (install-common.sh) before any mutation.
+platform_journal_provisional() {
+    [ "$1" = "$platform_root/etc/couvrefeu/backup" ] && [ ! -e "$1/ready" ] && [ ! -L "$1/ready" ]
+}
 platform_choose() {
     # Reads here are provisional only. Metadata, journal signatures and agreement
     # are checked after admission, before any private policy or mutation.
@@ -415,7 +421,13 @@ platform_choose() {
     for platform_journal in "$platform_root/etc/couvrefeu/backup" "$platform_recovery"; do
         if [ -e "$platform_journal/etc_couvrefeu_platform-profile.staged" ] || [ -L "$platform_journal/etc_couvrefeu_platform-profile.staged" ]; then
             [ -z "$platform_stage_profile" ] || platform_fail ambiguous_journals
-            platform_stage_profile=$(platform_read_profile "$platform_journal/etc_couvrefeu_platform-profile.staged") || exit 2
+            if platform_journal_provisional "$platform_journal"; then
+                # A kill inside the pre-ready journal write can leave this
+                # record empty or partial: only a complete profile is evidence.
+                platform_stage_profile=$(platform_read_profile "$platform_journal/etc_couvrefeu_platform-profile.staged" 2>/dev/null) || platform_stage_profile=
+            else
+                platform_stage_profile=$(platform_read_profile "$platform_journal/etc_couvrefeu_platform-profile.staged") || exit 2
+            fi
         fi
     done
     if [ -e "$platform_done" ] || [ -L "$platform_done" ]; then
@@ -577,12 +589,24 @@ platform_profile_validate() {
         if [ -e "$platform_stage" ] || [ -L "$platform_stage" ]; then
             platform_private "$platform_journal" 700
             platform_private "$platform_stage" 600
-            if [ "$platform_cleanup_binding" = 0 ]; then
-                platform_private "$platform_journal/etc_couvrefeu_platform-profile.after" 600
-                platform_expected=$(sha256sum "$platform_stage" | awk '{print $1}')":600:$CF_PLATFORM_OWNER"
-                printf '%s\n' "$platform_expected" | cmp -s - "$platform_journal/etc_couvrefeu_platform-profile.after" || platform_fail profile_journal
+            platform_after=$platform_journal/etc_couvrefeu_platform-profile.after
+            platform_stage_complete=1
+            # Pre-ready, a kill may precede the signature (absent or empty
+            # .after); a non-empty signature is always verified.
+            if platform_journal_provisional "$platform_journal" && [ ! -s "$platform_after" ] && [ ! -L "$platform_after" ]; then
+                platform_stage_complete=0
+                if [ -e "$platform_after" ]; then platform_private "$platform_after" 600; fi
             fi
-            [ "$(platform_read_profile "$platform_stage")" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
+            if [ "$platform_cleanup_binding" = 0 ] && [ "$platform_stage_complete" = 1 ]; then
+                platform_private "$platform_after" 600
+                platform_expected=$(sha256sum "$platform_stage" | awk '{print $1}')":600:$CF_PLATFORM_OWNER"
+                printf '%s\n' "$platform_expected" | cmp -s - "$platform_after" || platform_fail profile_journal
+            fi
+            if [ "$platform_stage_complete" = 1 ]; then
+                [ "$(platform_read_profile "$platform_stage")" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
+            elif platform_stage_value=$(platform_read_profile "$platform_stage" 2>/dev/null); then
+                [ "$platform_stage_value" = "$CF_PLATFORM_PROFILE" ] || platform_fail changed_profile
+            fi
         fi
     done
     if [ -e "$platform_installed" ] || [ -L "$platform_installed" ]; then

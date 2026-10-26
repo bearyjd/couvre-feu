@@ -69,6 +69,9 @@ fi
 PROFILE_INVENTORY=0
 if [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; then PROFILE_INVENTORY=1
 elif [ -e "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then PROFILE_INVENTORY=1
+# A pre-ready journal killed before its profile signature is still modern:
+# PREPARED (digest-bound) supplies its inventory before any record is used.
+elif [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ] && [ ! -e "$BACKUP/ready" ] && [ ! -L "$BACKUP/ready" ]; then PROFILE_INVENTORY=1
 elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1; fi
 if [ "$PROFILE_INVENTORY" = 1 ]; then
     FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
@@ -550,9 +553,14 @@ prepared_materialize() {
     for rel in $FILES; do
         k=$(key "$rel")
         cp "$CF_TRANSACTION_PREPARED/$k.before" "$CF_TRANSACTION_PREPARED/$k.mtime" "$BACKUP/"
-        rm -f "$BACKUP/$k.staged"
+        # Signature first: a kill never pairs a stale .after with new bytes.
+        rm -f "$BACKUP/$k.after" "$BACKUP/$k.staged"
         if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CRASH_AT:-}" = "materialize-$k.cleared" ]; then kill -KILL "$$"; fi
-        if [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.staged"
+        if [ "$rel" = etc/couvrefeu/platform-profile ]; then
+            # Profile selection evidence, exactly as install stages it (never
+            # the original's bytes): every later admission reads this record.
+            cp "$CF_TRANSACTION_PREPARED/profile" "$BACKUP/$k.staged"; chmod 600 "$BACKUP/$k.staged"
+        elif [ -e "$ROOT/$rel" ]; then cp -p "$ROOT/$rel" "$BACKUP/$k.staged"
         else : > "$BACKUP/$k.staged"; chmod 600 "$BACKUP/$k.staged"; fi
         if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CRASH_AT:-}" = "materialize-$k.staged" ]; then kill -KILL "$$"; fi
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"
