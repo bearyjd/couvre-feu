@@ -2,13 +2,19 @@
 # shellcheck disable=SC2034,SC1090,SC1091
 # Restore exact original files only after a complete drift preflight.
 set -eu
+CF_ENTRY_SESSION_PID=
+if [ "${1:-}" = --cf-transaction-session ]; then
+    [ "$#" -ge 2 ] || exit 2
+    CF_ENTRY_SESSION_PID=$2
+    shift 2
+fi
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # BEGIN authenticated bootstrap boundary
 if [ "${CF_TEST_MODE:-0}" != 1 ]; then PATH=/usr/sbin:/usr/bin:/sbin:/bin; fi
 LC_ALL=C
 export PATH LC_ALL
 umask 077
-if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
+if [ -n "${LD_PRELOAD-}${LD_LIBRARY_PATH-}${LD_AUDIT-}" ] || [ "${CF_TRANSACTION_DEFINITIONS_ONLY+x}${CF_TRANSACTION_LAUNCH_PID+x}${CF_TRANSACTION_PID+x}${CF_TRANSACTION_START+x}${CF_TRANSACTION_BOOT+x}${CF_TRANSACTION_RETIREMENT+x}${CF_TRANSACTION_RECOVER+x}${CF_TRANSACTION_FENCE+x}${CF_TRANSACTION_PREPARED+x}${CF_TRANSACTION_BASE+x}${CF_TRANSACTION_HELD+x}${CF_TRANSACTION_OWNED+x}${CF_TRANSACTION_TOKEN+x}${CF_TRANSACTION_PARENT+x}${CF_TRANSACTION_MUTEX+x}${CF_TRANSACTION_OWNER+x}${CF_TRANSACTION_DIGEST+x}${CF_TRANSACTION_STATE+x}${CF_PLATFORM_ADMITTED+x}${CF_PLATFORM_LOCKED+x}${CF_PLATFORM_NESTED+x}${CF_RELEASE_ID+x}${CF_PLATFORM_PROFILE+x}${CF_PLATFORM_CALLER_PID+x}${CF_PLATFORM_OWNER+x}${CF_PLATFORM_LIB+x}${CF_VENDOR_PROFILE+x}${CF_OS_TRUST_PROFILE+x}${CF_PLATFORM_ENTRY_TICK+x}${CF_PLATFORM_INITIAL_WRITE+x}${CF_RELEASE_MODULES+x}${vp_profile+x}" != "" ]; then
     printf '%s\n' 'couvre-feu: injected platform environment refused' >&2
     exit 2
 fi
@@ -24,7 +30,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=c254b9b4364d5f6e252126f4e37d05312cf7cec18b81515a3004b37009ce5820
+CF_BOOTSTRAP_PIN=b7c1c01fb7a731e0abe415fee17332fc2bf812e522824e595cac8d8ba6815a9a
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -34,21 +40,139 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
-platform_admit runtime "${CF_ROOT:-}" "$HERE/lib"
+platform_transaction_session "$@"
+# The durable transaction owner names the profile it was admitted under, as
+# for `cfctl recover-install-lock`: a kill before the profile journal record
+# leaves no other evidence. Explicit selection still refuses any staged,
+# completion, retirement or installed profile that disagrees with it.
+platform_uninstall_selection=runtime
+if [ "${CF_TEST_MODE:-0}" = 1 ]; then platform_uninstall_owner=${CF_ROOT:-}/.couvrefeu-transaction
+else platform_uninstall_owner=/etc/.couvrefeu-transaction; fi
+if [ -e "$platform_uninstall_owner" ] || [ -L "$platform_uninstall_owner" ]; then
+    platform_regular "$platform_uninstall_owner"
+    platform_private "$platform_uninstall_owner" 600
+    platform_uninstall_selection=$(sed -n '8p' "$platform_uninstall_owner")
+    case "$platform_uninstall_selection" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;;
+        *) platform_fail transaction_owner_profile;; esac
+fi
+platform_admit "$platform_uninstall_selection" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
-[ "${CF_TEST_MODE:-0}" = 1 ] || [ "$HERE" = "/etc/.couvrefeu-release-$CF_RELEASE_ID" ] || platform_fail external_recovery_release_required
+# Any complete authenticated external release is usable after a partial install.
 # shellcheck disable=SC1091
 . "$HERE/lib/install-common.sh"
 platform_deadline_check
 [ "$#" = 0 ] || fail 'usage: uninstall.sh'
 safe_paths
+if [ "${CF_TEST_MODE:-0}" != 1 ] && [ "${CF_TRANSACTION_DIGEST:-none}" = none ] && {
+    [ -e "$BACKUP" ] || [ -e "$DONE" ] || [ -e "$CF_TRANSACTION_RETIREMENT" ];
+}; then
+    fail 'legacy callback quiescence is unproven; automatic restoration refused; originals and journals preserved for separately authorized recovery'
+fi
 RELEASE_DIR=$ROOT/etc/.couvrefeu-release-$CF_RELEASE_ID
 RELEASE_RETIRE=0
+RETIRE_TARGET=$CF_RELEASE_ID
+RETIRE_LEGACY=0
+release_target_select() {
+    if retirement_present; then retirement_validate
+    else
+        RETIRE_TARGET=$CF_RELEASE_ID
+        RETIRE_LEGACY=0
+        if [ -e "$BACKUP/release-absent" ] && [ "${CF_TRANSACTION_DIGEST:-none}" = none ]; then
+            release_binding=$BACKUP/usr_lib_couvrefeu_platform-bootstrap.sh.after
+            platform_regular "$release_binding"
+            platform_private "$release_binding" 600
+            if ! { [ "$(stat -c %h "$release_binding")" = 1 ] && valid_signature_record "$release_binding" 0; }; then
+                fail 'invalid owned recovery release binding; preserved'
+            fi
+            release_bootstrap=$(awk -F: '{print $1}' "$release_binding")
+            if [ "$release_bootstrap" = "$(retirement_legacy_bootstrap)" ]; then
+                [ "$(cat "$release_binding")" = "$(retirement_legacy_bootstrap):644:$(id -u):$(id -g)" ] || fail 'legacy recovery release bootstrap metadata binding mismatch'
+                RETIRE_TARGET=$(retirement_legacy_id)
+                RETIRE_LEGACY=1
+            else
+                fail 'unknown legacy owned recovery release; journal preserved'
+            fi
+        fi
+    fi
+    RELEASE_DIR=$ROOT/etc/.couvrefeu-release-$RETIRE_TARGET
+}
+release_legacy_check() (
+    set +f
+    [ "$RETIRE_TARGET" = "$(retirement_legacy_id)" ] || fail 'unknown legacy release target'
+    if ! { [ -d "$RELEASE_DIR" ] && [ ! -L "$RELEASE_DIR" ]; }; then fail 'known legacy recovery release absent or unsafe; journal preserved'; fi
+    platform_private "$RELEASE_DIR" 700
+    if ! { [ -d "$RELEASE_DIR/lib" ] && [ ! -L "$RELEASE_DIR/lib" ]; }; then fail 'unsafe legacy recovery release lib'; fi
+    platform_private "$RELEASE_DIR/lib" 700
+    platform_regular "$RELEASE_DIR/release.sha256"
+    platform_private "$RELEASE_DIR/release.sha256" 600
+    if ! {
+        [ "$(stat -c %h "$RELEASE_DIR/release.sha256")" = 1 ] &&
+        [ "$(sha256sum "$RELEASE_DIR/release.sha256" | awk '{print $1}')" = "$(retirement_legacy_manifest)" ]
+    }; then fail 'legacy recovery release manifest drift; journal preserved'; fi
+    release_expected=$(retirement_target_names)
+    release_seen=$(awk 'BEGIN{s=""}{printf "%s%s",s,$2;s=" "}END{print ""}' "$RELEASE_DIR/release.sha256")
+    [ "$release_seen" = "$release_expected" ] || fail 'legacy recovery release inventory mismatch'
+    for release_entry in "$RELEASE_DIR"/* "$RELEASE_DIR"/.[!.]* "$RELEASE_DIR"/..?* "$RELEASE_DIR"/lib/* "$RELEASE_DIR"/lib/.[!.]* "$RELEASE_DIR"/lib/..?*; do
+        [ -e "$release_entry" ] || [ -L "$release_entry" ] || continue
+        release_name=${release_entry#"$RELEASE_DIR"/}
+        case "$release_name" in lib|release.sha256) continue;; esac
+        case " $release_expected " in *" $release_name "*) ;; *) fail 'foreign legacy recovery release entry; journal preserved';; esac
+    done
+    while read -r release_hash release_name; do
+        platform_regular "$RELEASE_DIR/$release_name"
+        case "$release_name" in lib/*) release_mode=644;; *) release_mode=755;; esac
+        platform_private "$RELEASE_DIR/$release_name" "$release_mode"
+        if ! {
+            [ "$(stat -c %h "$RELEASE_DIR/$release_name")" = 1 ] &&
+            [ "$(sha256sum "$RELEASE_DIR/$release_name" | awk '{print $1}')" = "$release_hash" ]
+        }; then fail 'legacy recovery release bytes changed; journal preserved'; fi
+    done < "$RELEASE_DIR/release.sha256"
+    [ "$(sha256sum "$RELEASE_DIR/lib/platform-bootstrap.sh" | awk '{print $1}')" = "$(retirement_legacy_bootstrap)" ] || fail 'legacy recovery bootstrap mismatch'
+)
 # A recovery release this installation created is retired only with exact
 # reviewed contents and no foreign entries; drift refuses and keeps it.
 release_retire_check() {
+    release_target_select
+    if retirement_present; then
+        retirement_validate
+        RELEASE_RETIRE=$RETIRE_RELEASE_OWNED
+        [ "$RELEASE_RETIRE" = 1 ] || return 0
+        [ -e "$RELEASE_DIR" ] || [ -L "$RELEASE_DIR" ] || return 0
+        if ! { [ -d "$RELEASE_DIR" ] && [ ! -L "$RELEASE_DIR" ]; }; then fail 'unsafe retiring recovery release; preserved'; fi
+        platform_private "$RELEASE_DIR" 700
+        release_names=$(retirement_target_names)
+        if [ -e "$RELEASE_DIR/lib" ] || [ -L "$RELEASE_DIR/lib" ]; then
+            if ! { [ -d "$RELEASE_DIR/lib" ] && [ ! -L "$RELEASE_DIR/lib" ]; }; then fail 'unsafe retiring recovery release lib; preserved'; fi
+            platform_private "$RELEASE_DIR/lib" 700
+        fi
+        # All remaining entries must still match the authenticated source.
+        # Missing entries are allowed only under the durable retirement receipt.
+        for entry in "$RELEASE_DIR"/* "$RELEASE_DIR"/.[!.]* "$RELEASE_DIR"/..?* "$RELEASE_DIR"/lib/* "$RELEASE_DIR"/lib/.[!.]* "$RELEASE_DIR"/lib/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            name=${entry#"$RELEASE_DIR"/}
+            [ "$name" != lib ] || continue
+            if [ "$name" = release.sha256 ]; then
+                release_hash=$(sed -n '10p' "$CF_TRANSACTION_RETIREMENT")
+                release_mode=600
+            else
+                release_hash=$(printf '%s\n' "$RETIRE_TARGET_PAIRS" | awk -v n="$name" '{for(i=1;i<=NF;i++){split($i,p,":");if(p[1]==n)print p[2]}}')
+                [ -n "$release_hash" ] || fail "unexpected recovery release entry: $name; preserved"
+                case "$name" in lib/*) release_mode=644;; *) release_mode=755;; esac
+            fi
+            platform_regular "$entry"
+            platform_private "$entry" "$release_mode"
+            if ! { [ "$(stat -c %h "$entry")" = 1 ] && [ "$(sha256sum "$entry" | awk '{print $1}')" = "$release_hash" ]; }; then fail "retiring recovery release drift: $name; preserved"; fi
+        done
+        return 0
+    fi
     [ -e "$BACKUP/release-absent" ] || return 0
     valid_marker "$BACKUP/release-absent" || fail 'invalid release marker; journal retained'
+    if [ "$RETIRE_LEGACY" = 1 ]; then
+        release_legacy_check
+        release_names=$(retirement_target_names)
+        RELEASE_RETIRE=1
+        return 0
+    fi
     if [ ! -e "$RELEASE_DIR" ] && [ ! -L "$RELEASE_DIR" ]; then return 0; fi
     ( platform_external_closure "$RELEASE_DIR" ) || fail "recovery release drift at $RELEASE_DIR; retained with journal"
     release_names=$(awk '{print $2}' "$RELEASE_DIR/release.sha256")
@@ -62,6 +186,38 @@ release_retire_check() {
 }
 # Final command only: exec leaves no shell reading this (possibly removed) script.
 release_retire() {
+    if retirement_present; then
+        retirement_validate
+        retirement_originals
+        retirement_prepared_check
+        release_retire_check
+        # Shells retain their open script inode across unlink; all helpers are
+        # already loaded. No removed release file is subsequently sourced.
+        if [ "$RELEASE_RETIRE" = 1 ] && [ -d "$RELEASE_DIR" ]; then
+            for release_name in $release_names release.sha256; do rm -f "$RELEASE_DIR/$release_name"; done
+            if [ -d "$RELEASE_DIR/lib" ]; then rmdir "$RELEASE_DIR/lib"; fi
+            rmdir "$RELEASE_DIR" || fail 'recovery release retirement incomplete; receipt retained'
+        fi
+        unlock_install
+        platform_lock_release
+        if [ -e "$CF_TRANSACTION_FENCE" ] || [ -L "$CF_TRANSACTION_FENCE" ]; then
+            platform_regular "$CF_TRANSACTION_FENCE"
+            platform_private "$CF_TRANSACTION_FENCE" 600
+            printf '%s\n' "$RETIRE_TOKEN" | cmp -s - "$CF_TRANSACTION_FENCE" || fail 'retirement fence mismatch; preserved'
+        fi
+        # The receipt fences admission through every interrupted final unlink,
+        # including after owner and DONE have disappeared. fd9 stays held.
+        rm -f "$CF_TRANSACTION_OWNER"
+        rm -f "$CF_TRANSACTION_FENCE"
+        if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CLEANUP_FAIL_AT:-}" = 'done' ]; then fail 'injected before DONE removal'; fi
+        rm -f "$DONE"
+        sync
+        platform_transaction_barrier retirement-final
+        rm -f "$CF_TRANSACTION_RETIREMENT"
+        trap - 0 1 2 15
+        [ "$RELEASE_RETIRE" != 1 ] || printf '%s\n' "Recovery release removed: $RELEASE_DIR"
+        exit 0
+    fi
     [ "$RELEASE_RETIRE" = 1 ] || exit 0
     # Names are validated release manifest entries without whitespace.
     # shellcheck disable=SC2086
@@ -72,7 +228,18 @@ release_retire() {
 # can be interrupted without losing the fact that every restoration succeeded.
 finish_cleanup() {
     CLEANUP_COUNT=0
-    platform_valid_done "$DONE" || fail 'unsafe/legacy recovery completion record; preserved'
+    if retirement_present; then
+        retirement_validate
+        retirement_originals
+        retirement_prepared_check
+        release_retire_check
+        if [ -e "$DONE" ] || [ -L "$DONE" ]; then
+            platform_valid_done "$DONE" || fail 'unsafe recovery completion record; preserved'
+        fi
+    else
+        platform_valid_done "$DONE" || fail 'unsafe/legacy recovery completion record; preserved'
+        if [ "${CF_TRANSACTION_DIGEST:-none}" != none ] || [ "$RETIRE_LEGACY" = 1 ]; then retirement_publish; fi
+    fi
     if [ -e "$BACKUP" ]; then
         journal_preflight cleanup
         # Remove the journal only while each managed path still holds its
@@ -104,6 +271,9 @@ finish_cleanup() {
         rmdir "$BACKUP" || fail 'recovery cleanup incomplete; completion record retained'
     fi
     if [ "${CF_TEST_MODE:-0}" = 1 ] && [ "${CF_TEST_UNINSTALL_CLEANUP_FAIL_AT:-}" = journal ]; then fail 'injected after journal removal'; fi
+    prepared_retire
+    if retirement_present; then return 0; fi
+    rm -f "$CF_TRANSACTION_FENCE" "$CF_TRANSACTION_OWNER"
     unlock_install
     platform_lock_release
     trap - 0 1 2 15
@@ -112,6 +282,11 @@ finish_cleanup() {
     platform_initial_write
     rm -f "$DONE"
 }
+if retirement_present; then
+    finish_cleanup
+    printf '%s\n' 'Original files restored; Couvre-feu installation removed.'
+    release_retire
+fi
 if [ -e "$DONE" ]; then
     if [ -e "$BACKUP" ]; then release_retire_check; fi
     finish_cleanup
@@ -119,10 +294,19 @@ if [ -e "$DONE" ]; then
     release_retire
 fi
 if [ ! -e "$BACKUP" ]; then
+    if [ "${CF_TRANSACTION_DIGEST:-none}" != none ]; then prepared_materialize
+    else
+        rm -f "$CF_TRANSACTION_FENCE" "$CF_TRANSACTION_OWNER"
     printf '%s\n' 'No recorded installation; no changes made.'
     exit 0
+    fi
 fi
+if [ ! -e "$BACKUP/ready" ] && [ "${CF_TRANSACTION_DIGEST:-none}" != none ]; then prepared_materialize; fi
 preflight
+# Historical release selection is anchored by the complete journal and trusted
+# fixed manifest. Refuse unknown/tampered historical trees before restoration.
+release_target_select
+if [ "$RETIRE_LEGACY" = 1 ]; then release_legacy_check; fi
 # Originals return by rename only (never a cross-filesystem mv, which BusyBox
 # would turn into a copy): prove one filesystem before the first change.
 if [ "$BACKUP" != "$RECOVERY" ]; then
@@ -136,6 +320,7 @@ for rel in $FILES; do
 done
 runtime_preflight
 platform_deadline_check
+recover_private_scratch
 # Persist successful kernel removal before touching helpers or executables.
 # Retries never invoke an installed program that has already been restored.
 if [ ! -f "$BACKUP/kernel-cleaned" ]; then
@@ -172,6 +357,7 @@ fi
 if [ ! -f "$BACKUP/restored" ]; then
     runtime_preflight
     platform_deadline_check
+    if [ -f "$BACKUP/activated" ] && live_tools; then cron_restore_barrier; fi
     if [ -d "$BASE/runtime" ]; then
         for p in "$BASE/runtime"/* "$BASE/runtime"/.[!.]* "$BASE/runtime"/..?*; do
             [ -e "$p" ] || continue
@@ -227,12 +413,7 @@ for rel in $FILES; do
         fail "exact restoration incomplete: $rel; journal retained"
     fi
 done
-# Restored crontab bytes may share one second with crond's directory check.
-# Restoration is already exact and verified; a signalling failure only warns.
-if live_tools; then
-    platform_initial_write
-    cron_service reload || printf '%s\n' 'couvre-feu: warning: cron reload failed; crond may keep a stale cfctl expire entry for up to an hour; run /etc/init.d/cron restart' >&2
-fi
+# Cron was reconciled while the installation's executable was still fenced.
 release_retire_check
 [ -f "$BACKUP/restored" ] || phase restored 2
 if [ -f "$BACKUP/etc_couvrefeu_platform-profile.after" ]; then

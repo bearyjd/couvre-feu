@@ -104,6 +104,86 @@ def tearDownModule():
     SOURCE.tmp.cleanup()
 
 
+class VersionedIdentityTests(unittest.TestCase):
+    """Use a private freshly frozen tree while production pins await the release gate."""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name)
+        shutil.copytree(REPO / 'router', cls.root / 'router')
+        (cls.root / 'tools').mkdir()
+        for name in ('freeze-router-release.py', 'strip-test-mode.py'):
+            shutil.copyfile(REPO / 'tools' / name, cls.root / 'tools' / name)
+        freezer = [sys.executable, '-I', str(cls.root / 'tools/freeze-router-release.py')]
+        subprocess.run(freezer, check=True, capture_output=True)
+        subprocess.run(freezer + ['--emit', str(cls.root / 'emitted')], check=True, capture_output=True)
+        cls.shipped = {'router/' + str(path.relative_to(cls.root / 'emitted')): path.read_bytes()
+                       for path in (cls.root / 'emitted').rglob('*') if path.is_file()}
+        cls.tool = load_tool(REPO / 'tools/live/first-rehearsal.py')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def repin(self, blobs):
+        pin = hashlib.sha256(blobs['router/lib/platform-bootstrap.sh']).hexdigest().encode()
+        for rel in ('install.sh', 'uninstall.sh', 'cfctl'):
+            path = 'router/' + rel
+            blobs[path] = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=' + pin, blobs[path])
+        return blobs
+
+    def test_independent_live_verifier_accepts_version_two_emitted_bytes(self):
+        self.tool.verify_release_identity(self.shipped)
+
+    def test_identity_covers_direct_installer_and_bootstrap_edits_despite_consistent_pins(self):
+        for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+            with self.subTest(rel=rel):
+                blobs = dict(self.shipped)
+                blobs['router/' + rel] += b'# direct source edit\n'
+                with self.assertRaises(self.tool.Refusal) as caught:
+                    self.tool.verify_release_identity(self.repin(blobs))
+                self.assertIn('release id', str(caught.exception))
+
+    def test_live_generated_fields_require_exactly_one_valid_assignment(self):
+        fields = [(name, 'CF_BOOTSTRAP_PIN') for name in ('install.sh', 'uninstall.sh', 'cfctl')]
+        fields += [('lib/platform-bootstrap.sh', name) for name in ('CF_RELEASE_ID', 'CF_RELEASE_MODULES')]
+        for rel, field in fields:
+            for defect in ('duplicate', 'missing', 'malformed', 'malformed-duplicate',
+                           'readonly ', 'export ', 'readonly -- ', 'export -- ',
+                           'readonly OTHER=value ', 'export OTHER=value ', 'readonly "', "export '"):
+                with self.subTest(rel=rel, field=field, defect=defect):
+                    blobs = dict(self.shipped)
+                    path = 'router/' + rel
+                    match = re.search(rb'(?m)^' + field.encode() + rb'=.*$', blobs[path])
+                    if defect == 'duplicate':
+                        blobs[path] += match[0] + b'\n'
+                    elif defect == 'missing':
+                        blobs[path] = blobs[path][:match.start()] + blobs[path][match.end() + 1:]
+                    elif defect == 'malformed':
+                        blobs[path] = blobs[path].replace(match[0], field.encode() + b'=invalid', 1)
+                    elif defect == 'malformed-duplicate':
+                        blobs[path] += field.encode() + b'=invalid\n'
+                    else:
+                        suffix = defect[-1] if defect[-1] in ('"', "'") else ''
+                        blobs[path] += (defect + field + '=invalid' + suffix + '\n').encode()
+                    with self.assertRaises(self.tool.Refusal) as caught:
+                        self.tool.verify_release_identity(blobs)
+                    self.assertIn(field, str(caught.exception))
+
+    def test_legacy_identity_is_explicitly_refused_for_new_live_payloads(self):
+        blobs = dict(self.shipped)
+        sha = lambda data: hashlib.sha256(data).hexdigest()
+        lines = [name + ':' + sha(blobs['router/lib/' + name]) for name in self.tool.RELEASE_MODULES]
+        cfctl = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', blobs['router/cfctl'])
+        lines += ['cfctl:' + sha(cfctl)] + [name + ':' + sha(blobs['router/' + name]) for name in ('cfctl-ssh', 'cfctl-scope')]
+        legacy = sha(('\n'.join(lines) + '\n').encode())
+        path = 'router/lib/platform-bootstrap.sh'
+        blobs[path] = re.sub(rb'(?m)^CF_RELEASE_ID=.*$', b'CF_RELEASE_ID=' + legacy.encode(), blobs[path])
+        with self.assertRaises(self.tool.Refusal) as caught:
+            self.tool.verify_release_identity(self.repin(blobs))
+        self.assertIn('legacy', str(caught.exception))
+
+
 class LiveRehearsalTests(unittest.TestCase):
     def setUp(self):
         self.tool = SOURCE.tool
@@ -118,6 +198,7 @@ class LiveRehearsalTests(unittest.TestCase):
         self.evidence_root = Path(tempfile.mkdtemp(prefix='couvre-feu-live-evidence-', dir=persistent))
         self.addCleanup(shutil.rmtree, self.evidence_root, True)
         self.model_fresh_router()
+        self.provision_mutex()
         self.fake_tools()
         self.cp_log = self.work / 'cp-p.log'
         self.truncating_cp('s')
@@ -234,7 +315,32 @@ class LiveRehearsalTests(unittest.TestCase):
                 if line.startswith('INFO staging /tmp/couvre-feu-first.'):
                     shutil.rmtree(line.split(' ', 2)[2], ignore_errors=True)
 
+    def provision_mutex(self):
+        # Shared with PilotBase: infrastructure persists after uninstall and is
+        # part of the raw BEFORE snapshot, with the same validated inode retained.
+        self.mutex = self.root / '.couvrefeu-mutex'
+        self.mutex.touch(mode=0o600, exist_ok=False)
+        self.mutex_identity = self.mutex_metadata()
+        self.assert_mutex_continuity()
+        self.addCleanup(self.assert_mutex_continuity)
+
+    def mutex_metadata(self):
+        info = self.mutex.lstat()
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                info.st_nlink, info.st_size, info.st_mtime_ns)
+
+    def assert_mutex_continuity(self):
+        self.assertFalse(self.mutex.is_symlink())
+        self.assertTrue(self.mutex.is_file())
+        self.assertEqual(self.mutex.read_bytes(), b'')
+        info = self.mutex.lstat()
+        self.assertEqual(info.st_mode & 0o7777, 0o600)
+        self.assertEqual((info.st_uid, info.st_gid), (os.getuid(), os.getgid()))
+        self.assertEqual(info.st_nlink, 1)
+        self.assertEqual(self.mutex_metadata(), self.mutex_identity)
+
     def router_snapshot(self):
+        self.assert_mutex_continuity()
         result = {}
         for path in sorted(self.root.rglob('*')):
             rel = str(path.relative_to(self.root))
@@ -834,9 +940,16 @@ class LiveRehearsalTests(unittest.TestCase):
                                  capture_output=True, text=True, check=True, cwd=out)
         # The freezer's formula, applied to the files it wrote (not to anything the tool declares).
         sha = lambda data: hashlib.sha256(data).hexdigest()
-        lines = [name + ':' + sha((emitted / 'lib' / name).read_bytes()) for name in self.tool.RELEASE_MODULES]
-        cfctl = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', (emitted / 'cfctl').read_bytes())
-        lines += ['cfctl:' + sha(cfctl)] + [name + ':' + sha((emitted / name).read_bytes()) for name in ('cfctl-ssh', 'cfctl-scope')]
+        lines = ['couvrefeu-router-release-v2'] + [
+            'lib/' + name + ':' + sha((emitted / 'lib' / name).read_bytes()) for name in self.tool.RELEASE_MODULES]
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+            data = (emitted / name).read_bytes()
+            if name in ('cfctl', 'install.sh', 'uninstall.sh'):
+                data = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data)
+            elif name == 'lib/platform-bootstrap.sh':
+                data = re.sub(rb'(?m)^CF_RELEASE_ID=.*$', b'CF_RELEASE_ID=', data)
+                data = re.sub(rb'(?m)^CF_RELEASE_MODULES=.*$', b'CF_RELEASE_MODULES=', data)
+            lines.append(name + ':' + sha(data))
         recomputed = sha(('\n'.join(lines) + '\n').encode())
         self.assertEqual(recomputed, freezer.stdout.strip())
         commit, blobs = self.tool.head_source()

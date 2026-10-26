@@ -30,6 +30,23 @@ stripper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stripper)
 router = Path(__file__).resolve().parents[1] / 'router'
 names = ['core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'state.awk', 'rules.awk', 'json.awk', 'vendor-platform.sh', 'activity.sh']
+IDENTITY_FORMAT = 'couvrefeu-router-release-v2'
+
+
+def generated_field(data, path, field, value_pattern):
+    """Require a canonical assignment; forbid export/readonly declarations of this field.
+
+    This generated-field policy recognizes declaration lines, not arbitrary shell evaluation.
+    """
+    key = field.encode()
+    assignments = re.findall(rb'^[ \t]*' + key + rb'[ \t]*=.*$', data, flags=re.M)
+    declarations = re.findall(rb'^[ \t]*(?:export|readonly)[ \t]+[^\r\n]*\b' + key + rb'\b[^\r\n]*$', data, flags=re.M)
+    valid = re.findall(rb'^' + key + rb'=(' + value_pattern + rb')$', data, flags=re.M)
+    if len(assignments) != 1 or len(valid) != 1 or declarations:
+        raise ValueError(path + ': must carry exactly one well-formed ' + field + ' assignment')
+    return re.sub(rb'^' + key + rb'=.*$', key + b'=', data, flags=re.M)
+
+
 pairs = [name + ':' + hashlib.sha256((router / 'lib' / name).read_bytes()).hexdigest() for name in names]
 expected = {}
 try:
@@ -39,25 +56,32 @@ try:
             raise ValueError(name + ': stripped wrapper fails sh -n')
 except ValueError as error:
     sys.exit('refused: ' + str(error))
-# The CF_RELEASE_ID additionally covers the boundary files. cfctl embeds CF_BOOTSTRAP_PIN, which
-# depends on the id, so its pin line is blanked for identity only; the manifest hashes it as shipped.
-cfctl_bytes = (router / 'cfctl').read_bytes()
-if (len(re.findall(rb'^CF_BOOTSTRAP_PIN=', cfctl_bytes, flags=re.M)) != 1
-        or len(re.findall(rb'^CF_BOOTSTRAP_PIN=[0-9a-f]{64}$', cfctl_bytes, flags=re.M)) != 1):
-    sys.exit('refused: cfctl must carry exactly one well-formed CF_BOOTSTRAP_PIN=<sha256> line')
-cfctl_identity = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', cfctl_bytes, flags=re.M)
-extras = ['cfctl:' + hashlib.sha256(cfctl_identity).hexdigest()] + [
-    name + ':' + hashlib.sha256(expected[name]).hexdigest() for name in ('cfctl-ssh', 'cfctl-scope')]
-identity = hashlib.sha256(('\n'.join(pairs + extras) + '\n').encode()).hexdigest()
-s = (router / 'lib/platform-bootstrap.sh').read_text()
-s = re.sub(r'^CF_RELEASE_ID=.*$', 'CF_RELEASE_ID=' + identity, s, flags=re.M)
-s = re.sub(r"^CF_RELEASE_MODULES=.*$", "CF_RELEASE_MODULES='" + ' '.join(pairs) + "'", s, flags=re.M)
-expected['lib/platform-bootstrap.sh'] = s.encode()
+# Version 2 binds every emitted source. Generated assignments are blanked only for
+# identity to break the id -> bootstrap -> entry pin cycle; the manifest hashes final bytes.
+try:
+    normalized = {name: generated_field((router / name).read_bytes(), name, 'CF_BOOTSTRAP_PIN', rb'[0-9a-f]{64}')
+                  for name in ('install.sh', 'uninstall.sh', 'cfctl')}
+    bootstrap = (router / 'lib/platform-bootstrap.sh').read_bytes()
+    bootstrap_identity = generated_field(bootstrap, 'lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
+    module_pattern = b"'" + b' '.join(re.escape(name.encode()) + rb':[0-9a-f]{64}' for name in names) + b"'"
+    normalized['lib/platform-bootstrap.sh'] = generated_field(
+        bootstrap_identity, 'lib/platform-bootstrap.sh', 'CF_RELEASE_MODULES', module_pattern)
+except ValueError as error:
+    sys.exit('refused: ' + str(error))
+identity_paths = ['lib/' + name for name in names] + [
+    'cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh']
+identity_lines = [IDENTITY_FORMAT] + [name + ':' + hashlib.sha256(
+    normalized[name] if name in normalized else expected[name] if name in expected else (router / name).read_bytes()
+).hexdigest() for name in identity_paths]
+identity = hashlib.sha256(('\n'.join(identity_lines) + '\n').encode()).hexdigest()
+s = re.sub(rb'^CF_RELEASE_ID=.*$', b'CF_RELEASE_ID=' + identity.encode(), bootstrap, flags=re.M)
+s = re.sub(rb'^CF_RELEASE_MODULES=.*$', b"CF_RELEASE_MODULES='" + ' '.join(pairs).encode() + b"'", s, flags=re.M)
+expected['lib/platform-bootstrap.sh'] = s
 pin = hashlib.sha256(expected['lib/platform-bootstrap.sh']).hexdigest()
 for name in ['install.sh', 'uninstall.sh', 'cfctl']:
-    s = (router / name).read_text()
-    s = re.sub(r'^CF_BOOTSTRAP_PIN=.*$', 'CF_BOOTSTRAP_PIN=' + pin, s, flags=re.M)
-    expected[name] = s.encode()
+    s = (router / name).read_bytes()
+    s = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=' + pin.encode(), s, flags=re.M)
+    expected[name] = s
 files = ['install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'] + ['lib/' + name for name in names] + ['lib/platform-bootstrap.sh']
 expected['release.sha256'] = ''.join(
     hashlib.sha256(expected[name] if name in expected else (router / name).read_bytes()).hexdigest() + '  ' + name + '\n'

@@ -1,0 +1,27 @@
+name: Pinned BusyBox 1.33.1
+description: >-
+  Install the router's BusyBox 1.33.1 (Alpine busybox-static 1.33.1-r8) as
+  /usr/bin/busybox, replacing apt's newer build. Hash-pinned; fails on mismatch.
+runs:
+  using: composite
+  steps:
+    - name: Download, verify and install pinned BusyBox
+      shell: bash
+      env:
+        APK_URL: https://dl-cdn.alpinelinux.org/alpine/v3.14/main/x86_64/busybox-static-1.33.1-r8.apk
+        APK_SHA256: 63612371ea48bcbb327926bcd8550daa0a9f2bf976060c7cb2025a3bb256dc6f
+        BIN_SHA256: afa625460bd5f4d1db52787dfd84e6c5b8126d7ab841b65cf61e410554edb60a
+      run: |
+        set -euo pipefail
+        work="$(mktemp -d)"
+        curl -fsSL --retry 3 -o "$work/bb.apk" "$APK_URL"
+        echo "$APK_SHA256  $work/bb.apk" | sha256sum -c -
+        tar -xzf "$work/bb.apk" -C "$work" bin/busybox.static
+        echo "$BIN_SHA256  $work/bin/busybox.static" | sha256sum -c -
+        sudo install -m 0755 "$work/bin/busybox.static" /usr/bin/busybox
+        banner="$(busybox 2>&1 | head -1 || true)"
+        echo "$banner"
+        case "$banner" in
+          *"BusyBox v1.33.1"*) ;;
+          *) echo "unexpected BusyBox banner: $banner" >&2; exit 1 ;;
+        esac

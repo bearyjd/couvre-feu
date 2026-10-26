@@ -31,7 +31,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
-from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy  # noqa: E402
+from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, drain_full_stdout, policy, start_with_full_stdout  # noqa: E402
 
 NEW = '02:00:00:00:00:03'
 NEW2 = '02:00:00:00:00:04'
@@ -346,8 +346,24 @@ class ScopeRefusalTests(ScopeCommon, unittest.TestCase):
                 self.assert_refused(self.add(NEW, env=dict(self.f.env, CF_SCOPE_ADMIN=admin)), 'scope_admin_invalid')
 
     def test_incomplete_installation(self):
-        complete = self.f.root / 'etc/couvrefeu/backup/complete'
+        # M4b: a journal that is `ready` without `complete` is an interrupted installation. The
+        # transaction gate (platform_transaction_gate, incomplete_installation) refuses every
+        # non-owned admitted command at admission, before core's generation check is reached;
+        # recovery is the explicit recover-install-lock flow. Premise: ready present, owner complete.
+        backup = self.f.root / 'etc/couvrefeu/backup'
+        complete = backup / 'complete'
+        self.assertEqual((backup / 'ready').read_text(), '1\n')
+        self.assertEqual((self.f.root / '.couvrefeu-transaction').read_text().splitlines()[1], 'complete')
         complete.unlink()
+        self.before = self.f.durable_snapshot()
+        for result in (self.add(NEW, SHA_ZERO), self.scope('scope-preview', NEW)):
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn('platform incomplete_installation', result.stderr)
+            self.assert_refused(result, 'platform_admission_refused')
+        # The core ready+complete guard stays live behind the gate: a present but wrong `complete`
+        # passes the gate's existence test and is refused by core as inactive_generation.
+        complete.write_text('0\n')
+        complete.chmod(0o600)
         self.before = self.f.durable_snapshot()
         self.assert_refused(self.add(NEW, SHA_ZERO), 'inactive_generation')
         self.assert_refused(self.scope('scope-preview', NEW), 'inactive_generation')
@@ -456,9 +472,13 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
         base = self.base()
         child = self.start(['rpc-sync'], 'before_write', stdin=self.sync_request())
         before = self.f.durable_snapshot()
+        # Both verbs mutate, so the paused rpc-sync already holds the permanent transaction
+        # mutex from admission (platform_transaction_gate): the second admin is refused there
+        # with transaction_contention, before core's cf_lock ('locked') is ever reached.
         result = self.add(NEW, base)
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(last_json(result.stdout)['errors'], ['locked'])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('transaction_contention', result.stderr)
+        self.assertEqual(last_json(result.stdout)['errors'], ['platform_admission_refused'])
         self.assertEqual(self.f.durable_snapshot(), before)
         child.send_signal(signal.SIGCONT)
         stdout, stderr = child.communicate(timeout=120)
@@ -469,9 +489,14 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
     def test_rpc_sync_waits_for_scope_add_lock(self):
         request = self.sync_request()  # read before the lock is taken; scope-add never changes policy
         child = self.start(['scope-add', NEW, '--base', self.base()], 'scope_before_write', confirm=tail6(NEW))
+        before = self.f.durable_snapshot()
+        # The paused scope-add holds the transaction mutex from admission, so rpc-sync is
+        # refused at its own admission (transaction_contention), not later by cf_lock.
         result = self.f.run('rpc-sync', raw=request)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('locked', json.loads(result.stdout)['errors'])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('transaction_contention', result.stderr)
+        self.assertEqual(json.loads(result.stdout)['errors'], ['platform_admission_refused'])
+        self.assertEqual(self.f.durable_snapshot(), before)
         child.send_signal(signal.SIGCONT)
         stdout, stderr = child.communicate(timeout=120)
         self.assertEqual(child.returncode, 0, stdout + stderr)
@@ -479,16 +504,37 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
         result = self.f.run('rpc-sync', raw=request)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_job_control_stops_are_ignored_before_any_scope_read(self):
+        # Structural (a behavioural stop of an orphaned session is discarded by the kernel):
+        # TSTP/TTIN/TTOU are ignored before the first cf_scope_load, so no terminal stop can
+        # land between reading the scope and taking or holding cf_lock.
+        body = (REPO / 'router/lib/core.sh').read_text()
+        run = body[body.index('cf_scope_run() {'):body.index('cf_scope_main() {')]
+        self.assertEqual(run.count("trap '' TSTP TTIN TTOU"), 1)
+        self.assertLess(run.index("trap '' TSTP TTIN TTOU"), run.index('cf_scope_load'))
+
     def test_two_admins_with_one_base_one_wins_other_is_stale(self):
         base = self.base()
+        # scope_before_lock is after admission: the paused admin already holds the
+        # transaction mutex, so a concurrent admin is refused and must retry.
+        # The old interleaving (second admin commits between the first's pre-lock read and
+        # its cf_lock) is impossible now that the mutex is held from admission. The CAS
+        # recheck under cf_lock in cf_scope_run (scope_base_conflict) is still exercised by
+        # the stale-base retry below and by test_stale_and_malformed_base.
         first = self.start(['scope-add', NEW, '--base', base], 'scope_before_lock', confirm=tail6(NEW),
                            env=dict(self.f.env, CF_SCOPE_ADMIN='alpha'))
-        self.ok(self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta')))
+        busy = self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta'))
+        self.assertEqual(busy.returncode, 2, busy.stdout + busy.stderr)
+        self.assertIn('transaction_contention', busy.stderr)
+        self.assertEqual(self.status()['scope'], [KID])
         first.send_signal(signal.SIGCONT)
         stdout, stderr = first.communicate(timeout=120)
-        self.assertNotEqual(first.returncode, 0, stdout + stderr)
-        self.assertEqual(last_json(stdout)['errors'], ['scope_base_conflict'])
-        self.assertEqual(self.status()['scope'], [KID, NEW2])
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(self.status()['scope'], [KID, NEW])
+        stale = self.add(NEW2, base, env=dict(self.f.env, CF_SCOPE_ADMIN='beta'))
+        self.assertNotEqual(stale.returncode, 0, stale.stdout + stale.stderr)
+        self.assertEqual(last_json(stale.stdout)['errors'], ['scope_base_conflict'])
+        self.assertEqual(self.status()['scope'], [KID, NEW])
 
     def test_stop_and_crash_at_each_write_step_keeps_rpc_and_uninstall_working(self):
         self.assertEqual(self.script('uninstall.sh').returncode, 0)
@@ -1046,6 +1092,72 @@ class ScopeStaticTests(unittest.TestCase):
                     result = subprocess.run(runtime + [copy + ' {print mac($0)?1:0}'], input=''.join(s + '\n' for s in samples),
                                             capture_output=True, text=True, timeout=30)
                     self.assertEqual(result.stdout.split(), expected, result.stderr)
+
+
+class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
+    """A client that stops reading stdout must never keep ANY lock: the permanent transaction mutex
+    (fd 9 flock), cf_lock or the platform lock. Each command blocks on an already full stdout pipe;
+    `expire` (which needs the mutex and cf_lock) must then still succeed, and the blocked command
+    must finish normally once the pipe is drained. The vendor-profile variant is in test-os-trust.py."""
+
+    def document(self):
+        current = self.status()
+        document = policy(current['acceptedPolicy']['revision'] + 1)
+        document['people'][0]['macs'] = [KID]
+        return json.dumps(document, separators=(',', ':'))
+
+    def assert_blocked_output_holds_no_lock(self, args, stdin=None, errors=()):
+        child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), *args], self.f.env, stdin)
+        self.addCleanup(lambda: child.poll() is None and (os.killpg(child.pid, signal.SIGKILL), child.wait()))
+        probe = self.f.run('expire', timeout=120)
+        self.assertEqual(probe.returncode, 0, (args, probe.stdout, probe.stderr))
+        self.assertIsNone(child.poll(), 'the blocked command must still be writing')
+        status, stdout = drain_full_stdout(child, read_end)
+        self.assertEqual(status, 0, stdout)
+        reply = last_json(stdout)
+        if errors is not None:
+            self.assertEqual(reply.get('errors'), list(errors), stdout)
+        return reply
+
+    def test_sync(self):
+        self.assert_blocked_output_holds_no_lock(('sync',), self.document())
+        self.assertEqual(self.status()['acceptedPolicy']['revision'], 1)
+
+    def test_rpc_sync(self):
+        self.assert_blocked_output_holds_no_lock(('rpc-sync',), ScopeConcurrencyTests.sync_request(self))
+        self.assertEqual(self.status()['acceptedPolicy']['revision'], 1)
+
+    def test_pause_and_resume(self):
+        self.assertEqual(self.f.run('sync', raw=self.document()).returncode, 0)
+        self.assert_blocked_output_holds_no_lock(('pause', 'alice'))
+        self.assert_blocked_output_holds_no_lock(('resume', 'alice'))
+
+    def test_expire(self):
+        self.assert_blocked_output_holds_no_lock(('expire',))
+
+    def test_rpc_status(self):
+        # rpc-status takes no transaction mutex but does take cf_lock.
+        self.assert_blocked_output_holds_no_lock(('rpc-status', '--json'))
+
+    def test_scope_preview(self):
+        self.assert_blocked_output_holds_no_lock(('scope-preview', NEW))
+
+    def test_unusable_buffer_parent_never_refuses_enforcement(self):
+        # The buffer is a convenience for the client, never a new dependency of enforcement:
+        # a tmp that is not sticky 1777 falls back to direct (pre-M4b) output with a warning.
+        tmp = self.f.root / 'tmp'
+        tmp.chmod(0o755)
+        for args in (('apply-fw',), ('expire',), ('rpc-status', '--json')):
+            with self.subTest(args=args):
+                result = self.f.run(*args, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(last_json(result.stdout).get('errors'), [], result.stdout)
+                self.assertIn('output buffer unavailable', result.stderr)
+
+    def test_status_control(self):
+        # Control: strict-profile status takes no lock at all, so it was never affected. Before any
+        # apply this fixture reports observed-set errors; only the complete status object matters here.
+        self.assertIn('drift', self.assert_blocked_output_holds_no_lock(('status', '--json'), errors=None))
 
 
 class StrippedScopeWrapperTests(unittest.TestCase):

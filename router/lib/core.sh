@@ -7,10 +7,24 @@ CF_PROTECTED=$CF_DIR/protected
 CF_RUNTIME=$CF_DIR/runtime
 CF_ERROR=
 CF_LOCKED=0
+CF_OUTPUT_WANTED=0
+CF_OUTPUT_HELD=0
 CF_SSH_CLIENT_FRESH=0
 CF_NOW_VALUE=
 CF_EXPIRY_NOW=
 CF_OWNER=$(id -u)
+# Internal stage state only; cfctl refuses these names from the environment.
+CF_SYNC_STAGED=0
+CF_SYNC_STAGE_MODE=
+CF_SYNC_STAGE_TRIED=0
+CF_INPUT_DIR=
+CF_STAGED_POLICY=
+CF_NEXT_DIGEST=
+CF_REQUEST_GENERATION=
+CF_REQUEST_ID=
+CF_BASE_REVISION=
+CF_BASE_DIGEST=
+CF_RPC_REQUIRE_RUNTIME=0
 
 cf_fail() { CF_ERROR=$1; return 1; }
 cf_backend_available() {
@@ -170,7 +184,12 @@ cf_protected_valid() {
     cf_safe_file "$CF_PROTECTED" && [ -s "$CF_PROTECTED" ] || { cf_fail unsafe_protected_file; return 1; }
     awk 'length($0)!=17 {exit 1} {n=split($0,a,":");if(n!=6)exit 1;for(i=1;i<=6;i++)if(a[i]!~/^[0-9a-f][0-9a-f]$/)exit 1;if(index("02468ace",substr(a[1],2,1))==0 || $0=="00:00:00:00:00:00" || seen[$0]++)exit 1}' "$CF_PROTECTED" || { cf_fail invalid_protected_mac; return 1; }
 }
-cf_canonical() { sort | awk -F '\t' '$1=="V"{v=$0;next}$1=="R"{r=$0;next}{a[++n]=$0}END{print v;print r;for(i=1;i<=n;i++)print a[i]}'; }
+# sort's status is captured (no pipefail in ash): a failed sort that still printed a prefix
+# yields no output and nonzero status, so callers fail closed instead of using a truncated policy.
+cf_canonical() {
+    cf_canonical_sorted=$(sort) || return 1
+    printf '%s\n' "$cf_canonical_sorted" | awk -F '\t' '$1=="V"{v=$0;next}$1=="R"{r=$0;next}{a[++n]=$0}END{print v;print r;for(i=1;i<=n;i++)print a[i]}'
+}
 cf_state_json() {
     awk -F '\t' '
     function bad(){exit 2}
@@ -215,6 +234,8 @@ cf_runtime_prepare() {
     cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime; return 1; }
 }
 cf_install_gate() {
+    platform_transaction_gate "$1"
+    cf_output_begin
     CF_INSTALL_AUTH=0
     if [ "$CF_LOCAL_TEST" = 1 ];then
         cf_install_lock=$CF_BASE/.couvrefeu-install.lock
@@ -256,39 +277,134 @@ cf_control_dirs() {
             *)cf_fail unsafe_control_directory;return 1;;esac
     done
 }
+# A runtime lock directory with no record at all, seen by a non-owned caller
+# that holds the transaction mutex on its own descriptor: its creator was a
+# mutex holder killed between mkdir and its first exclusive record create.
+cf_lock_unpublished() (
+    set +f
+    [ "${CF_TRANSACTION_OWNED:-0}" != 1 ] && [ "${CF_TRANSACTION_HELD:-0}" = 1 ] || exit 1
+    command -v platform_transaction_mutex_check >/dev/null 2>&1 || exit 1
+    cf_private_dir "$CF_RUNTIME/lock" || exit 1
+    for cf_lu_entry in "$CF_RUNTIME/lock"/* "$CF_RUNTIME/lock"/.[!.]* "$CF_RUNTIME/lock"/..?*; do
+        if [ -e "$cf_lu_entry" ] || [ -L "$cf_lu_entry" ]; then exit 1; fi
+    done
+    platform_transaction_mutex_check >/dev/null 2>&1
+)
+# Exclusive record create, then its write. 0: published; 1: refused, either
+# another writer claimed the name (locked) or a create/write error (unsafe_lock,
+# never masked as contention); a record we created but could not write is removed.
+cf_lock_record() {
+    cf_lr_path=$CF_RUNTIME/lock/$1
+    if ! (set -C; : > "$cf_lr_path") 2>/dev/null; then
+        if [ -e "$cf_lr_path" ] || [ -L "$cf_lr_path" ]; then cf_fail locked; else cf_fail unsafe_lock; fi
+        return 1
+    fi
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_FAULT:-}" = "$1" ]; then cf_lr_target=/dev/full; else cf_lr_target=$cf_lr_path; fi
+    if ! printf '%s\n' "$2" > "$cf_lr_target"; then
+        rm -f "$cf_lr_path" || :
+        cf_fail unsafe_lock
+        return 1
+    fi
+}
 cf_lock() {
     platform_deadline_check
     if [ "${CF_RPC_REQUIRE_RUNTIME:-0}" = 1 ];then
         cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime;return 1; }
     else cf_runtime_prepare || return 1;fi
     if ! mkdir -m 700 "$CF_RUNTIME/lock" 2>/dev/null; then
-        cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" || { cf_fail unsafe_lock; return 1; }
-        cf_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/lock/pid") || { cf_fail unsafe_lock; return 1; }
-        case $cf_pid in ''|*[!0-9]*) cf_fail unsafe_lock; return 1;; esac
-        [ "$cf_pid" -gt 1 ] || { cf_fail unsafe_lock; return 1; }
-        if kill -0 "$cf_pid" 2>/dev/null || [ -e "/proc/$cf_pid" ]; then cf_fail locked; return 1; fi
-        # Demonstrably dead PID. Remove only the two known records, never a tree.
-        [ ! -e "$CF_RUNTIME/lock/reload" ] || cf_safe_file "$CF_RUNTIME/lock/reload" || { cf_fail unsafe_lock; return 1; }
-        rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" || return 1
-        rmdir "$CF_RUNTIME/lock" || { cf_fail unsafe_lock; return 1; }
-        mkdir -m 700 "$CF_RUNTIME/lock" || { cf_fail locked; return 1; }
+        if cf_lock_unpublished; then
+            # Creator killed before its first record. Under our own transaction
+            # mutex every earlier mutex holder is dead; a lockless reader still
+            # inside its window loses its exclusive record create below.
+            rmdir "$CF_RUNTIME/lock" 2>/dev/null || { cf_fail locked; return 1; }
+            mkdir -m 700 "$CF_RUNTIME/lock" 2>/dev/null || { cf_fail locked; return 1; }
+        else
+            cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" || { cf_fail unsafe_lock; return 1; }
+            cf_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/lock/pid") || { cf_fail unsafe_lock; return 1; }
+            case $cf_pid in ''|*[!0-9]*) cf_fail unsafe_lock; return 1;; esac
+            [ "$cf_pid" -gt 1 ] || { cf_fail unsafe_lock; return 1; }
+            if kill -0 "$cf_pid" 2>/dev/null || [ -e "/proc/$cf_pid" ]; then cf_fail locked; return 1; fi
+            # Demonstrably dead PID. Remove only the two known records, never a tree.
+            [ ! -e "$CF_RUNTIME/lock/reload" ] || cf_safe_file "$CF_RUNTIME/lock/reload" || { cf_fail unsafe_lock; return 1; }
+            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" || return 1
+            rmdir "$CF_RUNTIME/lock" || { cf_fail unsafe_lock; return 1; }
+            mkdir -m 700 "$CF_RUNTIME/lock" || { cf_fail locked; return 1; }
+        fi
     fi
-    printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
+    # Owned token precedes the PID: a kill inside publication leaves only states
+    # (empty, token, token+PID prefix) that explicit recovery proves owned.
+    # Exclusive creates: exactly one writer can claim a directory.
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = runtime-mkdir ]; then kill -KILL 0; fi
+    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then
+        cf_lock_record token "$CF_TRANSACTION_TOKEN" || return 1
+        if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = runtime-token ]; then kill -KILL 0; fi
+    fi
+    if ! cf_lock_record pid "$$"; then
+        # Never leave OUR token behind as a token-only lock.
+        if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then
+            rm -f "$CF_RUNTIME/lock/token" || :
+            rmdir "$CF_RUNTIME/lock" 2>/dev/null || :
+        fi
+        return 1
+    fi
+    if [ "$CF_LOCAL_TEST" = 1 ] && [ "${CF_TEST_LOCK_CRASH_AT:-}" = runtime-pid ]; then kill -KILL 0; fi
     CF_LOCKED=1
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT
     trap 'cf_unlock; platform_lock_release; exit 143' TERM
-    trap 'cf_unlock; platform_lock_release' 0
+    trap 'cf_unlock; platform_lock_release; cf_output_release' 0
     platform_deadline_check
 }
 cf_unlock() {
     if [ "$CF_LOCKED" = 1 ]; then
         if [ "$(awk 'NR==1{print}' "$CF_RUNTIME/lock/pid" 2>/dev/null)" = "$$" ]; then
-            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload"
+            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" "$CF_RUNTIME/lock/token"
             rmdir "$CF_RUNTIME/lock" 2>/dev/null || :
         fi
         CF_LOCKED=0
     fi
+}
+# Output backpressure: a client that stops reading (stopped terminal, full SSH window) blocks a write,
+# and a write under a lock would hold it, fencing cron expire, fw3 apply-fw and uninstall. For cfctl
+# (CF_OUTPUT_WANTED), from the first held lock on (vendor admission, else the passed transaction gate)
+# stdout goes to an unlinked private file under the root-owned sticky tmp; cf_output_release drops
+# cf_lock, the platform lock and the transaction mutex, and only then writes it with a builtin. Every
+# EXIT trap ends here, so later refusals and platform_fail lines are released first too. Nothing is
+# created before a lock is held: a refusal at admission leaves the fixture tree untouched. Residuals
+# (stderr, admission-time refusal lines): docs/contracts/tier1-rpc.md section 9.
+# Never a new dependency of enforcement: if the buffer cannot be made, warn and write directly.
+cf_output_begin() {
+    [ "$CF_OUTPUT_WANTED" = 1 ] && [ "$CF_OUTPUT_HELD" != 1 ] || return 0
+    cf_output_open && return 0
+    CF_OUTPUT_WANTED=0
+    printf '%s\n' 'couvre-feu: warning: output buffer unavailable; writing output directly' >&2
+}
+cf_output_open() {
+    cf_ob_parent=$CF_BASE/tmp
+    if [ "$CF_LOCAL_TEST" = 1 ];then cf_ob_meta=$CF_OWNER:$(id -g):1777;else cf_ob_meta=0:0:1777;fi
+    [ -d "$cf_ob_parent" ] && [ ! -L "$cf_ob_parent" ] && [ "$(stat -c '%u:%g:%a' "$cf_ob_parent" 2>/dev/null)" = "$cf_ob_meta" ] || return 1
+    cf_ob_file=$(mktemp "$cf_ob_parent/couvrefeu-output.XXXXXX" 2>/dev/null) || return 1
+    case $cf_ob_file in "$cf_ob_parent"/couvrefeu-output.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) return 1;; esac
+    # One write and one independent read description of the same private file, by design.
+    # shellcheck disable=SC2094
+    cf_safe_file "$cf_ob_file" && command exec 7>"$cf_ob_file" 8<"$cf_ob_file" || { rm -f "$cf_ob_file";return 1; }
+    rm -f "$cf_ob_file" || return 1
+    command exec 6>&1 1>&7 || return 1
+    CF_OUTPUT_HELD=1
+}
+cf_output_release() {
+    cf_or_status=$?
+    CF_OUTPUT_WANTED=0
+    [ "$CF_OUTPUT_HELD" = 1 ] || return "$cf_or_status"
+    CF_OUTPUT_HELD=0
+    cf_unlock
+    platform_lock_release
+    platform_transaction_release
+    exec 1>&6 6>&- 7>&-
+    cf_or_text=$(cat <&8 && printf .) || cf_or_text=.
+    exec 8<&-
+    printf '%s' "${cf_or_text%.}"
+    return "$cf_or_status"
 }
 cf_reentrant_include() {
     [ -n "${CF_RELOAD_TOKEN-}" ] || return 1
@@ -552,10 +668,10 @@ cf_scope_run() {
         CF_SCOPE_ADMIN_NAME=$CF_SCOPE_ADMIN
     fi
     CF_RPC_REQUIRE_RUNTIME=1
+    trap '' TSTP TTIN TTOU
     cf_scope_load || { cf_scope_refuse;return 1; }
     if [ "$1" = scope-preview ];then cf_scope_preview || { cf_scope_refuse;return 1; };return 0;fi
     cf_rpc_checkpoint scope_before_lock
-    trap '' TSTP TTIN TTOU
     cf_lock || { cf_scope_refuse;return 1; }
     # Everything is re-read and re-checked under the lock: the CAS base, then every refusal and the guard.
     cf_scope_load || { cf_scope_refuse;return 1; }
@@ -619,14 +735,14 @@ cf_pause_edit() {
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
     # An explicit local pause is an emergency block: it also clears the person's allowance.
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&($2"")==(p""){next}{print}END{print "A",p,u}' | cf_canonical)
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v u="$cf_until" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}($1=="A"||$1=="U")&&($2"")==(p""){next}{print}END{print "A",p,u}' | cf_canonical) || { cf_fail invalid_policy; return 1; }
 }
 cf_resume_edit() {
     cf_person=$1
     cf_id_valid "$cf_person" && cf_person_exists "$cf_person" || { cf_fail unknown_person; return 1; }
     [ "$CF_REVISION" -lt 2147483647 ] || { cf_fail revision_exhausted; return 1; }
     CF_REVISION=$((CF_REVISION + 1))
-    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&($2"")==(p""){next}{print}' | cf_canonical)
+    CF_POLICY=$(printf '%s\n' "$CF_POLICY" | awk -F '\t' -v p="$cf_person" -v r="$CF_REVISION" 'BEGIN{OFS="\t"}$1=="R"{$2=r}$1=="A"&&($2"")==(p""){next}{print}' | cf_canonical) || { cf_fail invalid_policy; return 1; }
 }
 cf_timeout_available() {
     if [ "$CF_LOCAL_TEST" = 1 ] && [ -n "${CF_TEST_TIMEOUT-}" ];then
@@ -649,44 +765,121 @@ cf_input_deadline() {
     if [ "$CF_TIMEOUT_BUSYBOX" = 1 ];then "$CF_TIMEOUT" timeout "$@";else "$CF_TIMEOUT" "$@";fi
 }
 
+CF_NL='
+'
+# Strip one sentinel-protected trailing newline ("<text>\nx" -> "<text>"); refuse (empty)
+# text that lacks it or still contains a newline, since $(...) would hide trailing ones.
+cf_input_unwrap() {
+    cf_unwrap=${1%x}
+    case $cf_unwrap in *"$CF_NL") cf_unwrap=${cf_unwrap%"$CF_NL"};; *) cf_unwrap=;; esac
+    case $cf_unwrap in *"$CF_NL"*) cf_unwrap=;; esac
+}
+# Discard an unvalidated mktemp report: only rmdir (a fresh stage is empty; rmdir never
+# follows a symlink), only an absolute report, and only when it physically resolves to a
+# couvrefeu-input.* entry directly in the staging parent.
+cf_input_discard() {
+    cf_input_unwrap "$1"
+    case $cf_unwrap in /*) ;; *) return 0;; esac
+    [ ! -L "$cf_unwrap" ] || return 0
+    cf_input_unwrap "$(CDPATH='' cd -P -- "$cf_unwrap" 2>/dev/null && pwd -P && printf x)"
+    case ${cf_unwrap#"$cf_input_parent"/} in
+        "$cf_unwrap"|*/*) ;;
+        couvrefeu-input.*) rmdir -- "$cf_unwrap" 2>/dev/null || :;;
+    esac
+}
 cf_input_cleanup() {
     if [ -n "${CF_INPUT_DIR-}" ];then
-        rm -f "$CF_INPUT_DIR/input"
+        rm -f "$CF_INPUT_DIR/input" "$CF_INPUT_DIR/json.awk"
         rmdir "$CF_INPUT_DIR" 2>/dev/null || :
         CF_INPUT_DIR=
+    elif [ -n "${cf_input_made-}" ];then
+        cf_input_discard "$cf_input_made"
     fi
+    cf_input_made=
+}
+cf_input_fail() { cf_input_cleanup;cf_fail "$1";return 1; }
+# Bounded private parser copy, authenticated against the compiled module pin before
+# any stdin wait; the installed parser path is never executed after that wait.
+cf_input_parser() {
+    cf_parser_pin=
+    for cf_parser_pair in $CF_RELEASE_MODULES;do
+        case $cf_parser_pair in json.awk:*)cf_parser_pin=${cf_parser_pair#json.awk:};;esac
+    done
+    case $cf_parser_pin in *[!0-9a-f]*|'')return 1;;esac
+    [ "${#cf_parser_pin}" = 64 ] || return 1
+    [ -f "$CF_LIB/json.awk" ] && [ ! -L "$CF_LIB/json.awk" ] || return 1
+    # dd copies at most 17*4096 = 69632 bytes, one block past the 65536 cap, so an
+    # oversized parser is truncated to a still-detectable >65536 size and refused below.
+    cf_input_deadline -s KILL 6 dd if="$CF_LIB/json.awk" of="$CF_INPUT_DIR/json.awk" bs=4096 count=17 2>/dev/null || return 1
+    [ "$(wc -c < "$CF_INPUT_DIR/json.awk")" -le 65536 ] || return 1
+    cf_parser_digest=$(cf_input_deadline -s KILL 6 sha256sum "$CF_INPUT_DIR/json.awk") || return 1
+    [ "${cf_parser_digest%% *}" = "$cf_parser_pin" ]
 }
 cf_sync_stage() {
+    cf_stage_mode=${1:-0}
+    case $cf_stage_mode in 0|1) ;; *)cf_fail invalid_command;return 1;;esac
+    # A completed stage is reused only for the same mode; stdin is never reread.
+    if [ "$CF_SYNC_STAGED" = 1 ];then
+        [ "$CF_SYNC_STAGE_MODE" = "$cf_stage_mode" ] || { cf_fail invalid_command;return 1; }
+        return 0
+    fi
+    [ "$CF_SYNC_STAGE_TRIED" = 0 ] || { cf_fail invalid_command;return 1; }
+    CF_SYNC_STAGE_TRIED=1;CF_SYNC_STAGE_MODE=;CF_STAGED_POLICY=;CF_NEXT_DIGEST=
+    CF_REQUEST_GENERATION=;CF_REQUEST_ID=;CF_BASE_REVISION=;CF_BASE_DIGEST=
     platform_deadline_check
     cf_timeout_available || return 1
     cf_input_parent=$CF_BASE/tmp
     [ -d "$cf_input_parent" ] && [ ! -L "$cf_input_parent" ] && [ "$(CDPATH='' cd -- "$cf_input_parent" && pwd -P)" = "$cf_input_parent" ] || { cf_fail unsafe_input_directory;return 1; }
-    CF_INPUT_DIR=$cf_input_parent/couvrefeu-input.$$
-    mkdir -m 700 "$CF_INPUT_DIR" || { CF_INPUT_DIR=;cf_fail unsafe_input_directory;return 1; }
-    trap 'cf_input_cleanup; cf_unlock' 0
-    trap 'cf_input_cleanup; cf_unlock;exit 129' HUP
-    trap 'cf_input_cleanup; cf_unlock;exit 130' INT
-    trap 'cf_input_cleanup; cf_unlock;exit 143' TERM
-    # Deadline and byte bound apply before acquiring the policy mutation lock.
-    cf_input_deadline 10 dd bs=1 count=65537 of="$CF_INPUT_DIR/input" 2>/dev/null || { cf_input_cleanup;cf_fail input_deadline_or_read_failure;return 1; }
+    # Only a root-owned sticky 1777 parent (the router's /tmp; the fixture owner in local
+    # tests) stops another local user from renaming or removing the private stage.
+    if [ "$CF_LOCAL_TEST" = 1 ];then cf_input_parent_meta=$CF_OWNER:$(id -g):1777;else cf_input_parent_meta=0:0:1777;fi
+    [ "$(stat -c '%u:%g:%a' "$cf_input_parent" 2>/dev/null)" = "$cf_input_parent_meta" ] || { cf_fail unsafe_input_directory;return 1; }
+    # Reset before the traps: an inherited value must never reach cf_input_discard.
+    cf_input_made=
+    # Traps first, so a signal once the directory exists still removes it.
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release; cf_output_release' 0
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 129' HUP
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 130' INT
+    trap 'cf_input_cleanup; cf_unlock; platform_lock_release;exit 143' TERM
+    # Unpredictable name (mktemp, O_EXCL, 0700): no other local user can pre-create it
+    # in the shared sticky tmp directory and so deny every sync. The raw report stays in
+    # cf_input_made (signal traps only ever cf_input_discard it) and reaches CF_INPUT_DIR,
+    # and so the full cleanup, only after it matched the exact name in the parent and
+    # is a real private directory (an exactly-named symlink is only rmdir-discarded).
+    cf_input_made=$(mktemp -d "$cf_input_parent/couvrefeu-input.XXXXXX" 2>/dev/null && printf x) || { cf_input_cleanup;cf_fail unsafe_input_directory;return 1; }
+    cf_input_unwrap "$cf_input_made"
+    case $cf_unwrap in
+        "$cf_input_parent"/couvrefeu-input.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9])
+            cf_private_dir "$cf_unwrap" || { cf_input_fail unsafe_input_directory;return 1; }
+            CF_INPUT_DIR=$cf_unwrap;cf_input_made=;;
+        *)cf_input_fail unsafe_input_directory;return 1;;
+    esac
+    cf_input_parser || { cf_input_fail invalid_parser_source;return 1; }
+    platform_deadline_check
+    # Deadline and byte bound apply before acquiring any platform or policy lock.
+    cf_input_deadline 10 dd bs=1 count=65537 of="$CF_INPUT_DIR/input" 2>/dev/null || { cf_input_fail input_deadline_or_read_failure;return 1; }
     platform_deadline_check
     cf_input_size=$(wc -c < "$CF_INPUT_DIR/input")
-    if [ "$cf_input_size" -gt 65536 ];then cf_input_cleanup;cf_fail policy_too_large;return 1;fi
+    if [ "$cf_input_size" -gt 65536 ];then cf_input_fail policy_too_large;return 1;fi
     cf_ascii_size=$(tr -cd '\11\12\15\40-\176' < "$CF_INPUT_DIR/input" | wc -c)
-    [ "$cf_ascii_size" = "$cf_input_size" ] || { cf_input_cleanup;cf_fail invalid_policy_bytes;return 1; }
-    cf_parsed=$(awk -v rpc="${1:-0}" -f "$CF_LIB/json.awk" "$CF_INPUT_DIR/input")
+    [ "$cf_ascii_size" = "$cf_input_size" ] || { cf_input_fail invalid_policy_bytes;return 1; }
+    cf_parsed=$(awk -v rpc="$cf_stage_mode" -f "$CF_INPUT_DIR/json.awk" "$CF_INPUT_DIR/input")
     cf_rc=$?
     cf_input_cleanup
     [ "$cf_rc" = 0 ] || { cf_fail invalid_policy;return 1; }
-    if [ "${1:-0}" = 1 ];then
+    if [ "$cf_stage_mode" = 1 ];then
         CF_REQUEST_GENERATION=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $2}')
         CF_REQUEST_ID=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $3}')
         CF_BASE_REVISION=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $4}')
         CF_BASE_DIGEST=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1=="Q"{print $5}')
         cf_parsed=$(printf '%s\n' "$cf_parsed" | awk -F '\t' '$1!="Q"')
     fi
-    CF_STAGED_POLICY=$(printf '%s\n' "$cf_parsed" | cf_canonical)
-    CF_NEXT_DIGEST=$(printf '%s\n' "$CF_STAGED_POLICY" | sha256sum | awk '{print $1} ')
+    cf_staged=$(printf '%s\n' "$cf_parsed" | cf_canonical) || { cf_fail invalid_policy;return 1; }
+    cf_digest=$(printf '%s\n' "$cf_staged" | sha256sum) || { cf_fail invalid_policy;return 1; }
+    CF_STAGED_POLICY=$cf_staged
+    CF_NEXT_DIGEST=${cf_digest%% *}
+    CF_SYNC_STAGE_MODE=$cf_stage_mode
+    CF_SYNC_STAGED=1
 }
 cf_sync_read() {
     cf_new=$CF_STAGED_POLICY
@@ -699,7 +892,7 @@ cf_sync_read() {
 cf_check() {
     cf_missing=
     cf_timeout_available || cf_missing=timeout
-    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mv rm rmdir wc cmp cp tr id dirname env sync cat; do
+    for cf_dep in awk sort stat date sha256sum dd chmod mkdir mktemp mv rm rmdir wc cmp cp tr id dirname env sync cat; do
         command -v "$cf_dep" >/dev/null 2>&1 || cf_missing="$cf_missing $cf_dep"
     done
     for cf_dep in iptables ip6tables ipset uci conntrack ip fw3 sync; do

@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = Path(__file__).resolve().parents[2]
 PROTECTED = "02:00:00:00:00:aa"
@@ -94,10 +95,82 @@ def run_owned_process(command, *, timeout, input=None, interrupt_on_timeout=Fals
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
+def start_with_full_stdout(command, env, stdin=None, seconds=90):
+    """Start `command` with its stdout on an already full pipe, as a client that stopped reading.
+
+    Returns (process, read_end) once the shell itself is blocked writing (wchan pipe_write). The
+    caller owns read_end and the process (kill its group on failure); drain with drain_full_stdout.
+    """
+    read_end, write_end = os.pipe()
+    filler = os.open("/proc/self/fd/%d" % write_end, os.O_WRONLY | os.O_NONBLOCK)  # own description
+    try:
+        while True:
+            os.write(filler, b"#" * 4096)
+    except BlockingIOError:
+        pass
+    finally:
+        os.close(filler)
+    try:
+        process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                                   stdout=write_end, stderr=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        os.close(write_end)
+    if stdin is not None:
+        process.stdin.write(stdin.encode())
+        process.stdin.close()
+        process.stdin = None
+    wchan = Path("/proc/%d/wchan" % process.pid)
+    deadline = time.monotonic() + seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        try:
+            if "pipe_write" in wchan.read_text():
+                return process, read_end
+        except OSError:
+            pass
+        time.sleep(.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    os.close(read_end)
+    raise AssertionError("%s never blocked writing its output (exit %s)" % (command[-2:], process.returncode))
+
+
+def drain_full_stdout(process, read_end, timeout=60):
+    """Read the filled pipe to EOF and reap the process; returns (exit status, stdout without filler)."""
+    chunks = []
+    try:
+        while True:
+            data = os.read(read_end, 65536)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        os.close(read_end)
+    return process.wait(timeout=timeout), b"".join(chunks).decode().replace("#", "")
+
+
 def policy(revision=1):
     return {"version": 1, "revision": revision,
             "people": [{"id": "alice", "macs": [KID, OTHER_KID]}],
             "pauses": [], "schedules": [], "doh": {"ipv4": [], "ipv6": []}}
+
+
+def dead_prefix(pid):
+    """Longest proper decimal prefix of pid that names no live process, or None."""
+    for k in range(len(pid) - 1, 0, -1):
+        candidate = pid[:k]
+        if candidate.startswith("0"):
+            continue
+        try:
+            os.kill(int(candidate), 0)
+        except ProcessLookupError:
+            if not os.path.exists(f"/proc/{candidate}"):
+                return candidate
+        except PermissionError:
+            continue
+    return None
 
 
 class RouterFixture:
@@ -163,6 +236,7 @@ class RouterFixture:
         firewall.write_text("config defaults 'defaults'\n\toption input 'REJECT'\n")
         leases = self.root / "tmp/dhcp.leases"
         leases.parent.mkdir(parents=True)
+        leases.parent.chmod(0o1777)  # Stands in for the router's sticky 0:0:1777 /tmp.
         leases.write_text(f"0 {KID} 192.168.1.20 fixture *\n0 {OTHER_KID} 192.168.1.22 fixture2 *\n")
         self.env = dict(os.environ, CF_ROOT=str(self.root), CF_TEST_MODE="1",
                         CF_BACKEND_DIR=str(self.bin), CF_BACKEND_STATE=str(self.state),

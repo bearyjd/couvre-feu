@@ -70,5 +70,5 @@ These are unproven; do not rely on them until live evidence exists:
 
 Other constraints:
 
-- Floor MACs (the protected devices set at install time) can be removed only by reinstalling.
+- Floor MACs (install-time scope) are removable only by reinstall.
 - Growing the installed scope widens what `rpc-activity` exposes to the service.
