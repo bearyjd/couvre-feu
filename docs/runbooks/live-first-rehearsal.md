@@ -8,7 +8,15 @@ Before any rehearsal, complete the M4b gate and separately approved read-only `s
 
 ## 1. Prepare the private configuration
 
-Copy [`tools/live/config.example.json`](../../tools/live/config.example.json) to a private directory outside the repository and fill in the real values. The schema is in [`tools/live/README.md`](../../tools/live/README.md). Create the evidence directory with mode 0700 on a persistent, private filesystem (not tmpfs). Write the user's approval to the `authorizationPath` file and set `deadlineUtc` to the end of the approved window.
+Copy [`tools/live/config.example.json`](../../tools/live/config.example.json) to a private directory outside the repository and fill in the real values. The schema is in [`tools/live/README.md`](../../tools/live/README.md). Create the evidence directory with mode 0700 on a persistent, private filesystem (not tmpfs). Set `deadlineUtc` to the end of the approved window. The `authorizationPath` file is the written record of the approval; it must contain:
+
+- the user's approval statement, or a stable reference to it (a statement that approval is "recorded in the session transcript" is not enough on its own)
+- the `planSha256` approved (see step 2)
+- the approved window, including the `deadlineUtc` value
+- who approved
+- the date of approval
+
+`execute` checks only that the file exists as a regular file (not a symlink) and records its sha256 in the evidence. The file's sha256 is not part of `planSha256`; its path is. You can therefore write the file after `plan` (it has to carry `planSha256`) without changing the digest, but you must not change the path.
 
 Check out the reviewed commit. The payload is built from the `HEAD` blobs of `router/` and `tools/live/`, never from loose disk files. The tool refuses if the index or working tree differs from `HEAD` there, including untracked, ignored, skip-worktree or assume-unchanged files. It runs git with every `GIT_*` variable removed and `core.fsmonitor=false`.
 
@@ -18,7 +26,7 @@ Check out the reviewed commit. The payload is built from the `HEAD` blobs of `ro
 python3 -I tools/live/first-rehearsal.py plan "<PRIVATE_CONFIG>"
 ```
 
-`plan` runs only locally and sends nothing to the router. It prints:
+`plan` makes no network or `ssh` call. It reads the `HEAD` blobs, runs `sh -n` on the stripped wrappers and hashes local files, and it sends nothing to the router. It refuses on a dirty tree under `router/` and `tools/live/` (see step 1). `execute` makes the single `ssh` call. `plan` prints:
 
 - the source commit and release ID
 - the payload sha256 and size
@@ -31,6 +39,17 @@ python3 -I tools/live/first-rehearsal.py plan "<PRIVATE_CONFIG>"
 Show this output to the user. **The approval covers exactly `planSha256`.** Any change to the commit, configuration, template, key file or known_hosts file changes it, and the change needs new approval.
 
 ## 3. Execute once
+
+Before running `execute`, load the admin key into the agent that the terminal uses, with a lifetime that covers the whole window (see the [operator SSH agent guide](operator-ssh-agent.md)):
+
+```sh
+ssh-add -t <duration> ~/.ssh/couvre-feu-admin
+ssh-add -l
+```
+
+`ssh-add -l` must list the fingerprint in `adminKeyFingerprint`.
+
+`deadlineUtc` must be at least now + `remoteTimeoutSeconds` + 60 s (local extra) + 300 s (safety margin). With the default 1800 s timeout that is 2160 s (36 min) from now. `execute` checks this twice, once before it reads the authorization file and again after it creates the evidence directory; either check refuses if the time is short.
 
 ```sh
 python3 -I tools/live/first-rehearsal.py execute "<PRIVATE_CONFIG>" --expect-plan-sha256 <DISCLOSED_PLAN_SHA256>
@@ -73,7 +92,8 @@ The remote script refuses to begin INSTALL if more than 300 s have passed since 
 
 `remoteTimeoutSeconds` (default 1800 s) is a generous last-resort router-side `timeout -s KILL`. BusyBox `timeout` kills only its direct child, the rehearsal shell, so installer or uninstaller processes could keep running after it. Size the timeout well above the expected few-minute runtime so the script bounds itself first.
 
-INSTALL remains deliberately unbounded: a hung installer can outlive the remote timeout and leave an empty-policy installation; nothing is enrolled or paused then. The accepted M5 code-merge residual (2026-10-23) remains until a separately reviewed INSTALL supervisor proves whole-transaction drain and updates both live tools and budgets. The new recovery path does not itself bound INSTALL or authorize a watchdog. **M4b still blocks first live rehearsal and permanent installation:** final release identity, independent adversarial review, repository gates and separately approved target prerequisite inspection remain required.
+<!-- TODO(M4b merge): drop this blocker note once M4b is merged and its receipt is signed -->
+INSTALL remains deliberately unbounded: a hung installer can outlive the remote timeout and leave an empty-policy installation; nothing is enrolled or paused then. The accepted M5 code-merge residual (2026-10-23) remains until a separately reviewed INSTALL supervisor proves whole-transaction drain and updates both live tools and budgets. The new recovery path does not itself bound INSTALL or authorize a watchdog. **M4b still blocks first live rehearsal and permanent installation:** final release identity, independent adversarial review, repository gates and separately approved target prerequisite inspection remain required. M4b code is merged, but its receipt is not yet signed and the live rehearsal has not run.
 
 ### Stale install lock recovery
 
