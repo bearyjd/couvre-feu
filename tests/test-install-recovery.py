@@ -707,10 +707,17 @@ class InstallRecoveryTests(unittest.TestCase):
     def test_foreign_pid_only_runtime_lock_refuses_without_changes(self):
         self.killed_runtime_lock([])
         pid = self.root / "etc/couvrefeu/runtime/lock/pid"
-        pid.write_text(f"{os.getpid()}\n")
-        pid.chmod(0o600)
-        result = self.assert_refused_without_changes(self.recover)
-        self.assertIn("recovery lock owner mismatch", result.stderr)
+        # A dead foreign PID is an ownership mismatch; a live one (this test
+        # process) is a live holder. Both refuse without changes.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        for value, message in ((dead.pid, "recovery lock owner mismatch"),
+                               (os.getpid(), "live recovery lock holder")):
+            with self.subTest(live=value == os.getpid()):
+                pid.write_text(f"{value}\n")
+                pid.chmod(0o600)
+                result = self.assert_refused_without_changes(self.recover)
+                self.assertIn(message, result.stderr)
 
     def test_foreign_token_runtime_lock_refuses_without_changes(self):
         self.killed_runtime_lock([])
