@@ -1425,6 +1425,32 @@ cron_quiescence_preflight() (
         service_source_gate
         cron_quiescence_capture
         cron_pending_size=$(stat -c %s "$cron_pending")
+        [ "$cron_pending_size" -le 512 ] || fail 'oversized cron quiescence candidate'
+        # Boot and daemon lines record the killed writer's moment. A later boot
+        # or daemon only means that old daemon is gone (as cron_old_gone): check
+        # their shape, then bind header, live mode and token byte for byte.
+        cron_pending_lines=$(tr -dc '\n' < "$cron_pending" | wc -c)
+        cron_boot=$(sed -n '2p' "$cron_pending")
+        cron_old=$(sed -n '3p' "$cron_pending")
+        cron_boot_complete=0 cron_old_complete=0
+        [ "$cron_pending_lines" -lt 2 ] || cron_boot_complete=1
+        [ "$cron_pending_lines" -lt 3 ] || cron_old_complete=1
+        printf '%s\n' "$cron_boot" | awk -v full="$cron_boot_complete" 'NR==1{ok=$0!~/[^0-9a-f-]/&&(full?length($0)==36:length($0)<=36)}NR>1{ok=0}END{exit !ok}' || fail 'invalid cron quiescence candidate boot identity'
+        printf '%s\n' "$cron_old" | awk -v full="$cron_old_complete" -v fixture="${CF_TEST_MODE:-0}" '
+            function ids(v, partial,  n, a) {
+                if (v ~ /^[0-9]+:[0-9]+$/) { n = split(v, a, ":"); return length(a[1]) <= 10 && a[1] + 0 > 1 && length(a[2]) <= 20 }
+                if (!partial) return 0
+                if (v ~ /^[0-9]*$/) return length(v) <= 10
+                if (v ~ /^[0-9]+:$/) return length(v) <= 11
+                return 0
+            }
+            NR==1 {
+                v = $0
+                if (full) ok = v == "stopped" || (fixture == 1 && v ~ /^fixture:[0-9a-f]+$/ && length(v) == 72) || ids(v, 0)
+                else ok = v == "" || index("stopped", v) == 1 || (fixture == 1 && (index("fixture:", v) == 1 || (v ~ /^fixture:[0-9a-f]*$/ && length(v) <= 72))) || ids(v, 1)
+            }
+            NR>1 {ok=0}
+            END {exit !ok}' || fail 'invalid cron quiescence candidate daemon identity'
         cron_pending_limit=$(cron_quiescence_bytes | wc -c)
         [ "$cron_pending_size" -le "$cron_pending_limit" ] || fail 'oversized cron quiescence candidate'
         cron_quiescence_bytes | dd bs=1 count="$cron_pending_size" 2>/dev/null | cmp -s - "$cron_pending" || fail 'invalid cron quiescence candidate prefix'
