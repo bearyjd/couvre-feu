@@ -1155,8 +1155,9 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
                 self.assertIn('output buffer unavailable', result.stderr)
 
     def test_status_control(self):
-        # Control: strict-profile status takes no lock at all, so it was never affected. Before any
-        # apply this fixture reports observed-set errors; only the complete status object matters here.
+        # Control: strict-profile status takes no lock at all, so a full pipe cannot hold one. It was RED
+        # before errors=None: this fixture reports observed_set_read_failed before any apply, which tripped the
+        # errors==[] assertion (not a lock). Only the complete status object matters here.
         self.assertIn('drift', self.assert_blocked_output_holds_no_lock(('status', '--json'), errors=None))
 
 
