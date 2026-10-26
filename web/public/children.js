@@ -111,7 +111,7 @@ export function createChildren({ session, revisionToken, refresh, version }) {
     const where = STATE_LABEL[device.state] ?? (device.onRouter === null ? 'router state unknown' : device.onRouter ? 'on the router' : 'not on the router');
     return el('li', { class: 'passkey-row', 'data-device': device.id },
       el('span', {}, device.label), el('span', { class: 'fine-print' }, `${device.mac} · ${where}`),
-      el('button', { class: 'button secondary', type: 'button', disabled: busy || device.state !== 'active', 'aria-label': `Remove device ${device.label} from ${entry.name}`,
+      el('button', { class: 'button secondary', type: 'button', disabled: busy || device.state !== 'active', 'data-risk': 'destructive', 'aria-label': `Remove device ${device.label} from ${entry.name}`,
         onclick: () => void confirmed('device_remove', device.id, { precondition: revisionToken() }, `/admin/devices/${device.id}/remove`, (result) => queued(result) ?? `Removed ${device.label}.`) }, 'Remove'),
       ...moveControls(entry, device));
   }
@@ -138,7 +138,7 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       el('strong', {}, entry.name), el('span', { class: 'fine-print' }, `${kind} · ${entry.devices.length} device${entry.devices.length === 1 ? '' : 's'}`),
       el('ul', { class: 'passkey-list', 'aria-label': `Devices of ${entry.name}` }, ...entry.devices.map((device) => deviceRow(entry, device))),
       addForm(entry),
-      ...(entry.devices.length ? [] : [el('button', { class: 'button secondary', type: 'button', disabled: busy, 'aria-label': `Remove ${entry.name}`,
+      ...(entry.devices.length ? [] : [el('button', { class: 'button secondary', type: 'button', disabled: busy, 'data-risk': 'destructive', 'aria-label': `Remove ${entry.name}`,
         onclick: () => void confirmed('child_remove', entry.id, {}, `/admin/children/${entry.id}/remove`, () => `Removed ${entry.name}.`) }, `Remove ${kind.toLowerCase()}`)]));
   }
   function createForm() {
@@ -284,7 +284,7 @@ export function createBulk({ gate = () => null, session, people, revisionToken, 
       el('p', { class: 'fine-print', 'data-bulk-reason': '', hidden: !reason }, reason),
       el('div', { class: 'bulk-actions' },
         ...Object.entries(BULK).map(([action, spec]) => el('button', { class: action === 'pause_all' ? 'button primary' : 'button secondary', type: 'button', disabled: locked,
-          'data-action': action, onclick: () => { confirming = action; notice = ''; focus = '.bulk-confirm .button'; draw(); } }, spec.button))),
+          'data-action': action, ...(action === 'pause_all' ? { 'data-risk': 'destructive' } : {}), onclick: () => { confirming = action; notice = ''; focus = '.bulk-confirm .button'; draw(); } }, spec.button))),
       ...(confirming ? [confirmBox()] : []));
     root.hidden = false;
     if (focus) { root.querySelector(focus)?.focus(); focus = ''; }
