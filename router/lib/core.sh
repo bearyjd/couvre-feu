@@ -274,25 +274,49 @@ cf_control_dirs() {
             *)cf_fail unsafe_control_directory;return 1;;esac
     done
 }
+# A runtime lock directory with no record at all, seen by a non-owned caller
+# that holds the transaction mutex on its own descriptor: its creator was a
+# mutex holder killed between mkdir and its first exclusive record create.
+cf_lock_unpublished() (
+    set +f
+    [ "${CF_TRANSACTION_OWNED:-0}" != 1 ] && [ "${CF_TRANSACTION_HELD:-0}" = 1 ] || exit 1
+    command -v platform_transaction_mutex_check >/dev/null 2>&1 || exit 1
+    cf_private_dir "$CF_RUNTIME/lock" || exit 1
+    for cf_lu_entry in "$CF_RUNTIME/lock"/* "$CF_RUNTIME/lock"/.[!.]* "$CF_RUNTIME/lock"/..?*; do
+        if [ -e "$cf_lu_entry" ] || [ -L "$cf_lu_entry" ]; then exit 1; fi
+    done
+    platform_transaction_mutex_check >/dev/null 2>&1
+)
 cf_lock() {
     platform_deadline_check
     if [ "${CF_RPC_REQUIRE_RUNTIME:-0}" = 1 ];then
         cf_private_dir "$CF_RUNTIME" || { cf_fail unsafe_runtime;return 1; }
     else cf_runtime_prepare || return 1;fi
     if ! mkdir -m 700 "$CF_RUNTIME/lock" 2>/dev/null; then
-        cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" || { cf_fail unsafe_lock; return 1; }
-        cf_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/lock/pid") || { cf_fail unsafe_lock; return 1; }
-        case $cf_pid in ''|*[!0-9]*) cf_fail unsafe_lock; return 1;; esac
-        [ "$cf_pid" -gt 1 ] || { cf_fail unsafe_lock; return 1; }
-        if kill -0 "$cf_pid" 2>/dev/null || [ -e "/proc/$cf_pid" ]; then cf_fail locked; return 1; fi
-        # Demonstrably dead PID. Remove only the two known records, never a tree.
-        [ ! -e "$CF_RUNTIME/lock/reload" ] || cf_safe_file "$CF_RUNTIME/lock/reload" || { cf_fail unsafe_lock; return 1; }
-        rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" || return 1
-        rmdir "$CF_RUNTIME/lock" || { cf_fail unsafe_lock; return 1; }
-        mkdir -m 700 "$CF_RUNTIME/lock" || { cf_fail locked; return 1; }
+        if cf_lock_unpublished; then
+            # Creator killed before its first record. Under our own transaction
+            # mutex every earlier mutex holder is dead; a lockless reader still
+            # inside its window loses its exclusive record create below.
+            rmdir "$CF_RUNTIME/lock" 2>/dev/null || { cf_fail locked; return 1; }
+            mkdir -m 700 "$CF_RUNTIME/lock" 2>/dev/null || { cf_fail locked; return 1; }
+        else
+            cf_private_dir "$CF_RUNTIME/lock" && cf_safe_file "$CF_RUNTIME/lock/pid" || { cf_fail unsafe_lock; return 1; }
+            cf_pid=$(awk 'NR==1{print}NR>1{exit 2}' "$CF_RUNTIME/lock/pid") || { cf_fail unsafe_lock; return 1; }
+            case $cf_pid in ''|*[!0-9]*) cf_fail unsafe_lock; return 1;; esac
+            [ "$cf_pid" -gt 1 ] || { cf_fail unsafe_lock; return 1; }
+            if kill -0 "$cf_pid" 2>/dev/null || [ -e "/proc/$cf_pid" ]; then cf_fail locked; return 1; fi
+            # Demonstrably dead PID. Remove only the two known records, never a tree.
+            [ ! -e "$CF_RUNTIME/lock/reload" ] || cf_safe_file "$CF_RUNTIME/lock/reload" || { cf_fail unsafe_lock; return 1; }
+            rm -f "$CF_RUNTIME/lock/pid" "$CF_RUNTIME/lock/reload" || return 1
+            rmdir "$CF_RUNTIME/lock" || { cf_fail unsafe_lock; return 1; }
+            mkdir -m 700 "$CF_RUNTIME/lock" || { cf_fail locked; return 1; }
+        fi
     fi
-    printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid" || return 1
-    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then printf '%s\n' "$CF_TRANSACTION_TOKEN" > "$CF_RUNTIME/lock/token" || return 1; fi
+    # Owned token precedes the PID: a kill inside publication leaves only states
+    # (empty, token, token+PID prefix) that explicit recovery proves owned.
+    # Exclusive creates: exactly one writer can claim a directory.
+    if [ "${CF_TRANSACTION_OWNED:-0}" = 1 ]; then (set -C; printf '%s\n' "$CF_TRANSACTION_TOKEN" > "$CF_RUNTIME/lock/token") 2>/dev/null || { cf_fail locked; return 1; }; fi
+    (set -C; printf '%s\n' "$$" > "$CF_RUNTIME/lock/pid") 2>/dev/null || { cf_fail locked; return 1; }
     CF_LOCKED=1
     trap 'cf_unlock; platform_lock_release; exit 129' HUP
     trap 'cf_unlock; platform_lock_release; exit 130' INT

@@ -416,10 +416,10 @@ recover_install_preflight() {
         if [ "$RECOVERY_NEEDS_OWNER" = 1 ] && { [ -e /tmp/couvrefeu-platform.lock ] || [ -L /tmp/couvrefeu-platform.lock ]; }; then fail 'orphan platform lock alongside retirement receipt; preserved'; fi
         recover_owned_lock_check /tmp/couvrefeu-platform.lock
     fi
-    if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then
-        [ -f "$BASE/runtime/lock/token" ] || fail 'legacy runtime lock; manual recovery required'
-        recover_owned_lock_check "$BASE/runtime/lock"
-    fi
+    # Runtime publication is mkdir, token, PID (core.sh cf_lock), all under
+    # the transaction mutex this recovery now holds: an empty directory or a
+    # token/PID prefix of this owner's records is that dead owner's kill window.
+    if [ -e "$BASE/runtime/lock" ] || [ -L "$BASE/runtime/lock" ]; then recover_owned_lock_check "$BASE/runtime/lock"; fi
     if ! retirement_present; then
         prepared_recovery_check
         if [ "$CF_TRANSACTION_DIGEST" != none ]; then
@@ -1470,7 +1470,6 @@ runtime_preflight() (
     fi
     if ! { [ ! -e "$runtime/lock" ] && [ ! -L "$runtime/lock" ]; }; then
         [ "${1:-}" = recover-owned-lock ] || fail 'runtime lock present; installation/recovery stopped'
-        [ -f "$runtime/lock/token" ] || fail 'legacy runtime lock; manual recovery required'
         recover_owned_lock_check "$runtime/lock"
     fi
     expected_owner=$(stat -c '%u:%g' "$BACKUP/etc_couvrefeu_state.staged")
