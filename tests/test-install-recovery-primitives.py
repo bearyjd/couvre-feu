@@ -79,10 +79,6 @@ class InstallRecoveryPrimitiveTests(unittest.TestCase):
         if not cls.banner.startswith("BusyBox v"):
             raise AssertionError("CF_TEST_BUSYBOX must name a real BusyBox binary")
         print(f"Primitive runtime: {cls.busybox}: {cls.banner}", flush=True)
-        if "BusyBox v1.33.1" not in cls.banner:
-            raise unittest.SkipTest(
-                "primitive proofs require BusyBox 1.33.1 (the M4b gate); "
-                f"found {cls.banner}; run locally with CF_TEST_BUSYBOX=<1.33.1 binary>")
         cls.bb = shlex.quote(cls.busybox)
 
     def setUp(self):
