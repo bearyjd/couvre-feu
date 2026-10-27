@@ -9,13 +9,14 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=8b71046b20c2fb1fea4983f7bc46806cf6957c0255d408d3597f5cda89b93cfb
+CF_RELEASE_ID=a3419b275106444b12801f419de68e28d759fe9cd61ca9fa45e023e634a7bfde
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
-# Explicit recovery (install-common.sh) names the platform lock through this.
+# The single platform lock path: acquire, release, recover, the compatibility fence and
+# explicit recovery (install-common.sh) all name it through this variable.
 platform_lock_path=/tmp/couvrefeu-platform.lock
-CF_RELEASE_MODULES='core.sh:63895bb12ca81257f8132de21446b274bf16582172f2186f23a2a938f9690976 rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:4881b3b9d44fc95d22158048feeb91435f8dc1b0f74b605424fed77dfbc1c200 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:e093670bf47f6a9da749a73aef17a564c7e910e9b9acf5376bb331b56593b43b activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:4881b3b9d44fc95d22158048feeb91435f8dc1b0f74b605424fed77dfbc1c200 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:349b71a250b9387f2390f0bf6764f560583b44c4d71f31b5b262f3d87d12afb0 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -83,7 +84,7 @@ platform_canonical() {
 }
 platform_hash() {
     platform_regular "$1"
-    platform_hash_result=$(timeout -s KILL 6 sha256sum "$1") || platform_fail hash_read
+    platform_hash_result=$(timeout -s KILL 6 sha256sum "$1" 9>&-) || platform_fail hash_read
     [ "${platform_hash_result%% *}" = "$2" ] || platform_fail hash_mismatch
     platform_deadline_check
 }
@@ -261,7 +262,7 @@ platform_transaction_compat_clear() {
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then platform_existing_install=$CF_ROOT/.couvrefeu-install.lock
     else platform_existing_install=/tmp/couvrefeu-install.lock; fi
     if [ -e "$platform_existing_install" ] || [ -L "$platform_existing_install" ] ||
-        [ -e /tmp/couvrefeu-platform.lock ] || [ -L /tmp/couvrefeu-platform.lock ]; then
+        [ -e "$platform_lock_path" ] || [ -L "$platform_lock_path" ]; then
         platform_fail existing_compatibility_fence_requires_explicit_recovery
     fi
 }
@@ -383,13 +384,13 @@ platform_read_profile() {
     platform_regular "$1"
     # A marker preserves every trailing LF in the bounded read. Do not run wc
     # over provisional files: newline/NUL tails may otherwise be unbounded.
-    platform_read_value=$(timeout -s KILL 4 dd if="$1" bs=1 count=65 2>/dev/null && printf '.') || platform_fail profile_read
+    platform_read_value=$(timeout -s KILL 4 dd if="$1" bs=1 count=65 2>/dev/null 9>&- && printf '.') || platform_fail profile_read
     if [ "$platform_read_value" = "$(printf 'strict\n.')" ]; then platform_read_value=strict
     elif [ "$platform_read_value" = "$(printf 'gl-xe3000-4.8.3-logd-011-v1\n.')" ]; then platform_read_value=gl-xe3000-4.8.3-logd-011-v1
     elif [ "$platform_read_value" = "$(printf 'gl-xe3000-4.8.3-os-trust-v1\n.')" ]; then platform_read_value=gl-xe3000-4.8.3-os-trust-v1
     else platform_fail unknown_profile; fi
     # Exact bytes also reject NULs dropped by shell command substitution.
-    printf '%s\n' "$platform_read_value" | timeout -s KILL 4 cmp -s - "$1" || platform_fail profile_bytes
+    printf '%s\n' "$platform_read_value" | timeout -s KILL 4 cmp -s - "$1" 9>&- || platform_fail profile_bytes
     printf '%s\n' "$platform_read_value"
 }
 # Pre-ready profile journal record. A kill inside its write may leave it empty
@@ -405,7 +406,7 @@ platform_read_torn_profile() {
     platform_torn_size=$(platform_stat -c %s "$platform_torn_record") || platform_fail profile_read
     for platform_torn_profile in "$@"; do
         if [ "$platform_torn_size" -le "${#platform_torn_profile}" ] &&
-            printf '%s' "$platform_torn_profile" | timeout -s KILL 4 dd bs=1 count="$platform_torn_size" 2>/dev/null | timeout -s KILL 4 cmp -s - "$platform_torn_record"; then
+            printf '%s' "$platform_torn_profile" | timeout -s KILL 4 dd bs=1 count="$platform_torn_size" 2>/dev/null 9>&- | timeout -s KILL 4 cmp -s - "$platform_torn_record" 9>&-; then
             return 0
         fi
     done
@@ -413,11 +414,11 @@ platform_read_torn_profile() {
 }
 platform_done_legacy() {
     platform_regular "$1"
-    printf '2\n' | timeout -s KILL 4 cmp -s - "$1"
+    printf '2\n' | timeout -s KILL 4 cmp -s - "$1" 9>&-
 }
 platform_done_profile() {
     platform_regular "$1"
-    platform_done_value=$(timeout -s KILL 4 dd if="$1" bs=1 count=161 2>/dev/null && printf '.') || platform_fail completion_read
+    platform_done_value=$(timeout -s KILL 4 dd if="$1" bs=1 count=161 2>/dev/null 9>&- && printf '.') || platform_fail completion_read
     if [ "$platform_done_value" = "$(printf '2\n.')" ]; then
         platform_done_legacy "$1" || platform_fail completion_bytes
         printf 'strict\n'
@@ -425,7 +426,7 @@ platform_done_profile() {
     fi
     for platform_completion_profile in strict gl-xe3000-4.8.3-logd-011-v1 gl-xe3000-4.8.3-os-trust-v1; do
         if [ "$platform_done_value" = "$(printf '3\n%s\n%s\n.' "$platform_completion_profile" "$CF_RELEASE_ID")" ]; then
-            printf '3\n%s\n%s\n' "$platform_completion_profile" "$CF_RELEASE_ID" | timeout -s KILL 4 cmp -s - "$1" || platform_fail completion_bytes
+            printf '3\n%s\n%s\n' "$platform_completion_profile" "$CF_RELEASE_ID" | timeout -s KILL 4 cmp -s - "$1" 9>&- || platform_fail completion_bytes
             printf '%s\n' "$platform_completion_profile"
             return 0
         fi
@@ -503,10 +504,10 @@ platform_bootstrap_vendor() {
     if ! { [ -L /bin/stat ] && [ "$(readlink /bin/stat)" = /usr/libexec/stat-coreutils ]; }; then platform_fail stat_alternative; fi
     platform_stat() {
         if [ "$CF_PLATFORM_PROFILE" = "$CF_OS_TRUST_PROFILE" ]; then
-            platform_stat_result=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@") || platform_fail stat_read
+            platform_stat_result=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@" 9>&-) || platform_fail stat_read
             platform_deadline_check
             printf '%s\n' "$platform_stat_result"
-        else env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@"; fi
+        else env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LD_LIBRARY_PATH=/lib timeout -s KILL 4 /usr/libexec/stat-coreutils "$@" 9>&-; fi
     }
     [ "$(platform_stat -c '%u:%g:%a' /usr/libexec/stat-coreutils)" = 0:0:755 ] || platform_fail stat_metadata
     for platform_parent in / /lib /usr /bin; do
@@ -563,7 +564,7 @@ platform_lock_release() {
 }
 platform_lock_acquire() {
     if ! { [ -d /tmp ] && [ ! -L /tmp ] && [ "$(platform_stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ]; }; then platform_fail tmp_metadata; fi
-    CF_PLATFORM_LOCK=/tmp/couvrefeu-platform.lock
+    CF_PLATFORM_LOCK=$platform_lock_path
     mkdir -m 700 "$CF_PLATFORM_LOCK" 2>/dev/null || platform_fail transaction_contention
     CF_PLATFORM_LOCKED=1
     trap 'platform_lock_release' 0
@@ -583,7 +584,7 @@ platform_lock_acquire() {
 platform_lock_recover() (
     set +f
     # Explicit operation only; a partial/foreign record is never stolen.
-    CF_PLATFORM_LOCK=/tmp/couvrefeu-platform.lock
+    CF_PLATFORM_LOCK=$platform_lock_path
     if ! { [ -d /tmp ] && [ ! -L /tmp ] && [ "$(platform_stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ]; }; then platform_fail tmp_metadata; fi
     platform_private "$CF_PLATFORM_LOCK" 700
     # A KILL after mkdir, before the exclusive PID create, leaves a directory
@@ -614,7 +615,7 @@ platform_profile_validate() {
     if [ -e "$platform_done" ] && ! platform_done_legacy "$platform_done"; then
         platform_private "$platform_done" 600
         [ "$(platform_done_profile "$platform_done")" = "$CF_PLATFORM_PROFILE" ] || platform_fail conflicting_completion
-        printf '3\n%s\n%s\n' "$CF_PLATFORM_PROFILE" "$CF_RELEASE_ID" | timeout -s KILL 4 cmp -s - "$platform_done" || platform_fail completion_bytes
+        printf '3\n%s\n%s\n' "$CF_PLATFORM_PROFILE" "$CF_RELEASE_ID" | timeout -s KILL 4 cmp -s - "$platform_done" 9>&- || platform_fail completion_bytes
         platform_cleanup_binding=1
     fi
     for platform_journal in "$platform_root/etc/couvrefeu/backup" "$platform_recovery"; do
