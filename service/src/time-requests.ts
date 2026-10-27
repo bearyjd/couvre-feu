@@ -3,6 +3,8 @@ import { digest } from './auth.ts';
 import type { Store } from './db.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import type { Actor, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
+import { applyGrant, followGrants } from './time-request-grants.ts';
+import type { GrantContext } from './time-request-grants.ts';
 
 export const REQUEST_MINUTES = [15, 30, 60] as const;
 export const REQUEST_TTL_SECONDS = 900;
@@ -11,6 +13,12 @@ export const REASON_MAX_LENGTH = 140;
 /** Failed restore attempts back off 30 s, 60 s ... up to 5 minutes so a persistent rejection cannot flood the operations table. */
 export const REPAUSE_BACKOFF_BASE_SECONDS = 30, REPAUSE_BACKOFF_MAX_SECONDS = 300;
 const RECENT_SECONDS = 86400, BAD_TOKEN_LIMIT = 30, STATUS_LIMIT = 30;
+/** Distinct clients tracked by the bad-token limiter; beyond this, new clients share one overflow bucket. */
+const BAD_TOKEN_CLIENTS = 1024, OVERFLOW_CLIENT = '\u0000overflow';
+/** Invisible or line-breaking code points that could disguise a message (the emoji joiner U+200D stays allowed). */
+/** A lone UTF-16 surrogate is not text; it cannot be stored or rendered faithfully. */
+const UNPAIRED = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const INVISIBLE = /[\u061c\u200b\u200c\u200e\u200f\u2028\u2029\u2060\ufeff]/;
 const PERSON = /^[a-z][a-z0-9_]{0,31}$/, TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
 export type RequestState = 'pending' | 'approving' | 'approved' | 'declined' | 'expired' | 'unsupported' | 'apply_failed' | 'cancelled';
@@ -26,6 +34,17 @@ export interface PolicyPort {
  * (resolve) or refuse (throw AppError); the request is then approved for `until`.
  */
 export type ScheduleOverride = (input: {requestId: string; personId: string; minutes: number; until: number; actor: Actor}) => void | Promise<void>;
+export interface GrantReceipt {operationId: string; revision: number; until: number}
+export type GrantOutcome = 'pending' | 'confirmed' | 'failed' | 'ended';
+/**
+ * Router-side allowance port (real-router integration only). When present, every approval is a grant: an allowance that lifts both a
+ * manual pause and a schedule and expires on the router by itself. It supersedes ScheduleOverride and the resume + re-pause path.
+ */
+export interface GrantPort {
+    /** Queues the allowance (max 60 minutes, idempotent per key). Throws AppError, writing nothing, when refused. */
+    grant(actor: Actor, person: string, minutes: number, precondition: string | undefined, key: string): GrantReceipt;
+    outcome(operationId: string, person: string, until: number): GrantOutcome;
+}
 
 interface LinkRow {id: string; person_id: string; token_hash: string; created_by: string; created_at: number; revoked_at: number | null; revoked_by: string | null}
 interface RequestRow {
@@ -33,7 +52,7 @@ interface RequestRow {
     decided_by: string | null; decided_at: number | null; granted_minutes: number | null; allowance_until: number | null; decision_code: string | null;
     attempts: number; resume_operation_id: string | null; resume_revision: number | null; original_pause_until: number | null;
     repause_state: 'none' | 'waiting' | 'applying' | 'not_needed' | 'done' | 'superseded'; repause_operation_id: string | null; repause_error: string | null;
-    repause_failures: number; next_attempt_at: number | null;
+    repause_failures: number; next_attempt_at: number | null; apply_via: 'resume' | 'allowance'; grant_operation_id: string | null;
 }
 interface AccountRow {id: string; display_name: string; role: 'admin' | 'parent'; person_ids: string; permission_version: number}
 
@@ -54,7 +73,7 @@ export function normalizeReason(value: unknown): string {
     if (value === undefined) return '';
     if (typeof value !== 'string') throw new AppError(400, 'invalid_reason');
     const text = value.trim();
-    if ([...text].length > REASON_MAX_LENGTH || /[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/.test(text)) throw new AppError(400, 'invalid_reason');
+    if (UNPAIRED.test(value) || INVISIBLE.test(value) || [...text].length > REASON_MAX_LENGTH || /[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/.test(text)) throw new AppError(400, 'invalid_reason');
     return text;
 }
 function minutesOf(value: unknown): 15 | 30 | 60 {
@@ -67,11 +86,17 @@ export class TimeRequestService {
     readonly policy: PolicyPort;
     readonly now: () => number;
     readonly scheduleOverride?: ScheduleOverride;
+    readonly grants?: GrantPort;
     private readonly inFlight = new Set<string>();
-    private badTokens: number[] = [];
+    /** Per-client buckets: one hostile client can only rate-limit itself, never another client or any valid link. */
+    private badTokens = new Map<string, number[]>();
+    /** Per child (not per link): reissuing a link does not reset the per-minute limit. */
     private statusPolls = new Map<string, number[]>();
-    constructor(store: Store, policy: PolicyPort, now = () => Math.floor(Date.now() / 1000), scheduleOverride?: ScheduleOverride) {
-        this.store = store; this.policy = policy; this.now = now; this.scheduleOverride = scheduleOverride;
+    constructor(store: Store, policy: PolicyPort, now = () => Math.floor(Date.now() / 1000), scheduleOverride?: ScheduleOverride, grants?: GrantPort) {
+        this.store = store; this.policy = policy; this.now = now; this.scheduleOverride = scheduleOverride; this.grants = grants;
+    }
+    private grantContext(grants: GrantPort): GrantContext {
+        return {store: this.store, grants, now: this.now, inFlight: this.inFlight, audit: (...args) => this.audit(...args)};
     }
     private audit(actor: string, action: string, outcome: string, operationId: string | null = null, revision: number | null = null) {
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', actor, operationId, action, revision, this.now(), outcome);
@@ -197,6 +222,8 @@ export class TimeRequestService {
     private async decide(actor: Actor, row: RequestRow, minutes: number): Promise<void> {
         const people = await this.policy.people(actor), person = people.people.find(p => p.id === row.person_id);
         if (!person) throw new AppError(404, 'person_not_found');
+        // Real router: an allowance lifts pause and schedule alike and needs no service-side schedule claim or restore.
+        if (this.grants) return applyGrant(this.grantContext(this.grants), actor, row, minutes, people.revisionToken);
         const until = this.now() + minutes * 60;
         if (person.scheduleBlocked === null) throw new AppError(503, 'schedule_state_unknown');
         if (person.scheduleBlocked) {
@@ -249,8 +276,9 @@ export class TimeRequestService {
      */
     async advance(): Promise<void> {
         this.expire();
+        if (this.grants) followGrants(this.grantContext(this.grants));
         const now = this.now();
-        for (const row of this.store.all<RequestRow>("SELECT * FROM time_requests WHERE state='approving'")) {
+        for (const row of this.store.all<RequestRow>("SELECT * FROM time_requests WHERE state='approving' AND apply_via='resume'")) {
             // Intent was recorded but the process stopped before finalizing: the resume may have been applied, so it counts as approved.
             if (this.inFlight.has(row.id)) continue;
             this.store.transaction(() => {
@@ -320,6 +348,8 @@ export class TimeRequestService {
             try {
                 const people = await this.policy.people(actor), person = people.people.find(p => p.id === row.person_id);
                 if (person?.manualPause) return this.setRepause(row, 'superseded', null);
+                // A newer grant is in force: re-pausing now would end it (pause wins). Retry after it ends.
+                if (person?.allowance) throw new AppError(409, 'allowance_active');
                 if (!person || !people.revisionToken) throw new AppError(503, 'router_status_unavailable');
                 this.store.run('UPDATE time_requests SET attempts=attempts+1 WHERE id=?', row.id);
                 const outcome = await this.policy.mutate(actor, row.person_id, 'pause', {until: row.original_pause_until!}, people.revisionToken, `tr-${row.id}-p${row.attempts + 1}`);
@@ -338,7 +368,16 @@ export class TimeRequestService {
     }
 
     // ---- Child capability endpoints (no accounts, no cookies) -------------------------------------------------
-    private link(token: unknown): LinkRow {
+    /** Number of clients currently tracked by the bad-token limiter (bounded). */
+    badTokenClients(): number { return this.badTokens.size; }
+    private countBadToken(client: string | undefined, now: number): boolean {
+        for (const [key, times] of this.badTokens) if (!times.some(t => t > now - 60)) this.badTokens.delete(key);
+        const key = client === undefined ? '' : this.badTokens.has(client) || this.badTokens.size < BAD_TOKEN_CLIENTS - 1 ? client : OVERFLOW_CLIENT;
+        const recent = [...(this.badTokens.get(key) ?? []).filter(t => t > now - 60), now];
+        this.badTokens.set(key, recent);
+        return recent.length > BAD_TOKEN_LIMIT;
+    }
+    private link(token: unknown, client?: string): LinkRow {
         const now = this.now();
         let found: LinkRow | null = null;
         if (typeof token === 'string' && TOKEN.test(token)) {
@@ -349,31 +388,29 @@ export class TimeRequestService {
             }
         }
         if (found) return found;
-        this.badTokens = this.badTokens.filter(t => t > now - 60);
-        this.badTokens.push(now);
-        throw this.badTokens.length > BAD_TOKEN_LIMIT ? new AppError(429, 'rate_limited') : new AppError(404, 'link_invalid');
+        throw this.countBadToken(client, now) ? new AppError(429, 'rate_limited') : new AppError(404, 'link_invalid');
     }
     private pollLimit(link: LinkRow) {
-        const now = this.now(), recent = (this.statusPolls.get(link.id) ?? []).filter(t => t > now - 60);
+        const now = this.now(), recent = (this.statusPolls.get(link.person_id) ?? []).filter(t => t > now - 60);
         if (recent.length >= STATUS_LIMIT) throw new AppError(429, 'rate_limited');
-        this.statusPolls.set(link.id, [...recent, now]);
+        this.statusPolls.set(link.person_id, [...recent, now]);
     }
     private childStatus(link: LinkRow): ChildStatusDTO {
         const now = this.now(), row = this.store.get<RequestRow>('SELECT * FROM time_requests WHERE link_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', link.id);
         const retryAfter = row ? Math.max(0, row.created_at + REQUEST_COOLDOWN_SECONDS - now) : 0;
         const state = row?.state === 'approving' ? 'pending' : row?.state ?? 'none';
         return {state, minutes: row?.minutes ?? null, grantedMinutes: row?.granted_minutes ?? null, allowanceUntil: row?.allowance_until ?? null,
-            createdAt: row?.created_at ?? null, expiresAt: row?.expires_at ?? null, code: row ? CODES[row.state] ?? null : null,
+            createdAt: row?.created_at ?? null, expiresAt: row?.expires_at ?? null, code: row ? row.decision_code ?? CODES[row.state] ?? null : null,
             canRequest: state !== 'pending' && retryAfter === 0, retryAfter: state === 'pending' ? 0 : retryAfter};
     }
-    status(token: unknown): ChildStatusDTO {
-        const link = this.link(token);
+    status(token: unknown, client?: string): ChildStatusDTO {
+        const link = this.link(token, client);
         this.pollLimit(link);
         this.expire();
         return this.childStatus(link);
     }
-    submit(token: unknown, minutes: unknown, reason: unknown): ChildStatusDTO {
-        const link = this.link(token), granted = minutesOf(minutes), text = normalizeReason(reason);
+    submit(token: unknown, minutes: unknown, reason: unknown, client?: string): ChildStatusDTO {
+        const link = this.link(token, client), granted = minutesOf(minutes), text = normalizeReason(reason);
         this.pollLimit(link);
         this.expire();
         const now = this.now();

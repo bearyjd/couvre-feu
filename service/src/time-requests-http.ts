@@ -8,11 +8,12 @@ const LINK = /^\/people\/([a-z][a-z0-9_]{0,31})\/request-link(\/revoke)?$/;
 const DECISION = /^\/time-requests\/([0-9a-f-]{36})\/(approve|decline)$/;
 
 /** Unauthenticated capability routes. The token travels in the POST body only, never in a URL, header or cookie. */
-export function childRoute(service: TimeRequestService, path: string, payload: unknown): Routed {
-    if (path === '/child/status') return {status: 200, body: service.status(object(payload, ['token']).token)};
+export function childRoute(service: TimeRequestService, path: string, payload: unknown, client?: string): Routed {
+    // `client` (the TCP source address) only selects a bad-token rate-limit bucket; it is never stored or logged.
+    if (path === '/child/status') return {status: 200, body: service.status(object(payload, ['token']).token, client)};
     if (path === '/child/request') {
         const body = object(payload, ['token', 'minutes'], ['reason']);
-        return {status: 200, body: service.submit(body.token, body.minutes, body.reason)};
+        return {status: 200, body: service.submit(body.token, body.minutes, body.reason, client)};
     }
     throw new AppError(404, 'route_not_found');
 }

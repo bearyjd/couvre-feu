@@ -20,7 +20,7 @@ export interface SessionDTO extends Provenance {
     csrfToken: string;
     expiresAt: number;
 }
-export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move';
+export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow';
 export interface ScheduleWindowDTO {
     id: string;
     weekdays: string[];
@@ -98,6 +98,10 @@ export interface PersonDTO {
     } | null;
     scheduleBlocked: boolean | null;
     scheduleExplanation: string;
+    /** Integration only: the router-confirmed time allowance in force now (it lifts pause and schedule until `until`); null when none. */
+    allowance?: {
+        until: number;
+    } | null;
     /** Weekly windows from the latest observed policy; present only where this installation allows editing them. */
     schedules?: ScheduleWindowDTO[];
     schedulesEditable?: boolean;

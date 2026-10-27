@@ -11,12 +11,13 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
+import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
 }
@@ -99,7 +100,10 @@ export class IntegrationPolicy {
             if (until !== null && until !== 0 && until <= this.now()) throw new AppError(400, 'pause_expiry_must_be_future');
             return this.queue(actor, person, action, request, key, precondition, base => {
                 if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
-                return normalizePolicy({...base, revision: base.revision + 1,
+                // Pause wins: a pause also ends the child's time allowance (as cfctl pause does, core.sh cf_pause_edit), or the
+                // router would keep the child unblocked. Resume keeps the allowance, matching cf_resume_edit.
+                const allowances = action === 'pause' && base.allowances ? {allowances: base.allowances.filter(a => a.person !== person)} : {};
+                return normalizePolicy({...base, revision: base.revision + 1, ...allowances,
                     pauses: [...base.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: until!}] : [])]}, this.store.config.protectedMacs);
             });
         });
@@ -145,6 +149,7 @@ export class IntegrationPolicy {
         let allEnrolled = true;
         const people = children.map(child => {
             const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id);
+            const validUntil = Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, allowance = allowanceView(o, healthy, child.id);
             if (!enrolled) allEnrolled = false;
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
@@ -153,7 +158,8 @@ export class IntegrationPolicy {
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
-                ...integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, child.id),
+                ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
+                allowance,
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
                     generationMatches: o?.generation === config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,

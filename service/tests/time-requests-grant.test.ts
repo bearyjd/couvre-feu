@@ -5,6 +5,7 @@ import { TimeRequestService } from '../src/time-requests.ts';
 import { IntegrationGrants, MAX_GRANT_MINUTES } from '../src/integration-allowance.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
+import { AppError } from '../../shared/src/errors.ts';
 
 const ALL_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
 interface Row {id: string; state: string; allowance_until: number | null; granted_minutes: number | null; decision_code: string | null; grant_operation_id: string | null; repause_state: string}
@@ -15,6 +16,8 @@ async function world(over: Partial<RouterPolicy> = {}) {
     const now = f.now();
     // Owner-reviewed clock in UTC so the integration schedule claim is evaluable; the fixture clock is 00:00 UTC.
     f.config.scheduleClock = {timezone: 'UTC', conformance: {utcOffsetMinutes: 0, verifiedAt: now - 3600, validUntil: now + 3 * 86400, evidenceSha256: 'e'.repeat(64)}};
+    // Schedules on the router must be the manifest-owned ones (validateManagedPolicy).
+    if (over.schedules) f.config.enrollment = normalizePolicy({...f.config.enrollment, schedules: over.schedules});
     f.router.policy = normalizePolicy({...f.config.enrollment, revision: 1, ...over}, f.config.protectedMacs);
     await f.observe();
     const grants = new IntegrationGrants(f.policy);
@@ -88,8 +91,8 @@ test('pause wins: a single-child pause during a grant clears the allowance end t
         await w.dispatch(paused.result.operation.id);
         await w.service.advance();
         assert.equal(w.f.policy.people(actor).people[0].allowance, null);
-        assert.equal(w.row(id).decision_code, 'grant_ended_by_pause');
-        assert.equal(w.service.status(w.link.token, 'client-a').code, 'grant_ended_by_pause');
+        assert.equal(w.row(id).decision_code, 'grant_ended');
+        assert.equal(w.service.status(w.link.token, 'client-a').code, 'grant_ended');
     } finally { w.f.cleanup(); }
 });
 
@@ -99,6 +102,7 @@ test('a grant dispatched after its deadline is inert on the router and never rep
         const id = w.ask(15);
         await w.service.approve(actor, id, 15);
         w.f.advance(16 * 60);
+        await w.f.observe(); // operator dispatch long after the approval
         await w.dispatch(w.row(id).grant_operation_id!);
         await w.service.advance();
         assert.equal(w.row(id).state, 'apply_failed');
@@ -154,8 +158,13 @@ test('a refused grant releases the request for another try', async () => {
     const w = await world(bedtime);
     try {
         const id = w.ask(30);
-        w.f.advance(120); // observation is stale: the CAS path refuses before writing
-        await assert.rejects(w.service.approve(actor, id, 30), {code: 'approved_router_observation_required'});
+        // The CAS path refuses (e.g. a concurrent change moved the revision) and writes nothing.
+        const refusing = new TimeRequestService(w.f.store, w.f.policy, w.f.now, undefined, {grant: () => { throw new AppError(409, 'revision_conflict'); }, outcome: w.grants.outcome.bind(w.grants)});
+        await assert.rejects(refusing.approve(actor, id, 30), {code: 'revision_conflict'});
+        assert.equal(w.row(id).state, 'pending');
+        assert.equal(w.row(id).granted_minutes, null);
+        w.f.advance(120); // stale observation: refused before any intent is recorded
+        await assert.rejects(w.service.approve(actor, id, 30), {code: 'router_status_unavailable'});
         assert.equal(w.row(id).state, 'pending');
         assert.equal(w.f.store.get<{n: number}>('SELECT count(*) AS n FROM operations')!.n, 0);
     } finally { w.f.cleanup(); }
