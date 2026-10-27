@@ -56,12 +56,13 @@ test('the request message is hostile input: invisible and unpaired code points a
 });
 
 test('parents get a request-pending alert on the real path, without the reason text', async () => {
-    const f = integrationFixture(), port = 39500 + process.pid % 400, origin = `http://localhost:${port}`;
+    // Port 0: the OS picks a free one. No request is made to the server, so the origin is only a placeholder for Auth.
+    const f = integrationFixture(), port = 0, origin = 'http://localhost:4273';
     await f.observe();
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const ticks: (() => unknown)[] = [], realSet = globalThis.setInterval;
     globalThis.setInterval = ((handler: () => unknown, ms?: number, ...args: unknown[]) => { if (ms === 5000) { ticks.push(handler); return {unref() {}} as unknown as NodeJS.Timeout; } return realSet(handler, ms, ...args); }) as typeof setInterval;
-    const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`, timeRequests: {enabled: true}} as never, new ParentAlerts(f.store, null, f.now));
+    const server = appServer(auth, f.policy, {...f.config, port, origin, host: 'localhost:4273', timeRequests: {enabled: true}} as never, new ParentAlerts(f.store, null, f.now));
     try {
         server.listen(port, '127.0.0.1'); await once(server, 'listening');
         const service = new TimeRequestService(f.store, f.policy, f.now);

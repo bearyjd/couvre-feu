@@ -1106,18 +1106,107 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
         document['people'][0]['macs'] = [KID]
         return json.dumps(document, separators=(',', ':'))
 
-    def assert_blocked_output_holds_no_lock(self, args, stdin=None, errors=()):
-        child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), *args], self.f.env, stdin)
+    def assert_blocked_output_holds_no_lock(self, args, stdin=None, errors=(), status=0, confirm=None):
+        slave = None
+        if confirm is not None:
+            # The scope verbs need a TTY on stdin (else scope_tty_required before any lock).
+            master, slave = pty.openpty()
+            self.addCleanup(os.close, master)
+            os.write(master, (confirm + '\n').encode())
+            stdin = slave
+        try:
+            child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), *args], self.f.env, stdin)
+        finally:
+            if slave is not None:
+                os.close(slave)
         self.addCleanup(lambda: child.poll() is None and (os.killpg(child.pid, signal.SIGKILL), child.wait()))
         probe = self.f.run('expire', timeout=120)
         self.assertEqual(probe.returncode, 0, (args, probe.stdout, probe.stderr))
         self.assertIsNone(child.poll(), 'the blocked command must still be writing')
-        status, stdout = drain_full_stdout(child, read_end)
-        self.assertEqual(status, 0, stdout)
+        exit_status, stdout = drain_full_stdout(child, read_end)
+        self.assertEqual(exit_status, status, stdout)
         reply = last_json(stdout)
         if errors is not None:
             self.assertEqual(reply.get('errors'), list(errors), stdout)
         return reply
+
+    def test_apply_fw(self):
+        self.assert_blocked_output_holds_no_lock(('apply-fw',))
+
+    def test_remove_fw(self):
+        self.assert_blocked_output_holds_no_lock(('remove-fw',), errors=None)
+
+    def test_rpc_activity_and_inventory(self):
+        for verb in ('rpc-activity', 'rpc-inventory'):
+            with self.subTest(verb=verb):
+                self.assert_blocked_output_holds_no_lock((verb, '--json'), errors=None)
+
+    def test_scope_add_and_remove(self):
+        reply = self.assert_blocked_output_holds_no_lock(('scope-add', NEW, '--base', self.base()), confirm=tail6(NEW))
+        self.assertTrue(reply['ok'], reply)
+        reply = self.assert_blocked_output_holds_no_lock(('scope-remove', NEW, '--base', self.base()), confirm=tail6(NEW))
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(self.status()['scope'], [KID])
+
+    def test_refusal_raised_under_a_lock(self):
+        # A stale --base is refused under cf_lock (after the CAS read): that refusal is buffered too.
+        reply = self.assert_blocked_output_holds_no_lock(('scope-add', NEW, '--base', SHA_ZERO), confirm=tail6(NEW),
+                                                         errors=('scope_base_conflict',), status=1)
+        self.assertFalse(reply['ok'], reply)
+        self.assertEqual(self.status()['scope'], [KID])
+
+    def parked_pause(self, first=True):
+        """A `pause alice` stopped at before_write: it holds the transaction mutex and cf_lock."""
+        if first:
+            synced = self.f.run('sync', raw=self.document(), timeout=180)
+            self.assertEqual(synced.returncode, 0, synced.stdout + synced.stderr)
+        marker = self.f.root / 'rpc-stopped'
+        marker.unlink(missing_ok=True)
+        parked = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'pause', 'alice'],
+                                  env=dict(self.f.env, CF_TEST_RPC_STOP='before_write'), stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: parked.poll() is None and (os.killpg(parked.pid, signal.SIGKILL), parked.wait()))
+        self.assertTrue(wait_for(lambda: marker.exists() and proc_state(parked.pid) == 'T', 90), 'checkpoint not reached')
+        return parked
+
+    def test_signal_while_buffered_under_a_lock_releases_once(self):
+        # HUP/TERM delivered while the output is still buffered under the locks: the trap releases cf_lock and the
+        # mutex exactly once (no lock_owner_changed/unsafe_lock), writes at most the one buffered reply, and exits
+        # with the signal status; the next command is not fenced.
+        for signum, code in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(signal=signum):
+                parked = self.parked_pause(first=signum == signal.SIGHUP)
+                os.kill(parked.pid, signum)
+                os.kill(parked.pid, signal.SIGCONT)
+                stdout, stderr = parked.communicate(timeout=60)
+                self.assertEqual(parked.returncode, code, stdout + stderr)
+                self.assertLessEqual(len([line for line in stdout.splitlines() if line.startswith('{')]), 1, stdout)
+                self.assertNotIn('lock_owner_changed', stderr)
+                self.assertFalse((self.runtime / 'lock').exists(), 'cf_lock left behind')
+                probe = self.f.run('expire', timeout=120)
+                self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+
+    def test_signal_while_output_blocked_never_releases_a_foreign_lock(self):
+        # The blocked command has already released everything; another command then takes the mutex and cf_lock.
+        # HUP/TERM to the blocked one must not remove the other's cf_lock (nor close its flock).
+        for signum, code in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(signal=signum):
+                child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), 'expire'], self.f.env)
+                self.addCleanup(lambda c=child: c.poll() is None and (os.killpg(c.pid, signal.SIGKILL), c.wait()))
+                parked = self.parked_pause(first=signum == signal.SIGHUP)
+                held = (self.runtime / 'lock/pid').read_text()
+                self.assertEqual(held.strip(), str(parked.pid))
+                os.kill(child.pid, signum)
+                status, stdout = drain_full_stdout(child, read_end)
+                self.assertIn(status, (code, 0), stdout)
+                self.assertEqual((self.runtime / 'lock/pid').read_text(), held, 'a foreign cf_lock was released')
+                contended = self.f.run('expire', timeout=120)
+                self.assertNotEqual(contended.returncode, 0, 'the parked command must still hold the mutex/cf_lock')
+                os.kill(parked.pid, signal.SIGCONT)
+                stdout, stderr = parked.communicate(timeout=120)
+                self.assertEqual(parked.returncode, 0, stdout + stderr)
+                self.assertTrue(last_json(stdout)['ok'], stdout)
+                self.assertEqual(self.f.run('resume', 'alice', timeout=120).returncode, 0)
 
     def test_sync(self):
         self.assert_blocked_output_holds_no_lock(('sync',), self.document())
@@ -1159,6 +1248,44 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
         # before errors=None: this fixture reports observed_set_read_failed before any apply, which tripped the
         # errors==[] assertion (not a lock). Only the complete status object matters here.
         self.assertIn('drift', self.assert_blocked_output_holds_no_lock(('status', '--json'), errors=None))
+
+
+class OutputBufferFailureTests(ScopeCommon, unittest.TestCase):
+    """cf_output_open must leave no descriptor (6/7/8) or buffer file behind when it fails part-way, and a
+    buffer that cannot be read back must be reported on stderr (the command's own exit status is kept)."""
+
+    LEFTOVERS = ('fds() { for n in 6 7 8; do [ ! -e /proc/$$/fd/$n ] || printf "FD%s_OPEN\\n" "$n" >&2; done; }\n'
+                 'left() { set +f; for x in "$CF_BASE"/tmp/couvrefeu-output.*; do [ ! -e "$x" ] || printf "LEFT\\n" >&2; done; set -f; }\n')
+
+    def assert_clean_fallback(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('output buffer unavailable', result.stderr)
+        self.assertNotIn('_OPEN', result.stderr)
+        self.assertNotIn('LEFT', result.stderr)
+        self.assertEqual(result.stdout, 'DIRECT\n')
+
+    def test_redirection_failure_closes_the_write_descriptor(self):
+        # BusyBox 1.33.1 ash (host binary): a failed `command exec 7>ok 8<bad` returns 1, the shell survives,
+        # and fd 7 stays open. A write-only buffer makes the `8<` open fail (non-root fixture).
+        body = self.LEFTOVERS + 'cf_safe_file() { chmod 200 "$1"; }\nCF_OUTPUT_WANTED=1;cf_output_begin\nfds;left;echo DIRECT\n'
+        self.assert_clean_fallback(self.core_shell(body, tty=False))
+
+    def test_unlink_failure_closes_descriptors_and_removes_the_file(self):
+        body = self.LEFTOVERS + ('rm() { if [ ! -e "$CF_BASE/rm-failed" ]; then : > "$CF_BASE/rm-failed"; return 1; fi; command rm "$@"; }\n'
+                                 'CF_OUTPUT_WANTED=1;cf_output_begin\nfds;left;echo DIRECT\n')
+        self.assert_clean_fallback(self.core_shell(body, tty=False))
+
+    def test_lost_buffer_is_reported_and_the_status_is_kept(self):
+        for status in (0, 3):
+            with self.subTest(status=status):
+                body = ('CF_OUTPUT_WANTED=1;cf_output_begin\necho BUFFERED\ncat() { return 1; }\n'
+                        '(exit %d);cf_output_release;echo "rc=$?"\n' % status)
+                result = self.core_shell(body, tty=False)
+                self.assertEqual(result.stdout, 'rc=%d\n' % status, result.stdout + result.stderr)
+                self.assertIn('couvre-feu: warning: buffered output lost', result.stderr)
+        # Control: a readable buffer is written whole and silently.
+        result = self.core_shell('CF_OUTPUT_WANTED=1;cf_output_begin\necho BUFFERED\n(exit 0);cf_output_release;echo "rc=$?"\n', tty=False)
+        self.assertEqual((result.stdout, result.stderr), ('BUFFERED\nrc=0\n', ''))
 
 
 class StrippedScopeWrapperTests(unittest.TestCase):

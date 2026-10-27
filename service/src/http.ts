@@ -108,7 +108,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
     const drain = requests ? null : new TimeRequestService(auth.store, policy, clock, undefined, grants);
     // The demo feeds its alerts from main.ts; on the real path only the time-request rule is reconciled here, nothing else.
-    const pendingAlerts = requests && grants && alerts?.reconcile ? () => alerts.reconcile!({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
+    const reconcileAlerts = alerts?.reconcile?.bind(alerts);
+    const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
     const accounts = new AccountAdmin(auth);
     // Children/device groups and their devices are database-managed only against a real router integration.

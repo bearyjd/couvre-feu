@@ -5,7 +5,7 @@ vp_hash_value() {
     # Ordinary paths never follow a link; the explicit proc-image caller below
     # hashes its admitted magic link separately, after exact target validation.
     regular "$1"
-    value=$(timeout -s KILL 6 sha256sum "$1") || fail hash_read
+    value=$(timeout -s KILL 6 sha256sum "$1" 9>&-) || fail hash_read
     value=${value%% *}
     case "$value" in ''|*[!0-9a-f]*) fail hash_format;; esac
     [ "${#value}" = 64 ] || fail hash_length
@@ -80,7 +80,7 @@ vp_read_body() {
     # NUL is mapped to reserved SOH before BusyBox awk sees it; both controls
     # are rejected. Explicit dd and transform status footers preserve failures.
     {
-        if timeout -s KILL 6 dd if="$1" bs=1 count="$2" 2>/dev/null; then rc=0; else rc=$?; fi
+        if timeout -s KILL 6 dd if="$1" bs=1 count="$2" 2>/dev/null 9>&-; then rc=0; else rc=$?; fi
         printf '\nCF008_DD_END=%s\n' "$rc"
     } | tr '\000' '\001'
     transform_rc=$?
@@ -142,7 +142,7 @@ vp_starttime() {
 }
 vp_exe() {
     [ -L "$1" ] || return 2
-    exe=$(timeout -s KILL 4 readlink "$1" && printf ".") || return 2
+    exe=$(timeout -s KILL 4 readlink "$1" 9>&- && printf ".") || return 2
     # Keep any newline in the target; strip only our marker and readlink delimiter.
     exe=${exe%.}; exe=${exe%?}
     case "$exe" in /*) ;; *) return 2;; esac
@@ -269,7 +269,7 @@ vp_image() {
     [ "$(vp_exe "$1")" = "$2" ] || fail process_image_target
     inode=$(stat_private -L -c '%d:%i:%s' "$1") || fail process_image_stat
     [ "$inode" = "$(stat_private -c '%d:%i:%s' "$2")" ] || fail process_image_inode
-    image=$(timeout -s KILL 6 sha256sum "$1") || fail process_image_hash
+    image=$(timeout -s KILL 6 sha256sum "$1" 9>&-) || fail process_image_hash
     image=${image%% *}
     [ "$image" = "$(vp_hash_value "$2")" ] || fail process_image_hash
     [ "$(vp_exe "$1")" = "$2" ] && [ "$(stat_private -L -c '%d:%i:%s' "$1")" = "$inode" ] || fail process_image_changed

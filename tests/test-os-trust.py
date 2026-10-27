@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -255,14 +256,32 @@ mkdir() {{ command mkdir "$@";fixture_tick=1400; }};cf_lock;printf unsafe'''
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-dead-lock-') as folder:
             root=Path(folder);lock=root/'lock';lock.mkdir();(lock/'pid').write_text('999999999\n')
             text=self.bootstrap.read_text();start=text.index('platform_lock_recover() (');stop=text.index('platform_profile_validate()',start)
-            fn=text[start:stop].replace('/tmp/couvrefeu-platform.lock',str(lock))
+            fn=text[start:stop]
             body=f'''set -eu
+platform_lock_path={lock}
 {fn}
 fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ fixture_tick=1400; }};
 platform_lock_recover;printf unsafe'''
             r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertIn('admission_deadline',r.stderr);self.assertNotIn('unsafe',r.stdout)
             self.assertEqual((lock/'pid').read_text(),'999999999\n')
+    def test_platform_lock_path_is_the_single_source(self):
+        # Explicit recovery (install-common.sh) reads platform_lock_path; acquire, release, recover and the
+        # compatibility fence must name the same lock, never a second hard-coded copy.
+        text=self.bootstrap.read_text()
+        self.assertEqual([line for line in text.splitlines() if '/tmp/couvrefeu-platform.lock' in line],
+                         ['platform_lock_path=/tmp/couvrefeu-platform.lock'])
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-lock-path-') as folder:
+            lock=Path(folder)/'platform.lock'
+            body=f'''set -eu
+. "{self.bootstrap}"
+platform_lock_path={lock}
+platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ :; }};platform_deadline_check() {{ :; }}
+platform_lock_acquire;[ "$(cat "{lock}/pid")" = "$$" ];printf acquired;platform_lock_release;[ ! -e "{lock}" ];printf released
+mkdir "{lock}";printf '999999999\\n' > "{lock}/pid";platform_lock_recover;[ ! -e "{lock}" ];printf recovered
+platform_transaction_paths() {{ :; }};mkdir "{lock}";(platform_transaction_compat_clear) 2>/dev/null || printf fenced'''
+            r=self.run_shell(body)
+            self.assertEqual(r.stdout,'acquiredreleasedrecoveredfenced',r.stderr)
     def test_internal_receipt_separates_kernel_proof_and_protected_attempt(self):
         for zero,started,ok in [(True,False,True),(True,True,True),(False,True,True),(False,False,False)]:
             receipt=json.dumps({'ok':True,'removed':True,'zeroOwnedMutations':zero,'initialProtectedWrite':started,'errors':[]},separators=(',',':'))
@@ -339,14 +358,21 @@ fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
             self.assertIn('else platform_initial_write; env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /etc/init.d/firewall reload; fi',fn)
 
 class OperationalFlowTests(unittest.TestCase):
-    def os_trust_release(self,f):
+    def os_trust_release(self,f,stat_payload=None):
         # The genuine ash/router code uses the isolated JSON backend. Hardware
         # admission is the same explicit inert adapter as recovery fixtures.
+        # stat_payload keeps the genuine vendor platform_stat (env -i + timeout -s KILL)
+        # with only its payload path replaced, so its children can be observed.
         (f.root/'tmp').chmod(0o1777)
         release=f.root/'release';shutil.copytree(REPO/'router',release)
         bootstrap=release/'lib/platform-bootstrap.sh';text=bootstrap.read_text()
         start=text.index('platform_bootstrap_vendor() {');stop=text.index('platform_verify_modules()',start)
-        text=text[:start]+'platform_bootstrap_vendor() { :; }\n'+text[stop:]
+        adapter='platform_bootstrap_vendor() { :; }\n'
+        if stat_payload is not None:
+            body=text[start:stop];stat_start=body.index('    platform_stat() {');stat_stop=body.index('\n    }\n',stat_start)+7
+            adapter=('platform_bootstrap_vendor() {\n'+body[stat_start:stat_stop].replace('/usr/libexec/stat-coreutils',str(stat_payload))
+                     +'    stat() { platform_stat "$@"; }\n}\n')
+        text=text[:start]+adapter+text[stop:]
         text=text.replace('/tmp/couvrefeu-platform.lock',str(f.root/'tmp/couvrefeu-platform.lock'))
         text=text.replace("'%u:%g:%a' /tmp)","'%u:%g:%a' "+str(f.root/'tmp')+')').replace('0:0:1777',f'{os.getuid()}:{os.getgid()}:1777')
         text=text.replace('        vp_transaction_check >/dev/null','        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
@@ -408,7 +434,12 @@ class OperationalFlowTests(unittest.TestCase):
                                        expected_revision=current['acceptedPolicy']['revision'],expected_digest=current['policyDigest'],policy=data))
             cases=(('status',('status','--json'),None),('sync',('sync',),lambda:json.dumps(document()[1])),
                    ('rpc-sync',('rpc-sync',),rpc_request),('pause',('pause','alice'),None),('resume',('resume','alice'),None),
-                   ('expire',('expire',),None),('rpc-status',('rpc-status','--json'),None))
+                   ('expire',('expire',),None),('rpc-status',('rpc-status','--json'),None),
+                   ('apply-fw',('apply-fw',),None),('rpc-activity',('rpc-activity','--json'),None),
+                   ('rpc-inventory',('rpc-inventory','--json'),None),
+                   # A refusal raised under the platform lock and cf_lock (stale CAS revision).
+                   ('refusal',('rpc-sync',),lambda:json.dumps(dict(json.loads(rpc_request()),expected_revision=999))),
+                   ('remove-fw',('remove-fw',),None))  # last: it changes the firewall state
             for label,args,stdin in cases:
                 with self.subTest(command=label):
                     child,read_end=start_with_full_stdout(f.shell+[entry,*args],env,stdin() if stdin else None)
@@ -418,8 +449,82 @@ class OperationalFlowTests(unittest.TestCase):
                         self.assertIsNone(child.poll(),'the blocked command must still be writing')
                     finally:
                         status,stdout=drain_full_stdout(child,read_end)
-                    self.assertEqual(status,0,stdout)
+                    self.assertEqual(status,1 if label=='refusal' else 0,stdout)
                     self.assertTrue(stdout.rstrip().endswith('}'),stdout)
         finally:f.close()
+
+    def installed_entry(self,f,**release_options):
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import PROTECTED,KID
+        release=self.os_trust_release(f,**release_options)
+        env=dict(f.env,CF_TEST_INSTALL_KERNEL='1')
+        installed=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,'--activate','--protect',PROTECTED,'--rpc-allow',KID],
+                                 env=env,capture_output=True,text=True,timeout=120)
+        self.assertEqual(installed.returncode,0,installed.stderr+installed.stdout)
+        return str(f.root/'usr/sbin/cfctl'),env
+
+    def test_signal_while_output_blocked_keeps_a_foreign_platform_lock(self):
+        # The blocked command released every lock before writing. Another command then holds the
+        # platform lock, the mutex and cf_lock (stopped at before_write). HUP/TERM to the blocked one
+        # must release nothing it no longer owns.
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import RouterFixture,KID,policy,start_with_full_stdout,drain_full_stdout
+        f=RouterFixture()
+        try:
+            entry,env=self.installed_entry(f)
+            data=policy(2);data['people'][0]['macs']=[KID]
+            synced=subprocess.run(f.shell+[entry,'sync'],env=env,input=json.dumps(data),capture_output=True,text=True,timeout=120)
+            self.assertEqual(synced.returncode,0,synced.stderr+synced.stdout)
+            platform_lock=f.root/'tmp/couvrefeu-platform.lock';marker=f.root/'rpc-stopped'
+            for signum,code in ((signal.SIGHUP,129),(signal.SIGTERM,143)):
+                with self.subTest(signal=signum):
+                    child,read_end=start_with_full_stdout(f.shell+[entry,'expire'],env)
+                    marker.unlink(missing_ok=True)
+                    parked=subprocess.Popen(f.shell+[entry,'pause','alice'],env=dict(env,CF_TEST_RPC_STOP='before_write'),stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+                    try:
+                        deadline=time.monotonic()+90
+                        while not (marker.exists() and open('/proc/%d/stat'%parked.pid).read().rsplit(') ',1)[1][0]=='T'):
+                            self.assertLess(time.monotonic(),deadline,'checkpoint not reached');time.sleep(.1)
+                        held=(platform_lock/'pid').read_text();self.assertEqual(held.strip(),str(parked.pid))
+                        os.kill(child.pid,signum)
+                        status,stdout=drain_full_stdout(child,read_end)
+                        self.assertIn(status,(code,0),stdout)
+                        self.assertEqual((platform_lock/'pid').read_text(),held,'a foreign platform lock was released')
+                        self.assertTrue((f.root/'etc/couvrefeu/runtime/lock').exists(),'a foreign cf_lock was released')
+                        os.kill(parked.pid,signal.SIGCONT)
+                        out,err=parked.communicate(timeout=120)
+                        self.assertEqual(parked.returncode,0,out+err)
+                    finally:
+                        for process in (child,parked):
+                            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.wait()
+                    resumed=subprocess.run(f.shell+[entry,'resume','alice'],env=env,capture_output=True,text=True,timeout=120)
+                    self.assertEqual(resumed.returncode,0,resumed.stderr+resumed.stdout)
+        finally:f.close()
+
+    def test_mutex_children_do_not_inherit_fd9(self):
+        # The vendor platform_stat runs `timeout -s KILL` children, many of them under the transaction
+        # mutex. BusyBox timeout is reported to leave a detached watcher that inherits fds above 2; the
+        # payload below records fd 9 and emulates that watcher with a 2 s background sleep. A child that
+        # inherits fd 9 keeps the flock after cfctl exits, so the next `expire` gets transaction_contention.
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import RouterFixture
+        f=RouterFixture()
+        try:
+            log=f.root/'stat-fd9.log';payload=f.root/'stat-payload'
+            payload.write_text('#!/bin/sh\nprintf "%s\\n" "$(readlink /proc/$$/fd/9 2>/dev/null || echo closed)" >> '+str(log)+'\n'
+                               'sleep 2 </dev/null >/dev/null 2>&1 &\nexec stat "$@"\n')
+            payload.chmod(0o700)
+            entry,env=self.installed_entry(f,stat_payload=payload)
+            log.write_text('')
+            for args in (('expire',),('apply-fw',),('expire',),('pause','nobody')):
+                result=subprocess.run(f.shell+[entry,*args],env=env,capture_output=True,text=True,timeout=120)
+                self.assertNotIn('transaction_contention',result.stderr,args)
+                if args!=('pause','nobody'):self.assertEqual(result.returncode,0,(args,result.stdout,result.stderr))
+            seen=log.read_text().splitlines()
+            self.assertGreater(len(seen),10,'the genuine platform_stat was not exercised')
+            self.assertEqual([line for line in seen if line.endswith('.couvrefeu-mutex')],[],'a timeout child inherited the mutex fd 9')
+        finally:
+            time.sleep(2.2);f.close()
 
 if __name__=='__main__':unittest.main()

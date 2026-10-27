@@ -29,7 +29,8 @@ export function allowanceView(o: RPCObservation | null, healthy: boolean, person
 interface ScheduleClaim { scheduleBlocked: boolean | null; scheduleExplanation: string; scheduleValidUntil: number | null }
 /** A router-confirmed allowance lifts the schedule: the child is not shown as schedule-blocked until it ends (or the claim lapses). */
 export function scheduleWithAllowance<T extends ScheduleClaim>(schedule: T, allowance: {until: number} | null, validUntil: number): T {
-    if (!allowance || schedule.scheduleBlocked === false) return schedule;
+    // Unknown stays unknown (fail safe): an allowance never turns a missing schedule claim into "not blocked".
+    if (!allowance || schedule.scheduleBlocked !== true) return schedule;
     return {...schedule, scheduleBlocked: false, scheduleValidUntil: Math.min(allowance.until, validUntil, schedule.scheduleValidUntil ?? Number.MAX_SAFE_INTEGER),
         scheduleExplanation: `${schedule.scheduleExplanation} Extra time is active (router-confirmed allowance); the schedule applies again when it ends.`};
 }
@@ -51,7 +52,9 @@ export class IntegrationGrants implements GrantPort {
             if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
             return this.policy.queue(actor, person, 'allow', request, key, precondition ?? null, base => {
                 // queue() has already required a fresh healthy observation; the horizon is checked against ROUTER time, as admission does.
-                const routerTime = store.observation().value!.routerTime, until = routerTime + minutes * 60;
+                const observed = store.observation().value;
+                if (!observed) throw new AppError(503, 'approved_router_observation_required');
+                const routerTime = observed.routerTime, until = routerTime + minutes * 60;
                 if (!allowanceWithinHorizon(until, routerTime)) throw new AppError(409, 'allowance_beyond_horizon');
                 return allowancePolicy(base, store.config.protectedMacs, person, until);
             });
