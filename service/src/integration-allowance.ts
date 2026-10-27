@@ -5,7 +5,6 @@ import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import type { IntegrationOperation, IntegrationPolicy } from './integration-policy.ts';
 import type { GrantOutcome, GrantPort, GrantReceipt } from './time-requests.ts';
-import type { IntegrationManifest } from './integration-config.ts';
 import { audited } from './parent-audit.ts';
 import type { OperationResult } from '../../shared/src/contracts.ts';
 
@@ -73,12 +72,12 @@ export class IntegrationGrants implements GrantPort {
     /**
      * Reward time (F4): `minutes` (15 or 30) added to the child's allowance as ONE operation through the same queue() path a grant uses.
      * New allowance = remaining router-side allowance + reward, measured from router time, and the total never exceeds MAX_GRANT_MINUTES:
-     * a request over the cap is refused (reward_cap_exceeded), never clamped. A paused child is refused (child_paused): the pause wins.
+     * a request over the cap is refused (reward_cap_exceeded), never clamped. A paused child with no allowance in force is refused (child_paused): the pause wins; an allowance already lifting the pause is extended.
      * Off unless the manifest sets rewardTime.enabled (404 route_not_found). The key and precondition are the caller's, as for a pause.
      */
     reward(actor: Actor, person: string, minutes: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
         const store = this.policy.store;
-        if ((store.config as Pick<IntegrationManifest, 'rewardTime'>).rewardTime?.enabled !== true) throw new AppError(404, 'route_not_found');
+        if (store.config.rewardTime?.enabled !== true) throw new AppError(404, 'route_not_found');
         this.policy.authorized(actor, person);
         return audited(store, {actor: actor.id, action: 'reward_add', now: this.policy.now, people: () => [person], done: r => ({operationId: r.result.operation.id})},
             () => this.rewardAuthorized(actor, person, minutes, precondition, key));
@@ -97,10 +96,12 @@ export class IntegrationGrants implements GrantPort {
                 const observed = store.observation().value;
                 if (!observed) throw new AppError(503, 'approved_router_observation_required');
                 const routerTime = observed.routerTime;
-                if (base.pauses.some(p => p.person === person && (p.until === 0 || p.until > routerTime))) throw new AppError(409, 'child_paused');
                 const remaining = Math.max(0, (base.allowances?.find(a => a.person === person)?.until ?? 0) - routerTime);
+                // Grants lift pauses, so an allowance in force is extended even while paused; with none, a parent's pause wins.
+                if (remaining === 0 && base.pauses.some(p => p.person === person && (p.until === 0 || p.until > routerTime))) throw new AppError(409, 'child_paused');
                 if (remaining + minutes * 60 > MAX_GRANT_MINUTES * 60) throw new AppError(409, 'reward_cap_exceeded');
                 const until = routerTime + remaining + minutes * 60;
+                // Defence in depth: the 60 min cap above already keeps `until` well inside the router horizon.
                 if (!allowanceWithinHorizon(until, routerTime)) throw new AppError(409, 'allowance_beyond_horizon');
                 return allowancePolicy(base, store.config.protectedMacs, person, until);
             });

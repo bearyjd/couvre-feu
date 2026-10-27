@@ -10,6 +10,10 @@ CREATE TABLE parent_audit_next (
  result TEXT NOT NULL CHECK(result IN ('applied','failed','refused'))
 ) STRICT;
 INSERT INTO parent_audit_next(id,at,actor_id,action,person_id,operation_id,result) SELECT id,at,actor_id,action,person_id,operation_id,result FROM parent_audit;
+-- AUTOINCREMENT never reuses an id, so pruned ids must stay retired (an /audit/before/:id cursor must not land on a different row):
+-- copy the old counter (>= max(id)) onto the new table's sqlite_sequence row; the rename below moves that row to the final name.
+DELETE FROM sqlite_sequence WHERE name='parent_audit_next';
+INSERT INTO sqlite_sequence(name,seq) SELECT 'parent_audit_next',seq FROM sqlite_sequence WHERE name='parent_audit';
 DROP TABLE parent_audit;
 ALTER TABLE parent_audit_next RENAME TO parent_audit;
 CREATE INDEX parent_audit_person ON parent_audit(person_id,id);
