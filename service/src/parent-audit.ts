@@ -14,7 +14,7 @@ const SCOPE_MAX = 64;
 const REFUSED_MAX = 20;
 const REFUSED_WINDOW_SECONDS = 60;
 
-export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end'] as const;
+export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end', 'reward_add'] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 /** applied: accepted and queued (the router's own outcome stays on the operation). refused: rejected before anything was queued. failed: could not be carried out. */
 export type AuditResult = 'applied' | 'failed' | 'refused';
@@ -30,7 +30,7 @@ export interface AuditContext<T> {
 }
 
 /**
- * Who did what, per child. Stores ids and enums only (see migration 010) and is written only when the manifest's auditLog.enabled is true.
+ * Who did what, per child. Stores ids and enums only (see migrations 010 and 011) and is written only when the manifest's auditLog.enabled is true.
  * A failed write is logged by tag and swallowed: an audit problem must never turn a router operation that succeeded into an error.
  */
 export class ParentAudit {

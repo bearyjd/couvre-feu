@@ -235,6 +235,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, account.status, {...provenance, ...account.body as object});
                     return;
                 }
+                // Reward time: off (the manifest default), time requests off, or a parent the owner-mode gate excludes is a route that does not exist.
+                const reward = /^\/people\/([a-z][a-z0-9_]{0,31})\/reward$/.exec(path);
+                if (reward && grants && timeRequestsEnabled && mayDecide(session.dto.actor) && grants.policy.store.config.rewardTime?.enabled === true) {
+                    const result = grants.reward(session.dto.actor, reward[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
                 if (match) {
                     const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], clientKey(request.headers['idempotency-key']));

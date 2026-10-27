@@ -29,6 +29,8 @@ export interface IntegrationManifest {
     timeRequests?: {mode: TimeRequestMode};
     /** Audit log of parent actions; absent is off. */
     auditLog?: {enabled: boolean};
+    /** Reward time (F4): extra minutes added to a grant, capped with it at MAX_GRANT_MINUTES; absent is off. */
+    rewardTime?: {enabled: boolean};
     /** The account that decides time requests in 'owner' mode; must be one of `accounts`. */
     ownerAccountId?: string;
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
@@ -97,7 +99,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'rewardTime', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -146,11 +148,17 @@ export function integrationConfig(path: string): IntegrationConfig {
         if (typeof settings.enabled !== 'boolean') bad('invalid_audit_log');
         auditLog = {enabled: settings.enabled as boolean};
     }
+    let rewardTime: IntegrationManifest['rewardTime'];
+    if (m.rewardTime !== undefined) {
+        const settings = object(m.rewardTime, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_reward_time');
+        rewardTime = {enabled: settings.enabled as boolean};
+    }
     const ownerAccountId = m.ownerAccountId === undefined ? undefined : id(m.ownerAccountId);
     if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
     if (timeRequests?.mode === 'owner' && ownerAccountId === undefined) bad('owner_account_required');
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(rewardTime ? {rewardTime} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));
