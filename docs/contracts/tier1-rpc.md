@@ -349,10 +349,10 @@ Terminal and lock hazard (review S-M1): a write to a stopped or flow-controlled 
 stderr) are buffered and written only after both locks are released. M4b generalizes this for EVERY `cfctl` command (`sync`,
 `rpc-*`, `pause`/`resume`, `expire`, `apply-fw`, `status`, scope verbs): from the first held lock (vendor admission's platform
 lock, otherwise the passed transaction gate, i.e. `cf_install_gate` before `cf_lock`; `router/cfctl:208`, `router/lib/core.sh:236-238`)
-stdout goes to an unlinked private file under the root-owned sticky `$CF_BASE/tmp` (`/tmp` on the device; `cf_output_open`, `core.sh:381-395`)
-(if it cannot be made, a stderr warning and the pre-M4b direct output: never a refusal), and only after `cf_lock`, the platform lock and the permanent transaction mutex
+stdout goes to an unlinked private file under the root-owned sticky `$CF_BASE/tmp` (`/tmp` on the device; `cf_output_open`, `core.sh:383-400`)
+(if it cannot be made, a stderr warning and the pre-M4b direct output: never a refusal; a part-way failure closes fds 6/7/8 and removes the file first, because BusyBox 1.33.1 ash keeps the descriptors a failed `command exec` already opened, verified on the pinned host binary, UNVERIFIED on the device build), and only after `cf_lock`, the platform lock and the permanent transaction mutex
 (fd 9, closed, never `LOCK_UN`) are released is it written. Release order is `cf_lock`, then the platform lock, then the mutex
-(`cf_output_release`, `core.sh:398-402`); acquisition order is platform lock, mutex, `cf_lock`, so release is not the exact reverse (the same
+(`cf_output_release`, `core.sh:406-408`); acquisition order is platform lock, mutex, `cf_lock`, so release is not the exact reverse (the same
 order as the pre-existing exit path). Every EXIT trap does the same, so later refusals and `platform_fail`
 JSON lines are also written lock-free. Nothing is created before admission and the transaction gate, so a refusal at admission leaves
 `$CF_BASE/tmp` untouched; under the strict profile the buffer is created right after the gate, before `cf_lock` (harmless: it holds no
@@ -369,14 +369,15 @@ releases it right after; with `-ixon` and under 4 KiB of prior output this canno
 one line while holding the transaction mutex and are not routed through the buffer; they run inside the fence by design;
 (c) buffered stdout is lost if the process
 is killed, if the tmp buffer write fails (ENOSPC), or if releasing the platform lock itself fails (`lock_owner_changed`/`lock_cleanup`). A failed
-read of the buffer (`cf_or_text=.` on `cat` failure, `core.sh:404-405`) or ENOSPC on the buffer file can yield a truncated or empty reply while
-the command still exits with its own status (0 on success; `cf_output_release` returns the saved status). For `sync`/`rpc-sync` the policy is
-already committed by then. No stderr warning or nonzero exit is emitted today; adding one is a tracked follow-up;
-(d) BusyBox `timeout` is reported (not verified on the device) to leave a detached watcher grandchild that inherits fds above 2, including
-fd 9. `timeout -s KILL` calls made under the mutex (`platform_stat`, `platform-bootstrap.sh:506`; `vendor-platform.sh:8,83,145,272`) can then keep the
-flock alive up to about 1 s after fd 9 is closed, so a cron `expire` landing in that second can get `transaction_contention` (`flock -n`
-does not wait). The same window existed at process exit. Closing fd 9 for those children is a tracked follow-up and a device-verification item;
-(e) `CF_SCOPE_WARN` is written to stderr (`core.sh:703`) after `cf_lock` and the platform lock are released but while fd 9 is still held;
+read of the buffer (`core.sh:411`) now prints one stderr line, `couvre-feu: warning: buffered output lost`, and the command still exits with
+its own status (0 on success): for `sync`/`rpc-sync` the policy is already committed by then, so a nonzero exit would misreport it. ENOSPC on the
+buffer file can still yield a silently truncated reply;
+(d) fixed: every `timeout -s KILL` child (`platform-bootstrap.sh` `platform_hash`, profile/completion reads, vendor `platform_stat`;
+`vendor-platform.sh:8,83,145,272`) now runs with `9>&-`, so a detached BusyBox `timeout` watcher (reported, NOT verified on the device) cannot
+inherit the transaction mutex and keep its flock after fd 9 is closed. The fixture test emulates such a watcher with a backgrounded child of the
+genuine vendor `platform_stat` path (os-trust profile) and requires that no child sees fd 9 and no `expire` gets `transaction_contention`; it is
+a constructed watcher, not a measured BusyBox one. The pre-admission `timeout` calls in `cfctl`/`install.sh`/`uninstall.sh` run before fd 9 exists;
+(e) `CF_SCOPE_WARN` is written to stderr (`core.sh:710`) after `cf_lock` and the platform lock are released but while fd 9 is still held;
 a short line, unlikely to block, and stderr is not buffered. Ending the SSH session sends SIGHUP (and SIGCONT to an orphaned
 stopped group; kernel job-control behaviour, not tested on the device), whose trap releases both locks. A stopped or dead recorded PID does not authorize lock removal. Interrupted-install recovery uses a complete authenticated external
 `cfctl recover-install-lock`, then that source's single ordinary `uninstall.sh`, after separately approved inspection; see
@@ -384,12 +385,17 @@ stopped group; kernel job-control behaviour, not tested on the device), whose tr
 rejected: it would break mutual exclusion when the owner is continued (two writers) and the fixture checkpoints that deliberately hold
 the lock stopped.
 
-Tracked follow-ups (output buffering, not yet done):
-- Full-pipe tests for `apply-fw`, `remove-fw`, `scope-add`/`scope-remove`, `rpc-activity` and `rpc-inventory`, a refusal under a lock, and a
-  HUP/TERM while blocked on output.
-- Close fd 9 for `timeout` children (residual d).
-- A stderr warning (and nonzero exit) on buffer read failure (residual c).
-- fd cleanup on early failure in `cf_output_open`; BusyBox ash `command exec` redirection-error behaviour is UNVERIFIED on the device.
+Output-buffering follow-ups done (M4b hardening): full-pipe tests for `apply-fw`, `remove-fw`, `scope-add`/`scope-remove`, `rpc-activity`,
+`rpc-inventory` and a refusal raised under a lock (strict; os-trust for the same verbs except the scope verbs, which need the strict fixture's
+pty); HUP/TERM while output is buffered under the locks (releases once, exits 129/143) and while blocked after release (never releases another
+process's `cf_lock` or platform lock); fd 9 closed for `timeout` children; stderr warning on a lost buffer; fd cleanup in `cf_output_open`;
+`platform_lock_acquire`/`platform_lock_recover`/the compatibility fence read `platform_lock_path` (one source with explicit recovery).
+
+Remaining residuals (tracked, not fixed): PID reuse can make stale-lock recovery refuse until the recycled process exits or the router
+reboots; a lockless `status` between platform-lock `mkdir` and the pid write can be removed by an operator-run recovery; V1 "no owner record and
+no evidence" falls back to strict; torn/foreign lock records in tests are constructed files and real SIGKILLs land only at record boundaries
+(constructed-vs-real-kill fidelity); orphan `.couvrefeu-prepared.<token>` directories are not swept; the BusyBox `timeout` watcher and ash
+`command exec` behaviour are device-verification items.
 
 Exit status: 2 for `invalid_command`, 1 for every other refusal, on both the early (`cfctl`, pre-admission) and the core path.
 
