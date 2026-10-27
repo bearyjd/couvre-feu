@@ -14,6 +14,7 @@ import { integrationScheduleState } from './integration-schedules.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
+import { audited } from './parent-audit.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
@@ -87,8 +88,14 @@ export class IntegrationPolicy {
         return {status: dto.currentHealthy && op.state === 'confirmed' ? 200 : op.state === 'conflict' ? 409 : op.state === 'failed' ? 502 : 202,
             result: {...this.store.config.provenance, operation: dto, operationUrl: `/operations/${op.id}`}};
     }
-    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
+    /** `auditAs` names who the audit log records, apart from `actor` who is authorized: 'system' for background work, null for no entry (the caller records its own). */
+    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, auditAs: string | null = actor.id): {status: number; result: OperationResult} {
         this.authorized(actor, person);
+        if (auditAs === null) return this.mutateAuthorized(actor, person, action, input, precondition, key);
+        return audited(this.store, {actor: auditAs, action, now: this.now, people: () => [person], done: r => ({operationId: r.result.operation.id})},
+            () => this.mutateAuthorized(actor, person, action, input, precondition, key));
+    }
+    private mutateAuthorized(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
         const body = object(input, action === 'pause' ? ['until'] : []), until = action === 'pause' ? integer(body.until) : null;
         if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) throw new AppError(428, 'revision_precondition_required');

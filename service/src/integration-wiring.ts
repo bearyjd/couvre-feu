@@ -8,6 +8,7 @@ import { IntegrationPolicy } from './integration-policy.ts';
 import { IntegrationWorker } from './integration-worker.ts';
 import { inventoryRetentionDays } from './inventory-store.ts';
 import { ParentAlerts } from './parent-alerts.ts';
+import { auditFor } from './parent-audit.ts';
 import type { AsyncRouter } from './router-transport.ts';
 
 /**
@@ -21,6 +22,8 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
         try { activity.prune(); } catch { process.stderr.write('activity_prune_failed\n'); }
         // Inventory retention holds even while automatic dispatch is off.
         try { worker.inventory.prune(); } catch { process.stderr.write('inventory_prune_failed\n'); }
+        // Audit rows age out after 90 days whether or not the log is still on; this runs at startup and hourly (a bounded delete).
+        try { auditFor(store).prune(); } catch { process.stderr.write('parent_audit_prune_failed\n'); }
     };
     const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => appServer(auth, new IntegrationPolicy(store), serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory);
     return {worker, activity, prune, app};

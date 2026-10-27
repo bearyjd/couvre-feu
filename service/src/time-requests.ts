@@ -4,6 +4,7 @@ import type { Store } from './db.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import type { Actor, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
 import { applyGrant, followGrants } from './time-request-grants.ts';
+import { audited } from './parent-audit.ts';
 import type { GrantContext } from './time-request-grants.ts';
 
 export const REQUEST_MINUTES = [15, 30, 60] as const;
@@ -25,7 +26,7 @@ export type RequestState = 'pending' | 'approving' | 'approved' | 'declined' | '
 /** The only policy surface used: the existing revision-CAS read and mutate path. No router access of its own. */
 export interface PolicyPort {
     people(actor: Actor): PeopleDTO | Promise<PeopleDTO>;
-    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined):
+    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, auditAs?: string | null):
         {status: number; result: OperationResult} | Promise<{status: number; result: OperationResult}>;
 }
 /**
@@ -191,6 +192,16 @@ export class TimeRequestService {
 
     // ---- Parent decisions -------------------------------------------------------------------------------------
     decline(actor: Actor, id: string): ParentRequestDTO {
+        this.owned(actor, id);
+        return audited(this.store, {actor: actor.id, action: 'grant_decline', now: this.now, people: () => this.auditPeople(actor, id), done: () => ({operationId: null})},
+            () => this.declineOwned(actor, id));
+    }
+    /** The child of a request, but only if the actor may see it: the audit entry never names a child outside their scope. */
+    private auditPeople(actor: Actor, id: string): string[] {
+        const person = this.store.get<{person_id: string}>('SELECT person_id FROM time_requests WHERE id=?', id)?.person_id;
+        return person && actor.personIds.includes(person) ? [person] : [];
+    }
+    private declineOwned(actor: Actor, id: string): ParentRequestDTO {
         this.expire();
         const row = this.owned(actor, id);
         if (row.state !== 'pending' || this.inFlight.has(id)) throw new AppError(409, 'request_not_pending');
@@ -201,6 +212,12 @@ export class TimeRequestService {
         return this.parentDTO(this.owned(actor, id));
     }
     async approve(actor: Actor, id: string, minutes: unknown): Promise<ParentRequestDTO> {
+        this.owned(actor, id);
+        return audited(this.store, {actor: actor.id, action: 'grant_approve', now: this.now, people: () => this.auditPeople(actor, id), done: () => ({
+            operationId: this.store.get<{op: string | null}>('SELECT COALESCE(grant_operation_id,resume_operation_id) op FROM time_requests WHERE id=?', id)?.op ?? null})},
+            () => this.approveOwned(actor, id, minutes));
+    }
+    private async approveOwned(actor: Actor, id: string, minutes: unknown): Promise<ParentRequestDTO> {
         this.expire();
         const row = this.owned(actor, id), granted = minutesOf(minutes);
         if (row.state !== 'pending' || this.inFlight.has(id)) throw new AppError(409, 'request_not_pending');
@@ -251,7 +268,7 @@ export class TimeRequestService {
         });
         let resume: {id: string; revision: number} | null = null;
         try {
-            resume = (await this.policy.mutate(actor, row.person_id, 'resume', {}, people.revisionToken, key)).result.operation;
+            resume = (await this.policy.mutate(actor, row.person_id, 'resume', {}, people.revisionToken, key, null)).result.operation;
         } catch (error) {
             // The operation row is the witness that the write path committed, whatever error surfaced afterwards.
             resume = this.store.get<{id: string; revision: number}>('SELECT id,revision FROM operations WHERE person_id=? AND idempotency_key=?', row.person_id, key) ?? null;
@@ -354,7 +371,7 @@ export class TimeRequestService {
                 if (person?.allowance) throw new AppError(409, 'allowance_active');
                 if (!person || !people.revisionToken) throw new AppError(503, 'router_status_unavailable');
                 this.store.run('UPDATE time_requests SET attempts=attempts+1 WHERE id=?', row.id);
-                const outcome = await this.policy.mutate(actor, row.person_id, 'pause', {until: row.original_pause_until!}, people.revisionToken, `tr-${row.id}-p${row.attempts + 1}`);
+                const outcome = await this.policy.mutate(actor, row.person_id, 'pause', {until: row.original_pause_until!}, people.revisionToken, `tr-${row.id}-p${row.attempts + 1}`, 'system');
                 if (outcome.status === 409 || outcome.status === 502) throw new AppError(409, 'policy_change_not_applied');
                 return this.setRepause(row, outcome.status === 200 && outcome.result.operation.state === 'confirmed' ? 'done' : 'applying', null, outcome.result.operation.id);
             } catch (caught) {

@@ -9,6 +9,7 @@ import { CLIENT_KEY, TOKEN, activeChildren } from './integration-children.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { IntegrationOperation, IntegrationPolicy } from './integration-policy.ts';
 import type { Routed } from './time-requests-http.ts';
+import { audited } from './parent-audit.ts';
 
 /** Block everything / lift everything for the children the actor manages: ONE rpc-sync, ONE receipt (design M5). */
 export type BulkAction = 'pause_all' | 'resume_all';
@@ -68,11 +69,17 @@ export class BulkOps {
     }
     /** Verifies the step-up for the exact child list, then re-derives that list inside the write transaction and refuses any difference. */
     async perform(session: AuthSession, action: BulkAction, key: string | undefined, input: unknown): Promise<Routed> {
+        let known: readonly string[] = [];
+        return audited(this.store, {actor: session.dto.actor.id, action, now: this.policy.now, people: () => known,
+            done: r => ({operationId: (r.body as {operation: {id: string}}).operation.id})}, () => this.performBound(session, action, key, input, ids => { known = ids; }));
+    }
+    private async performBound(session: AuthSession, action: BulkAction, key: string | undefined, input: unknown, bound: (ids: string[]) => void): Promise<Routed> {
         if (!key || !CLIENT_KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!input || typeof input !== 'object' || Array.isArray(input)) throw new AppError(400, 'invalid_object');
         const {stepUp, ...rest} = input as Record<string, unknown>;
         const {until, precondition} = this.fields(action, rest);
         const ids = this.affected(session.dto.actor);
+        bound(ids);
         const proof = await this.auth.stepUpVerify(session, stepUp, this.binding(action, ids, until, precondition));
         const op = this.store.transaction(() => {
             const actor = this.auth.commitStepUp(session, proof);

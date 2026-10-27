@@ -24,6 +24,7 @@ import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
 import { inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
+import { auditFor } from './parent-audit.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -115,6 +116,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
+    // Audit log of parent actions: real-router integration only, and only when the manifest turns it on (read per request).
+    const audit = policy instanceof IntegrationPolicy ? auditFor(policy.store) : null;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
@@ -302,6 +305,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const page = /^\/alerts(?:\/before\/([0-9]+))?$/.exec(path);
             if (page && alerts) {
                 send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]), hiddenAlerts(session.dto.actor))});
+                return;
+            }
+            // Off (the default) is indistinguishable from a route that does not exist. No query strings: the page size and cursor are path segments, like /alerts/before/:id.
+            const auditPage = /^\/audit(?:\/limit\/([0-9]{1,4}))?(?:\/before\/([0-9]{1,15}))?$/.exec(path);
+            if (auditPage && audit?.enabled) {
+                const limit = auditPage[1] === undefined ? undefined : Number(auditPage[1]);
+                if (limit === 0) throw new AppError(400, 'invalid_limit');
+                send(response, 200, {...provenance, ...audit.list(session.dto.actor, {limit, before: auditPage[2] === undefined ? undefined : Number(auditPage[2])})});
                 return;
             }
             const parent = requests && mayDecide(session.dto.actor) && await parentGet(requests, session.dto.actor, path);
