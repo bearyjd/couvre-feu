@@ -208,3 +208,17 @@ test('HTTP alert routes require an authenticated session and reject malformed id
         assert.equal(post.status, 401);
     } finally { server.close(); store.close(); }
 });
+
+test('hidden kinds: list, openCount and acknowledge omit them for the caller only', () => {
+    const {store, alerts} = fixture();
+    alerts.reconcile({now, timeRequests: [{person: 'alex', requestId: 'r1', createdAt: now - 10}], people: people([person('alex', {status: 'failed'})])});
+    const kindsOf = (hidden?: string[]) => alerts.list(parent, undefined, hidden).alerts.map(a => a.kind);
+    assert.ok(kindsOf().includes('time_request_pending'));
+    const open = alerts.list(parent).openCount;
+    assert.ok(!kindsOf(['time_request_pending']).includes('time_request_pending'));
+    assert.equal(alerts.list(parent, undefined, ['time_request_pending']).openCount, open - 1);
+    const id = alerts.list(parent).alerts.find(a => a.kind === 'time_request_pending')!.id;
+    assert.throws(() => alerts.acknowledge(parent, id, ['time_request_pending']), {message: 'alert_not_found'});
+    assert.equal(alerts.acknowledge(parent, id).state, 'acknowledged');
+    store.db.close();
+});

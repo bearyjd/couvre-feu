@@ -13,6 +13,8 @@ import type { PolicyService } from './policy.ts';
 import type { DemoConfig } from './config.ts';
 import type { ActivityStore } from './activity-store.ts';
 import { provenance } from '../../shared/src/contracts.ts';
+import type { Actor } from '../../shared/src/contracts.ts';
+import { timeRequestMode } from './integration-config.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object, parseJSON } from '../../shared/src/json.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
@@ -92,8 +94,13 @@ export function remoteIPv4(address: string | undefined): string | undefined {
 const clientKey = (value: string | string[] | undefined): string | undefined => typeof value === 'string' && !value.startsWith('tr-') ? value : undefined;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
 export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore) {
-    // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
-    const timeRequestsEnabled = timeRequests !== undefined || auth.provenance.source !== 'real-router-integration' || (config as {timeRequests?: {enabled?: boolean}}).timeRequests?.enabled === true;
+    // Demo: always on. Real-router integration: per the private manifest's timeRequests mode (default off); child routes and the timer run in any mode but off.
+    const gated = timeRequests === undefined && auth.provenance.source === 'real-router-integration';
+    const mode = timeRequestMode((config as {timeRequests?: unknown}).timeRequests), ownerAccountId = (config as {ownerAccountId?: string}).ownerAccountId;
+    const timeRequestsEnabled = !gated || mode !== 'off';
+    // Who may see and decide requests (parent routes) and read their alert: everyone unless the manifest narrows it to the owner account.
+    const mayDecide = (actor: Actor) => !gated || mode === 'parents' || (mode === 'owner' && actor.id === ownerAccountId);
+    const hiddenAlerts = (actor: Actor): readonly string[] => mayDecide(actor) ? [] : ['time_request_pending'];
     const clock = (policy as {now?: () => number}).now ?? auth.now;
     // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
     const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
@@ -246,10 +253,10 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const acknowledge = /^\/alerts\/([0-9]+)\/acknowledge$/.exec(path);
                 if (acknowledge && alerts) {
                     object(payload, []);
-                    send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]))});
+                    send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]), hiddenAlerts(session.dto.actor))});
                     return;
                 }
-                const parent = requests && await parentPost(requests, session.dto.actor, path, payload);
+                const parent = requests && mayDecide(session.dto.actor) && await parentPost(requests, session.dto.actor, path, payload);
                 if (parent) {
                     send(response, parent.status, parent.body);
                     return;
@@ -294,10 +301,10 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             const page = /^\/alerts(?:\/before\/([0-9]+))?$/.exec(path);
             if (page && alerts) {
-                send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]))});
+                send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]), hiddenAlerts(session.dto.actor))});
                 return;
             }
-            const parent = requests && await parentGet(requests, session.dto.actor, path);
+            const parent = requests && mayDecide(session.dto.actor) && await parentGet(requests, session.dto.actor, path);
             if (parent) {
                 send(response, parent.status, parent.body);
                 return;
