@@ -54,6 +54,19 @@ FINGERPRINT = re.compile(r'SHA256:[A-Za-z0-9+/]{43}')
 DEADLINE = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')
 SAFETY_MARGIN_SECONDS = 300
 LOCAL_TIMEOUT_EXTRA_SECONDS = 60
+# INSTALL watchdog (first-rehearsal.sh cfr_install_supervised / cfp_run): TERM to the install's process group at the
+# allowance, KILL KILL_GRACE_SECONDS later, plus up to one 1 s poll at each deadline. PROVISIONAL (design 2026-10-25):
+# 240 rests on old-code live data (whole sessions took 32-40 s) and the M4b install on the target is unmeasured.
+# penn-pilot.py imports these: one source.
+INSTALL_ALLOWANCE_SECONDS = 240
+KILL_GRACE_SECONDS = 15
+SUPERVISION_POLL_SLACK_SECONDS = 2
+INSTALL_WORST_SECONDS = INSTALL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS + SUPERVISION_POLL_SLACK_SECONDS
+# first-rehearsal.sh CFR_PREMUTATION_BUDGET, then the worst-case install, then verify, the (unbounded) single uninstall,
+# restore and connectivity: 300 s is a judgement (the whole of six live sessions took 32-40 s), not a measured bound.
+PREMUTATION_BUDGET_SECONDS = 300
+POST_INSTALL_RESERVE_SECONDS = 300
+MINIMUM_REMOTE_TIMEOUT_SECONDS = PREMUTATION_BUDGET_SECONDS + INSTALL_WORST_SECONDS + POST_INSTALL_RESERVE_SECONDS
 EXIT_PASS, EXIT_REFUSED, EXIT_FAIL = 0, 1, 2
 REMOTE_PASS, REMOTE_REFUSED, REMOTE_FAIL = 0, 10, 20
 PASS_LINE = 'FIRST_REHEARSAL_PASS'
@@ -144,8 +157,8 @@ def validate_config(document):
         raise Refusal(f'platformProfile must be one of {", ".join(PROFILES)}')
     config['platformProfile'] = profile
     timeout = document.get('remoteTimeoutSeconds', 1800)
-    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 600 <= timeout <= 3600:
-        raise Refusal('remoteTimeoutSeconds must be an integer from 600 to 3600')
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not MINIMUM_REMOTE_TIMEOUT_SECONDS <= timeout <= 3600:
+        raise Refusal(f'remoteTimeoutSeconds must be an integer from {MINIMUM_REMOTE_TIMEOUT_SECONDS} to 3600')
     config['remoteTimeoutSeconds'] = timeout
     roles = document['roles']
     if not isinstance(roles, dict) or set(roles) != set(ROLES):
@@ -426,7 +439,8 @@ def build_payload(config, commit, blobs):
               'CFR_MGMT_IP': roles['management']['ip'], 'CFR_MGMT_MAC': roles['management']['mac'],
               'CFR_JD_IP': roles['jd_adult']['ip'], 'CFR_JD_MAC': roles['jd_adult']['mac'],
               'CFR_PENN_IP': roles['penn_child']['ip'], 'CFR_PENN_MAC': roles['penn_child']['mac'],
-              'CFR_HISTORICAL_MACS': ' '.join(config['protectedHistoricalMacs'])}
+              'CFR_HISTORICAL_MACS': ' '.join(config['protectedHistoricalMacs']),
+              'CFP_INSTALL_ALLOWANCE': str(INSTALL_ALLOWANCE_SECONDS), 'CFP_KILL_GRACE': str(KILL_GRACE_SECONDS)}
     for value in values.values():
         if not re.fullmatch(r'[0-9a-z.: -]+', value):
             raise Refusal('generated parameter has unexpected characters')
@@ -496,6 +510,9 @@ def plan(config, env):
                'platformProfile': config['platformProfile'], 'payloadSha256': hashlib.sha256(payload).hexdigest(),
                'payloadBytes': len(payload), 'remoteScriptSha256': script_sha, 'sshArgv': argv,
                'sshCommandLine': shlex.join(argv), 'remoteTimeoutSeconds': config['remoteTimeoutSeconds'],
+               'installAllowanceSeconds': INSTALL_ALLOWANCE_SECONDS, 'killGraceSeconds': KILL_GRACE_SECONDS,
+               'installWorstSeconds': INSTALL_WORST_SECONDS,
+               'minimumRemoteTimeoutSeconds': MINIMUM_REMOTE_TIMEOUT_SECONDS,
                'localTimeoutSeconds': config['remoteTimeoutSeconds'] + LOCAL_TIMEOUT_EXTRA_SECONDS,
                'deadlineUtc': config['deadlineUtc'], 'authorizationPath': config['authorizationPath'],
                'evidenceDir': config['evidenceDir'], 'roles': config['roles'],

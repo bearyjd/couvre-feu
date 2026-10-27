@@ -473,7 +473,7 @@ class PilotPlanTests(PilotBase):
         self.assertEqual(set(phases), {'ENROLL', 'PAUSE', 'RESUME', 'EXPIRY', 'DNS'})
         self.assertEqual(self.tool.worst_case_seconds(timing),
                          timing['premutationBudgetSeconds'] + self.tool.SAFE_BAND_WAIT_SECONDS
-                         + self.tool.INSTALL_ALLOWANCE_SECONDS + sum(phases.values())
+                         + self.tool.INSTALL_WORST_SECONDS + sum(phases.values())
                          + self.tool.TEARDOWN_RESERVE_SECONDS)
         config = self.tool.FR.load_config(self.write_config())
         commit, blobs = self.tool.FR.head_source()
@@ -714,7 +714,7 @@ class PilotPlanTests(PilotBase):
         self.assertEqual({name: tool.worst_case_seconds(timing, devices, scope)
                           for name, devices, scope in (('one', 1, False), ('two', 2, False),
                                                        ('one_scope', 1, True), ('two_scope', 2, True))},
-                         {'one': 3651, 'two': 3785, 'one_scope': 3833, 'two_scope': 3967})
+                         {'one': 3668, 'two': 3802, 'one_scope': 3850, 'two_scope': 3984})
         self.assertLessEqual(tool.worst_case_seconds(timing, 2, True), tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
         self.assertEqual(SHIPPED_TIMING['statusSettleSeconds'], 45)
         script = (REPO / 'tools/live/penn-pilot.sh').read_text()
@@ -739,7 +739,7 @@ class PilotPlanTests(PilotBase):
                     + tool.status_settle_worst_seconds(timing))
         self.assertEqual(tool.phase_worst_seconds(timing)['EXPIRY'], expected)
         # The shipped timing: with the pause extension, the ENROLL and post-expiry status settles and the KILL grace.
-        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3651)
+        self.assertEqual(tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING)), 3668)
         details = self.plan_details(self.write_config())
         self.assertEqual(details['timing']['cfctlAllowanceSeconds'], 45)
         config = tool.FR.load_config(self.write_config())
@@ -873,8 +873,8 @@ class PilotPlanTests(PilotBase):
         for key in ('scopeNegativeTest', 'scopePolicyJson', 'scopePolicySha256', 'scopeTestMac'):
             self.assertNotIn(key, details)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 3651)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3651)
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3668)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=False), 3668)
         self.assertIn('CFP_RPC_ALLOW', payload)  # the template default, not a generated parameter
         self.assertEqual(self.tool.load_config(self.write_config()),
                          dict(self.tool.FR.load_config(self.write_config()), schemaVersion=1))
@@ -920,8 +920,8 @@ class PilotPlanTests(PilotBase):
         self.assertNotIn('CFP_SCOPE_TEST', params)
         shipped = dict(self.tool.TIMING, **SHIPPED_TIMING)
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_CALL_SECONDS
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3651 + call)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3785)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3668 + call)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2), 3802)
         self.assertEqual(int(params['CFP_WORST_ENROLL']),
                          self.tool.phase_worst_seconds(self.tool.TIMING)['ENROLL'] + call)
         config = self.tool.load_config(config_path)
@@ -937,9 +937,9 @@ class PilotPlanTests(PilotBase):
         call = self.tool.SAFE_BAND_WAIT_SECONDS + self.tool.CFCTL_CALL_SECONDS
         scope_worst = call + 2 * self.tool.FIREWALL_STATE_WORST_SECONDS
         self.assertEqual(self.tool.FIREWALL_STATE_WORST_SECONDS, 3 * self.tool.READ_TIMEOUT_SECONDS)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3651 + scope_worst)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3833)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3967)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3668 + scope_worst)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=1, scope=True), 3850)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), 3984)
         self.assertLessEqual(self.tool.worst_case_seconds(shipped, devices=2, scope=True), self.tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
         disabled = self.plan_details(self.write_config(**self.two_devices(scopeNegativeTest=False)))
         self.assertEqual(disabled['phases'], list(self.tool.PHASES))
@@ -1551,9 +1551,9 @@ class PilotConfigV2Tests(PilotBase):
         self.assertEqual(v2, {'ENROLL': 677, 'PAUSE': 482, 'RESUME': 362, 'EXPIRY': 898, 'DNS': 80, 'SCOPE': 182,
                               'SCOPE-ADD-1': 814, 'SCOPE-ADD-2': 1143, 'MOVE': 1582, 'BULK': 1626, 'INVENTORY': 546,
                               'SCOPE-REMOVE': 1009})
-        self.assertEqual(self.tool.worst_case_seconds(shipped), 3651)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 10371)
-        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 10553)
+        self.assertEqual(self.tool.worst_case_seconds(shipped), 3668)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope_target=True), 10388)
+        self.assertEqual(self.tool.worst_case_seconds(shipped, scope=True, scope_target=True), 10570)
 
     def test_scope_negative_test_with_v2_orders_the_phase_and_budgets_it(self):
         details = self.plan_details(self.write_config(**self.v2(scopeNegativeTest=True)))
@@ -3104,6 +3104,74 @@ cfp_crond_count() { :; }
         self.assertLess(self.elapsed(done), 10)
         self.assertTrue((done.home / 'plock').is_dir(), 'a KILL skips the trap: the lock stays')
 
+    INSTALL_DRIVER = r"""
+export H
+PLOCK=$H/plock; export PLOCK
+CFR_PLATFORM_LOCK=$PLOCK; CFR_INSTALL_LOCK=$H/install.lock; CFR_RUNTIME_LOCK=$H/runtime-lock; CFR_TXN_DIR=$H/txn
+CFR_PROFILE=strict; CFR_MGMT_MAC=02:00:00:00:00:10; CFR_JD_MAC=02:00:00:00:00:20; CFR_HISTORICAL_MACS=02:00:00:00:00:40
+CFP_RPC_ALLOW=02:00:00:00:00:30
+CFP_INSTALL_ALLOWANCE=1; CFP_KILL_GRACE=3
+mkdir -p "$CFR_STAGE/router" "$H/txn"
+cp "$H/install.sh" "$CFR_STAGE/router/install.sh"
+cfp_adult_probe() { echo "PROBE $1"; return 0; }
+t0=$(date +%s)
+cfr_install_supervised --activate || cfp_install_failed $?
+echo "REACHED ELAPSED:$(( $(date +%s) - t0 ))"
+"""
+
+    def install_run(self, install, setup=''):
+        driver = self.TEARDOWN + setup + self.INSTALL_DRIVER
+        return self.run_driver(driver, files={'install.sh': install, 'uninstall.sh': 'echo RAN > "$H/uninstalled"\nexit 0\n'},
+                               timeout=60, stub_stop=False)
+
+    def test_a_term_honoured_install_timeout_with_nothing_left_takes_the_single_teardown(self):
+        done = self.install_run('trap \'rm -rf "$PLOCK"; exit 1\' TERM\nmkdir "$PLOCK"\nsleep 30 >/dev/null 2>&1 &\nwait\n')
+        self.assertEqual(self.stop_of(done), ['STOP INSTALL install_timeout'], done.stdout + done.stderr)
+        self.assertEqual(done.stdout.count('run uninstall.sh once'), 1)
+        self.assertEqual((done.home / 'uninstalled').read_text().strip(), 'RAN')
+        self.assertNotIn('install_timeout_killed', done.stdout)
+
+    def test_a_killed_install_stops_without_uninstall_and_names_the_operator_flow(self):
+        done = self.install_run('trap \'\' TERM\nmkdir "$PLOCK"\necho $$ > "$PLOCK/pid"\nwhile :; do sleep 1; done >/dev/null 2>&1\n')
+        self.assertEqual(done.returncode, 20, done.stdout + done.stderr)
+        self.assertEqual(self.stop_of(done), ['STOP INSTALL install_timeout_killed'])
+        self.assertIn('PHASE INSTALL FAIL install_timeout_killed', done.stdout)
+        self.assertIn('platform_lock=present', done.stdout)
+        self.assertIn('PENN_KERNEL_STATE stub', done.stdout)
+        self.assertIn('PROBE install_timeout', done.stdout)
+        self.assertIn('cfctl recover-install-lock', done.stdout)
+        self.assertEqual(done.stdout.splitlines()[-1], 'FAIL_AFTER_MUTATION INSTALL')
+        self.assertNotIn('run uninstall.sh', done.stdout)
+        self.assertFalse((done.home / 'uninstalled').exists())
+        self.assertNotIn('REACHED', done.stdout)
+
+    def test_an_active_owner_after_a_term_honoured_timeout_also_stops_without_uninstall(self):
+        owner = ('mkdir -p "$H/txn"\nprintf "CFTRANSACTION 1\\nactive\\n" > "$H/txn/.couvrefeu-transaction"\n')
+        done = self.install_run('trap \'exit 1\' TERM\nsleep 30 >/dev/null 2>&1 &\nwait\n', setup=owner)
+        self.assertEqual(self.stop_of(done), ['STOP INSTALL install_timeout_killed'], done.stdout + done.stderr)
+        self.assertIn('owner=active', done.stdout)
+        self.assertFalse((done.home / 'uninstalled').exists())
+
+    def test_a_plain_installer_failure_still_takes_the_teardown(self):
+        done = self.install_run('exit 3\n')
+        self.assertEqual(self.stop_of(done), ['STOP INSTALL installer_exit_nonzero'], done.stdout + done.stderr)
+        self.assertEqual((done.home / 'uninstalled').read_text().strip(), 'RAN')
+
+    def test_the_install_budget_counts_the_whole_watchdog_worst_case(self):
+        tool = self.tool
+        self.assertEqual(tool.INSTALL_WORST_SECONDS, 257)
+        self.assertEqual(tool.INSTALL_WORST_SECONDS,
+                         tool.INSTALL_ALLOWANCE_SECONDS + tool.KILL_GRACE_SECONDS + tool.SUPERVISION_POLL_SLACK_SECONDS)
+        params, _ = self.parameters(self.write_config())
+        self.assertEqual(params['CFP_INSTALL_ALLOWANCE'], str(tool.INSTALL_ALLOWANCE_SECONDS))
+        self.assertEqual((tool.FR.INSTALL_ALLOWANCE_SECONDS, tool.FR.KILL_GRACE_SECONDS),
+                         (tool.INSTALL_ALLOWANCE_SECONDS, tool.KILL_GRACE_SECONDS))
+        self.assertGreaterEqual(tool.UNINSTALL_ALLOWANCE_SECONDS, tool.INSTALL_ALLOWANCE_SECONDS)
+        # The outer `timeout -s KILL` (remoteTimeoutSeconds) must never fire inside the install's 257 s: the minimum
+        # carries the pre-mutation budget, one safe band and the whole 257 s before any phase or the teardown reserve.
+        text = (REPO / 'tools/live/penn-pilot.sh').read_text()
+        self.assertIn('cfr_install_supervised --activate || cfp_install_failed $?', text)
+
     def test_a_child_term_stage_is_not_skipped_for_the_wrapper(self):
         driver = self.term_driver("cfp_wrapper_run cfctl-ssh 'cfctl rpc-inventory --json' --rpc-only > /dev/null; echo \"RC:$?\"")
         driver = 'mkdir -p "$CFR_ROOT/usr/sbin"\ncp "$H/cfctl.sh" "$CFR_ROOT/usr/sbin/cfctl-ssh"\n' + driver
@@ -3556,7 +3624,7 @@ class PilotHardeningT3cTests(PilotShellBase):
         tool = self.tool
         worst = tool.worst_case_seconds(dict(tool.TIMING, **SHIPPED_TIMING), 2, True)
         self.assertLessEqual(worst, tool.V1_MAX_REMOTE_TIMEOUT_SECONDS)
-        self.assertEqual(worst, 3967)
+        self.assertEqual(worst, 3984)
 
 
 if __name__ == '__main__':

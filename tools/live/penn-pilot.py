@@ -129,10 +129,14 @@ V1_MAX_REMOTE_TIMEOUT_SECONDS = 4200
 # Each cfctl, wrapper and uninstall child gets TERM at its allowance (it releases its locks) and KILL only
 # KILL_GRACE_SECONDS later (penn-pilot.sh CFP_KILL_GRACE), plus up to one 1 s poll at each deadline.
 CFCTL_ALLOWANCE_SECONDS = 45
-KILL_GRACE_SECONDS = 15
-SUPERVISION_POLL_SLACK_SECONDS = 2
+KILL_GRACE_SECONDS = FR.KILL_GRACE_SECONDS
+SUPERVISION_POLL_SLACK_SECONDS = FR.SUPERVISION_POLL_SLACK_SECONDS
 CFCTL_CALL_SECONDS = CFCTL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS + SUPERVISION_POLL_SLACK_SECONDS
-INSTALL_ALLOWANCE_SECONDS = 240
+# The INSTALL is supervised too (first-rehearsal.sh cfr_install_supervised): TERM at the allowance, KILL a grace later,
+# up to 2 s of polling slack. The router-side `timeout -s KILL` signals only its direct child, so the budget must count
+# the whole 257 s or a firing outer timeout would orphan the install's setsid group with no teardown.
+INSTALL_ALLOWANCE_SECONDS = FR.INSTALL_ALLOWANCE_SECONDS
+INSTALL_WORST_SECONDS = INSTALL_ALLOWANCE_SECONDS + KILL_GRACE_SECONDS + SUPERVISION_POLL_SLACK_SECONDS
 # The uninstall is never given a shorter deadline than the install.
 UNINSTALL_ALLOWANCE_SECONDS = INSTALL_ALLOWANCE_SECONDS
 # The leg-2 cancel wait (the driver's idle acknowledgement and the scope quiet check) must outlast a leg that is
@@ -232,7 +236,7 @@ def new_phase_worst_seconds(timing):
 
 def worst_case_seconds(timing, devices=1, scope=False, scope_target=False):
     # The install waits for one safe band before running.
-    return (timing['premutationBudgetSeconds'] + SAFE_BAND_WAIT_SECONDS + INSTALL_ALLOWANCE_SECONDS
+    return (timing['premutationBudgetSeconds'] + SAFE_BAND_WAIT_SECONDS + INSTALL_WORST_SECONDS
             + sum(phase_worst_seconds(timing, devices, scope, scope_target).values()) + TEARDOWN_RESERVE_SECONDS)
 
 
@@ -392,6 +396,7 @@ def build_payload(config, commit, blobs, timing):
               'CFP_READ_TIMEOUT': READ_TIMEOUT_SECONDS, 'CFP_COUNTERS_WORST': COUNTERS_WORST_SECONDS,
               'CFP_ITERATION_WORST': iteration_worst_seconds(timing),
               'CFP_CFCTL_ALLOWANCE': CFCTL_ALLOWANCE_SECONDS, 'CFP_KILL_GRACE': KILL_GRACE_SECONDS,
+              'CFP_INSTALL_ALLOWANCE': INSTALL_ALLOWANCE_SECONDS,
               'CFP_UNINSTALL_ALLOWANCE': UNINSTALL_ALLOWANCE_SECONDS, 'CFP_LEG2_CANCEL_WAIT': LEG2_CANCEL_WAIT_SECONDS}
     budget = config_budget(config)
     # Only phases the template implements get a parameter (the v2 phase names are not shell identifiers).
@@ -459,7 +464,8 @@ def plan(config, env):
                'roles': config['roles'], 'protectedHistoricalMacs': config['protectedHistoricalMacs'],
                'knownHostsSha256': FR.regular_file_sha256(config['knownHostsPath'], 'knownHostsPath'),
                'adminPublicKeySha256': FR.regular_file_sha256(config['adminPublicKeyPath'], 'adminPublicKeyPath'),
-               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS, killGraceSeconds=KILL_GRACE_SECONDS), 'hostProbe': dict(HOST_PROBE),
+               'phases': list(pilot_phases(config)), 'timing': dict(TIMING, cfctlAllowanceSeconds=CFCTL_ALLOWANCE_SECONDS, killGraceSeconds=KILL_GRACE_SECONDS,
+                                                           installAllowanceSeconds=INSTALL_ALLOWANCE_SECONDS, installWorstSeconds=INSTALL_WORST_SECONDS), 'hostProbe': dict(HOST_PROBE),
                'dnsProbeName': DNS_PROBE_NAME, 'person': PERSON, 'operationId': OPERATION_ID,
                'policyJson': policy_json, 'policySha256': hashlib.sha256(policy_json.encode()).hexdigest(),
                'pauseRulesKernelTimeBound': False,

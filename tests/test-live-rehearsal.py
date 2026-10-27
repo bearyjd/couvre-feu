@@ -208,7 +208,7 @@ class LiveRehearsalTests(unittest.TestCase):
             'adminPublicKeyPath': str(self.work / 'admin.pub'), 'adminKeyFingerprint': self.fingerprint,
             'knownHostsPath': str(self.work / 'known_hosts'), 'evidenceDir': str(self.evidence_root / 'evidence'),
             'authorizationPath': str(self.work / 'authorization.txt'),
-            'deadlineUtc': '2026-10-12T19:00:00Z', 'platformProfile': 'strict', 'remoteTimeoutSeconds': 600,
+            'deadlineUtc': '2026-10-12T19:00:00Z', 'platformProfile': 'strict', 'remoteTimeoutSeconds': 900,
             'roles': {'management': MGMT, 'jd_adult': JD, 'penn_child': PENN},
             'protectedHistoricalMacs': HISTORICAL}
         (self.evidence_root / 'evidence').mkdir(mode=0o700)
@@ -388,7 +388,7 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual(len(argv), 1)
         self.assertEqual(argv[0][:2], ['-F', '/dev/null'])
         self.assertEqual(argv[0][-2:], ['root@' + HOST, 'exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C '
-                                        'SSH_CONNECTION="$SSH_CONNECTION" timeout -s KILL 600 /bin/sh -s'])
+                                        'SSH_CONNECTION="$SSH_CONNECTION" timeout -s KILL 900 /bin/sh -s'])
         self.assertIn('PASS:', out)
         # The baseline is local evidence: digests of every original and table.
         self.assertIn(f'SNAPSHOT F {self.root}/etc/config/firewall ', '\n'.join(stdout))
@@ -626,7 +626,7 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertIn('GlobalKnownHostsFile=/dev/null', details['sshArgv'])
         disclosed = details['planSha256']
         original_hosts = (self.work / 'known_hosts').read_text()
-        changes = {'remote timeout': lambda: self.write_config(remoteTimeoutSeconds=900),
+        changes = {'remote timeout': lambda: self.write_config(remoteTimeoutSeconds=1200),
                    'known hosts': lambda: (self.work / 'known_hosts').write_text(HOST + ' ssh-ed25519 AAAAchanged\n'),
                    'deadline': lambda: self.write_config(deadlineUtc='2026-10-12T19:30:00Z')}
         for label, change in changes.items():
@@ -641,7 +641,7 @@ class LiveRehearsalTests(unittest.TestCase):
 
     def test_deadline_includes_local_timeout_and_margin(self):
         config = self.tool.validate_config(json.loads(Path(self.write_config()).read_text()))
-        needed = datetime.timedelta(seconds=600 + 60 + 300)
+        needed = datetime.timedelta(seconds=900 + 60 + 300)
         self.tool.check_deadline(dict(config, deadline=self.now + needed), self.now)
         with self.assertRaises(self.tool.Refusal):
             self.tool.check_deadline(dict(config, deadline=self.now + needed - datetime.timedelta(seconds=1)), self.now)
@@ -1217,6 +1217,214 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         keys = [re.findall(r'"(\w+)":', line) for line in lines]
         self.assertEqual(keys[0], keys[1])
+
+
+class InstallWatchdogShellTests(unittest.TestCase):
+    """M4b INSTALL watchdog (design 2026-10-25, D-W1=A): the activating install runs under the shared `cfp_run`
+    supervisor (TERM at the allowance, KILL a grace later, whole process group). Function-level: the real template
+    minus its final call, a stub installer and stub router state. No router, no fixture install."""
+    TAIL = '# Parse everything above first; no child can read the remaining script.'
+    TERM_HONOURED = ('trap \'rm -rf "$PLOCK"; exit 1\' TERM\nmkdir "$PLOCK"\necho $$ > "$PLOCK/pid"\n'
+                     'sleep 30 >/dev/null 2>&1 &\nwait\n')
+    TERM_IGNORED = ('trap \'\' TERM\nmkdir "$PLOCK"\necho $$ > "$PLOCK/pid"\n'
+                    'while :; do sleep 1; done >/dev/null 2>&1\n')
+    DRIVER = r'''
+export H
+PLOCK=$H/plock; export PLOCK
+CFR_FIXTURE=1; CFR_ROOT=$H/root; CFR_STAGE=$H/stage; CFR_SH=%(shell)s
+CFR_PLATFORM_LOCK=$PLOCK; CFR_INSTALL_LOCK=$H/install.lock
+CFR_RUNTIME_LOCK=$CFR_ROOT/etc/couvrefeu/runtime/lock
+CFR_TXN_DIR=$H/txn; CFR_RELEASE_DIR=$H/rel
+CFR_PROFILE=strict; CFR_MGMT_MAC=02:00:00:00:00:10; CFR_JD_MAC=02:00:00:00:00:20; CFR_HISTORICAL_MACS=02:00:00:00:00:40
+CFP_INSTALL_ALLOWANCE=1; CFP_KILL_GRACE=3
+mkdir -p "$CFR_STAGE/router" "$CFR_TXN_DIR" "$CFR_RELEASE_DIR" "$CFR_ROOT/etc/couvrefeu/runtime"
+cp "$H/install.sh" "$CFR_STAGE/router/install.sh"
+cp "$H/uninstall.sh" "$CFR_RELEASE_DIR/uninstall.sh" 2>/dev/null || :
+cfr_snapshot() { return 1; }
+cfp_kernel_state() { echo stub; }
+t0=$(date +%%s)
+cfr_install_supervised --activate; rc=$?
+echo "SUPERVISED_RC:$rc ELAPSED:$(( $(date +%%s) - t0 ))"
+[ ! -e "$CFR_STAGE/run.signalled" ] || echo SIGNALLED_MARK
+%(after)s
+'''
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix='cf-wd-'))
+        self.addCleanup(shutil.rmtree, self.work, True)
+        template = (SOURCE.root / 'tools/live/first-rehearsal.sh').read_text()
+        self.head = template[:template.index(self.TAIL)]
+
+    def run_driver(self, install, after='', shell='sh', files=None, setup=''):
+        (self.work / 'install.sh').write_text(install)
+        for name, text in (files or {}).items():
+            (self.work / name).write_text(text)
+        script = self.head + '\n' + setup + self.DRIVER % {'shell': shlex.quote(shell), 'after': after}
+        (self.work / 'script.sh').write_text(script)
+        env = {'PATH': os.environ['PATH'], 'LC_ALL': 'C', 'HOME': str(self.work)}
+        done = subprocess.run(['sh', str(self.work / 'script.sh')], env=dict(env, H=str(self.work)),
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False)
+        return done
+
+    def elapsed(self, done):
+        return int(re.search(r'ELAPSED:([0-9]+)', done.stdout).group(1))
+
+    def shells(self):
+        return ('sh', 'busybox ash') if shutil.which('busybox') else ('sh',)
+
+    def owner(self, state):
+        (self.work / 'txn').mkdir(exist_ok=True)
+        (self.work / 'txn/.couvrefeu-transaction').write_text(
+            f'CFTRANSACTION 1\n{state}\n' + '\n'.join(['0' * 8 + '-0000-0000-0000-000000000000', '1234', '1', 'a' * 64, 'b' * 64,
+                                                       'strict', 'none', '1:2']) + '\n')
+
+    def test_a_hung_install_is_termed_at_the_allowance_and_reported_as_a_timeout(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done = self.run_driver(self.TERM_HONOURED, shell=shell, after='cfr_install_failed "$rc"; echo REACHED')
+                self.assertIn('SUPERVISED_RC:1 ', done.stdout, done.stdout + done.stderr)
+                self.assertIn('SIGNALLED_MARK', done.stdout)
+                self.assertLess(self.elapsed(done), 3, 'TERM must come at the allowance, not after the grace')
+                self.assertFalse((self.work / 'plock').exists(), 'a TERM-honouring installer releases its lock')
+
+    def test_term_honoured_with_nothing_left_runs_the_single_teardown(self):
+        self.owner('complete')
+        done = self.run_driver(self.TERM_HONOURED, files={'uninstall.sh': 'exit 0\n'},
+                               after='cfr_install_failed "$rc"; echo "REACHED FAILED:$CFR_FAILED"')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('PHASE INSTALL FAIL install_timeout', done.stdout)
+        self.assertIn('REACHED FAILED:1', done.stdout)
+        self.assertIn('INFO install_timeout state', done.stdout)
+        self.assertNotIn('install_timeout_killed', done.stdout)
+        self.assertNotIn('FAIL_AFTER_MUTATION', done.stdout)
+
+    def test_a_term_ignoring_installer_is_killed_after_the_grace_and_stops_without_recovery(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done = self.run_driver(self.TERM_IGNORED, shell=shell, files={'uninstall.sh': 'echo RAN > "$H/uninstalled"\n'},
+                                       after='cfr_install_failed "$rc"; echo REACHED')
+                self.assertIn('SUPERVISED_RC:137 ', done.stdout, done.stdout + done.stderr)
+                self.assertGreaterEqual(self.elapsed(done), 3, 'KILL only after the grace')
+                self.assertLess(self.elapsed(done), 10)
+                self.assertEqual(done.returncode, 20, done.stdout + done.stderr)
+                self.assertIn('PHASE INSTALL FAIL install_timeout_killed', done.stdout)
+                self.assertIn('platform_lock=present', done.stdout)
+                self.assertEqual(done.stdout.splitlines()[-1], 'FAIL_AFTER_MUTATION INSTALL')
+                self.assertNotIn('REACHED', done.stdout)
+                self.assertNotIn('run uninstall.sh', done.stdout)
+                self.assertFalse((self.work / 'uninstalled').exists())
+                shutil.rmtree(self.work / 'plock', ignore_errors=True)
+
+    def test_any_lock_or_an_active_owner_left_after_term_stops_without_uninstall(self):
+        cases = {'active owner': ('self.owner("active")', 'owner=active'),
+                 'install lock': ('(self.work / "install.lock").mkdir()', 'install_lock=present'),
+                 'runtime lock': ('(self.work / "root/etc/couvrefeu/runtime").mkdir(parents=True); '
+                                  '(self.work / "root/etc/couvrefeu/runtime/lock").mkdir()', 'runtime_lock=present'),
+                 'unreadable owner': ('(self.work / "txn/.couvrefeu-transaction").write_text("junk\\n")',
+                                      'owner=unreadable')}
+        for label, (arrange, expect) in cases.items():
+            with self.subTest(label):
+                shutil.rmtree(self.work, ignore_errors=True)
+                self.work.mkdir()
+                (self.work / 'txn').mkdir()
+                exec(arrange)  # noqa: S102 - literal test arrangements above
+                install = self.TERM_HONOURED
+                done = self.run_driver(install, files={'uninstall.sh': 'echo RAN > "$H/uninstalled"\n'},
+                                       after='cfr_install_failed "$rc"; echo REACHED')
+                self.assertEqual(done.returncode, 20, done.stdout + done.stderr)
+                self.assertIn('PHASE INSTALL FAIL install_timeout_killed', done.stdout)
+                self.assertIn(expect, done.stdout)
+                self.assertFalse((self.work / 'uninstalled').exists())
+
+    def test_term_honoured_without_an_installed_release_does_not_guess_a_teardown(self):
+        self.owner('complete')
+        done = self.run_driver(self.TERM_HONOURED, after='cfr_install_failed "$rc"; echo REACHED')
+        self.assertEqual(done.returncode, 20, done.stdout + done.stderr)
+        self.assertIn('PHASE INSTALL FAIL install_timeout', done.stdout)
+        self.assertIn('uninstall not attempted', done.stdout)
+        self.assertNotIn('install_timeout_killed', done.stdout)
+        self.assertNotIn('REACHED', done.stdout)
+
+    def test_a_plain_installer_failure_keeps_its_own_reason(self):
+        done = self.run_driver('exit 3\n', files={'uninstall.sh': 'exit 0\n'}, after='cfr_install_failed "$rc"; echo REACHED')
+        self.assertIn('SUPERVISED_RC:3 ', done.stdout)
+        self.assertNotIn('SIGNALLED_MARK', done.stdout)
+        self.assertEqual(done.returncode, 20, done.stdout + done.stderr)
+        self.assertIn('PHASE INSTALL FAIL installer_exit_nonzero; journal retained; uninstall not attempted', done.stdout)
+        self.assertNotIn('install_timeout', done.stdout)
+
+    def test_a_clean_install_is_untouched(self):
+        done = self.run_driver('exit 0\n')
+        self.assertIn('SUPERVISED_RC:0 ', done.stdout, done.stdout + done.stderr)
+        self.assertNotIn('SIGNALLED_MARK', done.stdout)
+
+    def test_the_install_receives_the_activation_argument_and_the_scoped_arguments(self):
+        done = self.run_driver('printf "%s\\n" "$@" > "$H/args"\nexit 0\n')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        args = (self.work / 'args').read_text().split()
+        self.assertEqual(args[:2], ['--platform-profile', 'strict'])
+        self.assertEqual(args[-1], '--activate')
+        self.assertIn('INFO run install.sh --platform-profile strict', done.stdout)
+
+    def test_a_forking_setsid_is_refused_before_any_mutation(self):
+        fake = '#!/bin/sh\n( "$@" ) </dev/null >/dev/null 2>&1 &\nexit 0\n'
+        setup = 'mkdir -p "$H/bin"\nprintf %s "$FAKE" > "$H/bin/setsid"\nchmod +x "$H/bin/setsid"\nPATH=$H/bin:$PATH\n'
+        driver = self.head + '\nexport H\nCFR_SH=sh\nCFR_STAGE=$H\n' + setup + 'cfr_setsid_check PREREQ\necho PASSED\n'
+        (self.work / 'script.sh').write_text(driver)
+        done = subprocess.run(['sh', str(self.work / 'script.sh')], env={'PATH': os.environ['PATH'], 'H': str(self.work), 'FAKE': fake},
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+        self.assertIn('PHASE PREREQ FAIL setsid_forks', done.stdout)
+        self.assertIn('REFUSED_BEFORE_MUTATION PREREQ', done.stdout)
+
+    def test_the_template_never_runs_the_activating_install_outside_the_supervisor(self):
+        text = (SOURCE.root / 'tools/live/first-rehearsal.sh').read_text()
+        code = [line for line in text.splitlines() if not line.lstrip().startswith('#')]
+        self.assertFalse([line for line in code if 'cfr_install --activate' in line], 'install must go through cfr_install_supervised')
+        self.assertEqual([line for line in code if 'cfr_install_supervised --activate' in line].__len__(), 1)
+        self.assertIn('cfp_run /dev/null "$CFP_INSTALL_ALLOWANCE"', text)
+        for name in ('CFP_INSTALL_ALLOWANCE', 'CFP_KILL_GRACE'):
+            self.assertEqual(re.findall(rf'(?m)^{name}=.*$', text).__len__(), 1, name)
+
+    def test_budget_arithmetic_counts_the_whole_install_worst_case(self):
+        tool = SOURCE.tool
+        self.assertEqual((tool.INSTALL_ALLOWANCE_SECONDS, tool.KILL_GRACE_SECONDS, tool.SUPERVISION_POLL_SLACK_SECONDS), (240, 15, 2))
+        self.assertEqual(tool.INSTALL_WORST_SECONDS, 257)
+        self.assertEqual(tool.MINIMUM_REMOTE_TIMEOUT_SECONDS,
+                         tool.PREMUTATION_BUDGET_SECONDS + tool.INSTALL_WORST_SECONDS + tool.POST_INSTALL_RESERVE_SECONDS)
+        self.assertLessEqual(tool.MINIMUM_REMOTE_TIMEOUT_SECONDS, 3600)
+        config = {'remoteTimeoutSeconds': tool.MINIMUM_REMOTE_TIMEOUT_SECONDS - 1}
+        document = json.loads(json.dumps({
+            'schemaVersion': 1, 'host': HOST, 'adminPublicKeyPath': '/k.pub', 'adminKeyFingerprint': 'SHA256:' + 'A' * 43,
+            'knownHostsPath': '/kh', 'evidenceDir': '/e', 'authorizationPath': '/a', 'deadlineUtc': '2026-10-12T19:00:00Z',
+            'remoteTimeoutSeconds': config['remoteTimeoutSeconds'],
+            'roles': {'management': MGMT, 'jd_adult': JD, 'penn_child': PENN}, 'protectedHistoricalMacs': HISTORICAL}))
+        with self.assertRaises(tool.Refusal):
+            tool.validate_config(document)
+        document['remoteTimeoutSeconds'] = tool.MINIMUM_REMOTE_TIMEOUT_SECONDS
+        self.assertEqual(tool.validate_config(document)['remoteTimeoutSeconds'], tool.MINIMUM_REMOTE_TIMEOUT_SECONDS)
+
+    def test_the_payload_carries_the_install_parameters_from_python_alone(self):
+        tool = SOURCE.tool
+        commit, blobs = tool.head_source()
+        config = {'platformProfile': 'strict', 'roles': {'management': MGMT, 'jd_adult': JD, 'penn_child': PENN},
+                  'protectedHistoricalMacs': HISTORICAL}
+        payload = tool.build_payload(config, commit, blobs)[0].decode()
+        self.assertIn("CFP_INSTALL_ALLOWANCE='240'\n", payload)
+        self.assertIn("CFP_KILL_GRACE='15'\n", payload)
+
+    def test_runbooks_no_longer_call_install_unbounded_and_keep_the_merge_markers(self):
+        for path in ('docs/runbooks/live-first-rehearsal.md', 'docs/runbooks/live-penn-pilot-v2.md', 'tools/live/README.md',
+                     'docs/integration-004.md', 'docs/CODEMAPS/live-tools.md'):
+            text = (REPO / path).read_text()
+            self.assertNotRegex(text, r'(?i)(deliberately unbounded|INSTALL (remains|is) unbounded|installer \(`install\.sh`\) remains unbounded'
+                                      r'|does not add a KILL watchdog)', path)
+        rehearsal = (REPO / 'docs/runbooks/live-first-rehearsal.md').read_text()
+        self.assertIn('TODO(M4b merge)', rehearsal)
+        for path in ('docs/runbooks/live-first-rehearsal.md', 'docs/runbooks/live-penn-pilot-v2.md'):
+            text = (REPO / path).read_text()
+            self.assertIn('install_timeout_killed', text, path)
+            self.assertIn('257', text, path)
 
 
 if __name__ == '__main__':
