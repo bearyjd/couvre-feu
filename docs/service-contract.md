@@ -85,19 +85,53 @@ A child asks for more time through a per-child request link; there are no child 
 | `POST /child/request` `{token, minutes, reason?}` | Child (token in body only) | Submit; one pending request per link, 5 minute cooldown after each request, reason at most 140 characters of plain text without control or bidirectional-override characters. |
 | `POST /child/status` `{token}` | Child | Own latest request: `pending`, `approved` (with `allowanceUntil`), `declined`, `expired`, `unsupported`, `apply_failed` or `cancelled`. Nothing else is returned. |
 
-Unanswered requests expire after 15 minutes. Link failures are indistinguishable (`404 link_invalid`) and flood-limited (`429`).
+Unanswered requests expire after 15 minutes. Link failures are indistinguishable (`404 link_invalid`) and flood-limited (`429`) per client: each TCP source address has its own bad-token bucket (at most 1024 tracked, then one shared overflow bucket), and a valid link is never refused by it, so one hostile client cannot lock other children's links. Status polls and submissions are limited to 30 per minute per child (reissuing a link does not reset it). The reason additionally refuses unpaired surrogates and invisible or line-breaking code points (U+061C, U+200B/C/E/F, U+2028/9, U+2060, U+FEFF); it is stored verbatim, rendered with `textContent` only, and never placed in alerts or the router policy.
 
-Approval effect, all through the existing revision-CAS `PolicyService.mutate` / `IntegrationPolicy.mutate` path using the approving parent's identity:
+Approval effect in the synthetic demo (and for legacy rows), through the existing revision-CAS `PolicyService.mutate` / `IntegrationPolicy.mutate` path using the approving parent's identity. Real-router integration with time requests enabled uses grants instead; see [Grants as router allowances](#grants-as-router-allowances-real-router-integration):
 
 - Active manual pause: `resume` now. The pause is restored by a later `pause` once the allowance ends, with its original expiry (or indefinite). The re-pause is skipped when the original pause would have ended inside the allowance, or when a later *pending or confirmed* policy operation for that child exists (failed and conflicted operations do not count). It runs as any active account assigned to the child, not the approver's session, and is retried without limit every few seconds until it succeeds or is provably unnecessary; while overdue the parent UI shows an alert. There is no terminal failure state that leaves the child unpaused. If the resume operation ends `failed` or `conflict`, the request becomes `apply_failed`.
 - Nothing blocking: approved with no policy change.
-- Schedule blocking: the policy contract has no override or allowance concept yet, so approval returns request state `unsupported` with code `schedule_override_unsupported` ("Not supported yet: schedules cannot be overridden") to both the parent and the child, and writes nothing. `TimeRequestService` accepts an optional `ScheduleOverride` hook; when provided it is called before approval proceeds and may refuse by throwing `AppError`.
+- Schedule blocking (demo only; the demo router has no allowances): approval returns request state `unsupported` with code `schedule_override_unsupported` ("Not supported yet: schedules cannot be overridden") to both the parent and the child, and writes nothing. `TimeRequestService` accepts an optional `ScheduleOverride` hook; when provided it is called before approval proceeds and may refuse by throwing `AppError`.
 - Schedule state unknown: `503 schedule_state_unknown`; the request stays pending.
 
 The allowance is `approval time + minutes`; on the integration path a `202` resume may take effect after operator dispatch, so the child can see "approved" slightly before enforcement lifts. Audit rows record `time_request_create|approve|decline|unsupported|expire|apply_failed|repause` and `request_link_issue|revoke`, with the deciding account in `time_requests.decided_by` and `decided_at`.
 
-Approval intent and fail-open window: the restore step (`TimeRequestService.repause`, the single place to replace with a router-side allowance once the policy contract has one) runs from the service. Intent is durable before the resume is attempted: one transaction moves the request to `approving` and records the original pause expiry, allowance end and restore obligation. A refused `mutate` (it refuses before writing) releases the claim back to `pending`; any unknown outcome (other error, 409/502 result) counts as approved so the pause is still restored; an `approving` row found after a restart is completed as approved. Revoking a link cancels only unanswered requests; `approving` and `approved` ones still complete. **Known fail-open window:** if the service is down when the allowance ends, the child stays unpaused until the service returns and restores the pause. Router-side expiry (a future `allowances` policy entry) removes this window.
+Approval intent and fail-open window: the restore step (`TimeRequestService.repause`, the single place to replace with a router-side allowance once the policy contract has one) runs from the service. Intent is durable before the resume is attempted: one transaction moves the request to `approving` and records the original pause expiry, allowance end and restore obligation. A refused `mutate` (it refuses before writing) releases the claim back to `pending`; any unknown outcome (other error, 409/502 result) counts as approved so the pause is still restored; an `approving` row found after a restart is completed as approved. Revoking a link cancels only unanswered requests; `approving` and `approved` ones still complete. **Known fail-open window:** if the service is down when the allowance ends, the child stays unpaused until the service returns and restores the pause. On the real router this window applies only to rows approved before grants existed; new approvals use router-side expiry (below).
 
-Enablement: in the synthetic demo, time requests are always on. In real-router integration they are **off by default**; the private manifest must set `"timeRequests": {"enabled": true}` (strictly validated; see [integration-004](integration-004.md)). When off, the child routes and request page return 404, no link can be issued and the 5 second follow-up timer is not armed. When on without automatic dispatch, the resume and the later re-pause each wait for an operator permit, and the router-local allowance (PR #31) is expected to replace the service-side re-pause.
+Enablement: in the synthetic demo, time requests are always on. In real-router integration they are **off by default**; the private manifest must set `"timeRequests": {"enabled": true}` (strictly validated; see [integration-004](integration-004.md)). When off, the child routes and request page return 404, no link can be issued and the 5 second follow-up timer is not armed. When on without automatic dispatch, each grant waits for an operator permit and stays `approving` until it is confirmed in force.
 
 Disabling time requests in integration does not abandon obligations: a drain-only timer continues to restore lifted pauses (no routes, no new requests) until none remain, then stops.
+
+### Grants as router allowances (real-router integration)
+
+Status: **unverified on this router.** Offline tests only (service fake router and router fixtures); no live run.
+
+- **What a grant is.** Approving a request on the real router queues an `allow` operation through `IntegrationPolicy.queue()`: the same CAS, single operation in flight and managed-policy validation as pause and resume. `IntegrationGrants` (`service/src/integration-allowance.ts`) writes it, and `TimeRequestService` uses it whenever the port is present.
+  - The router policy gains `allowances: [{person, until}]`. Pauses and schedules are left in place.
+  - The router lifts both a manual pause and a schedule while the allowance is active, and restores them at `until` by itself (`core.sh` `cf_enforced_policy`, `cf_gated_plan`). No service re-pause is needed.
+- **Limits.**
+  - At most 60 minutes per grant (owner decision), checked server-side. The router's horizon is 4 h.
+  - `until` = **router time** of the fresh observation + minutes, never the service clock.
+  - A later grant never shortens an active longer one.
+  - The idempotency key is `tr-<request>-a<n>`. A replay returns the same operation and deadline.
+- **Honest states.** The request becomes `approving` (`apply_via='allowance'`), not `approved`, when the parent taps. It becomes `approved` only when two things hold: the operation is confirmed, and a fresh healthy observation reports the allowance in `effectiveAllowances`.
+  - It becomes `apply_failed` with `grant_not_applied` when the operation fails or conflicts.
+  - It becomes `apply_failed` with `grant_not_in_force` when the deadline passes first. For example, an operator dispatches it late and the router admits it as an inert expired entry.
+  - An approval interrupted before its operation was queued goes back to `pending`. If the operation exists, it is found again by its key. Neither case is ever promoted blindly.
+  - A refused CAS writes nothing and releases the request.
+  - The child sees `approving` as `pending` ("Starting…").
+- **Pause wins.** A single-child Pause during a grant removes that child's allowance in the router-facing policy, as `cfctl pause` does locally. Bulk "block all" already did this. Resume keeps the allowance.
+  - Once the router no longer holds an approved grant before its deadline, the request keeps `approved` but gets code `grant_ended`. The child status returns that code.
+  - A legacy re-pause is deferred while a newer grant is in force, so it cannot end that grant.
+- **Display.** `PersonDTO.allowance` is the router-confirmed allowance in force (healthy observations only). While it is set, `scheduleBlocked` is `false`, bounded by the allowance end and the observation validity. The shared demo `scheduleBlocked()` also ignores schedules for a person with an active allowance.
+- **Approvers.** Approvers are any account whose scope includes the child: assigned parents, and admins through their scope (`scope_all` admins see every child). There is no passkey step-up, because a grant is at most 60 minutes, no more than a Resume.
+- **Alerts.** On the real path the 5 s time-request timer also reconciles the `time_request_pending` alert (counts only, no reason text). No other alert kind starts reconciling on the real router.
+- **Flag.** All of this exists only when the private manifest sets `"timeRequests": {"enabled": true}`, which is off by default. The demo keeps its old path (no allowances).
+  - Migrations: `009.sql` adds `time_requests.apply_via` and `grant_operation_id`; `integration-007.sql` admits `operations.action='allow'`.
+
+**Residuals and UNVERIFIED:**
+- **Kernel time gate.** Whether the xt_time `--datestart` gate re-blocks at `until` on this firmware with flow offload on is UNVERIFIED.
+- **Installed release.** Whether the router release currently installed includes allowances (#31) is UNVERIFIED. An older release is expected (not tested against one) to refuse the `allowances` key, so the grant would end `apply_failed`.
+- **No web UI yet.** There is no web UI for grants yet; the parent and child pages still show the older text.
+- **No ending action.** There is no "End extra time" action, and no alert when a grant stays unconfirmed for a long time.
+- **Shared bad-token bucket.** In trusted-proxy mode every LAN client shares the proxy's address, so the bad-token bucket is effectively global again. Valid links are still never blocked. Guessing is prevented by the 256-bit tokens, not by the limiter.

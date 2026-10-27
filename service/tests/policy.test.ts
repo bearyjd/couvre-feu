@@ -587,7 +587,7 @@ test('migrations 002-005 preserve policy/accounts and revokes legacy sessions/ch
         legacy.close();
         const upgraded = new Store(path);
         try {
-            assert.equal(upgraded.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 8);
+            assert.equal(upgraded.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 9);
             assert.equal(upgraded.get<{ n: number }>('SELECT count(*) n FROM activity_samples')!.n, 0);
             assert.equal(upgraded.get<{ revoked: number }>('SELECT revoked FROM sessions')!.revoked, 1);
             assert.equal(upgraded.get<{ n: number }>('SELECT count(*) n FROM challenges')!.n, 0);

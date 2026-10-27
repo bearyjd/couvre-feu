@@ -39,7 +39,7 @@ test('migration 007 upgrades a populated demo database in place and keeps every 
     try {
         legacy(path, ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql'], false).close();
         const store = new Store(path);
-        try { assertMigrated(store, 8); } finally { store.close(); }
+        try { assertMigrated(store, 9); } finally { store.close(); }
         const again = new Store(path);
         try { assert.equal(again.get<{n: number}>('SELECT count(*) n FROM credentials')!.n, 2); } finally { again.close(); }
     } finally { rmSync(dir, {recursive: true, force: true}); }
@@ -57,7 +57,7 @@ test('migration 007 upgrades a populated manifest-bound integration database wit
         const store = new IntegrationStore(config);
         try {
             // 008 follows in the same open: the manifest child and device are seeded, the manifest admin gets scope_all.
-            assertMigrated(store, 6);
+            assertMigrated(store, 7);
             assert.deepEqual(store.all<{id: string; scope_all: number}>('SELECT id,scope_all FROM accounts ORDER BY id').map(r => [r.id, r.scope_all]), [['other', 0], ['owner', 1]]);
             assert.deepEqual(store.all<{id: string; kind: string}>('SELECT id,kind FROM people').map(r => [r.id, r.kind]), [['pilot', 'child']]);
             assert.deepEqual({...store.get('SELECT target_digest,manifest_digest,generation FROM integration_state')!}, {target_digest: config.targetDigest, manifest_digest: config.manifestDigest, generation: config.router.generation});

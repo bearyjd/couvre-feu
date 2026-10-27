@@ -1,6 +1,7 @@
 import { ChildAdmin, childrenGet, childrenPost } from './admin-children.ts';
 import { BulkOps, bulkPost } from './integration-bulk.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
+import { IntegrationGrants } from './integration-allowance.ts';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -82,7 +83,7 @@ function send(response: ServerResponse, status: number, value: unknown) {
     response.end(JSON.stringify(value));
 }
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
-type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
+type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'> & Partial<Pick<ParentAlerts, 'reconcile'>>;
 /** Node reports IPv4 peers on dual-stack sockets as ::ffff:a.b.c.d; compare the plain IPv4 literal. */
 export function remoteIPv4(address: string | undefined): string | undefined {
     return address?.startsWith('::ffff:') ? address.slice(7) : address;
@@ -94,9 +95,13 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
     const timeRequestsEnabled = timeRequests !== undefined || auth.provenance.source !== 'real-router-integration' || (config as {timeRequests?: {enabled?: boolean}}).timeRequests?.enabled === true;
     const clock = (policy as {now?: () => number}).now ?? auth.now;
-    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock);
+    // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
+    const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
+    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock, undefined, grants);
     // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
-    const drain = requests ? null : new TimeRequestService(auth.store, policy, clock);
+    const drain = requests ? null : new TimeRequestService(auth.store, policy, clock, undefined, grants);
+    // The demo feeds its alerts from main.ts; on the real path only the time-request rule is reconciled here, nothing else.
+    const pendingAlerts = requests && grants && alerts?.reconcile ? () => alerts.reconcile!({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
     const accounts = new AccountAdmin(auth);
     // Children/device groups and their devices are database-managed only against a real router integration.
@@ -161,7 +166,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                         throw new AppError(404, 'route_not_found');
                     }
                     // Capability token in the body is the only credential: no cookies, no ambient authority, so no CSRF surface.
-                    const routed = childRoute(requests, path, payload);
+                    const routed = childRoute(requests, path, payload, remoteIPv4(request.socket.remoteAddress));
                     send(response, routed.status, routed.body);
                     return;
                 }
@@ -325,7 +330,9 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     let timer: NodeJS.Timeout | undefined;
     server.on('listening', () => {
         if (requests) {
-            timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
+            timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')).then(() => {
+                try { pendingAlerts?.(); } catch { process.stderr.write('time_request_alert_failed\n'); }
+            }), 5000);
             timer.unref();
         } else if (drain?.hasObligations()) {
             timer = setInterval(() => drain.drain().then(({remaining, overdue}) => {
