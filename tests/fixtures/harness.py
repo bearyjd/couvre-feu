@@ -114,7 +114,11 @@ def start_with_full_stdout(command, env, stdin=None, seconds=90):
 
     Returns (process, read_end) once the shell itself is blocked writing (wchan pipe_write). The
     caller owns read_end and the process (kill its group on failure); drain with drain_full_stdout.
+    `stdin` is text to write and close, or an open descriptor (e.g. a pty slave for the scope verbs).
     """
+    stdin_fd = stdin if isinstance(stdin, int) else None
+    if stdin_fd is not None:
+        stdin = None
     read_end, write_end = os.pipe()
     filler = os.open("/proc/self/fd/%d" % write_end, os.O_WRONLY | os.O_NONBLOCK)  # own description
     try:
@@ -125,7 +129,7 @@ def start_with_full_stdout(command, env, stdin=None, seconds=90):
     finally:
         os.close(filler)
     try:
-        process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+        process = subprocess.Popen(command, env=env, stdin=stdin_fd if stdin_fd is not None else subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                                    stdout=write_end, stderr=subprocess.DEVNULL, start_new_session=True)
     finally:
         os.close(write_end)
