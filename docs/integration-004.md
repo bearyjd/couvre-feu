@@ -263,9 +263,12 @@ must invalidate the record externally after any such reviewed event and re-estab
 exact-target clock/schedule evidence before definitive schedule state. This is an
 operational acceptance gate; local date/IANA conversion cannot substitute for it.
 
-Optional `timeRequests` is an exact object `{"enabled": true|false}`; any other shape
-rejects the manifest. Child time requests are OFF in integration mode unless it is
-present with `enabled: true`: when off, `/child/*`, `/request.html` and `/request.js`
+Optional `timeRequests` is an exact object `{"mode": "off"|"owner"|"parents"}` (legacy
+`{"enabled": true|false}` still parses as `parents`/`off`); any other shape rejects the
+manifest. `owner` requires the optional top-level `ownerAccountId`, which must name an
+entry of `accounts`; only that account sees or decides requests and their alert. Using
+these keys changes `manifestDigest` and `integrationScope`. Child time requests are OFF
+in integration mode unless a mode other than `off` is present: when off, `/child/*`, `/request.html` and `/request.js`
 return 404, no request link can be issued, and no follow-up timer runs. When on, an
 approval writes a resume through the normal revision-CAS path and the service later
 writes a re-pause. Without automatic `dispatch`, both of those queued intents wait for

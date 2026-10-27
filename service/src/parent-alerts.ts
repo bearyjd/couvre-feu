@@ -103,22 +103,25 @@ export class ParentAlerts {
     }
 
     /** Assigned people always; system (null person) alerts only for admins. */
-    private visibility(actor: Actor): {sql: string; args: string[]} {
+    /** `hidden` kinds are withheld from this caller (e.g. time requests for an account that may not see them). */
+    private visibility(actor: Actor, hidden: readonly string[] = []): {sql: string; args: string[]} {
         const people = actor.personIds.slice(0, 64), marks = people.map(() => '?').join(',');
         const parts = [...(people.length ? [`person_id IN (${marks})`] : []), ...(actor.role === 'admin' ? ['person_id IS NULL'] : [])];
-        return {sql: parts.length ? `(${parts.join(' OR ')})` : '0', args: people};
+        if (!parts.length) return {sql: '0', args: people};
+        const without = hidden.length ? ` AND kind NOT IN (${hidden.map(() => '?').join(',')})` : '';
+        return {sql: `((${parts.join(' OR ')})${without})`, args: [...people, ...hidden]};
     }
 
-    list(actor: Actor, before: number = Number.MAX_SAFE_INTEGER): ParentAlertPage {
-        const {sql, args} = this.visibility(actor);
+    list(actor: Actor, before: number = Number.MAX_SAFE_INTEGER, hidden: readonly string[] = []): ParentAlertPage {
+        const {sql, args} = this.visibility(actor, hidden);
         const rows = this.store.all<Row>(`SELECT * FROM parent_alerts WHERE ${sql} AND id < ? ORDER BY id DESC LIMIT ${PAGE_SIZE + 1}`, ...args, before);
         const openCount = this.store.get<{n: number}>(`SELECT count(*) n FROM parent_alerts WHERE ${sql} AND state='open'`, ...args)!.n;
         const more = rows.length > PAGE_SIZE, page = rows.slice(0, PAGE_SIZE);
         return {alerts: page.map(dto), nextBefore: more ? page[page.length - 1].id : null, openCount};
     }
 
-    acknowledge(actor: Actor, id: number): ParentAlertDTO {
-        const {sql, args} = this.visibility(actor);
+    acknowledge(actor: Actor, id: number, hidden: readonly string[] = []): ParentAlertDTO {
+        const {sql, args} = this.visibility(actor, hidden);
         return this.store.transaction(() => {
             const row = this.store.get<Row>(`SELECT * FROM parent_alerts WHERE id=? AND ${sql}`, id, ...args);
             if (!row) throw new AppError(404, 'alert_not_found');

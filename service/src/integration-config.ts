@@ -12,6 +12,12 @@ import { loadTLS, privateIPv4, privateListenHost } from './tls.ts';
 import type { TLSFiles } from './tls.ts';
 import { ACCOUNT_LIMIT } from './account-limits.ts';
 
+export type TimeRequestMode = 'off' | 'owner' | 'parents';
+/** The mode of a config's timeRequests setting; absent is off, and the legacy {enabled} form maps true to 'parents'. */
+export function timeRequestMode(setting: unknown): TimeRequestMode {
+    const s = (setting ?? {}) as {mode?: TimeRequestMode; enabled?: boolean};
+    return s.mode ?? (s.enabled === true ? 'parents' : 'off');
+}
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
     origin?: string;
@@ -19,8 +25,10 @@ export interface IntegrationManifest {
     /** Plain-HTTP LAN listener behind a TLS-terminating proxy: only these exact source addresses may connect. */
     trustedProxies?: string[];
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
-    /** Child time requests are off unless the owner enables them here. */
-    timeRequests?: {enabled: boolean};
+    /** Child time requests are off unless enabled here: 'owner' lets only ownerAccountId decide them, 'parents' every parent account. Legacy {enabled} is read as parents/off. */
+    timeRequests?: {mode: TimeRequestMode};
+    /** The account that decides time requests in 'owner' mode; must be one of `accounts`. */
+    ownerAccountId?: string;
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
     router: {host: string; user: 'root'; port: number; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
     /** Seeds the first child and device of a fresh database; children and devices are managed in the database afterwards. */
@@ -87,7 +95,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -119,12 +127,22 @@ export function integrationConfig(path: string): IntegrationConfig {
     }
     let timeRequests: IntegrationManifest['timeRequests'];
     if (m.timeRequests !== undefined) {
-        const settings = object(m.timeRequests, ['enabled']);
-        if (typeof settings.enabled !== 'boolean') bad('invalid_time_requests');
-        timeRequests = {enabled: settings.enabled as boolean};
+        const legacy = typeof m.timeRequests === 'object' && m.timeRequests !== null && !Array.isArray(m.timeRequests) && 'enabled' in m.timeRequests;
+        if (legacy) {
+            const settings = object(m.timeRequests, ['enabled']);
+            if (typeof settings.enabled !== 'boolean') bad('invalid_time_requests');
+            timeRequests = {mode: settings.enabled ? 'parents' : 'off'};
+        } else {
+            const settings = object(m.timeRequests, ['mode']);
+            if (!['off', 'owner', 'parents'].includes(settings.mode as string)) bad('invalid_time_requests');
+            timeRequests = {mode: settings.mode as TimeRequestMode};
+        }
     }
+    const ownerAccountId = m.ownerAccountId === undefined ? undefined : id(m.ownerAccountId);
+    if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
+    if (timeRequests?.mode === 'owner' && ownerAccountId === undefined) bad('owner_account_required');
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));

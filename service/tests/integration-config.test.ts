@@ -39,8 +39,20 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         save({...manifest, accounts: [...manifest.accounts, ...Array.from({length: ACCOUNT_LIMIT}, (_, i) => ({id: `p${i}`, displayName: 'P', role: 'parent', personIds: ['pilot']}))]}); assert.throws(() => integrationConfig(path), /invalid_integration_manifest|body_too_large/); // the 64 KiB manifest bound may bind first
         assert.equal(c.dispatch, undefined);
         assert.equal(c.timeRequests, undefined, 'time requests are off unless explicitly enabled');
-        save({...manifest, timeRequests: {enabled: true}}); assert.equal(integrationConfig(path).timeRequests?.enabled, true);
-        save({...manifest, timeRequests: {enabled: false}}); assert.equal(integrationConfig(path).timeRequests?.enabled, false);
+        // Legacy {enabled} still parses: true is 'parents' (every parent, as before), false is 'off'.
+        save({...manifest, timeRequests: {enabled: true}}); assert.deepEqual(integrationConfig(path).timeRequests, {mode: 'parents'});
+        save({...manifest, timeRequests: {enabled: false}}); assert.deepEqual(integrationConfig(path).timeRequests, {mode: 'off'});
+        for (const mode of ['off', 'parents']) { save({...manifest, timeRequests: {mode}}); assert.deepEqual(integrationConfig(path).timeRequests, {mode}); assert.equal(integrationConfig(path).ownerAccountId, undefined); }
+        save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId: 'parent'});
+        const owned = integrationConfig(path); assert.deepEqual(owned.timeRequests, {mode: 'owner'}); assert.equal(owned.ownerAccountId, 'parent');
+        assert.notEqual(owned.manifestDigest, c.manifestDigest, 'the new keys change the manifest digest and integration scope');
+        assert.notEqual(owned.provenance.integrationScope, c.provenance.integrationScope);
+        save({...manifest, timeRequests: {mode: 'parents'}, ownerAccountId: 'operator'}); assert.equal(integrationConfig(path).ownerAccountId, 'operator');
+        save({...manifest, timeRequests: {mode: 'owner'}}); assert.throws(() => integrationConfig(path), /owner_account_required/);
+        save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId: 'stranger'}); assert.throws(() => integrationConfig(path), /invalid_owner_account/);
+        save({...manifest, ownerAccountId: 'stranger'}); assert.throws(() => integrationConfig(path), /invalid_owner_account/);
+        for (const ownerAccountId of [1, null, '', ['parent']]) { save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId}); assert.throws(() => integrationConfig(path)); }
+        for (const timeRequests of [{mode: 'everyone'}, {mode: 1}, {mode: 'owner', extra: 1}, {mode: 'owner', enabled: true}, {mode: 'off', enabled: false}]) { save({...manifest, timeRequests, ownerAccountId: 'parent'}); assert.throws(() => integrationConfig(path)); }
         for (const timeRequests of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, true, null, []]) { save({...manifest, timeRequests}); assert.throws(() => integrationConfig(path)); }
         save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
         const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
