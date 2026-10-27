@@ -1,6 +1,7 @@
 // Parent-side time requests and child request links. All dynamic text is rendered with textContent.
 const MESSAGES = {
   schedule_override_unsupported: 'Not supported yet: schedules cannot be overridden, so the schedule still blocks access.',
+  grant_ended: 'approved, but access was paused, so the extra time has ended.',
   approval_not_applied: 'Approved, but the router change did not take effect.',
 };
 const POLL_MS = 5000;
@@ -65,6 +66,7 @@ export function createTimeRequests({ session, people }) {
   }
   function resolvedText(item) {
     const who = nameOf(item.personId), by = item.decidedBy ? ` by ${item.decidedBy}` : '';
+    if (item.state === 'approved' && item.code === 'grant_ended') return `${who}: ${MESSAGES.grant_ended}`;
     if (item.state === 'approved') return `${who}: approved ${item.grantedMinutes} minutes until ${clock(item.allowanceUntil)}${by}.`;
     if (item.state === 'approving') return `${who}: approval in progress.`;
     if (item.state === 'declined') return `${who}: declined${by}.`;

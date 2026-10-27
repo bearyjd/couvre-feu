@@ -88,3 +88,23 @@ test('turning a link off invalidates it for the child', async ({ page, browser, 
     await expect(child.locator('#child-form')).toBeHidden();
   } finally { await context.close(); }
 });
+
+test('an approved request whose grant was ended by a pause says the time has ended on both sides', async ({ page, browser, demo }) => {
+  clearSchedules(demo);
+  await enroll(page, demo, 'bryn');
+  const url = await createLink(page);
+  const { page: child, context } = await childPage(browser);
+  try {
+    await child.goto(url);
+    await child.getByRole('button', { name: 'Send request' }).click();
+    await page.getByRole('button', { name: 'Approve 15 minutes for Alex (fictional)' }).click();
+    await expect(page.locator('.time-request-history')).toContainText('approved 15 minutes');
+    await expect(child.locator('#child-state')).toContainText('Approved: 15 minutes', { timeout: 15000 });
+    // A pause during a router grant keeps the request approved but with code grant_ended.
+    demo.store.run("UPDATE time_requests SET decision_code='grant_ended' WHERE state='approved'");
+    await expect(child.locator('#child-state')).toHaveText(/^A parent paused access, so the extra time has ended\./, { timeout: 15000 });
+    await expect(child.locator('#child-state')).not.toContainText('Approved');
+    await expect(page.locator('.time-request-history')).toContainText('the extra time has ended', { timeout: 15000 });
+    await expect(page.locator('.time-request-history')).not.toContainText('approved 15 minutes until');
+  } finally { await context.close(); }
+});

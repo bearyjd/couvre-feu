@@ -20,7 +20,10 @@ const wait = (seconds) => seconds >= 60 ? `${Math.ceil(seconds / 60)} minutes` :
 function describe(status) {
   switch (status.state) {
     case 'pending': return `Waiting for a parent. You asked for ${minutes(status.minutes)}. This request expires at ${clock(status.expiresAt)}.`;
-    case 'approved': return `Approved: ${minutes(status.grantedMinutes)}, until ${clock(status.allowanceUntil)}.`;
+    case 'approved':
+      // A pause during the grant keeps the request approved but ends the extra time: never keep promising it.
+      if (status.code === 'grant_ended') return 'A parent paused access, so the extra time has ended.';
+      return `Approved: ${minutes(status.grantedMinutes)}, until ${clock(status.allowanceUntil)}.`;
     case 'declined': return 'Not this time. A parent said no.';
     case 'expired': return 'Nobody answered in time. You can ask again.';
     case 'cancelled': return 'This request was cancelled.';

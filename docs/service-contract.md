@@ -126,12 +126,17 @@ Status: **unverified on this router.** Offline tests only (service fake router a
 - **Display.** `PersonDTO.allowance` is the router-confirmed allowance in force (healthy observations only). While it is set, `scheduleBlocked` is `false`, bounded by the allowance end and the observation validity. The shared demo `scheduleBlocked()` also ignores schedules for a person with an active allowance.
 - **Approvers.** Approvers are any account whose scope includes the child: assigned parents, and admins through their scope (`scope_all` admins see every child). There is no passkey step-up, because a grant is at most 60 minutes, no more than a Resume.
 - **Alerts.** On the real path the 5 s time-request timer also reconciles the `time_request_pending` alert (counts only, no reason text). No other alert kind starts reconciling on the real router.
-- **Flag.** All of this exists only when the private manifest sets `"timeRequests": {"enabled": true}`, which is off by default. The demo keeps its old path (no allowances).
-  - Migrations: `009.sql` adds `time_requests.apply_via` and `grant_operation_id`; `integration-007.sql` admits `operations.action='allow'`.
-
+- **Flag.** Grants are created only when the private manifest sets `"timeRequests": {"enabled": true}` (off by default). The routes, the child page, the 5 s alert timer and the grant-writing port are mounted only then. The demo keeps its old path (no allowances). Some pieces are **always on**, flag or not:
+  - **Pause wins.** A single-child Pause strips that child's allowance in the router-facing policy (`IntegrationPolicy.mutate`), so it also applies with the flag off.
+  - **People reads.** `PersonDTO.allowance` is always filled from healthy observations and `scheduleWithAllowance` is always applied, so an allowance already on the router lifts the displayed schedule block even with the flag off. An unknown schedule claim (`scheduleBlocked === null`) stays unknown.
+  - **Migrations.** `009.sql` (adds `time_requests.apply_via` and `grant_operation_id`) and `integration-007.sql` (admits `operations.action='allow'`) always run.
+  - **Drain.** With the flag off, a drain-only timer still follows in-flight grants (`approving` to `approved` or `apply_failed`) and owed re-pauses, then stops. No route is mounted.
+  - **Behaviour change for existing rows (demo and legacy).** The per-child poll limit (30 per minute; status polls and submits have separate budgets) and the stricter `normalizeReason` (no invisible, line-breaking or unpaired code points) apply everywhere the service runs. The child `code` is now `decision_code`, falling back to the old state mapping (`unsupported` gives `schedule_override_unsupported`, `apply_failed` gives `approval_not_applied`), so legacy rows without a `decision_code` read as before.
+  - **Child status.** `allowanceUntil` is shown only for an `approved` request whose grant has not ended (never while `approving`).
+  - **Web copy.** An `approved` request with code `grant_ended` reads as ended on the child and parent pages, not as time in force.
 **Residuals and UNVERIFIED:**
 - **Kernel time gate.** Whether the xt_time `--datestart` gate re-blocks at `until` on this firmware with flow offload on is UNVERIFIED.
 - **Installed release.** Whether the router release currently installed includes allowances (#31) is UNVERIFIED. An older release is expected (not tested against one) to refuse the `allowances` key, so the grant would end `apply_failed`.
-- **No web UI yet.** There is no web UI for grants yet; the parent and child pages still show the older text.
+- **Limited web UI.** The parent and child pages show the `grant_ended` state, but there is no other grant-specific UI (no "End extra time" action, no countdown).
 - **No ending action.** There is no "End extra time" action, and no alert when a grant stays unconfirmed for a long time.
 - **Shared bad-token bucket.** In trusted-proxy mode every LAN client shares the proxy's address, so the bad-token bucket is effectively global again. Valid links are still never blocked. Guessing is prevented by the 256-bit tokens, not by the limiter.
