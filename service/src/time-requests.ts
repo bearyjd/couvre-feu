@@ -15,9 +15,9 @@ export const REPAUSE_BACKOFF_BASE_SECONDS = 30, REPAUSE_BACKOFF_MAX_SECONDS = 30
 const RECENT_SECONDS = 86400, BAD_TOKEN_LIMIT = 30, STATUS_LIMIT = 30;
 /** Distinct clients tracked by the bad-token limiter; beyond this, new clients share one overflow bucket. */
 const BAD_TOKEN_CLIENTS = 1024, OVERFLOW_CLIENT = '\u0000overflow';
-/** Invisible or line-breaking code points that could disguise a message (the emoji joiner U+200D stays allowed). */
 /** A lone UTF-16 surrogate is not text; it cannot be stored or rendered faithfully. */
 const UNPAIRED = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+/** Invisible or line-breaking code points that could disguise a message (the emoji joiner U+200D stays allowed). */
 const INVISIBLE = /[\u061c\u200b\u200c\u200e\u200f\u2028\u2029\u2060\ufeff]/;
 const PERSON = /^[a-z][a-z0-9_]{0,31}$/, TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
@@ -90,8 +90,10 @@ export class TimeRequestService {
     private readonly inFlight = new Set<string>();
     /** Per-client buckets: one hostile client can only rate-limit itself, never another client or any valid link. */
     private badTokens = new Map<string, number[]>();
-    /** Per child (not per link): reissuing a link does not reset the per-minute limit. */
+    /** Per child (not per link): reissuing a link does not reset the per-minute limit. Polls and submits have separate budgets. */
     private statusPolls = new Map<string, number[]>();
+    private submitCalls = new Map<string, number[]>();
+    private lastBadTokenSweep = 0;
     constructor(store: Store, policy: PolicyPort, now = () => Math.floor(Date.now() / 1000), scheduleOverride?: ScheduleOverride, grants?: GrantPort) {
         this.store = store; this.policy = policy; this.now = now; this.scheduleOverride = scheduleOverride; this.grants = grants;
     }
@@ -371,7 +373,11 @@ export class TimeRequestService {
     /** Number of clients currently tracked by the bad-token limiter (bounded). */
     badTokenClients(): number { return this.badTokens.size; }
     private countBadToken(client: string | undefined, now: number): boolean {
-        for (const [key, times] of this.badTokens) if (!times.some(t => t > now - 60)) this.badTokens.delete(key);
+        // Amortised: stale buckets are swept at most once per second (each bucket is also pruned when its own client returns).
+        if (now !== this.lastBadTokenSweep) {
+            this.lastBadTokenSweep = now;
+            for (const [key, times] of this.badTokens) if (!times.some(t => t > now - 60)) this.badTokens.delete(key);
+        }
         const key = client === undefined ? '' : this.badTokens.has(client) || this.badTokens.size < BAD_TOKEN_CLIENTS - 1 ? client : OVERFLOW_CLIENT;
         const recent = [...(this.badTokens.get(key) ?? []).filter(t => t > now - 60), now];
         this.badTokens.set(key, recent);
@@ -390,28 +396,30 @@ export class TimeRequestService {
         if (found) return found;
         throw this.countBadToken(client, now) ? new AppError(429, 'rate_limited') : new AppError(404, 'link_invalid');
     }
-    private pollLimit(link: LinkRow) {
-        const now = this.now(), recent = (this.statusPolls.get(link.person_id) ?? []).filter(t => t > now - 60);
+    private pollLimit(link: LinkRow, buckets: Map<string, number[]>) {
+        const now = this.now(), recent = (buckets.get(link.person_id) ?? []).filter(t => t > now - 60);
         if (recent.length >= STATUS_LIMIT) throw new AppError(429, 'rate_limited');
-        this.statusPolls.set(link.person_id, [...recent, now]);
+        buckets.set(link.person_id, [...recent, now]);
     }
     private childStatus(link: LinkRow): ChildStatusDTO {
         const now = this.now(), row = this.store.get<RequestRow>('SELECT * FROM time_requests WHERE link_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', link.id);
         const retryAfter = row ? Math.max(0, row.created_at + REQUEST_COOLDOWN_SECONDS - now) : 0;
+        // The deadline is only exposed once it is real: not while the router has not confirmed it, and not after a pause ended it.
+        const shown = row?.state === 'approved' && row.decision_code !== 'grant_ended';
         const state = row?.state === 'approving' ? 'pending' : row?.state ?? 'none';
-        return {state, minutes: row?.minutes ?? null, grantedMinutes: row?.granted_minutes ?? null, allowanceUntil: row?.allowance_until ?? null,
+        return {state, minutes: row?.minutes ?? null, grantedMinutes: row?.granted_minutes ?? null, allowanceUntil: shown ? row.allowance_until : null,
             createdAt: row?.created_at ?? null, expiresAt: row?.expires_at ?? null, code: row ? row.decision_code ?? CODES[row.state] ?? null : null,
             canRequest: state !== 'pending' && retryAfter === 0, retryAfter: state === 'pending' ? 0 : retryAfter};
     }
     status(token: unknown, client?: string): ChildStatusDTO {
         const link = this.link(token, client);
-        this.pollLimit(link);
+        this.pollLimit(link, this.statusPolls);
         this.expire();
         return this.childStatus(link);
     }
     submit(token: unknown, minutes: unknown, reason: unknown, client?: string): ChildStatusDTO {
         const link = this.link(token, client), granted = minutesOf(minutes), text = normalizeReason(reason);
-        this.pollLimit(link);
+        this.pollLimit(link, this.submitCalls);
         this.expire();
         const now = this.now();
         this.store.transaction(() => {

@@ -53,7 +53,7 @@ function settle(ctx: GrantContext, row: GrantRow, set: string, from: 'approving'
 function recover(ctx: GrantContext, row: GrantRow): GrantRow | null {
     const op = witness(ctx, row.person_id, `tr-${row.id}-a${row.attempts}`);
     if (!op) {
-        settle(ctx, row, `${RELEASE}`, 'approving', 'released:no_operation', 'time_request_approving');
+        settle(ctx, row, RELEASE, 'approving', 'released:no_operation', 'time_request_approving');
         return null;
     }
     const until = (JSON.parse(op.payload_json) as {allowances?: {person: string; until: number}[]}).allowances?.find(a => a.person === row.person_id)?.until ?? null;
