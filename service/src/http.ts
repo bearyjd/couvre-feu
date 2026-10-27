@@ -308,7 +308,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 return;
             }
             // Off (the default) is indistinguishable from a route that does not exist. No query strings: the page size and cursor are path segments, like /alerts/before/:id.
-            const auditPage = /^\/audit(?:\/limit\/([0-9]{1,4}))?(?:\/before\/([0-9]{1,16}))?$/.exec(path);
+            const auditPage = /^\/audit(?:\/limit\/([0-9]{1,4}))?(?:\/before\/([0-9]{1,15}))?$/.exec(path);
             if (auditPage && audit?.enabled) {
                 const limit = auditPage[1] === undefined ? undefined : Number(auditPage[1]);
                 if (limit === 0) throw new AppError(400, 'invalid_limit');

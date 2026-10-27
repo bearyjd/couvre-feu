@@ -12,7 +12,7 @@ import type { IntegrationPolicy, IntegrationOperation } from './integration-poli
 import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, TOKEN, activeChildren, devicesOf, movePolicy, withDevice, withoutDevice } from './integration-children.ts';
 import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
-import { audited } from './parent-audit.ts';
+import { audited, auditFor } from './parent-audit.ts';
 import type { AuditAction } from './parent-audit.ts';
 
 /** Child/device-group and device changes. Admin-only; every one needs a fresh step-up bound to the exact change. */
@@ -98,7 +98,7 @@ export class ChildAdmin {
     /** Verifies the step-up, then re-checks role, scope and installation identity and applies the change with its audit row in one transaction. */
     async perform(session: AuthSession, kind: ChildAction, target: string, input: unknown): Promise<Routed> {
         const action = AUDITED[kind];
-        if (!action) return this.performChange(session, kind, target, input);
+        if (!action || !auditFor(this.store).enabled) return this.performChange(session, kind, target, input);
         const actor = session.dto.actor;
         // Read before the change: a local device removal deletes the row it would be found by.
         const owner = kind === 'device_add' ? target : this.store.get<{person_id: string}>('SELECT person_id FROM devices WHERE id=?', target)?.person_id;

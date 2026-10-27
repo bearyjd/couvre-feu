@@ -297,3 +297,105 @@ test('pagination: newest first, default page, hard cap, cursor, and no unbounded
         assert.deepEqual(Object.keys(first.body.entries[0]).sort(), ['action', 'actorId', 'actorName', 'at', 'id', 'operationId', 'personId', 'result']);
     } finally { server.close(); await once(server, 'close'); f.cleanup(); }
 });
+
+const auditRows = (f: {store: {all<T>(sql: string): T[]}}): Row[] => f.store.all<Row>('SELECT actor_id,action,person_id,operation_id,result FROM parent_audit ORDER BY id').map(r => ({...r}));
+/** A pause the router has confirmed, so approving a request has something to lift. `before` is how many audit rows exist already. */
+async function pausedWorld() {
+    const w = await grantWorld({}), f = w.f;
+    f.config.auditLog = {enabled: true};
+    const paused = f.pause(0, 'pause_key_12345678');
+    await w.dispatch(paused.result.operation.id); f.advance(1); await f.observe();
+    return {...w, legacy: new TimeRequestService(f.store, f.policy, f.now), before: auditRows(f).length};
+}
+
+test('approve writes exactly one grant_approve row and no resume row, on the legacy path', async () => {
+    const w = await pausedWorld(), f = w.f;
+    try {
+        const id = w.ask(30);
+        await w.legacy.approve(actor, id, 30);
+        assert.ok(f.store.get("SELECT 1 FROM operations WHERE action='resume'"), 'the legacy path did queue a resume');
+        assert.deepEqual(auditRows(f).slice(w.before).map(r => [r.actor_id, r.action, r.person_id, r.result]), [['operator', 'grant_approve', 'pilot', 'applied']]);
+    } finally { f.cleanup(); }
+});
+
+test('approve writes exactly one grant_approve row and no resume row, on the grants path', async () => {
+    const w = await pausedWorld(), f = w.f;
+    try {
+        const id = w.ask(30);
+        await w.service.approve(actor, id, 30);
+        assert.deepEqual(auditRows(f).slice(w.before).map(r => [r.actor_id, r.action, r.person_id, r.result]), [['operator', 'grant_approve', 'pilot', 'applied']]);
+    } finally { f.cleanup(); }
+});
+
+test('the background re-pause is recorded as system/pause and never under a parent', async () => {
+    const w = await pausedWorld(), f = w.f;
+    try {
+        const id = w.ask(30);
+        await w.legacy.approve(actor, id, 30);
+        const resume = f.store.get<{id: string}>("SELECT id FROM operations WHERE action='resume'")!.id;
+        await w.dispatch(resume); f.advance(1); await f.observe();
+        f.advance(30 * 60 + 5); await f.observe();
+        await w.legacy.advance();
+        assert.notEqual(w.row(id).repause_state, 'none', 'a re-pause was owed');
+        const later = auditRows(f).slice(w.before + 1);
+        assert.deepEqual(later.map(r => [r.actor_id, r.action, r.person_id, r.result]), [['system', 'pause', 'pilot', 'applied']]);
+    } finally { f.cleanup(); }
+});
+
+test('refused rows are capped at 20 per actor per 60 s; other actors are unaffected; the window slides with the clock', () => {
+    const f = world();
+    try {
+        const audit = auditFor(f.store), count = (actorId: string) => f.store.get<{n: number}>("SELECT count(*) n FROM parent_audit WHERE actor_id=? AND result='refused'", actorId)!.n;
+        for (let i = 0; i < 21; i++) audit.record({actor: 'operator', action: 'pause', people: ['pilot'], result: 'refused', at: 1000 + i});
+        assert.equal(count('operator'), 20, 'the 21st within a minute is not stored');
+        audit.record({actor: 'parent', action: 'pause', people: ['pilot'], result: 'refused', at: 1021});
+        assert.equal(count('parent'), 1, 'another actor is unaffected');
+        audit.record({actor: 'operator', action: 'pause', people: ['pilot'], operationId: 'op-1', result: 'applied', at: 1022});
+        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM parent_audit WHERE operation_id='op-1'")!.n, 1, 'applied rows are not capped');
+        audit.record({actor: 'operator', action: 'pause', people: ['pilot'], result: 'refused', at: 1000 + 61});
+        assert.equal(count('operator'), 21, 'stored again once the oldest refusals are over a minute old');
+    } finally { f.cleanup(); }
+});
+
+test('flag off: the audit wrapper and its callbacks do no extra database work', async () => {
+    const w = await grantWorld(bedtime), f = w.f, seen: string[] = [];
+    try {
+        for (const method of ['get', 'all', 'run'] as const) {
+            const real = f.store[method].bind(f.store) as (sql: string, ...args: never[]) => unknown;
+            (f.store as unknown as Record<string, unknown>)[method] = (sql: string, ...args: never[]) => { seen.push(sql); return real(sql, ...args); };
+        }
+        const declined = w.ask(15);
+        w.service.decline(actor, declined);
+        f.advance(301); await f.observe();
+        const approved = w.ask(30);
+        await w.service.approve(actor, approved, 30);
+        assert.deepEqual(seen.filter(sql => /parent_audit|COALESCE\(grant_operation_id|SELECT person_id FROM time_requests WHERE id=\?/.test(sql)), []);
+        assert.equal(f.store.get<{n: number}>('SELECT count(*) n FROM parent_audit')!.n, 0);
+    } finally { f.cleanup(); }
+});
+
+test('flag off: a child-admin action does not read the device owner for the audit', async () => {
+    const f = world(false);
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const seen: string[] = [], real = f.store.get.bind(f.store) as (sql: string, ...args: never[]) => unknown;
+        (f.store as unknown as Record<string, unknown>).get = (sql: string, ...args: never[]) => { seen.push(sql); return real(sql, ...args); };
+        await f.child(op, 'device_move', 'd_kid2', {to: 'pilot'});
+        assert.deepEqual(seen.filter(sql => sql.includes('SELECT person_id FROM devices WHERE id=?')), []);
+        assert.equal(f.store.get<{n: number}>('SELECT count(*) n FROM parent_audit')!.n, 0);
+    } finally { f.cleanup(); }
+});
+
+test('the before cursor is at most 15 digits; limit takes 1 to 4 digits (clamped to 100), longer segments are 404', async () => {
+    const f = world(), port = 29000 + process.pid % 10000, o = `http://localhost:${port}`;
+    const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
+    const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
+    server.listen(port, '127.0.0.1'); await once(server, 'listening');
+    try {
+        const call = await http(f, auth, o, 'operator');
+        assert.equal((await call('/audit/before/999999999999999')).status, 200);
+        assert.equal((await call('/audit/before/1000000000000000')).status, 404);
+        assert.equal((await call('/audit/limit/9999')).status, 200);
+        assert.equal((await call('/audit/limit/10000')).status, 404);
+    } finally { server.close(); await once(server, 'close'); f.cleanup(); }
+});

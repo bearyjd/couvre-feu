@@ -11,6 +11,8 @@ export const AUDIT_PAGE_MAX = 100;
 const PRUNE_BATCH = 500;
 const PRUNE_BATCHES = 4;
 const SCOPE_MAX = 64;
+const REFUSED_MAX = 20;
+const REFUSED_WINDOW_SECONDS = 60;
 
 export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end'] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
@@ -41,10 +43,18 @@ export class ParentAudit {
     record(entry: AuditEntry): void {
         if (!this.enabled) return;
         try {
-            const at = entry.at ?? this.now(), people = entry.people.length ? [...new Set(entry.people)] : [null];
+            const at = entry.at ?? this.now();
+            if (entry.result === 'refused' && !entry.operationId && this.refusedRecently(entry.actor, at)) return;
+            const people = entry.people.length ? [...new Set(entry.people)] : [null];
             const write = () => { for (const person of people) this.store.run('INSERT OR IGNORE INTO parent_audit(at,actor_id,action,person_id,operation_id,result) VALUES(?,?,?,?,?,?)', at, entry.actor, entry.action, person, entry.operationId ?? null, entry.result); };
             if (this.store.db.isTransaction) write(); else this.store.transaction(write);
         } catch { process.stderr.write('parent_audit_write_failed\n'); }
+    }
+
+    /** Refused rows carry no operation id, so nothing else dedupes them: an actor's flood of refusals stops being stored after REFUSED_MAX in REFUSED_WINDOW_SECONDS. */
+    private refusedRecently(actor: string, at: number): boolean {
+        const n = this.store.get<{n: number}>("SELECT count(*) n FROM (SELECT 1 FROM parent_audit WHERE at>? AND actor_id=? AND result='refused' LIMIT ?)", at - REFUSED_WINDOW_SECONDS, actor, REFUSED_MAX)?.n ?? 0;
+        return n >= REFUSED_MAX;
     }
 
     /** Assigned children always; entries with no child only for admins (the same rule as parent alerts). */
@@ -98,6 +108,7 @@ export function audited<T>(store: Store, ctx: AuditContext<T>, work: () => Promi
 export function audited<T>(store: Store, ctx: AuditContext<T>, work: () => T): T;
 export function audited<T>(store: Store, ctx: AuditContext<T>, work: () => T | Promise<T>): T | Promise<T> {
     const audit = auditFor(store);
+    if (!audit.enabled) return work();
     // Building the entry reads the database too: any problem there is as harmless to the operation as a failed insert.
     const safely = (build: () => AuditEntry | null) => { try { const entry = build(); if (entry) audit.record(entry); } catch { process.stderr.write('parent_audit_write_failed\n'); } };
     const fail = (error: unknown) => safely(() => { const result = failureResult(error); return result && {actor: ctx.actor, action: ctx.action, people: ctx.people(), result, at: ctx.now()}; });

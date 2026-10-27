@@ -26,7 +26,7 @@ export type RequestState = 'pending' | 'approving' | 'approved' | 'declined' | '
 /** The only policy surface used: the existing revision-CAS read and mutate path. No router access of its own. */
 export interface PolicyPort {
     people(actor: Actor): PeopleDTO | Promise<PeopleDTO>;
-    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined):
+    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, auditAs?: string | null):
         {status: number; result: OperationResult} | Promise<{status: number; result: OperationResult}>;
 }
 /**
@@ -268,7 +268,7 @@ export class TimeRequestService {
         });
         let resume: {id: string; revision: number} | null = null;
         try {
-            resume = (await this.policy.mutate(actor, row.person_id, 'resume', {}, people.revisionToken, key)).result.operation;
+            resume = (await this.policy.mutate(actor, row.person_id, 'resume', {}, people.revisionToken, key, null)).result.operation;
         } catch (error) {
             // The operation row is the witness that the write path committed, whatever error surfaced afterwards.
             resume = this.store.get<{id: string; revision: number}>('SELECT id,revision FROM operations WHERE person_id=? AND idempotency_key=?', row.person_id, key) ?? null;
@@ -371,7 +371,7 @@ export class TimeRequestService {
                 if (person?.allowance) throw new AppError(409, 'allowance_active');
                 if (!person || !people.revisionToken) throw new AppError(503, 'router_status_unavailable');
                 this.store.run('UPDATE time_requests SET attempts=attempts+1 WHERE id=?', row.id);
-                const outcome = await this.policy.mutate(actor, row.person_id, 'pause', {until: row.original_pause_until!}, people.revisionToken, `tr-${row.id}-p${row.attempts + 1}`);
+                const outcome = await this.policy.mutate(actor, row.person_id, 'pause', {until: row.original_pause_until!}, people.revisionToken, `tr-${row.id}-p${row.attempts + 1}`, 'system');
                 if (outcome.status === 409 || outcome.status === 502) throw new AppError(409, 'policy_change_not_applied');
                 return this.setRepause(row, outcome.status === 200 && outcome.result.operation.state === 'confirmed' ? 'done' : 'applying', null, outcome.result.operation.id);
             } catch (caught) {

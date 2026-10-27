@@ -156,7 +156,8 @@ export class PolicyService {
         }
         return [precondition, key];
     }
-    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {
+    /** The demo policy is never audited: `_auditAs` only keeps the signature of PolicyPort. */
+    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, _auditAs?: string | null): {
         status: number;
         result: OperationResult;
     } {
