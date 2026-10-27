@@ -77,14 +77,15 @@ test('MOCK: grant shows Applying until the service confirms, then Granted until 
   await expect(page.getByRole('button', { name: 'End extra time for Alex (fictional)' })).toBeVisible();
 });
 
-test('MOCK: a grant that could not be applied says Couldn\'t apply with the reason code', async ({ page, demo }) => {
+test('MOCK: a grant that could not be applied says Couldn\'t apply with a parent-friendly reason', async ({ page, demo }) => {
   let failed = false;
   await mockParentRoutes(page, () => [request(failed ? { state: 'apply_failed', grantedMinutes: 30, code: 'grant_not_in_force' } : {})],
     (route) => { failed = true; return route.fulfill({ json: { request: request({ state: 'apply_failed', code: 'grant_not_in_force' }) } }); });
   await enroll(page, demo, 'bryn');
   await page.getByRole('button', { name: 'Grant 30 minutes for Alex (fictional)' }).click();
   await expect(page.locator('#time-requests')).toContainText("Couldn't apply");
-  await expect(page.locator('#time-requests')).toContainText('grant_not_in_force');
+  await expect(page.locator('#time-requests')).toContainText('the time ran out before the router applied it');
+  await expect(page.locator('#time-requests')).not.toContainText('grant_not_in_force');
   await expect(page.locator('#time-requests')).not.toContainText('Granted until');
 });
 
@@ -144,6 +145,7 @@ test('demo: grant a real request, see Granted until, then End extra time pauses 
     await expect(page.locator('.time-request')).toHaveCount(0);
     expect(demo.router.observe().policy.pauses).toEqual([]);
     await page.getByRole('button', { name: 'End extra time for Alex (fictional)' }).click();
+    await expect(page.locator('#time-requests .notice')).toContainText('Pause requested for Alex (fictional)');
     await expect.poll(() => demo.router.observe().policy.pauses.length, { timeout: 20000 }).toBe(1);
   } finally { await context.close(); }
 });
