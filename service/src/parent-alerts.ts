@@ -102,8 +102,10 @@ export class ParentAlerts {
             now, event ? 1 : 0, severity, details, open.id);
     }
 
-    /** Assigned people always; system (null person) alerts only for admins. */
-    /** `hidden` kinds are withheld from this caller (e.g. time requests for an account that may not see them). */
+    /**
+     * Assigned people always; system (null person) alerts only for admins.
+     * `hidden` kinds are withheld from this caller (e.g. time requests for an account that may not see them).
+     */
     private visibility(actor: Actor, hidden: readonly string[] = []): {sql: string; args: string[]} {
         const people = actor.personIds.slice(0, 64), marks = people.map(() => '?').join(',');
         const parts = [...(people.length ? [`person_id IN (${marks})`] : []), ...(actor.role === 'admin' ? ['person_id IS NULL'] : [])];

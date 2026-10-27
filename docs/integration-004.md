@@ -266,7 +266,7 @@ operational acceptance gate; local date/IANA conversion cannot substitute for it
 Optional `timeRequests` is an exact object `{"mode": "off"|"owner"|"parents"}` (legacy
 `{"enabled": true|false}` still parses as `parents`/`off`); any other shape rejects the
 manifest. `owner` requires the optional top-level `ownerAccountId`, which must name an
-entry of `accounts`; only that account sees or decides requests and their alert. Using
+entry of `accounts`; only that account sees or decides requests and their alert. `ownerAccountId` is validated but ignored in other modes. Mode `off` hides existing `time_request_pending` alerts from everyone (rows are kept and reappear when the mode is turned back on). Owner mode narrows the parent UI/API; it is **not** a security boundary against other admins: an admin whose scope covers all of the owner's children can still add a credential to the owner account. Tracked follow-ups: protect the owner account from other admins, and a startup check that the owner account exists and is active. A non-owner admin can still see an active allowance in `/people` and can end it with Pause (pause wins), and deleting a child is refused while a request is pending. Using
 these keys changes `manifestDigest` and `integrationScope`. Child time requests are OFF
 in integration mode unless a mode other than `off` is present: when off, `/child/*`, `/request.html` and `/request.js`
 return 404, no request link can be issued, and no follow-up timer runs. When on, an
