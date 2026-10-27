@@ -951,6 +951,7 @@ footer {
 .time-request-list, .time-request-history, .request-links { list-style: none; padding: 0; margin: 0 0 1rem; display: grid; gap: .75rem; }
 .time-request, .request-link { display: grid; gap: .4rem; padding: .75rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .request-link input { width: 100%; }
+.time-request .button, .time-request-history .button { min-height: 44px; min-width: 44px; }
 .child-request { max-width: 32rem; margin: 0 auto; padding: 1.5rem 1rem; display: grid; gap: 1rem; }
 .child-request fieldset { display: grid; gap: .5rem; border: 1px solid var(--line); border-radius: var(--radius); padding: .75rem; }
 .child-request input[type="text"] { width: 100%; }

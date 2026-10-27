@@ -8,7 +8,7 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 
 | # | Addition | Phase | State |
 |---|---|---|---|
-| 1 | Ask for time: web UI + parent one-tap approve | 1 | Service built (PR #86, #88; open) |
+| 1 | Ask for time: web UI + parent one-tap approve | 1 | Service built (PR #86, #88); parent web card built behind the flag (F3 PR, unmerged); child "starting..." state and live proof remain |
 | 5 | Reward Time (extra minutes on a grant) | 1 | Not started |
 | 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | Not started |
 | 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Not started |

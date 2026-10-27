@@ -102,6 +102,17 @@ Enablement: in the synthetic demo, time requests are always on. In real-router i
 
 Disabling time requests in integration does not abandon obligations: a drain-only timer continues to restore lifted pauses (no routes, no new requests) until none remain, then stops.
 
+### Parent ask-for-time card (web)
+
+The parent PWA (`web/public/time-requests.js`) shows one card per pending request: child name, requested minutes, and the child's reason text (rendered only with `textContent`, only in the signed-in parent's page, never in alerts or pushes). Controls are named for the child:
+
+- **Grant N min**: one tap, N = requested minutes up to the 60 minute cap (sends `POST /time-requests/:id/approve {minutes: N}`). **Decline** sends the decline route. Both are disabled while either is in flight, and a repeat tap sends nothing (the service also answers a second decision with `409 request_not_pending`).
+- **Honest states, never optimistic.** After a tap the card says "Applying..." until a later `GET /time-requests` reports `approved`; only then it says "Granted until HH:MM" (the router's `allowanceUntil`, formatted by the browser). `apply_failed` shows "Couldn't apply" with the reason code (`grant_not_applied`, `grant_not_in_force`). `grant_ended` and the demo's schedule-block `unsupported` keep their existing wording.
+- **End extra time** appears on a grant that is still in force. The router has no remove-allowance operation, so it sends the existing single-child Pause (pause wins, which ends the grant); the card keeps showing the grant until the service reports it ended.
+- **Flag.** A `404` from `GET /time-requests` (mode `off`, or a parent the owner mode excludes) hides the card and stops polling. The demo keeps time requests always on (its router has no allowances, so the demo uses the legacy resume path and never reports `approving`).
+- Accessibility: tap targets at least 44 px, status text in an `aria-live="polite"` region plus the app status line, no domains or device identifiers shown.
+- Status: **unverified on this router**; the card carries that note until the live grant test passes.
+
 ### Grants as router allowances (real-router integration)
 
 Status: **unverified on this router.** Offline tests only (service fake router and router fixtures); no live run.
