@@ -11,6 +11,7 @@ const FAILURE_TEXT = {
   apply_failed: 'the router change did not complete',
 };
 const GENERIC_FAILURE = 'the router did not confirm it';
+const failureText = (code) => (Object.hasOwn(FAILURE_TEXT, code) ? FAILURE_TEXT[code] : GENERIC_FAILURE);
 const LESS_MINUTES = [15, 30];
 const HISTORY_CAP = 8;
 const CAP_MINUTES = 60;
@@ -70,9 +71,11 @@ export function createTimeRequests({ session, people, end = async () => ({ sent:
     const asked = sessionKey();
     notice = ''; wantFocus = focus;
     busy.set(busyKey, kind); draw(true);
-    try { then(await call(path, body)); }
-    catch (error) { notice = error.message; }
-    if (asked !== sessionKey()) return;
+    let result = null, failure = '';
+    try { result = await call(path, body); }
+    catch (error) { failure = error.message; }
+    if (asked !== sessionKey()) return; // the session changed in flight: touch neither the notice nor the one-time link
+    if (failure) notice = failure; else then(result);
     busy.delete(busyKey);
     await load();
     draw(true);
@@ -133,11 +136,11 @@ export function createTimeRequests({ session, people, end = async () => ({ sent:
     if (activeGrant(item)) return `${who}: Granted until ${clock(item.allowanceUntil)}${by}.`;
     if (item.state === 'approved') return `${who}: extra time ended at ${clock(item.allowanceUntil)}${by}.`;
     if (item.state === 'approving') return `${who}: Applying… waiting for the router to confirm. Not granted yet.`;
-    if (item.state === 'apply_failed') return `${who}: Couldn't apply (${FAILURE_TEXT[item.code] ?? GENERIC_FAILURE}). No extra time was confirmed.`;
+    if (item.state === 'apply_failed') return `${who}: Couldn't apply (${failureText(item.code)}). No extra time was confirmed.`;
     if (item.state === 'declined') return `${who}: declined${by}.`;
     if (item.state === 'expired') return `${who}: expired unanswered.`;
     if (item.state === 'cancelled') return `${who}: cancelled when the link was turned off.`;
-    return `${who}: ${MESSAGES[item.code] ?? `could not be completed (${FAILURE_TEXT[item.code] ?? GENERIC_FAILURE})`}.`;
+    return `${who}: ${(Object.hasOwn(MESSAGES, item.code) ? MESSAGES[item.code] : null) ?? `could not be completed (${failureText(item.code)})`}.`;
   }
   function historyRow(item) {
     const props = item.code ? { 'data-code': item.code } : {};

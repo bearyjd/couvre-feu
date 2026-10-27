@@ -255,3 +255,64 @@ test.describe('Grant less', () => {
     expect(bodies).toEqual([{ minutes: 15 }]);
   });
 });
+
+test.describe('in-flight responses after a session change', () => {
+  async function switchSession(page: Page, demo: { token: (id: 'bryn' | 'jd') => string }) {
+    await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+    await page.getByLabel('One-use enrollment token').fill(demo.token('jd'));
+    await page.getByRole('button', { name: 'Create a demo passkey' }).click();
+  }
+
+  test('MOCK: a request link created before a session change never appears for the next session', async ({ page, demo }) => {
+    await mockList(page, () => [request()]);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    await page.route((url) => url.pathname === '/people/alex/request-link', async (route) => {
+      started += 1; await held;
+      await route.fulfill({ json: { path: '/request.html#LATE-SECRET-LINK' } });
+    });
+    await enroll(page, demo, 'bryn');
+    await page.getByRole('button', { name: 'Create request link for Alex (fictional)' }).click();
+    await expect.poll(() => started).toBe(1);
+    await switchSession(page, demo);
+    await expect(card(page)).toContainText('asks for 30 minutes');
+    release();
+    await page.waitForTimeout(6500); // the next poll redraws the card
+    await expect(page.locator('.request-link input')).toHaveCount(0);
+    const html = await page.evaluate(() => document.documentElement.outerHTML + [...document.querySelectorAll('input')].map((input) => input.value).join('|'));
+    expect(html).not.toContain('LATE-SECRET-LINK');
+  });
+
+  test('MOCK: a decision notice from before a session change never appears for the next session', async ({ page, demo }) => {
+    await mockList(page, () => [request()]);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    await decisions(page, async (route) => { started += 1; await held; await route.fulfill({ json: { request: request({ state: 'declined' }) } }); });
+    await enroll(page, demo, 'bryn');
+    await page.getByRole('button', { name: 'Decline request from Alex (fictional)' }).click();
+    await expect.poll(() => started).toBe(1);
+    await switchSession(page, demo);
+    await expect(card(page)).toContainText('asks for 30 minutes');
+    release();
+    await page.waitForTimeout(6500); // the next poll redraws the card
+    await expect(card(page)).not.toContainText('Request declined.');
+  });
+});
+
+test.describe('unknown codes get the generic text', () => {
+  for (const code of ['constructor', '__proto__', 'toString']) {
+    test(`MOCK: code ${code} is not looked up on Object.prototype`, async ({ page, demo }) => {
+      await mockList(page, () => [
+        request({ state: 'apply_failed', code, decidedBy: 'bryn' }),
+        request({ id: '22222222-2222-4222-8222-222222222222', state: 'unsupported', code, decidedBy: 'bryn' }),
+      ]);
+      await enroll(page, demo, 'bryn');
+      await expect(card(page)).toContainText('the router did not confirm it');
+      await expect(card(page)).not.toContainText('function');
+      await expect(card(page)).not.toContainText('[object');
+      await expect(card(page)).not.toContainText('native code');
+    });
+  }
+});
