@@ -54,6 +54,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         for (const ownerAccountId of [1, null, '', ['parent']]) { save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId}); assert.throws(() => integrationConfig(path)); }
         for (const timeRequests of [{mode: 'everyone'}, {mode: 1}, {mode: 'owner', extra: 1}, {mode: 'owner', enabled: true}, {mode: 'off', enabled: false}]) { save({...manifest, timeRequests, ownerAccountId: 'parent'}); assert.throws(() => integrationConfig(path)); }
         for (const timeRequests of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, true, null, []]) { save({...manifest, timeRequests}); assert.throws(() => integrationConfig(path)); }
+        // auditLog: absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.auditLog, undefined, 'the audit log is off unless explicitly enabled');
+        for (const enabled of [true, false]) { save({...manifest, auditLog: {enabled}}); assert.deepEqual(integrationConfig(path).auditLog, {enabled}); }
+        for (const auditLog of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, auditLog}); assert.throws(() => integrationConfig(path)); }
         save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
         const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
         const scheduled = {...manifest, enrollment: {...manifest.enrollment, schedules: [{person: 'pilot', id: 'bedtime', weekdays: ['Mon'], start: '21:00', stop: '07:00'}]}, scheduleClock: {timezone: 'America/New_York'}};

@@ -2,13 +2,14 @@ import type { Store } from './db.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import type { GrantPort } from './time-requests.ts';
+import { auditFor } from './parent-audit.ts';
 
 /** What the grant steps need from TimeRequestService. */
 export interface GrantContext {
     store: Store; grants: GrantPort; now: () => number; inFlight: ReadonlySet<string>;
     audit(actor: string, action: string, outcome: string, operationId?: string | null, revision?: number | null): void;
 }
-interface GrantRow {id: string; person_id: string; attempts: number; allowance_until: number | null; grant_operation_id: string | null}
+interface GrantRow {id: string; person_id: string; attempts: number; allowance_until: number | null; grant_operation_id: string | null; decided_by: string | null}
 const RELEASE = "state='pending',apply_via='resume',granted_minutes=NULL,allowance_until=NULL,grant_operation_id=NULL,decided_by=NULL,decided_at=NULL";
 
 /**
@@ -45,9 +46,16 @@ function witness(ctx: GrantContext, person: string, key: string): {id: string; p
     return ctx.store.get<{id: string; payload_json: string}>('SELECT id,payload_json FROM operations WHERE person_id=? AND idempotency_key=?', person, key);
 }
 function settle(ctx: GrantContext, row: GrantRow, set: string, from: 'approving' | 'approved', outcome: string, action: string) {
-    ctx.store.transaction(() => {
-        if (ctx.store.run(`UPDATE time_requests SET ${set} WHERE id=? AND state=?`, row.id, from).changes) ctx.audit('system', action, outcome, row.grant_operation_id);
+    const changed = ctx.store.transaction(() => {
+        const changes = ctx.store.run(`UPDATE time_requests SET ${set} WHERE id=? AND state=?`, row.id, from).changes;
+        if (changes) ctx.audit('system', action, outcome, row.grant_operation_id);
+        return Boolean(changes);
     });
+    // Parent-facing log, written once the transition is committed: an approval the router did not take is failed; a grant a later pause removed has ended.
+    if (!changed) return;
+    const audit = auditFor(ctx.store), at = ctx.now(), people = [row.person_id], operationId = row.grant_operation_id;
+    if (outcome === 'apply_failed') audit.record({actor: row.decided_by ?? 'system', action: 'grant_approve', people, operationId, result: 'failed', at});
+    else if (outcome === 'ended') audit.record({actor: 'system', action: 'grant_end', people, operationId, result: 'applied', at});
 }
 /** Re-links an operation queued just before a crash, or releases an approval that never reached the CAS path. */
 function recover(ctx: GrantContext, row: GrantRow): GrantRow | null {

@@ -11,7 +11,7 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 | 1 | Ask for time: web UI + parent one-tap approve | 1 | Service built (PR #86, #88; open) |
 | 5 | Reward Time (extra minutes on a grant) | 1 | Not started |
 | 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | Not started |
-| 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Not started |
+| 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Audit log built behind `auditLog.enabled` (off; unverified on a router); digest not started |
 | 4 | Push notifications (self-hosted ntfy or Web Push) | 2 | Sketch only ([service contract](service-contract.md#gap-notification-delivery-beyond-the-app)) |
 | 2 | Weekly schedules / bedtime with age-band templates | 3 | Designed; owner decisions recorded |
 | 3 | Unknown-device alerts + new devices default to restricted | 4 | Not started |
@@ -129,7 +129,7 @@ Can be built and merged offline behind flags before Phase 0 finishes; turning fl
 
 - **Steps (PR-sized):**
   1. Service: per-account flag gate (owner only / all parents). Tests: gate off, owner only, all.
-  2. Service: audit log table (actor account, action type, child, time, operation id, result; no free text). Writes from pause, resume, bulk, move, grant. Route `GET /audit` scoped like alerts. Tests: scoping 404s, no reason text stored.
+  2. Service: audit log table (actor account, action type, child, time, operation id, result; no free text). Writes from pause, resume, bulk, move, grant. Route `GET /audit` scoped like alerts. Tests: scoping 404s, no reason text stored. **Built (flag `auditLog.enabled`, off; unverified on a router; see [service contract](service-contract.md#audit-log-of-parent-actions-flagged-off)).**
   3. Web: ask-for-time parent card (applying, then confirmed or "couldn't apply"; never optimistic), Grant and End, child "starting..." state; demo router keeps the feature disabled. Tests: Playwright on the demo; update the parent PWA spec.
   4. Service + web: Reward Time as one allowance op through `queue()` (the same path schedules S4 will reuse); cap per the owner's decision. Tests: arithmetic at the cap, the 14400 s horizon from router time, pause ends it.
   5. Service + web: focus window, one-shot = a timed pause with a "Focus" label. Tests: expiry, ask-for-time interaction per decision.

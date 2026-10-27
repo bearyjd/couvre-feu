@@ -4,6 +4,7 @@ import type { Store } from './db.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import type { Actor, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
 import { applyGrant, followGrants } from './time-request-grants.ts';
+import { audited } from './parent-audit.ts';
 import type { GrantContext } from './time-request-grants.ts';
 
 export const REQUEST_MINUTES = [15, 30, 60] as const;
@@ -191,6 +192,16 @@ export class TimeRequestService {
 
     // ---- Parent decisions -------------------------------------------------------------------------------------
     decline(actor: Actor, id: string): ParentRequestDTO {
+        this.owned(actor, id);
+        return audited(this.store, {actor: actor.id, action: 'grant_decline', now: this.now, people: () => this.auditPeople(actor, id), done: () => ({operationId: null})},
+            () => this.declineOwned(actor, id));
+    }
+    /** The child of a request, but only if the actor may see it: the audit entry never names a child outside their scope. */
+    private auditPeople(actor: Actor, id: string): string[] {
+        const person = this.store.get<{person_id: string}>('SELECT person_id FROM time_requests WHERE id=?', id)?.person_id;
+        return person && actor.personIds.includes(person) ? [person] : [];
+    }
+    private declineOwned(actor: Actor, id: string): ParentRequestDTO {
         this.expire();
         const row = this.owned(actor, id);
         if (row.state !== 'pending' || this.inFlight.has(id)) throw new AppError(409, 'request_not_pending');
@@ -201,6 +212,12 @@ export class TimeRequestService {
         return this.parentDTO(this.owned(actor, id));
     }
     async approve(actor: Actor, id: string, minutes: unknown): Promise<ParentRequestDTO> {
+        this.owned(actor, id);
+        return audited(this.store, {actor: actor.id, action: 'grant_approve', now: this.now, people: () => this.auditPeople(actor, id), done: () => ({
+            operationId: this.store.get<{op: string | null}>('SELECT COALESCE(grant_operation_id,resume_operation_id) op FROM time_requests WHERE id=?', id)?.op ?? null})},
+            () => this.approveOwned(actor, id, minutes));
+    }
+    private async approveOwned(actor: Actor, id: string, minutes: unknown): Promise<ParentRequestDTO> {
         this.expire();
         const row = this.owned(actor, id), granted = minutesOf(minutes);
         if (row.state !== 'pending' || this.inFlight.has(id)) throw new AppError(409, 'request_not_pending');
