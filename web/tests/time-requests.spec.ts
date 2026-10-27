@@ -50,11 +50,11 @@ test('child asks for time, parent approves, the pause ends, and the child sees t
     await expect(card).toContainText('Alex (fictional) asks for 30 minutes');
     await expect(card).toContainText('<b>homework</b>');
     expect(await card.locator('b').count()).toBe(0);
-    await page.getByRole('button', { name: 'Approve 15 minutes for Alex (fictional)' }).click();
-    await expect(page.locator('.time-request-history')).toContainText('approved 15 minutes');
+    await page.getByRole('button', { name: 'Grant 30 minutes for Alex (fictional)' }).click();
+    await expect(page.locator('.time-request-history')).toContainText('Granted until');
     await expect(page.locator('.time-request')).toHaveCount(0);
 
-    await expect(child.locator('#child-state')).toContainText('Approved: 15 minutes', { timeout: 15000 });
+    await expect(child.locator('#child-state')).toContainText('Approved: 30 minutes', { timeout: 15000 });
     await expect.poll(() => demo.router.observe().policy.pauses.length).toBe(0);
     await expect(child.locator('#child-form')).toBeHidden();
   } finally { await context.close(); }
@@ -68,7 +68,7 @@ test('approval during a schedule block says it is not supported yet on both side
     await child.goto(url);
     await child.getByRole('button', { name: 'Send request' }).click();
     await expect(page.locator('.time-request')).toContainText('asks for 15 minutes');
-    await page.getByRole('button', { name: 'Approve 15 minutes for Alex (fictional)' }).click();
+    await page.getByRole('button', { name: 'Grant 15 minutes for Alex (fictional)' }).click();
     await expect(page.locator('#time-requests .notice')).toContainText('Not supported yet: schedules cannot be overridden');
     await expect(child.locator('#child-state')).toContainText('Not supported yet', { timeout: 15000 });
     expect(demo.router.observe().policy.pauses).toEqual([]);
@@ -97,14 +97,14 @@ test('an approved request whose grant was ended by a pause says the time has end
   try {
     await child.goto(url);
     await child.getByRole('button', { name: 'Send request' }).click();
-    await page.getByRole('button', { name: 'Approve 15 minutes for Alex (fictional)' }).click();
-    await expect(page.locator('.time-request-history')).toContainText('approved 15 minutes');
+    await page.getByRole('button', { name: 'Grant 15 minutes for Alex (fictional)' }).click();
+    await expect(page.locator('.time-request-history')).toContainText('Granted until');
     await expect(child.locator('#child-state')).toContainText('Approved: 15 minutes', { timeout: 15000 });
     // A pause during a router grant keeps the request approved but with code grant_ended.
     demo.store.run("UPDATE time_requests SET decision_code='grant_ended' WHERE state='approved'");
     await expect(child.locator('#child-state')).toHaveText(/^A parent paused access, so the extra time has ended\./, { timeout: 15000 });
     await expect(child.locator('#child-state')).not.toContainText('Approved');
     await expect(page.locator('.time-request-history')).toContainText('the extra time has ended', { timeout: 15000 });
-    await expect(page.locator('.time-request-history')).not.toContainText('approved 15 minutes until');
+    await expect(page.locator('.time-request-history')).not.toContainText('Granted until');
   } finally { await context.close(); }
 });
