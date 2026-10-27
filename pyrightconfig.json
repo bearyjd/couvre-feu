@@ -1,0 +1,17 @@
+{
+  "include": ["tests", "tools"],
+  "exclude": ["**/node_modules", "**/__pycache__", "tests/fixtures/.cache"],
+  "pythonVersion": "3.12",
+  "extraPaths": ["tests/fixtures"],
+  "reportMissingModuleSource": "none",
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "extraPaths": ["tests/fixtures"],
+      "reportOptionalMemberAccess": "none",
+      "reportOptionalSubscript": "none",
+      "reportArgumentType": "none",
+      "reportAttributeAccessIssue": "none"
+    }
+  ]
+}
