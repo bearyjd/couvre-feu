@@ -18,7 +18,7 @@ Changed-policy/drift/selective-reload reconstruction stages an inactive generati
 
 ## Before approving a live script
 
-Resolve firmware identity, individually callable conntrack/ip6tables, shell/awk and newly required timeout behavior, timezone and clock health, GL includes/marks, DNS listener ownership and AdGuard health, current GL parental controls and acceleration. Obtain protected identities and uniquely resolve the current control client's IP-to-MAC mapping. The script must fail rather than guess on missing/ambiguous mappings or overlap. Preserve protection for noninteractive cron/include operations. Do not change WAN, dnsmasq, existing GL controls or offload merely to obtain a passing test.
+Resolve firmware identity, individually callable conntrack/ip6tables, shell/awk and newly required timeout behavior, timezone and clock health, GL includes/marks, DNS listener ownership and AdGuard health, current GL parental controls and acceleration. Obtain protected identities and uniquely resolve the current control client's IP-to-MAC mapping. The script must fail rather than guess on missing/ambiguous mappings or overlap. Preserve protection for noninteractive cron/include operations. Do not change WAN, dnsmasq, existing GL controls or offload merely to obtain a passing test. (The owner's 2026-10-27 lift of the "no DNS changes" rule covers only the kids' firewall DNS rules, not these.)
 
 Require a protected recovery connection, exact original backup/journal, safe uninstall procedure and an explicit abort condition before activation. Separately approve even read-only router commands. For isolated integration, establish real compatible tools first; missing dependencies keep the gate pending.
 
@@ -31,7 +31,7 @@ Require a protected recovery connection, exact original backup/journal, safe uni
 | Resume during schedule | Manual pause clears while active schedule continues blocking; no bonus or Allow-until implied. |
 | Timed pause, service offline | Absolute expiry survives service loss, cron re-evaluates current policy, access resumes within declared minute tolerance only if schedule allows. Verify reboot/stale sync cannot resurrect expiry. |
 | Manual IPv4 DNS | Approved child queries to a chosen external resolver reach local DNS through kids-only redirect; correlate DNS logs/packet evidence and GL marks. Do not assume listener identity or logging is enabled. Any logging change needs separate consent/approval. Adults retain their original behavior. |
-| Known DoH / Firefox | Choose an endpoint actually in the approved list; Firefox DoH fails or falls back. Record destination and result; a list cannot establish universal encrypted-DNS prevention. |
+| Known DoH / Firefox | Choose an endpoint actually in the approved list; Firefox DoH fails or falls back. Record destination and result; a list cannot establish universal encrypted-DNS prevention. The DoH set is filled only from the policy `doh` arrays (at most 256 per family); the service does not generate it. |
 | DoT/DoQ | Approved child TCP/UDP 853 and UDP 784/8853 attempts fail while protected adults remain unaffected. |
 | IPv6 | On a real approved child with usable global IPv6 and route, pause blocks external traffic. If unavailable, mark test unavailable, not passed. Verify external DNS blocking without NAT6 and local DNS usability. |
 | Offload | Verify established-flow and schedule cutoff across the actual enabled acceleration path. Missing FLOWOFFLOAD text does not establish absence of hardware offload. Do not disable acceleration without separate approval. |

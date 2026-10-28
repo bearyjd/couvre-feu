@@ -8,16 +8,16 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 
 | # | Addition | Phase | State |
 |---|---|---|---|
-| 1 | Ask for time: web UI + parent one-tap approve | 1 | Service built (PR #86, #88); parent web card built behind the flag (F3 PR, unmerged); child "starting..." state and live proof remain |
-| 5 | Reward Time (extra minutes on a grant) | 1 | Service built behind `rewardTime.enabled` (off; unverified on a router); web UI not started |
+| 1 | Ask for time: web UI + parent one-tap approve | 1 | Built and merged, all behind `timeRequests.mode` (off by default): service (PR #86, #88), per-account gate off/owner/parents (F1, PR #92), parent card with Grant, Grant less, Decline and End extra time (F3, PR #94). Unverified on this router: live proof remains |
+| 5 | Reward Time (extra minutes on a grant) | 1 | Service built and merged (F4, PR #95) behind `rewardTime.enabled` (off; unverified on this router); no web UI yet |
 | 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | Not started |
-| 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Audit log built behind `auditLog.enabled` (off; unverified on a router); digest not started |
+| 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Audit log built and merged (F2, PR #93) behind `auditLog.enabled` (off; unverified on this router; service only, no web view); digest not started |
 | 4 | Push notifications (self-hosted ntfy or Web Push) | 2 | Sketch only ([service contract](service-contract.md#gap-notification-delivery-beyond-the-app)) |
 | 2 | Weekly schedules / bedtime with age-band templates | 3 | Designed; owner decisions recorded |
 | 3 | Unknown-device alerts + new devices default to restricted | 4 | Not started |
 | 10 | Guest / visitor profile (internet only, no LAN) | 4 | Not started |
 | 8 | Per-child daily online time, labelled an estimate | 5 | Not started |
-| 9 | DNS hardening (port 853, wider DoH list, VPN/Tor feed) | 5 (or 4) | Blocked on the "no DNS changes" rule |
+| 9 | DNS hardening (wider DoH list, VPN/Tor feed; port 853 is already blocked for kids) | 5 (or 4) | Rule lifted for the kids' firewall DNS rules only (2026-10-27); VPN/Tor feed and release still undecided |
 
 Phase 0 (prove what already exists) comes before all of them.
 
@@ -39,10 +39,10 @@ Open before the first live use:
 
 | Item | State |
 |---|---|
-| Ask for time (child requests, parent one-tap approval as timed grants) | Service built behind `timeRequests.enabled` (off by default) in PR #86 and its follow-up PR #88 (both still open on 2026-10-27): grants are router allowances, 60 min cap, lift pauses and schedules, a parent's Pause ends a grant. Web side and live proof remain: [Planned additions](#planned-additions) item 1, Phase 1. The design is in the maintainer's local planning notes (not in this repository). |
+| Ask for time (child requests, parent one-tap approval as timed grants) | Built behind `timeRequests.mode` (off by default; legacy `enabled` reads as `parents`): service in PR #86 and follow-up PR #88, per-account gate in PR #92, parent card in PR #94 (all merged). Grants are router allowances, 60 min cap, lift pauses and schedules, a parent's Pause ends a grant. Live proof remains: [Planned additions](#planned-additions) item 1, Phase 1. The design is in the maintainer's local planning notes (not in this repository). |
 | Weekly schedules / bedtime per child | Designed; builds after ask-for-time. Item 2, Phase 3. The first four steps need no router change and can merge behind an off-by-default flag; live proof of the time windows (flow offload off) needs the owner at home. The design is in the maintainer's local planning notes (not in this repository). |
 | Device recognition and unknown-device alerts | Not started. Item 3, Phase 4. Alerts can use the existing read-only `rpc-inventory` ([tier1-rpc §2](contracts/tier1-rpc.md)); only "new devices default to restricted" needs a router change. |
-| DNS enforcement | Partly shipped (kids' port 53 redirect, DoH set; see [enforcement contract](enforcement-contract.md)). Gap: port 853 and broader DoH coverage. Item 9, Phase 5. Needs the "no DNS changes" project rule lifted explicitly, and the DNS baseline re-measured. |
+| DNS enforcement | Partly shipped, all unproven on a live router: kids' IPv4 port 53 redirect (IPv6 port 53 rejected), kids' DoT/DoQ block (TCP/UDP 853, UDP 784 and 8853, unconditional: `router/lib/firewall.sh:53-58`), and a DoH reject set filled from the policy `doh` arrays (at most 256 per family; nothing in the service generates the list yet). See [enforcement contract](enforcement-contract.md#dns-enforcement-today). Item 9, Phase 5: wider DoH list and VPN/Tor feed. The owner lifted the "no DNS changes" rule on 2026-10-27 for the kids' firewall DNS rules only. `AGENTS.md:39` still forbids changing dnsmasq or the WAN zone; DHCP and adult/management traffic stay out of scope because the lift covered only those rules. The DNS baseline still has to be re-measured. |
 | Per-child AdGuard profiles | Not recommended: on the GL firmware it likely breaks GL's own filtering, and AdGuard's per-client schedule is an inverse window that does not match this project's schedule model. Research notes are local (not in this repository). |
 
 ## Tier 3: later
@@ -59,11 +59,11 @@ Source: the comparable-products research (PR #90, `docs/research/comparable-prod
 | 2 | Weekly schedules / bedtime with age-band templates | High | M | No for steps S1-S4; optional S5 (router reports kernel tz) | Low | Windows with flow offload off then on, cross-midnight, DST | Item 1 merged (Extra time reuses its allowance path); item 6 audit log | Age bands and template times (new). Already decided: who edits, step-up only on loosening/deleting, Extra time/Skip tonight = allowance with the 60 min cap, merge behind a flag before live proof, cap 8 windows per child | `schedules.editable` |
 | 3 | Unknown-device alerts + new devices default to restricted/unassigned | Medium-high: closes the "new phone escapes" gap | M | Alerts: no (existing read-only `rpc-inventory`). Default-restricted: yes | Low: MAC, vendor prefix, sanitised hostname only; stored for the parent view, never pushed | MAC rotation on phones with private Wi-Fi addresses; default rule never touches protected or management MACs | Item 4 (to notify); Phase 0 router release settled | What "restricted" means (blocked, or guest profile from item 10); whether to default-restrict at all | `deviceAlerts.enabled` (service); router: off unless the desired JSON carries the new field |
 | 4 | Push notifications for approvals, expiries, unknown devices, drift | High: alerts are only visible while the app is open today | M | No | Low if payloads stay content-free (see [Privacy gate](#privacy-design-gate)) | Delivery while WAN/DNS is flaky; honest "not delivered" state | Existing `parent_alerts` | Push provider (self-hosted ntfy vs browser Web Push); quiet hours | `push.enabled` |
-| 5 | Reward Time: extra minutes added to a grant without changing the schedule | Medium | S | No | None | Grant arithmetic against the 60 min cap (the 14400 s router horizon stays as a defence-in-depth guard) | Item 1 | Whether reward + grant may exceed 60 min in total (new; the 60 min rule so far is per request) | `rewardTime.enabled` |
-| 6 | Audit log of parent actions; weekly digest (counts only) | Medium: both parents can see who did what | S (log) + S (digest) | No | Low: counts and action types only, no domains | None beyond status fidelity | Log: none. Digest: item 4 or the in-app view | Digest recipients and day/time; audit retention | `auditLog.enabled`, `digest.enabled` |
+| 5 | Reward Time: extra minutes added to a grant without changing the schedule | Medium | S | No | None | Grant arithmetic against the 60 min cap (the 14400 s router horizon stays as a defence-in-depth guard) | Item 1 | None. Decided and built: reward and grant together never exceed 60 min from router time | `rewardTime.enabled` |
+| 6 | Audit log of parent actions; weekly digest (counts only) | Medium: both parents can see who did what | S (log) + S (digest) | No | Low: counts and action types only, no domains | None beyond status fidelity | Log: none. Digest: item 4 or the in-app view | Digest recipients and day/time. Audit retention is decided (90 days) | `auditLog.enabled`, `digest.enabled` |
 | 7 | Focus / homework window: one-shot or recurring | Medium | S | No (one-shot reuses timed pause; recurring reuses schedules) | None | Same as timed-pause expiry; recurring = item 2's proof | One-shot: none. Recurring: item 2 | Whether a child's ask-for-time may end a focus window (default proposal: yes, like any pause) | `focus.enabled` |
 | 8 | Per-child daily online time, labelled an estimate | Medium, with real accuracy risk | L | Probably none (estimate from existing `rpc-activity` counters, enforcement through the existing pause op); UNVERIFIED | Medium: usage pattern of a minor; store daily totals only | Counter accuracy vs real use: flow offload bypasses the counters, background traffic, IPv6 | Phase 0; item 4 | Semantics (estimate only, or auto-pause at the limit), limits per child, what counts as "online" | `quota.enabled` |
-| 9 | DNS hardening: port 853, wider DoH list, VPN/Tor list feed | Medium | M | Yes | Low (no logging; block lists only) | Real bypass attempts from a test device; DNS baseline re-measured before and after | Owner lifts the "no DNS/dnsmasq/WAN changes" rule in writing | The rule lift itself; feed source and update cadence | Router: off unless the desired JSON carries the new field |
+| 9 | DNS hardening: wider DoH list, VPN/Tor list feed (port 853 for kids is already blocked) | Medium | M | Yes for a feed or new rule shape (a new release id); a DoH list alone rides the existing `doh` policy field | Low (no logging; block lists only) | Real bypass attempts from a test device; DNS baseline re-measured before and after | Rule lifted 2026-10-27 for the kids' firewall DNS rules only (`AGENTS.md:39` still forbids dnsmasq and WAN changes; DHCP and adult/management traffic stay out of scope) | Feed source and licence for a VPN/Tor list, update cadence, the 64 KB policy input limit (a large list may not fit), and whether a new router release is cut | Router: off unless the desired JSON carries the new field |
 | 10 | Guest / visitor profile: unassigned devices get internet only, no LAN | Medium | M | Yes | Low | Isolation actually blocks LAN, including the router admin page from a guest device, while password login from adult devices still works | Item 3 (same unassigned-device rule) | Isolation scope (no LAN at all, or allow printers/casting); whether guests are time-limited | `guest.enabled` (service); router as item 3 |
 
 Corrections to the research table: item 3 needs a router change only for default-restriction (alerts use the existing inventory RPC); item 8 probably needs no router change; item 6's audit log and the schedules design's audit step are one piece of work; item 5 and schedules S4 "Extra time" are one allowance path.
@@ -84,7 +84,7 @@ Also avoid OpenAppFilter code (GPL-2.0, not combinable with this AGPL-3.0 projec
 
 - **PR shape:** service, then web, then docs, each its own PR where it is more than a few lines. Tests come first in each PR (write the failing test, then the code). CI is the authority.
 - **Flags:** every addition gets a manifest key, absent = off, following the existing `timeRequests` pattern in `service/src/integration-config.ts` (strict optional keys, so each new key is a small, reviewable manifest-schema change). Router-side features are off unless the desired JSON carries the new field, so an older service never turns them on.
-- **Rollout per flag:** off, then owner only, then all parents. Today a flag is manifest-wide; "owner only" needs a per-account gate that does not exist yet. That gate is the first PR of Phase 1 (UNVERIFIED that it fits the current account model; check before building). Until it exists, rollout is off, then on for the household, chosen by the owner.
+- **Rollout per flag:** off, then owner only, then all parents. Today a flag is manifest-wide; "owner only" needs a per-account gate: `timeRequests.mode` `owner` (F1, PR #92) does this for time requests and Reward Time. It is not a security boundary against other admins (see [service contract](service-contract.md#operating-notes-for-the-flagged-features)); `auditLog` and `rewardTime` flags are still manifest-wide.
 - **Labels:** anything not proven on the real router is shown and documented as "unverified on this router".
 - **Live steps** (only after Phase 0's rehearsal passes, owner at home): log the invocation and release hash first; one run; on failure stop and report; console rollback ready; never disable or confine router or CT107 password login.
 - **Shared files.** These are touched by many items, so the phases are ordered to keep one open PR per file at a time where possible:
@@ -125,18 +125,20 @@ Every PR in Phases 1-5 states in its description how it meets these; reviewers b
 
 ### Phase 1: no-router wins on built foundations (items 1, 5, 7 one-shot, 6 audit log)
 
+**Progress (2026-10-27):** steps 1 to 4 and 6 are merged behind flags, all off and unverified on this router. Step 5 (item 7, focus window) is not started. Per-item live proof waits for Phase 0.
+
 Can be built and merged offline behind flags before Phase 0 finishes; turning flags on waits for Phase 0.
 
 - **Steps (PR-sized):**
-  1. Service: per-account flag gate (owner only / all parents). Tests: gate off, owner only, all.
-  2. Service: audit log table (actor account, action type, child, time, operation id, result; no free text). Writes from pause, resume, bulk, move, grant. Route `GET /audit` scoped like alerts. Tests: scoping 404s, no reason text stored. **Built (flag `auditLog.enabled`, off; unverified on a router; see [service contract](service-contract.md#audit-log-of-parent-actions-flagged-off)).**
-  3. Web: ask-for-time parent card (applying, then confirmed or "couldn't apply"; never optimistic), Grant and End, child "starting..." state; demo router keeps the feature disabled. Tests: Playwright on the demo; update the parent PWA spec.
-  4. Service + web: Reward Time as one allowance op through `queue()` (the same path schedules S4 will reuse); cap per the owner's decision. Tests: arithmetic at the cap from router time (the 14400 s horizon is a defence-in-depth guard behind the cap), pause ends it; a paused child with no active allowance is refused, one with an allowance in force is extended. **Service built (flag `rewardTime.enabled`, off; unverified on a router; reward + grant together capped at 60 min, refused not clamped; see [service contract](service-contract.md#reward-time-flagged-off)); web follows.**
+  1. Service: per-account flag gate (owner only / all parents). Tests: gate off, owner only, all. **Built (F1, PR #92, merged): `timeRequests.mode` off, owner or parents plus `ownerAccountId`; unverified on this router.**
+  2. Service: audit log table (actor account, action type, child, time, operation id, result; no free text). Writes from pause, resume, bulk, move, grant. Route `GET /audit` scoped like alerts. Tests: scoping 404s, no reason text stored. **Built (F2, PR #93, merged; flag `auditLog.enabled`, off; unverified on this router; see [service contract](service-contract.md#audit-log-of-parent-actions-flagged-off)).**
+  3. Web: ask-for-time parent card (applying, then confirmed or "couldn't apply"; never optimistic), Grant and End, child "starting..." state; demo router keeps the feature disabled. Tests: Playwright on the demo; update the parent PWA spec. **Built (F3, PR #94, merged): Grant, Grant less, Decline, End extra time, honest Applying/Granted states; the child "starting..." copy was not part of it. Unverified on this router.**
+  4. Service + web: Reward Time as one allowance op through `queue()` (the same path schedules S4 will reuse); cap per the owner's decision. Tests: arithmetic at the cap from router time (the 14400 s horizon is a defence-in-depth guard behind the cap), pause ends it; a paused child with no active allowance is refused, one with an allowance in force is extended. **Service built (F4, PR #95, merged; flag `rewardTime.enabled`, off; unverified on a router; reward + grant together capped at 60 min, refused not clamped; see [service contract](service-contract.md#reward-time-flagged-off)); web follows.**
   5. Service + web: focus window, one-shot = a timed pause with a "Focus" label. Tests: expiry, ask-for-time interaction per decision.
-  6. Docs: service contract, operating guide.
+  6. Docs: service contract, operating guide. **Done (F6): [operating notes](service-contract.md#operating-notes-for-the-flagged-features).**
 - **Entry:** #86 and #88 merged.
 - **Exit / done:** all merged with flags off; CI green; each item labelled unverified until its live check (grant lift and re-block, reward arithmetic on the router, focus expiry) passes after Phase 0.
-- **Owner decisions before start:** Reward Time total cap; may ask-for-time end a focus window; audit retention.
+- **Owner decisions before start:** may ask-for-time end a focus window (still open). Decided and built: Reward Time total cap (reward + grant together at most 60 min), audit retention (90 days).
 - **Router release:** none.
 - **Rollout:** owner only for a week, then all parents.
 - **Stop / rollback:** any grant shown "approved" that the router did not confirm, or any unscoped audit read: flag off, fix, re-review.
@@ -178,10 +180,10 @@ Before Phases 3-5 because later items emit events into it.
 ### Phase 5: estimates and hardening (items 8, 9)
 
 - **Item 8 steps:** (1) measurement spike, offline then live: compare counter-based "online minutes" with known use on a test device, offload off and on; publish the error found; (2) service: daily estimate from `rpc-activity` deltas, labelled "estimate"; (3) web: per-child view; (4) only if the owner chooses enforcement: auto-pause at the limit via the existing pause op, with a warning push first.
-- **Item 9 steps:** (1) re-measure the DNS baseline and record it; (2) router: port 853 block for children, wider DoH list, VPN/Tor list from a feed (licence checked), all behind a desired-JSON field; (3) bypass tests from a test device; (4) docs with the limits (VPN to an unknown IP still works).
-- **Entry:** Phase 0; for 8 also Phase 2 (warning push); for 9 the owner's written lift of the "no DNS/dnsmasq/WAN changes" rule.
+- **Item 9 steps:** (1) re-measure the DNS baseline and record it; (2) router: wider DoH list and VPN/Tor list from a feed (licence checked; port 853 for kids is already blocked, `router/lib/firewall.sh:53-58`), behind a desired-JSON field; only the kids' firewall DNS rules may change; (3) bypass tests from a test device; (4) docs with the limits (VPN to an unknown IP still works).
+- **Entry:** Phase 0; for 8 also Phase 2 (warning push); for 9 the owner's lift of 2026-10-27 (kids' firewall DNS rules only; `AGENTS.md:39` still forbids dnsmasq and WAN changes; DHCP and adult/management traffic stay out of scope).
 - **Exit / done:** 8: the measured error is shown next to the estimate. 9: baseline before and after recorded; bypass attempts blocked or the gap documented.
-- **Owner decisions before start:** quota semantics and limits; DNS rule lift and feed choice.
+- **Owner decisions before start:** quota semantics and limits; VPN/Tor feed source and licence, and whether to cut a new release.
 - **Router release:** 8 none (UNVERIFIED until the spike); 9 joins Phase 4's release if the lift came first, otherwise one more release id.
 - **Rollout:** estimate visible to the owner only for two weeks before anyone acts on it; enforcement only after that.
 - **Stop / rollback:** an estimate off by more than the published error, or any DNS breakage for adults: flag off or roll back the release.
@@ -203,11 +205,11 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 | Before | Decision |
 |---|---|
 | Phase 0 | Watchdog bound from a real measurement; approve the plan hash; which open router changes go into the rehearsal release |
-| Phase 1 | Reward Time total cap (may reward + grant exceed 60 min?); may ask-for-time end a focus window; audit retention |
+| Phase 1 | May ask-for-time end a focus window (open). Decided: Reward Time total cap 60 min, audit retention 90 days |
 | Phase 2 | Push provider (ntfy vs Web Push); digest recipients and day/time; quiet hours |
 | Phase 3 | Age bands and template times; timezone strategy at the live test |
 | Phase 4 | What "restricted" means for new devices; guest isolation scope; whether DNS hardening joins this release |
-| Phase 5 | Quota semantics (estimate only or auto-pause) and limits; lift of the "no DNS/dnsmasq/WAN changes" rule and the VPN/Tor feed source |
+| Phase 5 | Quota semantics (estimate only or auto-pause) and limits; VPN/Tor feed source and licence, the 64 KB policy input limit, new router release (the rule lift for the kids' firewall DNS rules was given 2026-10-27) |
 
 ### Unverified
 

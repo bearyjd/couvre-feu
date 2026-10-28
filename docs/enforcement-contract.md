@@ -93,7 +93,22 @@ Native rules explicitly set `proto=all`: fw3's omitted-protocol default would co
 
 These choices were checked against official [fw3 rules.c](https://github.com/openwrt/firewall3/blob/master/rules.c), [fw3 main.c](https://github.com/openwrt/firewall3/blob/master/main.c) and [UCI cli.c](https://github.com/openwrt/uci/blob/master/cli.c). No upstream source was copied. Native zone rules alone cannot stop established traffic; broken-helper fallback does not promise stream cutoff.
 
-IPv4 kids TCP/UDP external DNS is DNATed to the validated LAN router address; a narrow kids-only UDP INPUT allowance precedes GL leak protection. IPv6 forwarded TCP/UDP port 53 is rejected rather than NAT6 redirected; local kids UDP DNS allowance uses validated observed router IPv6 addresses. This is a PRP deviation, not a claim that local IPv6 DNS or GL integration is verified. No dnsmasq/WAN configuration change is included. Existing GL controls and protected adults must remain unaffected.
+IPv4 kids TCP/UDP external DNS is DNATed to the validated LAN router address; a narrow kids-only UDP INPUT allowance precedes GL leak protection. IPv6 forwarded TCP/UDP port 53 is rejected rather than NAT6 redirected; local kids UDP DNS allowance uses validated observed router IPv6 addresses. This is a PRP deviation, not a claim that local IPv6 DNS or GL integration is verified. No dnsmasq/WAN configuration change is included. Existing GL controls and protected adults must remain unaffected. The full list of what is blocked today is in [DNS enforcement today](#dns-enforcement-today).
+
+## DNS enforcement today
+
+All of this is offline-tested only; **unverified on this router** until the live proof. Kids' devices only (the `cf_kids` set); adult and management traffic is not matched.
+
+| What | Rule (`router/lib/firewall.sh`) |
+|---|---|
+| Port 53, IPv4 | TCP/UDP to any other address is DNATed to the router's LAN address (line 72); a narrow UDP INPUT allowance precedes GL leak protection (line 70) |
+| Port 53, IPv6 | Forwarded TCP/UDP rejected, not redirected (line 63); UDP to the router's observed IPv6 addresses is accepted (line 67) |
+| DoT/DoQ | TCP and UDP port 853 rejected for both families, and UDP 784 and 8853 rejected (lines 53-58). Unconditional: no policy field is needed |
+| DoH | Destinations in the `cf_doh` (IPv4) and `cf_doh6` (IPv6) sets are rejected (lines 59-60). The sets are filled only from the policy `doh` arrays |
+
+Limits: the `doh` arrays hold at most 256 unique addresses per family. Nothing in the service generates or refreshes them (`doh` is empty unless the owner supplies it), so DoH coverage is only as good as the supplied list. The whole policy input is also limited to 65536 bytes. VPN, Tor, cellular and any encrypted resolver not in the list are not blocked.
+
+**Rule change of 2026-10-27.** The owner lifted the project's "no DNS changes" rule for one purpose: the kids' firewall DNS rules (item 9 of the [roadmap](ROADMAP.md)). `AGENTS.md:39` still forbids changing dnsmasq configuration or the WAN zone. DHCP and adult or management traffic also stay out of scope, because the lift covered only the kids' firewall DNS rules (a statement of that scope, not an `AGENTS.md` quote). **Still undecided:** the VPN/Tor list (feed source and licence), whether a list can fit the 64 KB policy input limit, and whether to cut a new router release for it. No such change is built.
 
 ## Unchanged reconciliation and reconstruction risk
 
