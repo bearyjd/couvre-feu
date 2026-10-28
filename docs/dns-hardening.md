@@ -28,12 +28,16 @@ NextDNS publishes no resolver addresses on a documentation page; its row below i
 | AdGuard DNS default, non-filtering, family (IPv4 + IPv6) | https://adguard-dns.io/en/public-dns.html | 2026-10-27 |
 | NextDNS anycast 45.90.28.0, 45.90.30.0, 2a07:a8c0::, 2a07:a8c1:: | vendor client source: https://github.com/nextdns/nextdns/blob/9b004cccbccf01b0a3a4f502cd2b4298e88870c3/run.go (lines 612, 622, 623, 626; also config/config.go:141) | 2026-10-27 |
 | CleanBrowsing family, adult, security (IPv4 + IPv6) | https://cleanbrowsing.org/filters/ | 2026-10-27 |
+| Mullvad DNS dns, adblock, base, extended, family, all (IPv4 + IPv6; owner decision 2026-10-28) | https://mullvad.net/en/help/dns-over-https-and-dns-over-tls (shutdown announcement: https://mullvad.net/en/blog/shutting-down-our-public-encrypted-dns-servers-and-sponsoring-quad9-instead, 2026-09-03) | 2026-10-28 |
 
 Dropped, not included:
 
 - OpenDNS IPv6 (2620:119:35::35 and similar): the official support article now redirects and no current official page could be read.
-- Mullvad DNS: its page says the public service ends 2026-11-02; the addresses may then be reused by someone else.
 - NextDNS addresses seen only in forum posts (for example the `.63` addresses), and any /22 or /24 range.
+
+## Planned retirement: Mullvad
+
+Mullvad's page says: "Please note that the public encrypted DNS service will be discontinued on November 2, 2026." The addresses are listed anyway (owner decision 2026-10-28). After 2026-11-02, from 2026-11-03, move the twelve Mullvad addresses (194.242.2.{2,3,4,5,6,9} and 2a07:e340::{2,3,4,5,6,9}) out of `DOH_PROVIDERS` and into `DOH_RETIRED_IPV4/IPV6`, so the removal path strips them from routers: a released address that is reused by someone else would otherwise stay blocked for the kids. The removal only runs while the `dnsHardening` key is present in the manifest (`dohList:true` or `dohList:false`): with the key absent the policy is returned untouched, so a router that never had the key keeps whatever its `doh` list already holds. Mullvad's pages say nothing about what happens to the addresses after the shutdown, so the reuse risk is an assumption, not a statement from Mullvad. Add a retirement test when the move is made. Add a retirement test in that change (the retired addresses are absent from the list, present in `DOH_RETIRED_*`, and removed by `reconcileStaticDoh`).
 
 ## Turn on, turn off, rollback
 
