@@ -15,6 +15,7 @@ import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
 import { audited } from './parent-audit.ts';
+import { mergeStaticDoh, protectedAddressesOf } from './doh-list.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
@@ -130,7 +131,7 @@ export class IntegrationPolicy {
         if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
         if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
-        const policy = build(o.acceptedPolicy), id = randomUUID(), now = this.now();
+        const policy = this.withStaticDoh(build(o.acceptedPolicy)), id = randomUUID(), now = this.now();
         stage?.(id);
         validateManagedPolicy(policy, this.store.config, this.store, false);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
@@ -141,6 +142,14 @@ export class IntegrationPolicy {
         this.store.run('UPDATE service_state SET desired_json=?,highwater=highwater+1 WHERE singleton=1', policyJSON(policy));
         this.store.run("INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,'pending')", actor.id, id, action, policy.revision, now);
         return this.row(id)!;
+    }
+    /** Flag dnsHardening.dohList: add the static public DoH list to the policy being submitted. Off (absent) returns it untouched. */
+    private withStaticDoh(policy: RouterPolicy): RouterPolicy {
+        const config = this.store.config;
+        if (config.dnsHardening?.dohList !== true) return policy;
+        const merged = mergeStaticDoh(policy.doh, protectedAddressesOf(config));
+        if (merged.refused > 0) process.stderr.write(`${merged.tag}\n`);
+        return normalizePolicy({...policy, doh: merged.doh}, config.protectedMacs);
     }
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
     private enrolled(o: RPCObservation | null, child: string): boolean {
