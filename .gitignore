@@ -19,3 +19,4 @@ test-results/
 .env.*
 !.env.example
 !.env.*.example
+.omc/plans/

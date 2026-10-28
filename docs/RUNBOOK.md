@@ -52,12 +52,17 @@ Service side: `npm run integration:start -- "<PRIVATE_MANIFEST>"` refuses an edi
 - Service: database migrations (`PRAGMA user_version`, forward only) are not reversible. Before upgrading or any migration, stop the service and copy `integration.sqlite` together with `integration.sqlite-wal` and `integration.sqlite-shm` from `dataDir` into a private backup. Restore all three files together.
 - A manifest edit changes its digest and existing database bindings refuse it; use reviewed private backup and recovery or a fresh enrollment, never edit identity markers to bypass the refusal.
 
+## Feature flags
+
+Time requests, the audit log and Reward Time ship off. Operating notes and the turn-on and turn-off checklist (including why a manifest edit needs `integration:rebind`) are in the [service contract](service-contract.md#operating-notes-for-the-flagged-features).
+
 ## Known limits
 
 Couvre-feu enforces at the router. These cases are outside what a router can do:
 
 - Mobile data and hotspots: a device that leaves the home network is not enforced.
-- VPN and IP-direct traffic: traffic that avoids DNS or tunnels past the router is not reliably blocked.
+- VPN and IP-direct traffic: traffic that avoids DNS or tunnels past the router is not reliably blocked. There is no VPN/Tor list yet (feed source, licence and size limit undecided).
+- Encrypted DNS: kids' port 853 and UDP 784/8853 are blocked, but DoH is blocked only for addresses in the policy `doh` arrays (at most 256 per family, supplied by hand today), so any DoH resolver not listed still works. Unverified on a live router.
 - A skilled kid: a determined child with technical knowledge may find a way around router-level controls.
 
 These are unproven; do not rely on them until live evidence exists:
