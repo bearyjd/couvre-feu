@@ -12,6 +12,7 @@ import { TestAuthenticator } from './authenticator.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
 import { AUDIT_ACTIONS } from '../src/parent-audit.ts';
+import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
@@ -132,6 +133,82 @@ test('child ask during a focus window stays pending and does not lift the pause;
         assert.equal(w.row(id).state, 'approved');
         assert.equal((w.f.router.policy.allowances ?? []).some(a => a.person === 'pilot'), true);
         assert.notEqual(w.f.policy.people(actor).people[0].allowance, null);
+    } finally { w.f.cleanup(); }
+});
+
+test('the label follows the allowance: null while a parent-approved allowance lifts the pause, back to focus when it ends', async () => {
+    const r = await focusWorld(), w = r.w;
+    try {
+        await w.dispatch(r.focus(60).result.operation.id);
+        assert.equal(r.label(), 'focus');
+        const id = w.ask(15);
+        await w.service.approve(actor, id, 15);
+        await w.dispatch(w.row(id).grant_operation_id!);
+        await w.service.advance();
+        assert.notEqual(w.f.policy.people(actor).people[0].allowance, null, 'allowance in force');
+        assert.equal(w.f.router.policy.pauses.some(p => p.person === 'pilot'), true, 'the pause entry stays on the router');
+        assert.equal(r.label(), null, 'the pause is not blocking, so it is not labelled');
+        w.f.advance(15 * 60 + 1); await w.f.observe();
+        assert.equal(w.f.policy.people(actor).people[0].allowance, null, 'allowance over');
+        assert.equal(w.f.policy.people(actor).people[0].effectiveManualPause !== null, true, 'the pause blocks again');
+        assert.equal(r.label(), 'focus', 'the pause entry is still the focus one');
+    } finally { w.f.cleanup(); }
+});
+
+test('the latest pause-type operation is chosen by insertion order, not the service clock: a clock step backwards does not mislabel a later pause', async () => {
+    const r = await focusWorld(), w = r.w;
+    try {
+        const out = r.focus(60);
+        await w.dispatch(out.result.operation.id);
+        const until = r.pauseOf(out.result.operation.id)!.until;
+        w.f.advance(-600); await w.f.observe();
+        const manual = w.f.policy.mutate(actor, 'pilot', 'pause', {until}, r.token(), 'manual_key_1234567890');
+        await w.dispatch(manual.result.operation.id);
+        assert.equal(w.f.policy.people(actor).people[0].manualPause?.until, until, 'same deadline');
+        assert.equal(r.label(), null, 'the later manual pause owns the label');
+    } finally { w.f.cleanup(); }
+});
+
+test('a failed newer pause-type operation does not hide the label', async () => {
+    const r = await focusWorld(), w = r.w;
+    try {
+        const out = r.focus(60);
+        await w.dispatch(out.result.operation.id);
+        const until = r.pauseOf(out.result.operation.id)!.until;
+        const manual = w.f.policy.mutate(actor, 'pilot', 'pause', {until}, r.token(), 'manual_key_1234567890');
+        assert.equal(r.label(), null, 'a pending newer pause owns the label');
+        w.f.store.run("UPDATE operations SET state='failed' WHERE id=?", manual.result.operation.id);
+        assert.equal(r.label(), 'focus', 'the failed operation changed nothing');
+    } finally { w.f.cleanup(); }
+});
+
+test('pause wins: a focus window requested while a grant or reward allowance is in force strips it (policy and audit)', async () => {
+    for (const via of ['grant', 'reward']) {
+        const r = await focusWorld(), w = r.w;
+        try {
+            w.f.config.rewardTime = {enabled: true};
+            const token = () => w.f.policy.people(actor).revisionToken!;
+            const op = via === 'grant' ? w.grants.grant(actor, 'pilot', 30, token(), 'tr-seed').operationId : w.grants.reward(actor, 'pilot', 15, token(), 'reward_key_1234567890').result.operation.id;
+            await w.dispatch(op);
+            assert.equal((w.f.router.policy.allowances ?? []).some(a => a.person === 'pilot'), true, `${via} allowance in force`);
+            const out = r.focus(30);
+            assert.equal((r.payload(out.result.operation.id).allowances ?? []).some(a => a.person === 'pilot'), false, `${via}: queued policy has no allowance`);
+            assert.deepEqual(r.audit().map(a => [a.action, a.result]), via === 'grant' ? [['focus_start', 'applied']] : [['reward_add', 'applied'], ['focus_start', 'applied']]);
+        } finally { w.f.cleanup(); }
+    }
+});
+
+test('the label needs the pause in force to be the one the focus operation set: a pause edited on the router (drift) drops it', async () => {
+    const r = await focusWorld(), w = r.w;
+    try {
+        const out = r.focus(60);
+        await w.dispatch(out.result.operation.id);
+        const until = r.pauseOf(out.result.operation.id)!.until;
+        assert.equal(r.label(), 'focus');
+        w.f.router.policy = normalizePolicy({...w.f.router.policy, pauses: [{person: 'pilot', until: until + 120}]}, w.f.config.protectedMacs);
+        w.f.advance(1); await w.f.observe();
+        assert.equal(w.f.policy.people(actor).people[0].effectiveManualPause?.until, until + 120);
+        assert.equal(r.label(), null);
     } finally { w.f.cleanup(); }
 });
 

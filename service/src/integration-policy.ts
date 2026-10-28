@@ -200,7 +200,7 @@ export class IntegrationPolicy {
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
                 ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
-                allowance, pauseLabel: this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
+                allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
                     generationMatches: o?.generation === config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,
@@ -218,10 +218,12 @@ export class IntegrationPolicy {
     /**
      * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the
      * focus label. A later manual pause, bulk pause, resume or expiry therefore clears it; the router never sees the label.
+     * Only confirmed or pending operations count (a failed or conflicted newer one changed nothing) and "latest" is insertion order,
+     * so a service clock step backwards cannot reorder them. The caller passes null while an allowance lifts the pause.
      */
     private pauseLabel(child: string, inForceUntil: number | undefined): 'focus' | null {
         if (inForceUntil === undefined) return null;
-        const latest = this.store.get<IntegrationOperation>("SELECT * FROM operations WHERE action IN ('pause','resume','pause_all','resume_all') AND id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1", child);
+        const latest = this.store.get<IntegrationOperation>("SELECT * FROM operations WHERE action IN ('pause','resume','pause_all','resume_all') AND state IN ('confirmed','pending') AND id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY rowid DESC LIMIT 1", child);
         if (!latest || latest.action !== 'pause' || (JSON.parse(latest.request_json) as {label?: string}).label !== 'focus') return null;
         return (JSON.parse(latest.payload_json) as RouterPolicy).pauses.find(p => p.person === child)?.until === inForceUntil ? 'focus' : null;
     }
