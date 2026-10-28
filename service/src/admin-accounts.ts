@@ -60,7 +60,12 @@ const bindingOf = (kind: AdminAction, target: string, params: Record<string, unk
 
 export class AccountAdmin {
     readonly auth: Auth;
-    constructor(auth: Auth) { this.auth = auth; }
+    /** In time-request owner mode, the one account other admins may not take over (credentials, role, active state). */
+    readonly protectedOwner: string | undefined;
+    constructor(auth: Auth, protectedOwner?: string) { this.auth = auth; this.protectedOwner = protectedOwner; }
+    private protect(actor: Actor, target: string): void {
+        if (this.protectedOwner !== undefined && target === this.protectedOwner && actor.id !== target) throw new AppError(403, 'owner_account_protected');
+    }
     private get store() { return this.auth.store; }
     private allowed(actor: Actor, kind: AdminAction): void {
         if (kind !== 'own_passkey_revoke' && actor.role !== 'admin') throw new AppError(403, 'admin_required');
@@ -140,7 +145,9 @@ export class AccountAdmin {
             return {body: {account: this.dto(this.account(id))}, audit: id};
         }
         case 'token_issue': {
-            if (!this.managed(actor, target).active) throw new AppError(409, 'account_disabled');
+            const issueFor = this.managed(actor, target);
+            this.protect(actor, target);
+            if (!issueFor.active) throw new AppError(409, 'account_disabled');
             // Pending passkeys go first, so they never block a new token against the limit (the transaction rolls back on refusal).
             rejectPendingPasskeys(this.store, target, actor.id, now);
             if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', target)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached', `This account already has ${PASSKEYS_PER_ACCOUNT} passkeys; remove one first.`);
@@ -153,6 +160,7 @@ export class AccountAdmin {
         case 'account_role':
         case 'account_active': {
             this.managed(actor, target);
+            this.protect(actor, target);
             // Bumping the permission version ends every session of that account at its next request.
             if (kind === 'account_role') this.store.run('UPDATE accounts SET role=?,permission_version=permission_version+1 WHERE id=?', params.role as string, target);
             else this.store.run('UPDATE accounts SET active=?,permission_version=permission_version+1 WHERE id=?', params.active ? 1 : 0, target);
@@ -161,6 +169,7 @@ export class AccountAdmin {
         case 'passkey_approve': {
             const pending = this.credential(target);
             this.managed(actor, pending.account_id);
+            this.protect(actor, pending.account_id);
             if (pending.state !== 'pending') throw new AppError(409, 'passkey_not_pending');
             this.store.run("UPDATE credentials SET state='active' WHERE id=?", target);
             return {body: {passkey: this.passkeys(this.credential(target).account_id).find(p => p.id === target)}, audit: target};
