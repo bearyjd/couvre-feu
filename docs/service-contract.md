@@ -172,8 +172,8 @@ Status: **unverified on this router.** Offline tests only (service fake router a
 **Residuals and UNVERIFIED:**
 - **Kernel time gate.** Whether the xt_time `--datestart` gate re-blocks at `until` on this firmware with flow offload on is UNVERIFIED.
 - **Installed release.** Whether the router release currently installed includes allowances (#31) is UNVERIFIED. An older release is expected (not tested against one) to refuse the `allowances` key, so the grant would end `apply_failed`.
-- **Limited web UI.** The parent and child pages show the `grant_ended` state, but there is no other grant-specific UI (no "End extra time" action, no countdown).
-- **No ending action.** There is no "End extra time" action, and no alert when a grant stays unconfirmed for a long time.
+- **Limited web UI.** The parent card has Grant, Grant less, Decline and End extra time (`web/public/time-requests.js`), and both pages show the `grant_ended` state. There is no countdown.
+- **No alert** when a grant stays unconfirmed for a long time.
 - **Shared bad-token bucket.** In trusted-proxy mode every LAN client shares the proxy's address, so the bad-token bucket is effectively global again. Valid links are still never blocked. Guessing is prevented by the 256-bit tokens, not by the limiter.
 
 ### Reward Time (flagged off)
@@ -191,3 +191,31 @@ A parent adds 15 or 30 minutes to a child's allowance without touching the sched
 - **Idempotent.** A replay with the same key, minutes and precondition returns the first operation (202 with `Location: /operations/:id`) and queues nothing; the same key with other minutes is 409 `idempotency_payload_conflict`.
 - **Audit.** When `auditLog.enabled`, one `reward_add` entry: actor = the parent, child id, operation id, result `applied` (accepted and queued; the router's outcome stays on the operation) or `refused`. A replay adds no second row.
 - **Privacy.** Ids and enums only. The minutes are not stored in the audit log and no reason text exists.
+
+## Operating notes for the flagged features
+
+Everything below ships **OFF** and is **unverified on this router** until the Phase 0 live proof in the [roadmap](ROADMAP.md#live-proof). These notes were checked against the code on `main` (PR #92 to #95); the sections above give the detail.
+
+| Feature | Manifest key (all absent = off) | What it gates |
+|---|---|---|
+| Time requests (F1, F3) | `"timeRequests": {"mode": "off" \| "owner" \| "parents"}`; legacy `{"enabled": true}` reads as `parents`. Top-level `"ownerAccountId"` | Child request link and page, parent ask-for-time card, grants |
+| Audit log (F2) | `"auditLog": {"enabled": true}` | Writes to `parent_audit` and `GET /audit` |
+| Reward Time (F4) | `"rewardTime": {"enabled": true}` | `POST /people/:id/reward` |
+
+**Owner mode (F1).** `timeRequests.mode` `owner` needs a top-level `ownerAccountId` naming an entry in `accounts` (`owner_account_required` and `invalid_owner_account` refuse the manifest otherwise: `service/src/integration-config.ts:157-159`). Only that account sees or decides requests and the `time_request_pending` alert (`service/src/http.ts:103-104`). Reward Time follows the same gate. **It is not a security boundary against other admins**: it hides the feature, it does not stop another admin from using other routes (for example Pause, Resume or editing devices). Tracked follow-ups, not built: protect the owner account from other admins, and a startup check that the owner account exists and is active (today the check only confirms the id is listed in `accounts`).
+
+**Audit log (F2).** `GET /audit` is 404 when the flag is off and is scoped like alerts (see above). Rows older than 90 days are deleted (`AUDIT_RETENTION_SECONDS`, `service/src/parent-audit.ts:7`; at most 2000 rows per prune). `applied` means the service accepted and queued the action, **not** that the router confirmed it; the router's outcome stays on `GET /operations/:id`. One grant can produce two rows for the same operation (`grant_approve` `applied`, then `failed` if the router never took it), so read the latest row per operation id. Refused rows are capped (20 per actor per 60 seconds, `REFUSED_MAX` and `REFUSED_WINDOW_SECONDS`), so a burst of refusals is not fully recorded. With the flag off, nothing is written and no extra database work is done. There is no web view of the log yet.
+
+**Parent ask-for-time card (F3).** Shown only while `GET /time-requests` succeeds, so it disappears in mode `off` or for a parent that owner mode excludes. Buttons: **Grant N min** (N = the requested minutes, up to 60), **Grant less** (only durations below the request, from 15 and 30; a 15 minute request shows none), **Decline**, and **End extra time** on a grant in force (sends an indefinite Pause, which ends the grant). The card says "Applying..." until the router confirms, then "Granted until HH:MM"; it never shows an optimistic state.
+
+**Reward Time (F4).** 15 or 30 minutes only, service only (no web control yet). The total allowance from router time after the reward may not exceed 60 minutes (`MAX_GRANT_MINUTES`): a request over that is **refused** with 409 `reward_cap_exceeded`, never clamped, so 45 remaining plus 15 is accepted and 45 plus 30 is refused. A paused child with no allowance in force gets 409 `child_paused`. The route is 404 `route_not_found` when `rewardTime.enabled` is off, when `timeRequests.mode` is off, or for a parent the owner mode excludes, and 404 `person_not_found` for a child outside the caller's scope (`service/src/http.ts:239-240`, `service/src/integration-allowance.ts:80-102`). Neither 404 writes an audit row.
+
+### How to turn a flag on
+
+1. **Pick the order.** Phase 0 live proof first. Then one flag at a time: `timeRequests` in mode `owner`, then `auditLog`, then `rewardTime` (it needs `timeRequests` on). `parents` mode only after the owner-only week has been clean.
+2. **Back up.** Stop the service, copy `integration.sqlite` with its `-wal` and `-shm` files from `dataDir` to a private backup ([RUNBOOK](RUNBOOK.md)).
+3. **Edit a copy of the private manifest.** Add the key from the table above (strict: `enabled` must be a boolean, `mode` one of the three values). For `owner` mode also set `ownerAccountId`. Never put the manifest, account names or addresses in the repository.
+4. **Rebind, do not just restart.** The database binds the exact manifest bytes, so any edit, flag included, is refused at start. Use `npm run integration:rebind -- "<OLD_MANIFEST>" "<NEW_MANIFEST>" "<OLD_SHA256>" "<NEW_SHA256>"` with the service and dispatch stopped ([integration-004](integration-004.md#rebinding-to-a-later-manifest)). It refuses while an operation is pending or a time request owes a restore, and it resets the router observation and desired policy, so observe the router before re-enabling dispatch. Accounts and passkeys are kept.
+5. **Start the service** and check: the parent page loads and sign-in works; with `owner` mode only the owner account sees the ask-for-time card; a non-owner gets 404 from `GET /time-requests`; `GET /audit` returns 200 (not 404) when `auditLog` is on; no flag-off route has appeared (`POST /people/:id/reward` is 404 until `rewardTime` is on).
+6. **Watch the first uses.** After a first grant or reward: the request stays "Applying..." until the router confirms it; the audit row shows `applied`; `GET /operations/:id` shows the router outcome; the child is re-blocked at the end time. Any grant shown approved that the router did not confirm, or any audit read outside a parent's children: turn the flag off and stop.
+7. **Turn off.** Stop the service, set the key off (`"mode": "off"`, `"enabled": false`, or remove it), rebind to that manifest, restart. Effects: time requests off hides the card, returns 404 on the child routes, and keeps stored rows; grants already queued are still followed to confirmation by a drain-only timer; a reward already queued is still dispatched; audit rows are kept until their 90 days pass. Password login on the router and CT107 is never touched by any flag.
