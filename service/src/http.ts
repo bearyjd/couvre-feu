@@ -114,7 +114,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const reconcileAlerts = alerts?.reconcile?.bind(alerts);
     const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
-    const accounts = new AccountAdmin(auth);
+    const accounts = new AccountAdmin(auth, gated && mode === 'owner' ? ownerAccountId : undefined);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
@@ -240,6 +240,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const reward = /^\/people\/([a-z][a-z0-9_]{0,31})\/reward$/.exec(path);
                 if (reward && grants && rewardOn(session.dto.actor)) {
                     const result = grants.reward(session.dto.actor, reward[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
+                // Focus window: the same gates as Reward Time, plus its own flag.
+                const focus = /^\/people\/([a-z][a-z0-9_]{0,31})\/focus$/.exec(path);
+                if (focus && grants && timeRequestsEnabled && mayDecide(session.dto.actor) && grants.policy.store.config.focus?.enabled === true) {
+                    const result = grants.policy.focus(session.dto.actor, focus[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;

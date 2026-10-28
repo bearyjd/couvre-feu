@@ -241,7 +241,7 @@ const insertAudit = (db: DatabaseSync, at: number, action: string, op: string | 
 test('migration 011 on a seeded pre-011 database keeps rows and ids, the three indexes, STRICT and the CHECKs, and admits reward_add', () => {
     const m = preEleven(db => { insertAudit(db, 1, 'pause', 'op_one'); insertAudit(db, 2, 'grant_approve', null); insertAudit(db, 3, 'resume', 'op_three'); });
     try {
-        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 11);
+        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12, 'opened by the current Store, so 012 has run too');
         assert.deepEqual(m.store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), [
             {id: 1, at: 1, actor_id: 'parent', action: 'pause', person_id: 'pilot', operation_id: 'op_one', result: 'applied'},
             {id: 2, at: 2, actor_id: 'parent', action: 'grant_approve', person_id: 'pilot', operation_id: null, result: 'applied'},
