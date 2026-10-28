@@ -18,6 +18,8 @@ import { audited } from './parent-audit.ts';
 import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
+/** Focus window (F5): the minutes a parent may start. */
+export const FOCUS_MINUTES: readonly number[] = [15, 30, 45, 60, 90, 120];
 export interface IntegrationOperation {
     id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
@@ -96,11 +98,25 @@ export class IntegrationPolicy {
         return audited(this.store, {actor: auditAs, action, now: this.now, people: () => [person], done: r => ({operationId: r.result.operation.id})},
             () => this.mutateAuthorized(actor, person, action, input, precondition, key));
     }
-    private mutateAuthorized(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
-        const body = object(input, action === 'pause' ? ['until'] : []), until = action === 'pause' ? integer(body.until) : null;
+    /**
+     * Focus window (F5): the existing timed pause (same mutateAuthorized/queue() path) for `minutes` from ROUTER time, recorded with the closed label
+     * 'focus' on the operation. Only a pause that is not already in force is replaced: a focus window never shortens or converts a parent's pause.
+     * Off unless the manifest sets focus.enabled (404 route_not_found). Audited as focus_start.
+     */
+    focus(actor: Actor, person: string, minutes: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
+        if (this.store.config.focus?.enabled !== true) throw new AppError(404, 'route_not_found');
+        this.authorized(actor, person);
+        return audited(this.store, {actor: actor.id, action: 'focus_start', now: this.now, people: () => [person], done: r => ({operationId: r.result.operation.id})}, () => {
+            if (typeof minutes !== 'number' || !FOCUS_MINUTES.includes(minutes)) throw new AppError(400, 'invalid_minutes');
+            return this.mutateAuthorized(actor, person, 'pause', {}, precondition, key, minutes);
+        });
+    }
+    private mutateAuthorized(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, focusMinutes?: number): {status: number; result: OperationResult} {
+        const body = object(input, action === 'pause' && focusMinutes === undefined ? ['until'] : []), until = action === 'pause' && focusMinutes === undefined ? integer(body.until) : null;
         if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) throw new AppError(428, 'revision_precondition_required');
-        const request = JSON.stringify({person, action, until, precondition, permissionVersion: actor.permissionVersion});
+        // A focus window's deadline comes from router time inside the transaction, so it is not part of the replay identity.
+        const request = JSON.stringify({person, action, until, ...(focusMinutes === undefined ? {} : {label: 'focus', minutes: focusMinutes}), precondition, permissionVersion: actor.permissionVersion});
         const op = this.store.transaction(() => {
             this.store.assertIdentity();
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
@@ -108,11 +124,17 @@ export class IntegrationPolicy {
             if (until !== null && until !== 0 && until <= this.now()) throw new AppError(400, 'pause_expiry_must_be_future');
             return this.queue(actor, person, action, request, key, precondition, base => {
                 if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
+                let pauseUntil = until;
+                if (focusMinutes !== undefined) {
+                    const routerTime = this.store.observation().value!.routerTime;
+                    if (base.pauses.some(p => p.person === person && (p.until === 0 || p.until > routerTime))) throw new AppError(409, 'child_paused');
+                    pauseUntil = routerTime + focusMinutes * 60;
+                }
                 // Pause wins: a pause also ends the child's time allowance (as cfctl pause does, core.sh cf_pause_edit), or the
                 // router would keep the child unblocked. Resume keeps the allowance, matching cf_resume_edit.
                 const allowances = action === 'pause' && base.allowances ? {allowances: base.allowances.filter(a => a.person !== person)} : {};
                 return normalizePolicy({...base, revision: base.revision + 1, ...allowances,
-                    pauses: [...base.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: until!}] : [])]}, this.store.config.protectedMacs);
+                    pauses: [...base.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: pauseUntil!}] : [])]}, this.store.config.protectedMacs);
             });
         });
         return this.result(op);
@@ -178,7 +200,7 @@ export class IntegrationPolicy {
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
                 ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
-                allowance,
+                allowance, pauseLabel: this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
                     generationMatches: o?.generation === config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,
@@ -192,6 +214,16 @@ export class IntegrationPolicy {
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
+    }
+    /**
+     * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the
+     * focus label. A later manual pause, bulk pause, resume or expiry therefore clears it; the router never sees the label.
+     */
+    private pauseLabel(child: string, inForceUntil: number | undefined): 'focus' | null {
+        if (inForceUntil === undefined) return null;
+        const latest = this.store.get<IntegrationOperation>("SELECT * FROM operations WHERE action IN ('pause','resume','pause_all','resume_all') AND id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1", child);
+        if (!latest || latest.action !== 'pause' || (JSON.parse(latest.request_json) as {label?: string}).label !== 'focus') return null;
+        return (JSON.parse(latest.payload_json) as RouterPolicy).pauses.find(p => p.person === child)?.until === inForceUntil ? 'focus' : null;
     }
     /** Admin-only, scoped: device identifiers never reach parents. */
     devices(actor: Actor) {

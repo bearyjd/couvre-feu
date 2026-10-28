@@ -243,6 +243,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, result.status, result.result);
                     return;
                 }
+                // Focus window: the same gates as Reward Time, plus its own flag.
+                const focus = /^\/people\/([a-z][a-z0-9_]{0,31})\/focus$/.exec(path);
+                if (focus && grants && timeRequestsEnabled && mayDecide(session.dto.actor) && grants.policy.store.config.focus?.enabled === true) {
+                    const result = grants.policy.focus(session.dto.actor, focus[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
                 if (match) {
                     const result = await policy.mutate(session.dto.actor, match[1], match[2] as 'pause' | 'resume', payload, request.headers['if-match'], clientKey(request.headers['idempotency-key']));

@@ -67,7 +67,7 @@ const rowsFor = (rows: Row[], action: string) => rows.filter(r => r.action === a
 test('migration 010 adds an ids-and-enums-only parent_audit table to fresh stores', () => {
     const f = world();
     try {
-        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 9);
+        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 10);
         assert.deepEqual(f.store.all<{name: string}>("SELECT name FROM pragma_table_info('parent_audit')").map(c => c.name), ['id', 'at', 'actor_id', 'action', 'person_id', 'operation_id', 'result']);
         const insert = (action: string, result: string) => f.store.run('INSERT INTO parent_audit(at,actor_id,action,person_id,operation_id,result) VALUES(1,?,?,?,NULL,?)', 'parent', action, 'pilot', result);
         insert('pause', 'applied');

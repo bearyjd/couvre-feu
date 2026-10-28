@@ -96,6 +96,8 @@ export interface PersonDTO {
     effectiveManualPause: {
         until: number;
     } | null;
+    /** Integration only: `focus` while the pause in force is a parent-started focus window; null for any other pause or none. */
+    pauseLabel?: 'focus' | null;
     scheduleBlocked: boolean | null;
     scheduleExplanation: string;
     /** Integration only: the router-confirmed time allowance in force now (it lifts pause and schedule until `until`); null when none. */

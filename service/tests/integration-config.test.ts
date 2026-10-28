@@ -62,6 +62,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.rewardTime, undefined, 'reward time is off unless explicitly enabled');
         for (const enabled of [true, false]) { save({...manifest, rewardTime: {enabled}}); assert.deepEqual(integrationConfig(path).rewardTime, {enabled}); }
         for (const rewardTime of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, rewardTime}); assert.throws(() => integrationConfig(path)); }
+        // focus (F5): absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.focus, undefined, 'focus window is off unless explicitly enabled');
+        for (const enabled of [true, false]) { save({...manifest, focus: {enabled}}); assert.deepEqual(integrationConfig(path).focus, {enabled}); }
+        for (const focus of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, focus}); assert.throws(() => integrationConfig(path)); }
         save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
         const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
         const scheduled = {...manifest, enrollment: {...manifest.enrollment, schedules: [{person: 'pilot', id: 'bedtime', weekdays: ['Mon'], start: '21:00', stop: '07:00'}]}, scheduleClock: {timezone: 'America/New_York'}};
