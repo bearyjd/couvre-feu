@@ -31,79 +31,81 @@ SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.
 
 
 # Measured seconds, per suite, for the cases that dominate its runtime; every
-# other case weighs DEFAULT_WEIGHT. Used only to spread cases over the four
+# other case weighs DEFAULT_WEIGHT. Used only to spread cases over each suite's
 # partitions so no shard approaches the lane budget: a stale or missing entry
 # makes the split less even but never changes which cases run (coverage is
 # proven in discovery_plan). Refresh: take the 'TIMING: __main__.<Class>.<test>
 # <n>s' lines from a CI run's shard logs (emitted per case by
 # tests/fixtures/harness.py, relayed by main()) and keep entries of roughly
-# 30 s or more as {'<Class>.<test>': seconds}. Seeded from CI run 40377200351.
+# 30 s or more as {'<Class>.<test>': seconds}. Seeded from CI run 40377200351; test-core refreshed from run 40667834404.
 DEFAULT_WEIGHT = 5
+# Partitions per suite (default 4). test-core.py is ~3900 s of serial cases: four
+# shards ran 630-1290 s against the 1800 s lane budget, five stay near 800 s.
+DEFAULT_PARTITIONS = 4
+PARTITION_COUNTS = {'test-core.py': 5}
+LANE_TIMEOUT = 1800
 CASE_WEIGHTS = {
     'test-core.py': {
-        'CoreTests.test_nan_and_inf_person_ids_pause_only_themselves': 173,
-        'CoreTests.test_allowance_unblocks_schedule_and_local_expiry_reblocks_without_service': 120,
-        'CoreTests.test_cached_ipv6_aliases_cover_schedule_pause_guards_and_conntrack': 114,
-        'ActivityTests.test_counter_epoch_changes_whenever_counters_reset': 108,
-        'InstalledPackageTests.test_actual_installed_core_lifecycle_and_exact_recovery': 106,
-        'CoreTests.test_ipv6_valid_state_changes_preserve_confirmation_and_noop_sync': 105,
-        'CoreTests.test_pause_resume_all_person_devices_increment_revision': 105,
-        'CoreTests.test_pending_apply_records_and_missing_confirmation_require_recovery_work': 100,
-        'CoreTests.test_healthy_unchanged_expire_and_apply_verify_without_kernel_mutations': 98,
-        'CoreTests.test_latent_native_selector_cannot_be_blessed_by_healthy_kernel_witness': 88,
-        'CoreTests.test_allowance_overrides_manual_pause_and_expiry_restores_it': 82,
-        'CoreTests.test_expiry_is_local_and_same_revision_replay_cannot_resurrect': 81,
-        'CoreTests.test_cross_midnight_schedule_rotates_weekdays_and_excludes_stop': 80,
-        'CoreTests.test_backward_clock_jump_does_not_resurrect_expired_allowance': 75,
-        'CoreTests.test_pause_flushes_every_known_ipv4_ipv6_source_and_destination': 74,
-        'CoreTests.test_sync_open_stdin_cannot_lock_out_local_expiry': 73,
-        'CoreTests.test_expiry_removes_mac_pause_when_ipv6_neighbor_is_not_fresh': 70,
-        'CoreTests.test_allowance_horizon_boundary_and_expired_allowance_is_inert': 69,
-        'CoreTests.test_reload_reconstructs_owned_rules_and_sets': 69,
-        'CoreTests.test_wholly_absent_interrupted_initial_staging_recovers_old_policy': 68,
-        'CoreTests.test_native_metadata_without_dual_family_witness_cannot_confirm': 67,
-        'CoreTests.test_cli_pause_is_an_emergency_block_that_clears_the_allowance': 64,
-        'CoreTests.test_expired_kid_lease_cannot_flush_current_protected_adult': 64,
-        'CoreTests.test_surplus_owned_native_section_cannot_survive_healthy_empty_schedule': 64,
-        'CoreTests.test_backward_clock_jump_does_not_resurrect_already_expired_pause': 58,
-        'CoreTests.test_observation_accepts_equivalent_iptables_serialization': 58,
+        'CoreTests.test_allowance_unblocks_schedule_and_local_expiry_reblocks_without_service': 169,
+        'InstalledPackageTests.test_actual_installed_core_lifecycle_and_exact_recovery': 158,
+        'ActivityTests.test_counter_epoch_changes_whenever_counters_reset': 109,
+        'CoreTests.test_nan_and_inf_person_ids_pause_only_themselves': 104,
+        'CoreTests.test_pause_resume_all_person_devices_increment_revision': 104,
+        'CoreTests.test_healthy_unchanged_expire_and_apply_verify_without_kernel_mutations': 101,
+        'CoreTests.test_cached_ipv6_aliases_cover_schedule_pause_guards_and_conntrack': 89,
+        'CoreTests.test_observation_accepts_equivalent_iptables_serialization': 86,
+        'CoreTests.test_ipv6_valid_state_changes_preserve_confirmation_and_noop_sync': 84,
+        'CoreTests.test_pause_flushes_every_known_ipv4_ipv6_source_and_destination': 82,
+        'CoreTests.test_cross_midnight_schedule_rotates_weekdays_and_excludes_stop': 79,
+        'CoreTests.test_allowance_overrides_manual_pause_and_expiry_restores_it': 78,
+        'CoreTests.test_latent_native_selector_cannot_be_blessed_by_healthy_kernel_witness': 74,
+        'CoreTests.test_changed_child_address_rebuilds_inbound_guards': 73,
+        'CoreTests.test_reload_reconstructs_owned_rules_and_sets': 73,
+        'CoreTests.test_allowance_horizon_boundary_and_expired_allowance_is_inert': 72,
+        'CoreTests.test_cli_pause_is_an_emergency_block_that_clears_the_allowance': 71,
+        'CoreTests.test_expired_kid_lease_cannot_flush_current_protected_adult': 69,
+        'CoreTests.test_backward_clock_jump_does_not_resurrect_expired_allowance': 62,
+        'CoreTests.test_backward_clock_jump_does_not_resurrect_already_expired_pause': 61,
+        'CoreTests.test_pending_apply_records_and_missing_confirmation_require_recovery_work': 61,
+        'CoreTests.test_native_metadata_without_dual_family_witness_cannot_confirm': 59,
+        'CoreTests.test_repeat_sync_and_apply_fw_are_idempotent': 57,
+        'CoreTests.test_expiry_removes_mac_pause_when_ipv6_neighbor_is_not_fresh': 56,
         'CoreTests.test_early_schedule_covers_inbound_ipv4_ipv6_without_blocking_adults': 55,
-        'CoreTests.test_native_schedule_extra_source_narrowing_cannot_confirm': 55,
         'CoreTests.test_native_schedule_hidden_by_earlier_accept_cannot_confirm': 54,
-        'InstalledPackageTests.test_actual_uninstall_partial_kernel_cleanup_then_retry': 52,
-        'CoreTests.test_changed_child_address_rebuilds_inbound_guards': 48,
-        'CoreTests.test_set_drift_rebuilds_instead_of_skipping_actual_verification': 48,
-        'CoreTests.test_unknown_person_cli_and_shell_payload_never_mutate': 47,
-        'InstalledPackageTests.test_uninstall_removes_activity_accounting_in_both_families': 47,
-        'CoreTests.test_higher_revision_with_same_effective_rules_updates_confirmation': 46,
-        'CoreTests.test_apply_failure_cannot_report_confirmed_success_and_can_retry': 44,
-        'CoreTests.test_preexisting_failed_or_missing_alias_remains_an_inventory_gap': 42,
-        'CoreTests.test_known_target_input_prefixes_are_safe_disjoint_from_kid_dns': 41,
-        'CoreTests.test_repeat_sync_and_apply_fw_are_idempotent': 41,
-        'ActivityTests.test_zero_owned_refusal_preserves_accounting_until_both_proofs_pass': 40,
-        'CoreTests.test_parent_hook_narrowed_to_tcp_cannot_confirm': 39,
-        'CoreTests.test_expire_killed_before_pid_publication_does_not_wedge_later_expiry': 38,
-        'CoreTests.test_invalid_allowances_rejected_without_mutation': 38,
-        'CoreTests.test_native_reject_requires_real_wan_device_and_complete_multiwan_coverage': 38,
-        'CoreTests.test_failed_observation_never_reports_healthy_confirmation': 37,
-        'CoreTests.test_stale_and_conflicting_equal_revision_refuse_without_mutation': 37,
-        'ActivityTests.test_blocked_hits_are_attributed_and_counters_never_change_verdicts': 35,
-        'CoreTests.test_failed_set_observation_during_apply_cannot_replace_confirmation': 35,
-        'CoreTests.test_invalid_clock_never_honors_allowance': 35,
-        'CoreTests.test_alive_lock_refuses_concurrent_mutation_then_interruption_recovers': 34,
-        'CoreTests.test_cached_ipv6_state_only_change_during_active_transition_succeeds': 34,
-        'CoreTests.test_selected_neighbor_explicit_lan_device_is_accepted': 34,
-        'CoreTests.test_status_observes_actual_drift_without_mutating': 34,
+        'InstalledPackageTests.test_uninstall_removes_activity_accounting_in_both_families': 50,
+        'CoreTests.test_expiry_is_local_and_same_revision_replay_cannot_resurrect': 48,
+        'CoreTests.test_unknown_person_cli_and_shell_payload_never_mutate': 48,
+        'InstalledPackageTests.test_actual_uninstall_partial_kernel_cleanup_then_retry': 47,
+        'CoreTests.test_lock_record_write_error_is_unsafe_lock_and_leaves_no_record': 46,
+        'CoreTests.test_preexisting_failed_or_missing_alias_remains_an_inventory_gap': 46,
+        'CoreTests.test_expire_killed_before_pid_publication_does_not_wedge_later_expiry': 43,
+        'CoreTests.test_sync_open_stdin_cannot_lock_out_local_expiry': 43,
+        'CoreTests.test_set_drift_rebuilds_instead_of_skipping_actual_verification': 42,
+        'CoreTests.test_surplus_owned_native_section_cannot_survive_healthy_empty_schedule': 42,
+        'CoreTests.test_failed_empty_owned_chain_read_cannot_confirm_a_new_revision': 41,
+        'CoreTests.test_wholly_absent_interrupted_initial_staging_recovers_old_policy': 41,
+        'CoreTests.test_parent_hook_narrowed_to_tcp_cannot_confirm': 40,
+        'CoreTests.test_failed_observation_never_reports_healthy_confirmation': 38,
+        'CoreTests.test_host_prefix_equivalence_is_family_specific': 38,
+        'CoreTests.test_status_rejects_missing_hook_and_extra_owned_accept': 38,
+        'CoreTests.test_alive_lock_refuses_concurrent_mutation_then_interruption_recovers': 37,
+        'CoreTests.test_invalid_allowances_rejected_without_mutation': 37,
+        'ActivityTests.test_counters_parse_sum_and_sort_by_person_then_mac': 36,
+        'CoreTests.test_higher_revision_with_same_effective_rules_updates_confirmation': 36,
+        'CoreTests.test_invalid_clock_never_honors_allowance': 36,
+        'CoreTests.test_native_schedule_extra_source_narrowing_cannot_confirm': 36,
+        'CoreTests.test_known_protected_ipv6_ssh_client_can_sync': 35,
+        'CoreTests.test_known_protected_ssh_client_can_sync': 35,
+        'CoreTests.test_persisted_recovery_phase_blocks_enforcement_recreation': 35,
+        'CoreTests.test_stale_and_conflicting_equal_revision_refuse_without_mutation': 35,
+        'CoreTests.test_status_observes_actual_drift_without_mutating': 35,
+        'CoreTests.test_sync_stage_injected_environment_refused': 35,
+        'InstalledPackageTests.test_preflight_only_uninstall_retains_proof_across_sync_failure_and_process_kill': 35,
+        'ActivityTests.test_blocked_hits_are_attributed_and_counters_never_change_verdicts': 34,
+        'CoreTests.test_native_reject_requires_real_wan_device_and_complete_multiwan_coverage': 34,
         'CoreTests.test_unpublished_lock_with_a_record_is_never_stolen_by_expire': 34,
-        'ActivityTests.test_accounting_rules_cover_only_assigned_children_as_pure_counters': 33,
-        'CoreTests.test_existing_gl_mac_drop_before_forward_hook_is_preserved': 33,
-        'CoreTests.test_past_pause_never_becomes_indefinite': 33,
-        'CoreTests.test_sync_stage_injected_environment_refused': 33,
-        'CoreTests.test_allowance_without_allowances_key_keeps_legacy_shape': 32,
-        'CoreTests.test_initial_sync_confirms_observed_sets': 32,
-        'CoreTests.test_known_protected_ssh_client_can_sync': 32,
-        'CoreTests.test_owned_hooks_are_first_lan_scoped_and_have_no_forward_accept': 31,
-        'CoreTests.test_lock_record_write_error_is_unsafe_lock_and_leaves_no_record': 30,
+        'CoreTests.test_allowance_without_allowances_key_keeps_legacy_shape': 33,
+        'CoreTests.test_known_target_input_prefixes_are_safe_disjoint_from_kid_dns': 31,
     },
     'test-fixture-process.py': {
         'FixtureProcessTests.test_router_success_preserves_result_and_confirmation': 36,
@@ -249,7 +251,7 @@ def cases(suite):
             yield case.id().split('.', 1)[1]
 
 
-def run_lane(job, directory, timeout=1800, started=None):
+def run_lane(job, directory, timeout=LANE_TIMEOUT, started=None):
     filename, index, group = job
     log = directory / f'{filename}-{index}.log'
     with log.open('w') as stream:
@@ -301,7 +303,7 @@ def discovery_plan():
         names = sorted(cases(unittest.defaultTestLoader.loadTestsFromModule(module)))
         if not names or len(names) != len(set(names)):
             raise ValueError(f'empty or duplicate discovery: {filename}')
-        partitions = partition_cases(names, CASE_WEIGHTS.get(filename))
+        partitions = partition_cases(names, CASE_WEIGHTS.get(filename), PARTITION_COUNTS.get(filename, DEFAULT_PARTITIONS))
         union = [case for group in partitions for case in group]
         if not all(partitions) or sorted(union) != names or len(union) != len(set(union)):
             raise ValueError(f'incomplete or duplicate partition coverage: {filename}')
@@ -384,7 +386,7 @@ def selection(argv):
     action.add_argument('--write-plan')
     action.add_argument('--shard', choices=SUITES)
     action.add_argument('--verify-receipts')
-    parser.add_argument('--partition', choices=('0', '1', '2', '3'))
+    parser.add_argument('--partition', choices=tuple(str(index) for index in range(max(PARTITION_COUNTS.values(), default=DEFAULT_PARTITIONS))))
     parser.add_argument('--plan')
     parser.add_argument('--receipt')
     args = parser.parse_args(argv)
@@ -429,7 +431,7 @@ def main(argv=()):
     directory.chmod(0o700)
 
     failed = False
-    # Partitions remain four per suite (see partition_cases); this only bounds concurrent lane execution.
+    # Partition counts come from PARTITION_COUNTS; this only bounds concurrent lane execution.
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for future in as_completed([pool.submit(run_lane, job, directory) for job in jobs]):
             filename, index, count, status, log = future.result()

@@ -222,7 +222,6 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 
 ## Follow-ups
 
-- A fifth `test-core` CI partition (that suite cannot get under about 1000 s per shard with four).
 - Split the tab logic out of `app.js` into its own file (needs a service static-file allowlist change).
 - Close fd 9 for `timeout` children, a stderr warning when buffered output is lost, and the remaining full-pipe/signal tests (tracked in [tier1-rpc §9](contracts/tier1-rpc.md)).
 - Parent iPhone check of the iOS restyle before it merges.

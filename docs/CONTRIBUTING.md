@@ -45,7 +45,7 @@ Host `sh -n` alone is not ash proof: `tests/run.sh` reports `PENDING` when BusyB
 
 **Service and web.** `npm ci && npm run typecheck && npm run test:service`, then `npx playwright install chromium && npm run test:web`. This is the CI `local-demo` job.
 
-**Router fixtures.** The nine sharded suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`, `test-penn-pilot.py`, `test-penn-pilot-leg2.py`, `test-penn-pilot-leg2-guards.py`, `test-scope-admin.py`, `test-inventory.py`) are slow. CI splits each into 4 partitions (36 shards) and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
+**Router fixtures.** The nine sharded suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`, `test-penn-pilot.py`, `test-penn-pilot-leg2.py`, `test-penn-pilot-leg2-guards.py`, `test-scope-admin.py`, `test-inventory.py`) are slow. CI splits each into 4 partitions, except `test-core.py` with 5 (37 shards), and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
 
 ```sh
 export CF_TEST_SHELL="busybox ash" CF_TEST_AWK="busybox awk" CF_TEST_TIMEOUT="busybox timeout" CF_TEST_WORKERS=1
