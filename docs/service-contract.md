@@ -178,7 +178,7 @@ Status: **unverified on this router.** Offline tests only (service fake router a
 
 ### Reward Time (flagged off)
 
-Status: **unverified on this router.** Offline tests only. Service only; no web UI yet.
+Status: **unverified on this router.** Offline tests only. The parent UI is built (see the parent-UI section below); both are behind `rewardTime.enabled`, which is off.
 
 A parent adds 15 or 30 minutes to a child's allowance without touching the schedule. It is one `allow` operation through `IntegrationPolicy.queue()`, the same CAS path as a grant (`IntegrationGrants.reward`, `service/src/integration-allowance.ts`).
 
@@ -208,7 +208,23 @@ Everything below ships **OFF** and is **unverified on this router** until the Ph
 
 **Parent ask-for-time card (F3).** Shown only while `GET /time-requests` succeeds, so it disappears in mode `off` or for a parent that owner mode excludes. Buttons: **Grant N min** (N = the requested minutes, up to 60), **Grant less** (only durations below the request, from 15 and 30; a 15 minute request shows none), **Decline**, and **End extra time** on a grant in force (sends an indefinite Pause, which ends the grant). The card says "Applying..." until the router confirms, then "Granted until HH:MM"; it never shows an optimistic state.
 
-**Reward Time (F4).** 15 or 30 minutes only, service only (no web control yet). The total allowance from router time after the reward may not exceed 60 minutes (`MAX_GRANT_MINUTES`): a request over that is **refused** with 409 `reward_cap_exceeded`, never clamped, so 45 remaining plus 15 is accepted and 45 plus 30 is refused. A paused child with no allowance in force gets 409 `child_paused`. The route is 404 `route_not_found` when `rewardTime.enabled` is off, when `timeRequests.mode` is off, or for a parent the owner mode excludes, and 404 `person_not_found` for a child outside the caller's scope (`service/src/http.ts:239-240`, `service/src/integration-allowance.ts:80-102`). Neither 404 writes an audit row.
+**Reward Time (F4).** 15 or 30 minutes only (parent buttons: see **Parent Reward Time buttons** below). The total allowance from router time after the reward may not exceed 60 minutes (`MAX_GRANT_MINUTES`): a request over that is **refused** with 409 `reward_cap_exceeded`, never clamped, so 45 remaining plus 15 is accepted and 45 plus 30 is refused. A paused child with no allowance in force gets 409 `child_paused`. The route is 404 `route_not_found` when `rewardTime.enabled` is off, when `timeRequests.mode` is off, or for a parent the owner mode excludes, and 404 `person_not_found` for a child outside the caller's scope (`service/src/http.ts:239-240`, `service/src/integration-allowance.ts:80-102`). Neither 404 writes an audit row.
+
+**Parent Reward Time buttons (item 5, web).** Each child's card has **Reward +15 min** and **Reward +30 min** (`web/public/reward-time.js`), named for the child ("Add 15 minutes of extra time for Alex"), at least 44px tall, with a polite status line. They send `POST /people/:id/reward` through the same path as Pause (fresh status read, `If-Match` revision token, a new `Idempotency-Key`) and then follow the operation like Pause does. There is no feature field in any service response, so the buttons are shown until the first tap answers 404; they are then hidden for the rest of the session with no error. They are not offered to a child who is paused with no allowance in force. They are disabled while a request or its operation is pending.
+
+| State | What the parent sees |
+|-------|----------------------|
+| Request sent, operation pending | "Applying..." and no extra time; buttons disabled |
+| Operation confirmed and the router-reported allowance in force | "Extra time until HH:MM (unverified on this router)" (router allowance time shown in the browser's clock format) |
+| Operation failed or unconfirmed | "Extra time was not applied: the router did not confirm it." / "The router did not say whether the extra time was applied." |
+| 409 `reward_cap_exceeded` | "That would go past the 60 minute limit." |
+| 409 `child_paused` | "This child is paused. End the pause first, then add extra time." |
+| 409 `revision_conflict` | "The status changed, so nothing was sent." and the status is refreshed |
+| 409 `operation_in_progress` | "Another change is still being applied." |
+| 404 | controls hidden, nothing shown |
+| any other code | "Extra time could not be added. Nothing was changed." (raw codes are never shown) |
+
+Privacy: the page keeps no reward data beyond memory for the current session; signing out or a changed session key clears the controls and text, and a response that arrives after that is ignored. The page stores nothing in `localStorage`. Unverified on this router: nothing here has been seen on live hardware.
 
 ### How to turn a flag on
 
