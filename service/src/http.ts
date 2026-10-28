@@ -112,7 +112,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const reconcileAlerts = alerts?.reconcile?.bind(alerts);
     const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
-    const accounts = new AccountAdmin(auth);
+    const accounts = new AccountAdmin(auth, gated && mode === 'owner' ? ownerAccountId : undefined);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;

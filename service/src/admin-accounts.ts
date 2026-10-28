@@ -60,7 +60,17 @@ const bindingOf = (kind: AdminAction, target: string, params: Record<string, unk
 
 export class AccountAdmin {
     readonly auth: Auth;
-    constructor(auth: Auth) { this.auth = auth; }
+    /** In time-request owner mode, the one account other admins may not take over (credentials, role, active state). */
+    readonly ownerAccountId: string | undefined;
+    constructor(auth: Auth, ownerAccountId?: string) { this.auth = auth; this.ownerAccountId = ownerAccountId; }
+    /** Owner mode: no other admin may issue a token for, approve or revoke a passkey of, re-role or deactivate the owner account. Runs after the scope check. */
+    private assertNotOwnerTakeover(actor: Actor, target: string): void {
+        if (this.ownerAccountId !== undefined && target === this.ownerAccountId && actor.id !== target) throw new AppError(403, 'owner_account_protected');
+    }
+    /** Owner mode: the owner may not deactivate, demote or strip themselves of their last active passkey; no one else could undo it (token_issue is guarded for others). */
+    private assertNotOwnerSelfLockout(actor: Actor, target: string, locksOut: boolean): void {
+        if (locksOut && this.ownerAccountId !== undefined && target === this.ownerAccountId && actor.id === target) throw new AppError(409, 'owner_self_lockout');
+    }
     private get store() { return this.auth.store; }
     private allowed(actor: Actor, kind: AdminAction): void {
         if (kind !== 'own_passkey_revoke' && actor.role !== 'admin') throw new AppError(403, 'admin_required');
@@ -140,7 +150,10 @@ export class AccountAdmin {
             return {body: {account: this.dto(this.account(id))}, audit: id};
         }
         case 'token_issue': {
-            if (!this.managed(actor, target).active) throw new AppError(409, 'account_disabled');
+            const issueFor = this.managed(actor, target);
+            // Order matters: the scope check comes first so an out-of-scope admin never learns which account is the owner.
+            this.assertNotOwnerTakeover(actor, target);
+            if (!issueFor.active) throw new AppError(409, 'account_disabled');
             // Pending passkeys go first, so they never block a new token against the limit (the transaction rolls back on refusal).
             rejectPendingPasskeys(this.store, target, actor.id, now);
             if (this.store.get<{n: number}>('SELECT count(*) n FROM credentials WHERE account_id=?', target)!.n >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached', `This account already has ${PASSKEYS_PER_ACCOUNT} passkeys; remove one first.`);
@@ -153,6 +166,8 @@ export class AccountAdmin {
         case 'account_role':
         case 'account_active': {
             this.managed(actor, target);
+            this.assertNotOwnerTakeover(actor, target);
+            this.assertNotOwnerSelfLockout(actor, target, kind === 'account_role' ? params.role !== 'admin' : params.active === false);
             // Bumping the permission version ends every session of that account at its next request.
             if (kind === 'account_role') this.store.run('UPDATE accounts SET role=?,permission_version=permission_version+1 WHERE id=?', params.role as string, target);
             else this.store.run('UPDATE accounts SET active=?,permission_version=permission_version+1 WHERE id=?', params.active ? 1 : 0, target);
@@ -161,6 +176,7 @@ export class AccountAdmin {
         case 'passkey_approve': {
             const pending = this.credential(target);
             this.managed(actor, pending.account_id);
+            this.assertNotOwnerTakeover(actor, pending.account_id);
             if (pending.state !== 'pending') throw new AppError(409, 'passkey_not_pending');
             this.store.run("UPDATE credentials SET state='active' WHERE id=?", target);
             return {body: {passkey: this.passkeys(this.credential(target).account_id).find(p => p.id === target)}, audit: target};
@@ -168,7 +184,15 @@ export class AccountAdmin {
         case 'passkey_revoke':
         case 'own_passkey_revoke': {
             const revoked = this.credential(target, kind === 'own_passkey_revoke' ? actor.id : undefined);
-            if (kind === 'passkey_revoke') this.managed(actor, revoked.account_id);
+            if (kind === 'passkey_revoke') {
+                this.managed(actor, revoked.account_id);
+                this.assertNotOwnerTakeover(actor, revoked.account_id);
+            }
+            // Owner mode: the owner's last active passkey stays (the thrown error rolls back the whole transaction).
+            if (revoked.state === 'active' && actor.id === revoked.account_id) {
+                const remaining = this.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id=? AND state='active' AND id<>?", revoked.account_id, target)!.n;
+                this.assertNotOwnerSelfLockout(actor, revoked.account_id, remaining === 0);
+            }
             this.store.run('DELETE FROM credentials WHERE id=?', target);
             this.store.run('UPDATE sessions SET revoked=1 WHERE credential_id=?', target);
             // A token issued before the removal must not outlive it (it might otherwise meet an account left without passkeys).
