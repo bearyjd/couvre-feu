@@ -108,7 +108,7 @@ All of this is offline-tested only; **unverified on this router** until the live
 
 Limits: the `doh` arrays hold at most 256 unique addresses per family. Nothing in the service generates or refreshes them (`doh` is empty unless the owner supplies it), so DoH coverage is only as good as the supplied list. The whole policy input is also limited to 65536 bytes. VPN, Tor, cellular and any encrypted resolver not in the list are not blocked.
 
-**Rule change of 2026-10-27.** The owner lifted the project's "no DNS changes" rule for one purpose: the kids' firewall DNS rules (item 9 of the [roadmap](ROADMAP.md)). dnsmasq, the WAN zone, DHCP and adult or management traffic stay prohibited (`AGENTS.md`). **Still undecided:** the VPN/Tor list (feed source and licence), whether a list can fit the 64 KB policy input limit, and whether to cut a new router release for it. No such change is built.
+**Rule change of 2026-10-27.** The owner lifted the project's "no DNS changes" rule for one purpose: the kids' firewall DNS rules (item 9 of the [roadmap](ROADMAP.md)). `AGENTS.md:39` still forbids changing dnsmasq configuration or the WAN zone. DHCP and adult or management traffic also stay out of scope, because the lift covered only the kids' firewall DNS rules (a statement of that scope, not an `AGENTS.md` quote). **Still undecided:** the VPN/Tor list (feed source and licence), whether a list can fit the 64 KB policy input limit, and whether to cut a new router release for it. No such change is built.
 
 ## Unchanged reconciliation and reconstruction risk
 
