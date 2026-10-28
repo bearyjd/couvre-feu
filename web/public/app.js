@@ -19,7 +19,7 @@ try { alertStorage = localStorage; } catch { alertStorage = null; }
 const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
-const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
+const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
@@ -254,19 +254,21 @@ async function logout() {
   }
 }
 
+// Resolves {sent, reason}: sent is true only once the service accepted the request (never a confirmation of the outcome).
 async function mutate(personId, action, presetSeconds) {
-  if (!canControl()) return;
+  if (!canControl()) return { sent: false, reason: controlBlock() };
   const beforeRevision = state.people.revisionToken;
   const beforeScope = actorScope(state.session.actor);
   const requestedDuration = presetSeconds ?? state.durations.get(personId) ?? '0';
   const generation = state.generation;
   // Fresh reads are part of this click, never an automatic mutation retry.
   const refreshed = await refresh({ quiet: true });
-  if (!refreshed || generation !== state.generation || !canControl()) return;
+  if (!refreshed || generation !== state.generation || !canControl()) return { sent: false, reason: controlBlock() ?? 'Status could not be refreshed.' };
   if (beforeRevision !== state.people.revisionToken || beforeScope !== actorScope(state.session.actor)) {
     announce('The revision or your permissions changed. Status has been refreshed; review it and choose the action again.', true);
-    return;
+    return { sent: false, reason: 'The revision or your permissions changed. Review the status and try again.' };
   }
+  let outcome = { sent: false, reason: 'Your session changed.' };
   state.busy = true;
   renderControlState();
   announce(`Sending ${action === 'resume' ? 'resume' : 'manual pause'} request. A request is not confirmation.`);
@@ -276,7 +278,8 @@ async function mutate(personId, action, presetSeconds) {
       method: 'POST', body: action === 'pause' ? { until } : {},
       headers: { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken },
     });
-    if (generation !== state.generation) return;
+    if (generation !== state.generation) return outcome;
+    outcome = { sent: true, reason: null };
     state.operation = result.operation;
     const person = state.people.people.find((entry) => entry.id === personId);
     if (person) { person.latestOperation = result.operation; person.status = result.operation.state; }
@@ -286,16 +289,20 @@ async function mutate(personId, action, presetSeconds) {
     if (['pending', 'unknown'].includes(result.operation.state)) void followOperation(result.operation.id, generation);
     else await refresh({ quiet: true });
   } catch (error) {
-    if (generation !== state.generation) return;
+    if (generation !== state.generation) return outcome;
     state.needsRefresh = true;
     if (error instanceof APIError && error.status === 409) {
+      outcome = { sent: false, reason: 'Revision conflict. Nothing was sent again; review the status and try again.' };
       announce('Revision conflict. No retry was sent. Refresh status, review the change, then choose the action again.', true);
     } else if (error instanceof APIError && [401, 403].includes(error.status)) {
+      outcome = { sent: false, reason: 'This action is not authorized.' };
       resetView();
       announce('This action is not authorized. Sign in again; local status has been cleared.', true);
     } else if (error instanceof APIError) {
+      outcome = { sent: false, reason: error.message };
       announce(`The request failed: ${error.message} Refresh status before another action.`, true);
     } else {
+      outcome = { sent: false, reason: 'The outcome is unknown; check the pause status before trying again.' };
       state.localUnknown = true;
       state.offline = !navigator.onLine;
       announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
@@ -303,6 +310,7 @@ async function mutate(personId, action, presetSeconds) {
   } finally {
     if (generation === state.generation) { state.busy = false; render(); }
   }
+  return outcome;
 }
 
 const COVERAGE_REFUSALS = ['incomplete_address_coverage', 'incomplete_transition_address_coverage'];
