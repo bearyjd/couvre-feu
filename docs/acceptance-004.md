@@ -39,7 +39,7 @@ under genuine BusyBox as well; no local pass authorizes live use.
 | Parser and bounds | Reject duplicate/unknown fields, malformed identity, oversized/deep/non-ASCII/trailing JSON and open stdin within deadline; local expiry remains available |
 | Exact CAS | Generation/revision/digest checked under lock; concurrent/local/same-revision different-policy changes conflict before writes |
 | Durable acceptance | Crash boundaries preserve policy plus exact receipt together; replay writes nothing and retains original expiry; conflicting reuse fails |
-| Receipt capacity | 128 accepted identities retained; next new acceptance fails closed while exact historical lookup/replay works |
+| Receipt capacity | At most 128 accepted identities retained; the next new acceptance evicts the oldest receipt (never the current one) in the same write as the policy change; replay of a retained identity works, replay of an evicted one is a `policy_conflict` and its status receipt is `null` |
 | Lifecycle and scope | Legacy mutations clear current identity; expiry preserves it; protected/other MACs refuse; journal/scope mismatch and delayed old-generation requests reject |
 | Async worker | Deferred transport sees no SQLite transaction; one unresolved operation, durable claims/epochs and stale-callback fences hold across processes |
 | Dispatch permits | No permit means zero transport calls, including GET/polls/restart; exact steps consumed once; changed payload/target/retry refused |
