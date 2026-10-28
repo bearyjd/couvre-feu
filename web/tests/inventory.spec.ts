@@ -49,11 +49,20 @@ test('admin sees the devices newest first with the right flags, names labelled a
   expect(await noHorizontalScroll(page)).toBe(true);
 });
 
+// Drain every route handler before a test ends, also when an assertion above threw: a handler still awaiting route.fetch would
+// otherwise be charged to the NEXT test ("route.fetch: Test ended") and hide the real failure behind a misleading one.
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' }); });
+
 test('hostile device names (markup, scripts, very long, right-to-left) render as inert text', async ({ page, integration: f }) => {
   seed(f);
   // The database refuses such names, so the response is rewritten: the page must stay safe even if the service were wrong.
   const hostile = [HOSTILE, '<script>window.__xss=2</script>', 'x'.repeat(300), '\u202Eevil\u05D0\u05D1\u05D2'];
+  // Sign-in loads the list twice (session change, then state version change). Hold every later response back, as a loaded CI runner does,
+  // so the test body ends with a route callback still in flight; that must not surface as a failure of the next test.
+  // Do not remove the delay: it is what makes this test a regression guard for the draining below instead of a rare flake.
+  let seen = 0;
   await page.route('**/admin/inventory', async (route) => {
+    if (seen++ > 0) await new Promise((resolve) => setTimeout(resolve, 400));
     const response = await route.fetch(); const body = await response.json();
     body.inventory.devices.forEach((device: { hostname: string | null }, i: number) => { device.hostname = hostile[i % hostile.length]; });
     await route.fulfill({ response, json: body });
@@ -70,6 +79,8 @@ test('hostile device names (markup, scripts, very long, right-to-left) render as
   expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
   expect(await panel(page).locator('[data-name][dir="auto"]').count()).toBe(5);
   expect(await noHorizontalScroll(page)).toBe(true);
+  await page.unrouteAll({ behavior: 'wait' }); // let the second (version-change) load finish its rewrite before the page closes
+  expect(seen).toBeGreaterThanOrEqual(2); // the guard only guards while sign-in still loads the list twice
   expect(errors).toEqual([]);
 });
 
