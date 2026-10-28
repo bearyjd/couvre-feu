@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-27; planned additions added 2026-10-27. This is the current plan; [`.omc/plans/full-app-roadmap.md`](../.omc/plans/full-app-roadmap.md) is the original, historical proposal. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
+Status as of 2026-10-27; planned additions added 2026-10-27. This is the current plan; the original proposal was an internal planning note that is no longer kept in the repository. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
 
 ## Planned additions at a glance
 
