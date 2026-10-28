@@ -67,7 +67,7 @@ export class AccountAdmin {
     private assertNotOwnerTakeover(actor: Actor, target: string): void {
         if (this.ownerAccountId !== undefined && target === this.ownerAccountId && actor.id !== target) throw new AppError(403, 'owner_account_protected');
     }
-    /** Owner mode: the owner may not deactivate or demote themselves; no one else could undo it (token_issue is guarded for others). */
+    /** Owner mode: the owner may not deactivate, demote or strip themselves of their last active passkey; no one else could undo it (token_issue is guarded for others). */
     private assertNotOwnerSelfLockout(actor: Actor, target: string, locksOut: boolean): void {
         if (locksOut && this.ownerAccountId !== undefined && target === this.ownerAccountId && actor.id === target) throw new AppError(409, 'owner_self_lockout');
     }
@@ -187,6 +187,11 @@ export class AccountAdmin {
             if (kind === 'passkey_revoke') {
                 this.managed(actor, revoked.account_id);
                 this.assertNotOwnerTakeover(actor, revoked.account_id);
+            }
+            // Owner mode: the owner's last active passkey stays (the thrown error rolls back the whole transaction).
+            if (revoked.state === 'active' && actor.id === revoked.account_id) {
+                const remaining = this.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id=? AND state='active' AND id<>?", revoked.account_id, target)!.n;
+                this.assertNotOwnerSelfLockout(actor, revoked.account_id, remaining === 0);
             }
             this.store.run('DELETE FROM credentials WHERE id=?', target);
             this.store.run('UPDATE sessions SET revoked=1 WHERE credential_id=?', target);

@@ -39,3 +39,50 @@ test('HTTP: another admin issuing a token for the owner account is allowed in pa
     assert.equal(refused.status, 403);
     assert.equal(refused.error, 'owner_account_protected');
 });
+
+/** Operator and parent are both admins, parent is the owner account: the operator acts on the parent's credential and account over HTTP. */
+async function operatorActsOnParent(mode: 'owner' | 'parents', portOffset: number): Promise<Record<string, {status: number; error?: string}>> {
+    const f = integrationFixture(), port = 36000 + (process.pid + portOffset) % 10000, origin = `http://localhost:${port}`;
+    f.store.run("UPDATE accounts SET role='admin' WHERE id='parent'");
+    const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
+    const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`, timeRequests: {mode}, ownerAccountId: 'parent'} as typeof f.config);
+    server.listen(port, '127.0.0.1'); await once(server, 'listening');
+    try {
+        const client = () => {
+            const jar = new Map<string, string>(); let csrf = '';
+            return async (path: string, input: unknown) => {
+                const response = await fetch(origin + path, {method: 'POST', headers: {Origin: origin, Cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; '), ...(csrf ? {'X-CSRF-Token': csrf} : {}), 'Content-Type': 'application/json'}, body: JSON.stringify(input)});
+                for (const entry of response.headers.getSetCookie()) { const [k, v] = entry.split(';')[0].split('='); jar.set(k, v); }
+                const body = await response.json();
+                if (body.csrfToken) csrf = body.csrfToken;
+                return {status: response.status, body};
+            };
+        };
+        const key = new TestAuthenticator(), operator = client(), ownerKey = new TestAuthenticator(), owner = client();
+        for (const [call, account, authenticator] of [[operator, 'operator', key], [owner, 'parent', ownerKey]] as const) {
+            const token = randomBytes(32).toString('base64url');
+            f.store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), account, f.now() + 600);
+            const options = await call('/auth/register/options', {token});
+            assert.equal((await call('/auth/register/verify', {challengeId: options.body.challengeId, response: authenticator.register(options.body.options, origin)})).status, 200);
+        }
+        const act = async (path: string, action: string, target: string, params: Record<string, unknown>) => {
+            const step = await operator('/step-up/options', {action, target, params});
+            assert.equal(step.status, 200);
+            const result = await operator(path, {...params, stepUp: {challengeId: step.body.challengeId, response: key.login(step.body.options, origin)}});
+            return {status: result.status, error: result.body.error?.code ?? result.body.code ?? result.body.error};
+        };
+        const results: Record<string, {status: number; error?: string}> = {};
+        results.role = await act('/admin/accounts/parent/role', 'account_role', 'parent', {role: 'parent'});
+        results.active = await act('/admin/accounts/parent/active', 'account_active', 'parent', {active: false});
+        const credential = ownerKey.credentialId.toString('base64url');
+        results.revoke = await act(`/admin/passkeys/${credential}/revoke`, 'passkey_revoke', credential, {});
+        return results;
+    } finally { server.close(); f.cleanup(); }
+}
+
+test('HTTP: another admin revoking an owner passkey or changing the owner role/active state is refused in owner mode and allowed in parents mode', async () => {
+    const refused = await operatorActsOnParent('owner', 3);
+    for (const kind of ['role', 'active', 'revoke']) { assert.equal(refused[kind].status, 403, kind); assert.equal(refused[kind].error, 'owner_account_protected', kind); }
+    const allowed = await operatorActsOnParent('parents', 4);
+    for (const kind of ['role', 'active', 'revoke']) assert.equal(allowed[kind].status, 200, kind);
+});

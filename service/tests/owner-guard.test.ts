@@ -57,17 +57,47 @@ test('owner mode: another admin cannot revoke a passkey of the owner account; th
     } finally { f.close(); }
 });
 
-test('owner mode: the owner may revoke their own passkey, by either route; other accounts stay revocable by admins', async () => {
+const addCredential = (f: {store: Store}, id: string, account: string, state: 'active' | 'pending') =>
+    f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES(?,?,?,0,'[]',?)", id, account, new Uint8Array([1]), state);
+
+test('owner mode: the owner cannot revoke their last active passkey, by either route; they stay signed in and nothing is committed', async () => {
+    for (const route of ['passkey_revoke', 'own_passkey_revoke'] as const) {
+        const f = await fixture('bryn');
+        try {
+            const credential = credentialOf(f, 'bryn'), before = f.snapshot(), counters = () => JSON.stringify(f.store.all('SELECT id,counter,last_used_at FROM credentials ORDER BY id')), used = counters();
+            await assert.rejects(f.act(f.admin, f.bryn, route, credential), code('owner_self_lockout'), route);
+            assert.equal(f.snapshot(), before);
+            // The step-up challenge itself is single-use at verify time (as for every refusal); the commit (counter bump) is rolled back.
+            assert.equal(counters(), used);
+            assert.equal(f.bryn.session().dto.actor.id, 'bryn');
+        } finally { f.close(); }
+    }
+});
+
+test('owner mode: the owner may revoke one of several active passkeys, or a pending one of their own, by either route', async () => {
+    for (const route of ['passkey_revoke', 'own_passkey_revoke'] as const) {
+        const f = await fixture('bryn');
+        try {
+            addCredential(f, 'bryn_second', 'bryn', 'active');
+            addCredential(f, 'bryn_pending', 'bryn', 'pending');
+            await f.act(f.admin, f.bryn, route, 'bryn_second');
+            await f.act(f.admin, f.bryn, route, 'bryn_pending');
+            assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id='bryn'")!.n, 1);
+            await assert.rejects(f.act(f.admin, f.bryn, route, credentialOf(f, 'bryn')), code('owner_self_lockout'), route);
+        } finally { f.close(); }
+    }
+});
+
+test('owner mode: other accounts may revoke their last passkey; without owner mode the owner may too', async () => {
     const f = await fixture('bryn');
     try {
-        await f.act(f.admin, f.bryn, 'passkey_revoke', credentialOf(f, 'bryn'));
-        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id='bryn'")!.n, 0);
+        await f.act(f.admin, f.carol, 'own_passkey_revoke', credentialOf(f, 'carol'));
+        await f.act(f.admin, f.jd, 'passkey_revoke', credentialOf(f, 'jd'));
     } finally { f.close(); }
-    const g = await fixture('bryn');
-    try {
-        await g.act(g.admin, g.bryn, 'own_passkey_revoke', credentialOf(g, 'bryn'));
-        await g.act(g.admin, g.jd, 'passkey_revoke', credentialOf(g, 'carol'));
-    } finally { g.close(); }
+    const g = await fixture(undefined);
+    try { await g.act(g.admin, g.bryn, 'own_passkey_revoke', credentialOf(g, 'bryn')); } finally { g.close(); }
+    const h = await fixture('jd');
+    try { await h.act(h.admin, h.bryn, 'passkey_revoke', credentialOf(h, 'bryn')); } finally { h.close(); }
 });
 
 test('owner mode: an admin outside the owner scope gets the scope error, never owner_account_protected', async () => {
