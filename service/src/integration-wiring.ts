@@ -29,10 +29,10 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
     return {worker, activity, prune, app};
 }
 
-/** Owner mode fails closed when the owner account is missing or inactive (nobody can decide requests); say so once at startup. Never throws, never logs ids. */
+/** Owner mode fails closed when the owner account is missing, inactive or has no active passkey (nobody can decide requests); say so once at startup. Never throws, never logs ids. */
 export function checkOwnerAccount(config: IntegrationConfig, store: IntegrationStore, write: (line: string) => unknown = line => process.stderr.write(line)): void {
     if (config.timeRequests?.mode !== 'owner' || config.ownerAccountId === undefined) return;
     let available = false;
-    try { available = store.get<{active: number}>('SELECT active FROM accounts WHERE id=?', config.ownerAccountId)?.active === 1; } catch { /* unreadable counts as unavailable */ }
+    try { available = store.get<{n: number}>("SELECT count(*) n FROM accounts a JOIN credentials c ON c.account_id=a.id WHERE a.id=? AND a.active=1 AND c.state='active'", config.ownerAccountId)!.n > 0; } catch { /* unreadable counts as unavailable */ }
     if (!available) write('owner_account_unavailable\n');
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Store } from '../src/db.ts';
 import { seedAccounts } from '../src/fixtures.ts';
-import { Auth, issueBootstrap } from '../src/auth.ts';
+import { Auth, digest, issueBootstrap } from '../src/auth.ts';
 import { AccountAdmin } from '../src/admin-accounts.ts';
 import type { AdminAction } from '../src/admin-accounts.ts';
 import type { AuthSession } from '../src/auth.ts';
@@ -23,22 +23,84 @@ async function fixture(ownerAccountId: string | undefined) {
     let now = 1791691200;
     const auth = new Auth(store, origin, () => now);
     const setup = new AccountAdmin(auth), admin = new AccountAdmin(auth, ownerAccountId);
-    const device = async (id: 'jd' | 'bryn'): Promise<Device> => {
+    const device = async (id: string): Promise<Device> => {
         const key = new TestAuthenticator(), browser = randomBytes(32).toString('base64url');
-        const options = await auth.registrationOptions({token: issueBootstrap(store, id, now)}, browser);
+        // issueBootstrap knows only the fictional jd/bryn; carol gets the same first-enrollment token by direct insert.
+        let token: string;
+        if (id === 'carol') { token = randomBytes(32).toString('base64url'); store.run('INSERT INTO bootstrap_tokens(hash,account_id,expires_at,first_enrollment) VALUES(?,?,?,1)', digest(token), id, now + 600); } else token = issueBootstrap(store, id, now);
+        const options = await auth.registrationOptions({token}, browser);
         const result = await auth.registrationVerify({challengeId: options.challengeId, response: key.register(options.options, origin)}, browser);
         return {key, session: () => auth.session(result.token, browser)};
     };
-    const jd = await device('jd'), bryn = await device('bryn');
+    // carol (admin, blair) is outside the scope of bryn (alex); ghost is a configured owner id with no account.
+    store.run("INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES('carol','Carol (fictional)','admin','[\"blair\"]',?)", randomBytes(32).toString('base64url'));
+    const jd = await device('jd'), bryn = await device('bryn'), carol = await device('carol');
     const act = async (service: AccountAdmin, who: Device, action: AdminAction, target: string, params: Record<string, unknown> = {}) => {
         const options = await service.stepUpOptions(who.session(), {action, target, params});
         return service.perform(who.session(), action, target, {...params, stepUp: {challengeId: options.challengeId, response: who.key.login(options.options, origin)}});
     };
-    const snapshot = () => JSON.stringify([store.all('SELECT id,role,active,permission_version FROM accounts ORDER BY id'), store.all('SELECT id,state FROM credentials ORDER BY id'),
+    const snapshot = () => JSON.stringify([store.all('SELECT id,role,active,permission_version FROM accounts ORDER BY id'), store.all('SELECT id,state FROM credentials ORDER BY id'), store.all('SELECT hash,revoked FROM sessions ORDER BY hash'),
         store.all('SELECT hash,consumed FROM bootstrap_tokens ORDER BY hash'), store.all('SELECT actor_id,action,outcome FROM audit ORDER BY rowid')]);
-    return {store, auth, setup, admin, jd, bryn, act, snapshot, close: () => store.close()};
+    return {store, auth, setup, admin, jd, bryn, carol, act, snapshot, close: () => store.close()};
 }
 const ATTACKS: [AdminAction, Record<string, unknown>][] = [['token_issue', {label: 'x'}], ['account_role', {role: 'parent'}], ['account_active', {active: false}]];
+const credentialOf = (f: {store: Store}, account: string) => f.store.get<{id: string}>("SELECT id FROM credentials WHERE account_id=? AND state='active'", account)!.id;
+
+test('owner mode: another admin cannot revoke a passkey of the owner account; the passkey stays active and no session is revoked', async () => {
+    const f = await fixture('bryn');
+    try {
+        const credential = credentialOf(f, 'bryn'), before = f.snapshot();
+        await assert.rejects(f.act(f.admin, f.jd, 'passkey_revoke', credential), code('owner_account_protected'));
+        assert.equal(f.snapshot(), before);
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM credentials WHERE id=?', credential)!.state, 'active');
+        assert.equal(f.store.get<{n: number}>('SELECT count(*) n FROM sessions WHERE revoked=1')!.n, 0);
+    } finally { f.close(); }
+});
+
+test('owner mode: the owner may revoke their own passkey, by either route; other accounts stay revocable by admins', async () => {
+    const f = await fixture('bryn');
+    try {
+        await f.act(f.admin, f.bryn, 'passkey_revoke', credentialOf(f, 'bryn'));
+        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id='bryn'")!.n, 0);
+    } finally { f.close(); }
+    const g = await fixture('bryn');
+    try {
+        await g.act(g.admin, g.bryn, 'own_passkey_revoke', credentialOf(g, 'bryn'));
+        await g.act(g.admin, g.jd, 'passkey_revoke', credentialOf(g, 'carol'));
+    } finally { g.close(); }
+});
+
+test('owner mode: an admin outside the owner scope gets the scope error, never owner_account_protected', async () => {
+    const f = await fixture('bryn');
+    try {
+        const before = f.snapshot();
+        const cases: [AdminAction, string, Record<string, unknown>][] = [['token_issue', 'bryn', {label: 'x'}], ['account_role', 'bryn', {role: 'parent'}], ['account_active', 'bryn', {active: false}], ['passkey_revoke', credentialOf(f, 'bryn'), {}]];
+        for (const [kind, target, params] of cases) await assert.rejects(f.act(f.admin, f.carol, kind, target, params), code('outside_scope'), kind);
+        const issued = await f.act(f.setup, f.jd, 'token_issue', 'bryn') as {token: string};
+        const key = new TestAuthenticator(), browser = randomBytes(32).toString('base64url');
+        const options = await f.auth.registrationOptions({token: issued.token}, browser);
+        await f.auth.enroll({challengeId: options.challengeId, response: key.register(options.options, origin)}, browser);
+        await assert.rejects(f.act(f.admin, f.carol, 'passkey_approve', f.store.get<{id: string}>("SELECT id FROM credentials WHERE state='pending'")!.id), code('outside_scope'));
+        assert.notEqual(f.snapshot(), before);
+    } finally { f.close(); }
+    const g = await fixture('ghost');
+    try {
+        await assert.rejects(g.act(g.admin, g.jd, 'token_issue', 'ghost', {label: 'x'}), code('account_not_found'));
+    } finally { g.close(); }
+});
+
+test('owner mode: the owner cannot deactivate or demote their own account (409 owner_self_lockout); other changes stay allowed', async () => {
+    const f = await fixture('bryn');
+    try {
+        const before = f.snapshot();
+        await assert.rejects(f.act(f.admin, f.bryn, 'account_active', 'bryn', {active: false}), code('owner_self_lockout'));
+        await assert.rejects(f.act(f.admin, f.bryn, 'account_role', 'bryn', {role: 'parent'}), code('owner_self_lockout'));
+        assert.equal(f.snapshot(), before);
+        await f.act(f.admin, f.bryn, 'account_active', 'bryn', {active: true});
+    } finally { f.close(); }
+    const g = await fixture(undefined);
+    try { await g.act(g.admin, g.bryn, 'account_role', 'bryn', {role: 'parent'}); } finally { g.close(); }
+});
 
 test('owner mode: another admin cannot add a credential to, change the role of or deactivate the owner; no state changes', async () => {
     const f = await fixture('bryn');
@@ -100,6 +162,11 @@ test('startup check: logs one fixed tag for an inactive or missing owner; silent
     try {
         const run = (config: Parameters<typeof checkOwnerAccount>[0]) => { const lines: string[] = []; checkOwnerAccount(config, f.store, line => lines.push(line)); return lines; };
         const owner = {...f.config, timeRequests: {mode: 'owner' as const}, ownerAccountId: 'parent'};
+        // Active but without any active passkey: nobody can sign in as the owner.
+        assert.deepEqual(run(owner), ['owner_account_unavailable\n']);
+        f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES('owner_pending','parent',?,0,'[]','pending')", new Uint8Array([1]));
+        assert.deepEqual(run(owner), ['owner_account_unavailable\n']);
+        f.store.run("INSERT INTO credentials(id,account_id,public_key,counter,transports,state) VALUES('owner_key','parent',?,0,'[]','active')", new Uint8Array([1]));
         assert.deepEqual(run(owner), []);
         assert.deepEqual(run({...f.config, timeRequests: {mode: 'parents' as const}, ownerAccountId: 'parent'}), []);
         assert.deepEqual(run(f.config), []);
@@ -107,6 +174,7 @@ test('startup check: logs one fixed tag for an inactive or missing owner; silent
         assert.deepEqual(run(owner), ['owner_account_unavailable\n']);
         assert.deepEqual(run({...f.config, timeRequests: {mode: 'parents' as const}, ownerAccountId: 'parent'}), []);
         f.store.run("UPDATE accounts SET active=1 WHERE id='parent'");
+        f.store.run("DELETE FROM credentials WHERE account_id='parent'");
         f.store.run("DELETE FROM accounts WHERE id='parent'");
         assert.deepEqual(run(owner), ['owner_account_unavailable\n']);
     } finally { f.cleanup(); }
