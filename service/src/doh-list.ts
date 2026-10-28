@@ -24,19 +24,28 @@ export const DOH_PROVIDERS: readonly DohProvider[] = Object.freeze([
     {name: 'AdGuard DNS', source: 'https://adguard-dns.io/en/public-dns.html', verified: '2026-10-27',
         ipv4: ['94.140.14.14', '94.140.15.15', '94.140.14.140', '94.140.14.141', '94.140.14.15', '94.140.15.16'],
         ipv6: ['2a10:50c0::ad1:ff', '2a10:50c0::ad2:ff', '2a10:50c0::1:ff', '2a10:50c0::2:ff', '2a10:50c0::bad1:ff', '2a10:50c0::bad2:ff']},
-    // NextDNS publishes no address page; these are the anycast bootstrap addresses in the vendor's own client source
-    // (github.com/nextdns/nextdns config.go at 9b004cccbccf01b0a3a4f502cd2b4298e88870c3). Profile-specific addresses are not covered.
-    {name: 'NextDNS', source: 'https://github.com/nextdns/nextdns/blob/9b004cccbccf01b0a3a4f502cd2b4298e88870c3/config.go', verified: '2026-10-27',
+    // NextDNS publishes no resolver addresses on a documentation page. These are the anycast bootstrap addresses in the vendor's own
+    // client source: github.com/nextdns/nextdns run.go at 9b004cccbccf01b0a3a4f502cd2b4298e88870c3, lines 612, 622, 623 and 626
+    // (`https://dns.nextdns.io#45.90.28.0,2a07:a8c0::,45.90.30.0,2a07:a8c1::`); config/config.go:141 shows the same 45.90.28.0 form.
+    // Profile-specific addresses are not covered.
+    {name: 'NextDNS', source: 'https://github.com/nextdns/nextdns/blob/9b004cccbccf01b0a3a4f502cd2b4298e88870c3/run.go', verified: '2026-10-27',
         ipv4: ['45.90.28.0', '45.90.30.0'], ipv6: ['2a07:a8c0::', '2a07:a8c1::']},
     {name: 'CleanBrowsing', source: 'https://cleanbrowsing.org/filters/', verified: '2026-10-27',
         ipv4: ['185.228.168.168', '185.228.169.168', '185.228.168.10', '185.228.169.11', '185.228.168.9', '185.228.169.9'],
         ipv6: ['2a0d:2a00:1::', '2a0d:2a00:2::', '2a0d:2a00:1::1', '2a0d:2a00:2::1', '2a0d:2a00:1::2', '2a0d:2a00:2::2']}
     // Mullvad DNS is left out: its page announces the public service ends on 2026-11-02, after which the addresses may be reused.
-].map(p => Object.freeze(p)));
+].map(p => Object.freeze({...p, ipv4: Object.freeze([...p.ipv4]), ipv6: Object.freeze([...p.ipv6])})));
 
-const unique = (items: readonly string[]): readonly string[] => Object.freeze([...new Set(items)].sort());
+export const unique = (items: readonly string[]): readonly string[] => Object.freeze([...new Set(items)].sort());
 export const DOH_IPV4: readonly string[] = unique(DOH_PROVIDERS.flatMap(p => p.ipv4));
 export const DOH_IPV6: readonly string[] = unique(DOH_PROVIDERS.flatMap(p => p.ipv6));
+
+/**
+ * Every address this list ever shipped and later removed from the code. Append here (never delete) when an entry is dropped from
+ * DOH_PROVIDERS, so the next policy operation with the flag present strips it from the router.
+ */
+export const DOH_RETIRED_IPV4: readonly string[] = Object.freeze([]);
+export const DOH_RETIRED_IPV6: readonly string[] = Object.freeze([]);
 
 const FAMILY_CAP = 256;
 export const DOH_CONFLICT_TAG = 'doh_list_protected_conflict';
@@ -78,10 +87,25 @@ export function mergeStaticDoh(existing: RouterPolicy['doh'], protectedAddresses
         const kept = new Set(current), added: string[] = [];
         for (const ip of list) {
             if (kept.has(ip)) continue;
-            if (nets.some(net => covers(net, v6, parseNet(ip).base))) { refused++; continue; }
+            const value = parseNet(ip).base;
+            if (nets.some(net => covers(net, v6, value))) { refused++; continue; }
             if (kept.size + added.length < FAMILY_CAP) added.push(ip);
         }
         return [...kept, ...added].sort();
     };
     return {doh: {ipv4: family(existing.ipv4, DOH_IPV4, false), ipv6: family(existing.ipv6, DOH_IPV6, true)}, refused, tag: DOH_CONFLICT_TAG};
+}
+
+/**
+ * Flag-present reconciliation: strip the retired addresses and, when the flag is off, the whole current list; then, when on, merge
+ * the current list. Entries that are in neither set (hand-added or otherwise) are never touched. Callers skip this when the flag is absent.
+ */
+export function reconcileStaticDoh(existing: RouterPolicy['doh'], enabled: boolean, protectedAddresses: readonly string[],
+    retired: {readonly ipv4: readonly string[]; readonly ipv6: readonly string[]} = {ipv4: DOH_RETIRED_IPV4, ipv6: DOH_RETIRED_IPV6}): DohMerge {
+    const strip = (current: readonly string[], gone: readonly string[], list: readonly string[]) => {
+        const drop = new Set([...gone, ...(enabled ? [] : list)]);
+        return current.filter(ip => !drop.has(ip));
+    };
+    const base = {ipv4: strip(existing.ipv4, retired.ipv4, DOH_IPV4), ipv6: strip(existing.ipv6, retired.ipv6, DOH_IPV6)};
+    return enabled ? mergeStaticDoh(base, protectedAddresses) : {doh: base, refused: 0, tag: DOH_CONFLICT_TAG};
 }

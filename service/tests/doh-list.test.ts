@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
-import { DOH_IPV4, DOH_IPV6, DOH_PROVIDERS, mergeStaticDoh, protectedAddressesOf } from '../src/doh-list.ts';
+import { DOH_IPV4, DOH_IPV6, DOH_PROVIDERS, DOH_RETIRED_IPV4, DOH_RETIRED_IPV6, mergeStaticDoh, protectedAddressesOf, reconcileStaticDoh, unique } from '../src/doh-list.ts';
 import { integrationConfig } from '../src/integration-config.ts';
 import { canonicalIPv6, normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
@@ -34,6 +34,13 @@ test('list invariants: sorted, unique, canonical, within the per-family cap', ()
     assert.ok(DOH_IPV4.every(ip => /^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/.test(ip) && ip.split('.').every(p => +p <= 255)));
     assert.ok(DOH_IPV6.every(ip => canonicalIPv6(ip) === ip));
     assert.ok(Object.isFrozen(DOH_PROVIDERS));
+    for (const p of DOH_PROVIDERS) assert.ok(Object.isFrozen(p) && Object.isFrozen(p.ipv4) && Object.isFrozen(p.ipv6), p.name);
+    for (const retired of [DOH_RETIRED_IPV4, DOH_RETIRED_IPV6]) assert.ok(Object.isFrozen(retired));
+});
+
+test('unique: removes duplicates and sorts', () => {
+    assert.deepEqual([...unique(['9.9.9.9', '1.1.1.1', '9.9.9.9', '1.1.1.1'])], ['1.1.1.1', '9.9.9.9']);
+    assert.ok(Object.isFrozen(unique(['a'])));
 });
 
 test('every entry is public unicast: no private, loopback, link-local, ULA or documentation space', () => {
@@ -106,6 +113,38 @@ test('no list entry falls inside the addresses the manifest protects (router, li
     assert.equal(mergeStaticDoh(empty, protectedAddresses).refused, 0);
 });
 
+const live = (ipv4: string[], ipv6: string[] = []) => ({ipv4, ipv6});
+test('reconcile: flag on adds the list; flag off strips exactly the current list and keeps everything else', () => {
+    const base = live(['192.0.2.53'], ['2001:db8::53']);
+    const on = reconcileStaticDoh(base, true, []);
+    for (const ip of DOH_IPV4) assert.ok(on.doh.ipv4.includes(ip));
+    const off = reconcileStaticDoh(on.doh, false, []);
+    assert.deepEqual(off.doh, base, 'on then off restores the original');
+    assert.deepEqual(reconcileStaticDoh(on.doh, true, []).doh, on.doh, 'idempotent on');
+    assert.deepEqual(reconcileStaticDoh(off.doh, false, []).doh, off.doh, 'idempotent off');
+    assert.equal(off.refused, 0);
+});
+
+test('reconcile: a hand-added unrelated address is never removed, on or off', () => {
+    const hand = live(['203.0.113.7', '192.0.2.53'], ['2001:db8::7']);
+    for (const enabled of [true, false]) {
+        const out = reconcileStaticDoh(hand, enabled, [], {ipv4: ['198.51.100.9'], ipv6: []}).doh;
+        assert.ok(out.ipv4.includes('203.0.113.7') && out.ipv4.includes('192.0.2.53') && out.ipv6.includes('2001:db8::7'), String(enabled));
+    }
+});
+
+test('reconcile: retired addresses are stripped whenever the flag is present, whether on or off', () => {
+    const retired = {ipv4: ['198.51.100.9'], ipv6: ['2001:db8::9']};
+    const held = live(['198.51.100.9', '192.0.2.53'], ['2001:db8::9']);
+    for (const enabled of [true, false]) {
+        const out = reconcileStaticDoh(held, enabled, [], retired).doh;
+        assert.ok(!out.ipv4.includes('198.51.100.9') && !out.ipv6.includes('2001:db8::9'), String(enabled));
+        assert.ok(out.ipv4.includes('192.0.2.53'));
+    }
+    assert.deepEqual(DOH_RETIRED_IPV4, []);
+    assert.deepEqual(DOH_RETIRED_IPV6, []);
+});
+
 function policyWith(doh: RouterPolicy['doh']): RouterPolicy {
     return normalizePolicy({version: 1, revision: 1, people: [{id: 'pilot', macs: ['02:10:20:30:40:50']}], pauses: [], schedules: [], doh});
 }
@@ -120,12 +159,12 @@ async function queued(flag: unknown, doh: RouterPolicy['doh'] = {ipv4: ['192.0.2
     return {f, id: out.result.operation.id, payload, envelope};
 }
 
-test('flag absent or off: the submitted policy is byte-identical to today (existing doh preserved, nothing added)', async () => {
+test('flag absent: the submitted policy equals the hard-coded pre-change policy; explicit false on a router without the list changes nothing', async () => {
     const absent = await queued(undefined), off = await queued({dohList: false});
     try {
-        assert.deepEqual(absent.payload.doh, {ipv4: ['192.0.2.53'], ipv6: []});
-        assert.equal(JSON.stringify(absent.payload), JSON.stringify(off.payload));
-        assert.equal(JSON.stringify(absent.envelope.policy), JSON.stringify(off.envelope.policy));
+        const expected = {version: 1, revision: 2, people: [{id: 'pilot', macs: ['02:10:20:30:40:50']}], pauses: [{person: 'pilot', until: 0}], schedules: [], doh: {ipv4: ['192.0.2.53'], ipv6: []}};
+        assert.equal(JSON.stringify(absent.payload), JSON.stringify(expected));
+        assert.equal(JSON.stringify(off.payload), JSON.stringify(expected));
     } finally { absent.f.cleanup(); off.f.cleanup(); }
 });
 
@@ -156,17 +195,25 @@ test('flag on with a router-protected address equal to a list entry: that entry 
     } finally { f.cleanup(); }
 });
 
-test('the list is sticky: once the router holds it, turning the flag off does not remove it from later submissions', async () => {
+async function afterListApplied(flag: unknown) {
     const on = await queued({dohList: true});
-    try {
-        const plan = on.f.worker.prepare('apply', on.id); await on.f.worker.execute(plan, plan.scriptSha256);
-        (on.f.config as unknown as {dnsHardening: unknown}).dnsHardening = {dohList: false};
-        on.f.advance(1); await on.f.observe();
-        const next = on.f.policy.mutate({id: 'operator', displayName: 'Test operator', role: 'admin', personIds: ['pilot'], permissionVersion: '1'}, 'pilot', 'resume', {}, on.f.policy.people({id: 'operator', displayName: 'Test operator', role: 'admin', personIds: ['pilot'], permissionVersion: '1'}).revisionToken!, 'second_key_123456789');
-        const payload = JSON.parse(on.f.store.get<{payload_json: string}>('SELECT payload_json FROM operations WHERE id=?', next.result.operation.id)!.payload_json) as RouterPolicy;
-        assert.deepEqual(payload.doh.ipv4, on.payload.doh.ipv4);
-        assert.deepEqual(payload.doh.ipv6, on.payload.doh.ipv6);
-    } finally { on.f.cleanup(); }
+    const plan = on.f.worker.prepare('apply', on.id); await on.f.worker.execute(plan, plan.scriptSha256);
+    (on.f.config as unknown as {dnsHardening: unknown}).dnsHardening = flag;
+    on.f.advance(1); await on.f.observe();
+    const actor = {id: 'operator', displayName: 'Test operator', role: 'admin' as const, personIds: ['pilot'], permissionVersion: '1'};
+    const next = on.f.policy.mutate(actor, 'pilot', 'resume', {}, on.f.policy.people(actor).revisionToken!, 'second_key_123456789');
+    const payload = JSON.parse(on.f.store.get<{payload_json: string}>('SELECT payload_json FROM operations WHERE id=?', next.result.operation.id)!.payload_json) as RouterPolicy;
+    return {on, payload};
+}
+
+test('rollback: once the router holds the list, an explicit dohList:false strips it on the next operation', async () => {
+    const {on, payload} = await afterListApplied({dohList: false});
+    try { assert.deepEqual(payload.doh, {ipv4: ['192.0.2.53'], ipv6: []}); } finally { on.f.cleanup(); }
+});
+
+test('an absent dnsHardening key is not a rollback: the router list is left untouched', async () => {
+    const {on, payload} = await afterListApplied(undefined);
+    try { assert.deepEqual(payload.doh, on.payload.doh); } finally { on.f.cleanup(); }
 });
 
 test('manifest dnsHardening: absent is OFF; strict {dohList: boolean}', async () => {

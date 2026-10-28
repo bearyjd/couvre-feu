@@ -15,7 +15,7 @@ import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
 import { audited } from './parent-audit.ts';
-import { mergeStaticDoh, protectedAddressesOf } from './doh-list.ts';
+import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 export interface IntegrationOperation {
@@ -143,11 +143,14 @@ export class IntegrationPolicy {
         this.store.run("INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,'pending')", actor.id, id, action, policy.revision, now);
         return this.row(id)!;
     }
-    /** Flag dnsHardening.dohList: add the static public DoH list to the policy being submitted. Off (absent) returns it untouched. */
+    /**
+     * Flag dnsHardening.dohList: true adds the static public DoH list (and strips retired entries); an explicit false removes the
+     * list and retired entries from the policy being submitted. An absent key returns the policy untouched.
+     */
     private withStaticDoh(policy: RouterPolicy): RouterPolicy {
         const config = this.store.config;
-        if (config.dnsHardening?.dohList !== true) return policy;
-        const merged = mergeStaticDoh(policy.doh, protectedAddressesOf(config));
+        if (config.dnsHardening === undefined) return policy;
+        const merged = reconcileStaticDoh(policy.doh, config.dnsHardening.dohList, protectedAddressesOf(config));
         if (merged.refused > 0) process.stderr.write(`${merged.tag}\n`);
         return normalizePolicy({...policy, doh: merged.doh}, config.protectedMacs);
     }
