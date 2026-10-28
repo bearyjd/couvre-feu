@@ -88,6 +88,34 @@ test('owner mode: the owner may revoke one of several active passkeys, or a pend
     }
 });
 
+test('owner mode: a pending passkey does not count as a remaining one; revoking the only active passkey is refused even beside a pending one', async () => {
+    for (const route of ['passkey_revoke', 'own_passkey_revoke'] as const) {
+        const f = await fixture('bryn');
+        try {
+            addCredential(f, 'bryn_pending', 'bryn', 'pending');
+            const credential = credentialOf(f, 'bryn'), before = f.snapshot();
+            await assert.rejects(f.act(f.admin, f.bryn, route, credential), code('owner_self_lockout'), route);
+            assert.equal(f.snapshot(), before);
+            assert.equal(f.store.get<{state: string}>('SELECT state FROM credentials WHERE id=?', credential)!.state, 'active');
+        } finally { f.close(); }
+    }
+});
+
+test('owner mode: with no active passkey, the owner may revoke a pending one (the rule guards active passkeys only)', async () => {
+    // A step-up needs an active passkey, so no route can reach this state; exercise the rule through apply() directly.
+    type Applier = {apply: (actor: AuthSession['dto']['actor'], kind: AdminAction, target: string, params: Record<string, unknown>) => unknown};
+    for (const route of ['passkey_revoke', 'own_passkey_revoke'] as const) {
+        const f = await fixture('bryn');
+        try {
+            const actor = f.bryn.session().dto.actor;
+            f.store.run("DELETE FROM credentials WHERE id=?", credentialOf(f, 'bryn'));
+            addCredential(f, 'bryn_pending', 'bryn', 'pending');
+            (f.admin as unknown as Applier).apply(actor, route, 'bryn_pending', {});
+            assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM credentials WHERE account_id='bryn'")!.n, 0, route);
+        } finally { f.close(); }
+    }
+});
+
 test('owner mode: other accounts may revoke their last passkey; without owner mode the owner may too', async () => {
     const f = await fixture('bryn');
     try {
