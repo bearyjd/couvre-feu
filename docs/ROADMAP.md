@@ -9,7 +9,7 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 | # | Addition | Phase | State |
 |---|---|---|---|
 | 1 | Ask for time: web UI + parent one-tap approve | 1 | Built and merged, all behind `timeRequests.mode` (off by default): service (PR #86, #88), per-account gate off/owner/parents (F1, PR #92), parent card with Grant, Grant less, Decline and End extra time (F3, PR #94). Unverified on this router: live proof remains |
-| 5 | Reward Time (extra minutes on a grant) | 1 | Service built and merged (F4, PR #95) behind `rewardTime.enabled` (off; unverified on this router); parent UI built behind `rewardTime.enabled` (unverified on this router) |
+| 5 | Reward Time (extra minutes on a grant) | 1 | Service built and merged (F4, PR #95) behind `rewardTime.enabled` (off; unverified on this router); parent UI built behind `rewardTime.enabled`, shown per viewer via the `rewardTime` field of `GET /people` (unverified on this router) |
 | 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | Not started |
 | 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Audit log built and merged (F2, PR #93) behind `auditLog.enabled` (off; unverified on this router; service only, no web view); digest not started |
 | 4 | Push notifications (self-hosted ntfy or Web Push) | 2 | Sketch only ([service contract](service-contract.md#gap-notification-delivery-beyond-the-app)) |

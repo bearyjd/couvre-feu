@@ -41,7 +41,7 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
     try {
         const html = await (await proxyFetch('/')).text(); assert.match(html, /data-source="real-router-integration"/); assert.match(html, /Private router integration/); assert.doesNotMatch(html, /fictional account|Synthetic demo/);
         assert.match(html, new RegExp(`data-automatic-dispatch="${enabled}"`));
-        assert.match(await (await proxyFetch('/sw.js')).text(), /cf-shell-integration-dddd/);
+        assert.match(await (await proxyFetch('/sw.js')).text(), /cf-shell-integration-dddd[^']*-v3'/);
         assert.equal((await request('/people', undefined, {Host: 'untrusted.example.test'})).status, 403);
         assert.equal((await request('/people', undefined, {Origin: 'https://untrusted.example.test'})).status, 403);
         assert.equal(auth.rpID, enabled ? 'parent.example.test' : 'localhost');

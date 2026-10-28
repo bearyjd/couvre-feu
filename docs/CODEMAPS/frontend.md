@@ -11,7 +11,7 @@
 | parent-alerts.js | server-persisted alerts + badge |
 | operational-alerts.js | browser-local journal of operational alerts |
 | time-requests.js | parent: request links, approve/decline |
-| reward-time.js | parent: Reward +15 / +30 min buttons (flagged off) |
+| reward-time.js | parent: Reward +15 / +30 min buttons (shown only when `/people` says `rewardTime`; flagged off) |
 | request.html, request.js | child page; token in URL fragment |
 | sw.js | shell-only offline cache; no API cache, no queued writes |
 | manifest.webmanifest, icon.svg | PWA metadata |
