@@ -471,7 +471,6 @@ finally:
             # Greedy longest-first guarantees the spread is at most the heaviest case.
             self.assertLessEqual(max(loads) - min(loads), max([runner.DEFAULT_WEIGHT, *weights.values()]), (suite, loads))
 
-
     def test_ci_matrix_and_receipt_gate_match_the_planned_partitions(self):
         text = (REPO / ".github/workflows/ci.yml").read_text()
         block = text.split("  fixture_shards:\n", 1)[1].split("\n  fixtures:\n", 1)[0]
@@ -491,11 +490,12 @@ finally:
         with patch.object(runner, "source_revision", return_value="f" * 40):
             plan = runner.discovery_plan()
         self.assertEqual(runner.PARTITION_COUNTS["test-core.py"], 5)
+        self.assertLessEqual(runner.LANE_TIMEOUT, 1800)
         for suite in runner.SUITES:
             weights = runner.CASE_WEIGHTS.get(suite, {})
             loads = [sum(weights.get(case, runner.DEFAULT_WEIGHT) for case in shard["cases"])
                      for shard in plan["shards"] if shard["suite"] == suite]
-            self.assertLessEqual(max(loads), 0.7 * runner.LANE_TIMEOUT, (suite, loads))
+            self.assertLessEqual(max(loads), 0.7 * 1800, (suite, loads))
 
     def test_heavy_ipv6_alias_case_gives_every_cfctl_call_a_load_tolerant_deadline(self):
         # Quiet-host measurement: each of its two cfctl calls takes ~50 s of the default 60 s.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run independent private-root cases in four bounded subprocess lanes."""
+"""Run independent private-root cases in bounded subprocess lanes."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 import hashlib
@@ -40,7 +40,8 @@ SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.
 # 30 s or more as {'<Class>.<test>': seconds}. Seeded from CI run 40377200351; test-core refreshed from run 40667834404.
 DEFAULT_WEIGHT = 5
 # Partitions per suite (default 4). test-core.py is ~3900 s of serial cases: four
-# shards ran 630-1290 s against the 1800 s lane budget, five stay near 800 s.
+# shards ran 630-1290 s against the 1800 s lane budget; five predict about 770 s each.
+# The longest predicted shard is now test-penn-pilot.py at about 1047 s (58%).
 DEFAULT_PARTITIONS = 4
 PARTITION_COUNTS = {'test-core.py': 5}
 LANE_TIMEOUT = 1800

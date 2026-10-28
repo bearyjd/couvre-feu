@@ -222,6 +222,7 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 
 ## Follow-ups
 
+- Shard `test-penn-pilot.py` further: its four partitions predict about 1043-1047 s each, now the longest CI shard (58% of the 1800 s lane budget).
 - Split the tab logic out of `app.js` into its own file (needs a service static-file allowlist change).
 - Close fd 9 for `timeout` children, a stderr warning when buffered output is lost, and the remaining full-pipe/signal tests (tracked in [tier1-rpc §9](contracts/tier1-rpc.md)).
 - Parent iPhone check of the iOS restyle before it merges.

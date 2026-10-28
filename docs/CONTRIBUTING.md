@@ -56,7 +56,7 @@ python3 tests/run-fixtures.py --shard test-core.py --partition 0 --plan "$PRIVAT
 python3 tests/run-fixtures.py --verify-receipts "$PRIVATE_DIR/receipts" --plan "$PRIVATE_DIR/plan.json"
 ```
 
-`--shard` takes one of the nine suites (the `SUITES` tuple in `tests/run-fixtures.py`, which must match the `ci.yml` matrix) and `--partition` 0 to 3. A lane that skips a case is a failure. Smaller suites (`test-install.py`, `test-no-dev-stdin.py`, `test-platform-integration.py`, `test-os-trust.py`, `test-client-probe.py`, `test-live-rehearsal.py`) run directly with `python3 tests/<name>.py`.
+`--shard` takes one of the nine suites (the `SUITES` tuple in `tests/run-fixtures.py`, which must match the `ci.yml` matrix) and `--partition` 0 to 3 (0 to 4 for `test-core.py`). A lane that skips a case is a failure. Smaller suites (`test-install.py`, `test-no-dev-stdin.py`, `test-platform-integration.py`, `test-os-trust.py`, `test-client-probe.py`, `test-live-rehearsal.py`) run directly with `python3 tests/<name>.py`.
 
 **TMPDIR.** Fixtures and the integration service require private roots. A path whose ancestors are symlinks or writable by other users (without the sticky bit, owned by root) is refused with `unsafe_private_ancestor`. Point `TMPDIR` at a directory under your home that only you can write, mode 0700, and keep evidence and manifests there, never in the repository.
 
