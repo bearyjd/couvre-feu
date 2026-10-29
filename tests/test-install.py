@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: measured: installer shell runs 0.5 s max against 10-20 s limits (load 3-25)
 """Filesystem recovery fixtures; never invokes router/system backends."""
 import atexit
 import contextlib

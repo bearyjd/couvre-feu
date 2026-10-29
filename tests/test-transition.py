@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: UNMEASURED: fixture shard (too long to time here); 5-10 s bounds on single shell runs and SIGKILL reaps, follow-up
 """Guarded transition/crash models; these do not establish real packet behavior."""
 import importlib.util
 import json

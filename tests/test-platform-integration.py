@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: measured: shell snippets <0.1 s against 3-10 s limits (load 3-6)
 """Native ash integration fixtures. No root writes, vendor payload or live router.
 
 Vendor adapter fixtures substitute the pinned payload/attestation boundary,

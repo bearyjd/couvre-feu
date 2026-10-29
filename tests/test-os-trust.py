@@ -25,6 +25,9 @@ spec=importlib.util.spec_from_file_location('platform_fixtures',REPO/'tests/test
 platform=importlib.util.module_from_spec(spec);spec.loader.exec_module(platform)
 SHELL=platform.SHELL
 PROFILE='gl-xe3000-4.8.3-os-trust-v1'
+# Bound for one shell snippet or reap. Measured at 0.00-0.23 s (one case sleeps ~4 s on purpose) with load average 3-25;
+# 30 s keeps >100x headroom for a CI runner yet a real hang still fails in 30 s.
+SHELL_TIMEOUT=30
 
 class StaticWitnessTests(unittest.TestCase):
     def setUp(self):
@@ -67,7 +70,7 @@ vp_profile={PROFILE}
 
     def tearDown(self):self.temp.cleanup()
     def run_helper(self,extra=''):
-        return subprocess.run(SHELL+['-c',self.setup+extra+'\nvp_transaction_check'],capture_output=True,text=True,timeout=10)
+        return subprocess.run(SHELL+['-c',self.setup+extra+'\nvp_transaction_check'],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
     def test_static_success_has_distinct_result_without_population_scan(self):
         r=self.run_helper();self.assertEqual(r.returncode,0,r.stderr)
         self.assertIn('OS_TRUST_PROFILE_ATTESTED:',r.stdout);self.assertNotIn('VENDOR_PROFILE_ATTESTED:',r.stdout)
@@ -116,7 +119,7 @@ vp_profile={PROFILE}
         for profile in [PROFILE,'strict',platform.PROFILE,None]:
             with self.subTest(profile=profile):
                 selector='unset vp_profile' if profile is None else 'vp_profile='+profile
-                result=subprocess.run(SHELL+['-c',self.setup+'\n'+selector+direct],capture_output=True,text=True,timeout=10)
+                result=subprocess.run(SHELL+['-c',self.setup+'\n'+selector+direct],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
                 self.assertEqual(result.returncode==0,profile==PROFILE,result.stderr)
                 if profile!=PROFILE:self.assertIn('unobserved_group_writable_path' if profile==platform.PROFILE else 'unsupported_vendor_profile',result.stderr)
         result=self.run_helper();self.assertEqual(result.returncode,0,result.stderr)
@@ -127,7 +130,7 @@ vp_profile={PROFILE}
         firmware.chmod(0o664)
         self.assertIn('metadata_owner',self.run_helper('stat_private() { printf "7:0:664\\n"; }').stderr)
         other=self.root/'etc/unknown-firmware';other.write_text('4.8.3\n');other.chmod(0o664)
-        result=subprocess.run(SHELL+['-c',self.setup+f'\nvp_metadata "{other}"'],capture_output=True,text=True,timeout=10)
+        result=subprocess.run(SHELL+['-c',self.setup+f'\nvp_metadata "{other}"'],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
         self.assertIn('unobserved_group_writable_path',result.stderr)
     def test_account_drift_and_provider_appearance_after_first_witness_refuse(self):
         # Rename only the fixture wrapper so the actual complete PID1 witness
@@ -149,7 +152,7 @@ class DeadlineTests(unittest.TestCase):
         self.bootstrap=REPO/'router/lib/platform-bootstrap.sh'
         self.setup=f'. "{self.bootstrap}"; CF_PLATFORM_PROFILE={PROFILE}; CF_PLATFORM_ENTRY_TICK=100; '
     def run_shell(self,body):
-        return subprocess.run(SHELL+['-c',self.setup+body],capture_output=True,text=True,timeout=10)
+        return subprocess.run(SHELL+['-c',self.setup+body],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
     def test_exclusive_centisecond_boundary_and_anchor_reuse(self):
         for tick,ok in [(100,True),(1399,True),(1400,False),(99,False)]:
             r=self.run_shell(f'platform_clock_tick() {{ printf {tick}; }}; platform_deadline_check; platform_deadline_check;printf complete')
@@ -204,7 +207,7 @@ class DeadlineTests(unittest.TestCase):
                 self.assertEqual(list((root/'tmp').iterdir()),[])
             finally:
                 if child.poll() is None:child.kill()
-                child.communicate(timeout=5)
+                child.communicate(timeout=SHELL_TIMEOUT)
     def test_native_blocked_stat_producer_cannot_grant_initial_write(self):
         text=self.bootstrap.read_text();start=text.index('    platform_stat() {')
         stop=text.index('    [ "$(platform_stat -c',start);fragment=text[start:stop]

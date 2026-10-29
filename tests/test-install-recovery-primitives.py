@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: measured: busybox/lock primitives finish in <0.01 s against 5 s waits (load 3-25)
 """Real BusyBox primitive proofs, using private files and pipe barriers only.
 
 The M4b gate must record a run with BusyBox 1.33.1. These are local kernel and

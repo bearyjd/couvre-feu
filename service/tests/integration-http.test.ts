@@ -72,7 +72,8 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
         const result = await request('/people/pilot/pause', {until: 0}, headers); assert.equal(result.status, 202); assert.equal(result.body.operation.dispatch, enabled ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
         if (automatic) {
             automatic.start();
-            const deadline = Date.now() + 1000;
+            // Polls every 10 ms and exits on confirmation (whole test measured 0.43 s); the bound only matters for a real hang.
+            const deadline = Date.now() + 15000;
             while (f.policy.operation(verified.body.actor, result.body.operation.id).state !== 'confirmed' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
         }
         for (let i = 0; i < 3; i++) { const operation = await request('/operations/' + result.body.operation.id); assert.equal(operation.body.state, enabled ? 'confirmed' : 'pending'); assert.equal(operation.body.source, 'real-router-integration'); assert.equal((await request('/people')).status, 200); }

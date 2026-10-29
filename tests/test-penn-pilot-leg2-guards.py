@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: the 4-8 s waits reap drivers whose own deadlines are 1-4 s by design (measured 1-2 s); the driver deadlines test the timeout path
 """Leg-2 pty driver guards (T4 review fixes): the digest-bound argv and plan checks, the ack command run for real
 against a fake /proc, signal handling of the driver process, and re-hashing of the pinned known-hosts and identity files.
 Same harness as tests/test-penn-pilot-leg2.py (fake ssh, no router). Fictional MACs and documentation IPs only."""
