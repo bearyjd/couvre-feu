@@ -19,7 +19,7 @@
 
 # Couvre-feu
 
-Router-local internet pause and schedules, an authenticated fictional parent demo, and a separate operator-dispatched one-device integration path. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. Integration source implements exact policy CAS, durable receipts and asynchronous SSH; it is not installed or accepted on the target router. Real packet behavior and household production remain pending; companions and bonus grants are later work. A service-side estimate of per-child network activity from router byte counters (not app use, websites or screen time) is described in [activity service](docs/activity-service.md); live collection needs the router counters command and an approved invocation.
+Router-local internet pause and schedules, an authenticated fictional parent demo, and a separate operator-dispatched one-device integration path. The shell core targets GL.iNet GL-XE3000 / OpenWrt 21.02 / fw3 + legacy iptables. Integration source implements exact policy CAS, durable receipts and asynchronous SSH; it is not installed or accepted on the target router. Real packet behavior and household production remain pending; companions are later work, and bonus time (Reward Time) is built but flagged off and unverified on this router. A service-side estimate of per-child network activity from router byte counters (not app use, websites or screen time) is described in [activity service](docs/activity-service.md); live collection needs the router counters command and an approved invocation.
 
 AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforcement-core.md) and [inspection report](docs/spike-001.md) explain the target. [Enforcement contract](docs/enforcement-contract.md), [acceptance and recovery](docs/acceptance-001.md), [parent PWA specification](docs/prp/PRP-002-parent-pwa.md), [policy service specification](docs/prp/PRP-003-policy-service.md), and [companion limits](docs/companion-capabilities.md) describe each phase. [PRP-005](docs/prp/PRP-005-domain-observations.md) is a proposal only for privacy-scoped domain observations; collection stays off. No Fengard source was copied.
 
@@ -78,6 +78,16 @@ The temporary [client probe](tests/client-probe/README.md) is prepared and teste
 ## Child time requests
 
 A parent can create a private request link per child (parent app, "Time requests"). The child opens `/request.html#<token>` with no account or passkey, picks 15/30/60 minutes and sees pending/approved/declined. Approval ends a current manual pause and restores it when the allowance ends, through the existing revision-CAS write path. Schedules cannot be overridden yet and say so. Details and security model: [service contract](docs/service-contract.md#child-time-requests).
+
+## Flagged features (all off by default, unverified on this router)
+
+Each is a key in the private integration manifest; absent means off. Status and PR numbers: [roadmap](docs/ROADMAP.md#planned-additions-at-a-glance); behavior and rules: [service contract](docs/service-contract.md#operating-notes-for-the-flagged-features).
+
+- Ask for time: `timeRequests.mode` `off`, `owner` or `parents` (with `ownerAccountId`); service and parent card built (PR #86, #88, #92, #94). In `owner` mode other admins cannot change the owner's account and the owner cannot lock themselves out (PR #100).
+- Reward Time: `rewardTime.enabled`; service (PR #95) and parent buttons (PR #107, shown per viewer through the `rewardTime` field of `GET /people`).
+- Focus window: `focus.enabled`; one-shot service only (PR #104), no web UI yet.
+- Audit log of parent actions: `auditLog.enabled`; table `parent_audit` (migrations 010 to 012), `GET /audit`, service only (PR #93), no web view yet.
+- DNS hardening: `dnsHardening.dohList` merges the static public DoH resolver list (`service/src/doh-list.ts`) into each submitted policy; see [DNS hardening](docs/dns-hardening.md).
 
 ## Local verification
 

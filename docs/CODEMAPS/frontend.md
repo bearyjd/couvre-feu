@@ -1,15 +1,16 @@
-<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~218 -->
+<!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~218 -->
 # Frontend (web/public, static PWA, no bundler)
 | File | Role |
 |---|---|
 | index.html, styles.css | parent shell |
-| app.js (~530 lines) | main UI; calls /auth/session, /people, ops; imports auth-client, status-cache |
+| app.js (~580 lines) | main UI; calls /auth/session, /people, ops; imports auth-client, status-cache |
 | auth-client.js | WebAuthn createPasskey/getPasskey |
 | status-cache.js | actor-scoped cache of status/alert evidence |
 | schedule-editor.js/.css | schedule CRUD UI (shared/src/schedule-edit.ts rules) |
 | activity.js | per-child estimated activity (DOM + textContent only) |
 | parent-alerts.js | server-persisted alerts + badge |
 | operational-alerts.js | browser-local journal of operational alerts |
+| accounts.js, children.js | passkeys and parent accounts; children, devices, Block all/Unblock all and "Devices on the network" (all behind step-up for changes) |
 | time-requests.js | parent: request links, approve/decline |
 | reward-time.js | parent: Reward +15 / +30 min buttons (shown only when `/people` says `rewardTime`; flagged off) |
 | request.html, request.js | child page; token in URL fragment |

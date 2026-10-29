@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~299 -->
+<!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~299 -->
 # Architecture
 Monorepo: router (OpenWrt ash/awk) + service (Node 26.8.1 TS, no build) + static PWA.
 
@@ -16,15 +16,17 @@ parent browser (PWA, passkey)
 Entry points
 - `npm run demo:start` main.ts: fake router (demo-router/) + synthetic data.
 - `npm run integration:start <manifest>` integration-main.ts: real router over SSH; dispatch only if manifest `dispatch.enabled`.
-- `integration:bootstrap` issues CLI-only enrollment token; `integration:dispatch` operator dispatch.
+- `integration:bootstrap` issues CLI-only enrollment token (further passkeys: admin UI add-device tokens, approved by an admin, step-up bound); `integration:dispatch` operator dispatch.
 - Router: install.sh / uninstall.sh / cfctl, release pinned by router/release.sha256 (tools/freeze-router-release.py). The shipped tree is `--emit`ted: cfctl-ssh and cfctl-scope lose their CF_TEST_MODE block (tools/strip-test-mode.py); release.sha256 covers final emitted bytes; version-2 CF_RELEASE_ID binds all emitted sources, including install/uninstall/bootstrap, with generated assignments normalized to break pin cycles.
 
+Flagged-off features (manifest keys; absent = off; all unverified on this router): `timeRequests.mode` off|owner|parents (+ `ownerAccountId`), `rewardTime.enabled`, `focus.enabled`, `auditLog.enabled` (table `parent_audit`), `dnsHardening.dohList` (service/src/doh-list.ts). Details: [backend](backend.md), [data](data.md), docs/service-contract.md.
 Trust boundaries
 - Service never gets a shell: cfctl-ssh accepts only `cfctl rpc-*|status|pause|resume|sync|expire|apply-fw` tokens.
+- In `owner` mode the owner account is guarded against other admins and against self-lockout (admin-accounts.ts, PR #100).
 - Router is source of truth for enforcement; service holds desired policy (revision CAS) and an observation.
 - Time-limited pause/allowance expires via the immutable generation-bound cron callback even if service is down.
 - A permanent kernel mutex fences install/runtime/recovery workers; immutable PREPARED and a final retirement receipt bind exact restoration. Admin-only external-source recovery precedes the single uninstaller. Production legacy automatic restore refuses; target eligibility remains UNVERIFIED. [Recovery contract](../runbooks/vendor-platform-admission.md).
 
 Maps: [backend](backend.md) [frontend](frontend.md) [data](data.md) [dependencies](dependencies.md) [router](router.md) [live-tools](live-tools.md)
 
-Layout: router/ service/ shared/src (contracts, router-rpc, router-schema, activity-evidence, schedule-edit) web/public tools/ tests/ docs/ demo-router/src.
+Layout: router/ service/ (migrations 001..012 + integration-001..007) shared/src (contracts, router-rpc, router-schema, activity-evidence, schedule-edit) web/public tools/ tests/ docs/ demo-router/src.
