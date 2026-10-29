@@ -281,7 +281,7 @@ test('quick pause presets show remaining time, End now removes the pause, and ex
   await enroll(page, demo);
   await expect(page.getByRole('button', { name: /^Pause Alex \(fictional\) for \d+ minutes$/ })).toHaveText(['Pause 15 min', 'Pause 30 min', 'Pause 60 min']);
   await expect(page.getByRole('button', { name: 'Extra time 15 / 30 / 60 min' })).toBeDisabled();
-  await expect(page.locator('[data-extra-time="alex"]')).toContainText('no allowance concept');
+  await expect(page.locator('[data-extra-time="alex"]')).toContainText('not turned on');
   await page.getByRole('button', { name: 'Pause Alex (fictional) for 30 minutes', exact: true }).click();
   await expect(page.locator('.operation')).toContainText('Pause confirmed');
   await expect(page.locator('[data-remaining]')).toHaveText(/^(29|30)m \d+s$/);

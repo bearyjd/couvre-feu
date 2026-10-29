@@ -347,3 +347,29 @@ test('HTTP: flag off, time requests off, out-of-scope child and the owner-mode g
         } finally { await s.close(); r.w.f.cleanup(); }
     }
 });
+
+test('HTTP: GET /people carries a read-only rewardTime boolean only when the reward route would answer for that viewer', async () => {
+    const cases: {name: string; reward: boolean; mode?: 'off' | 'owner' | 'parents'; account: string; expected: boolean}[] = [
+        {name: 'flag off', reward: false, mode: 'parents', account: 'operator', expected: false},
+        {name: 'time requests off', reward: true, mode: 'off', account: 'operator', expected: false},
+        {name: 'time requests absent', reward: true, account: 'operator', expected: false},
+        {name: 'owner mode, non-owner parent', reward: true, mode: 'owner', account: 'parent', expected: false},
+        {name: 'owner mode, the owner', reward: true, mode: 'owner', account: 'operator', expected: true},
+        {name: 'parents mode, a scoped parent', reward: true, mode: 'parents', account: 'parent', expected: true}];
+    for (const c of cases) {
+        const r = await rewardWorld({}, {reward: c.reward, audit: true});
+        if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
+        if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
+        const s = await serve(r, ports++);
+        try {
+            const who = await session(r.w.f, s.o, c.account);
+            const people = await who.send('GET', '/people');
+            assert.equal(people.status, 200, c.name);
+            if (c.expected) assert.equal(people.body.rewardTime, true, c.name); else assert.ok(!people.body.rewardTime, `${c.name}: absent or false`);
+            // The signal is one viewer-level boolean: nothing per child, no audit row, no operation, and the body never names the feature otherwise.
+            assert.ok(people.body.people.every((p: Record<string, unknown>) => !('rewardTime' in p)), `${c.name}: not per child`);
+            assert.equal(r.audit().length, 0, c.name); assert.equal(r.ops(), 0, c.name);
+            if (!c.expected) assert.ok(!JSON.stringify(people.body).includes('rewardTime'), `${c.name}: no trace of the feature`);
+        } finally { await s.close(); r.w.f.cleanup(); }
+    }
+});

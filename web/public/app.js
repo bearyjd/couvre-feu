@@ -4,6 +4,7 @@ import { createScheduleEditor, actionVerb } from './schedule-editor.js';
 import { createParentAlerts } from './parent-alerts.js';
 import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
+import { createRewardTime } from './reward-time.js';
 import { createAccounts } from './accounts.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
@@ -20,6 +21,7 @@ const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
+const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
@@ -255,7 +257,7 @@ async function logout() {
 }
 
 // Resolves {sent, reason}: sent is true only once the service accepted the request (never a confirmation of the outcome).
-async function mutate(personId, action, presetSeconds) {
+async function mutate(personId, action, presetSeconds, minutes) {
   if (!canControl()) return { sent: false, reason: controlBlock() };
   const beforeRevision = state.people.revisionToken;
   const beforeScope = actorScope(state.session.actor);
@@ -271,15 +273,15 @@ async function mutate(personId, action, presetSeconds) {
   let outcome = { sent: false, reason: 'Your session changed.' };
   state.busy = true;
   renderControlState();
-  announce(`Sending ${action === 'resume' ? 'resume' : 'manual pause'} request. A request is not confirmation.`);
+  announce(`Sending ${({ resume: 'resume', reward: 'extra time' })[action] ?? 'manual pause'} request. A request is not confirmation.`);
   try {
     const until = requestedDuration === '0' ? 0 : now() + Number(requestedDuration);
     const result = await api(`/people/${encodeURIComponent(personId)}/${action}`, {
-      method: 'POST', body: action === 'pause' ? { until } : {},
+      method: 'POST', body: action === 'pause' ? { until } : action === 'reward' ? { minutes } : {},
       headers: { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken },
     });
     if (generation !== state.generation) return outcome;
-    outcome = { sent: true, reason: null };
+    outcome = { sent: true, reason: null, operationId: result.operation.id };
     state.operation = result.operation;
     const person = state.people.people.find((entry) => entry.id === personId);
     if (person) { person.latestOperation = result.operation; person.status = result.operation.state; }
@@ -291,7 +293,12 @@ async function mutate(personId, action, presetSeconds) {
   } catch (error) {
     if (generation !== state.generation) return outcome;
     state.needsRefresh = true;
-    if (error instanceof APIError && error.status === 409) {
+    if (action === 'reward' && error instanceof APIError && ![401, 403].includes(error.status)) {
+      // The Reward Time controls explain every refusal themselves from the code; a 404 means the feature is off for this viewer.
+      outcome = { sent: false, reason: null, code: error.code, status: error.status };
+      state.needsRefresh = error.code === 'revision_conflict'; // every other refusal changed nothing
+      announce(''); // the per-child status line says what happened; drop the stale "Sending" notice
+    } else if (error instanceof APIError && error.status === 409) {
       outcome = { sent: false, reason: 'Revision conflict. Nothing was sent again; review the status and try again.' };
       announce('Revision conflict. No retry was sent. Refresh status, review the change, then choose the action again.', true);
     } else if (error instanceof APIError && [401, 403].includes(error.status)) {
@@ -373,7 +380,7 @@ function renderAuthControls() {
 
 function renderControlState() {
   const enabled = canControl();
-  for (const button of document.querySelectorAll('[data-control], [data-quick-pause]')) button.disabled = !enabled;
+  for (const button of document.querySelectorAll('[data-control], [data-quick-pause], [data-reward-minutes]:not([data-reward-busy])')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   bulk.update();
   $('#refresh').disabled = state.busy || state.refreshing || state.offline;
@@ -390,7 +397,7 @@ function renderConnection() {
 }
 
 function renderPeople() {
-  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown]);
+  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown, rewardTime.signature()]);
   if (renderKey === state.renderKey) return;
   const focused = document.activeElement?.dataset?.focusKey;
   const openDetails = new Set([...document.querySelectorAll('[data-details-key][open]')].map((element) => element.dataset.detailsKey));
@@ -410,8 +417,9 @@ function renderPeople() {
       <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}${device.change ? ` · ${device.change === 'adding' ? 'being added' : device.change === 'moving' ? 'being moved' : 'being removed'}` : ''}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="quick-pauses" role="group" aria-label="Quick pause for ${label}">${[[900, '15'], [1800, '30'], [3600, '60']].map(([seconds, minutes]) => `<button class="button primary" type="button" data-quick-pause="${seconds}" data-person-id="${id}" data-focus-key="quick-${seconds}-${id}" aria-label="Pause ${label} for ${minutes} minutes">Pause ${minutes} min</button>`).join('')}</div>
       ${timedPause ? `<p class="remaining" role="timer" aria-label="Time remaining on ${label} timed pause">Time left: <strong data-remaining="${effectiveManual.until}"></strong></p>` : ''}
-      <p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: the router policy has no allowance concept yet, so a schedule block cannot be lifted temporarily. Pausing and ending a pause work as shown.</span></p>
+      ${rewardTime.offered() ? '' : `<p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: extra time is not turned on for your account in this installation. Pausing and ending a pause work as shown.</span></p>`}
       <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="${timedPause ? `End ${label} timed pause now` : `Resume ${label} manual pause`}">${timedPause ? 'End now' : 'Resume'}</button></div>
+      ${rewardTime.markup(person)}
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
       <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy ${isReal() ? 'router' : 'synthetic'} confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
     </article>`;
@@ -468,7 +476,7 @@ function render() {
   }
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
-    renderConnection(); renderPeople(); renderControlState();
+    renderConnection(); renderPeople(); renderControlState(); rewardTime.afterRender();
     activityPanel.update(state.people.people, Boolean(state.session) && !state.offline);
   } else {
     activityPanel.clear();
@@ -534,6 +542,8 @@ $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);
 });
 $('#people').addEventListener('click', (event) => {
+  const reward = event.target.closest('[data-reward-minutes]');
+  if (reward && !reward.disabled) { void rewardTime.tap(reward.dataset.personId, Number(reward.dataset.rewardMinutes)); return; }
   const button = event.target.closest('[data-control], [data-quick-pause]');
   if (button && !button.disabled) void mutate(button.dataset.personId, button.dataset.quickPause ? 'pause' : button.dataset.control, button.dataset.quickPause);
 });
