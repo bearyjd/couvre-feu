@@ -7,6 +7,8 @@ import io
 import json
 from pathlib import Path
 import shlex
+import ast
+import re
 import shutil
 import signal
 import subprocess
@@ -37,6 +39,11 @@ def process_state(pid):
         return status.read_text().split(")", 1)[1].split()[0]
     except (FileNotFoundError, ProcessLookupError):
         return None
+
+
+def stub_count(filename):
+    # One stub case per partition keeps every miniature shard nonempty.
+    return runner.PARTITION_COUNTS.get(filename, runner.DEFAULT_PARTITIONS)
 
 
 class FixtureProcessTests(unittest.TestCase):
@@ -332,7 +339,7 @@ finally:
                 (root / "tests").mkdir()
                 for filename in runner.SUITES:
                     body = "import unittest\nfrom pathlib import Path\nclass Cases(unittest.TestCase):\n"
-                    for index in range(4):
+                    for index in range(stub_count(filename)):
                         body += f"    def test_{index}(self):\n        with Path({str(root / 'executed')!r}).open('a') as stream: stream.write({(filename + ':' + str(index) + chr(10))!r})\n"
                         body += f"        self.assertFalse({fail and filename == 'test-core.py' and index == 0!r})\n"
                     body += "if __name__ == '__main__': unittest.main()\n"
@@ -352,11 +359,11 @@ finally:
                     return real_pool(**kwargs)
                 with patch.object(runner, 'source_revision', return_value='f'*40), patch.dict(os.environ, CF_TEST_WORKERS=str(workers)), patch.object(runner, "ThreadPoolExecutor", pool), patch.object(runner, "REPO", root), patch.object(runner.tempfile, "mkdtemp", make_logs), contextlib.redirect_stdout(output):
                     self.assertEqual(runner.main(), 1 if fail else 0)
-                self.assertEqual(len((root / "executed").read_text().splitlines()), 4 * len(runner.SUITES))
-                self.assertEqual(len(set((root / "executed").read_text().splitlines())), 4 * len(runner.SUITES))
+                self.assertEqual(len((root / "executed").read_text().splitlines()), sum(map(stub_count, runner.SUITES)))
+                self.assertEqual(len(set((root / "executed").read_text().splitlines())), sum(map(stub_count, runner.SUITES)))
                 self.assertEqual(logs.exists(), fail)
                 for filename in runner.SUITES:
-                    for index in range(1, 5):
+                    for index in range(1, stub_count(filename) + 1):
                         self.assertIn(f'{filename} lane {index}, 1 cases', output.getvalue())
                 if fail:
                     self.assertIn("FAIL: test-core.py", output.getvalue())
@@ -372,7 +379,7 @@ finally:
                 shutil.copy2(REPO / relative, destination)
             for filename in runner.SUITES:
                 body = "import unittest\nfrom pathlib import Path\nclass Cases(unittest.TestCase):\n"
-                for index in range(4):
+                for index in range(stub_count(filename)):
                     body += f"    def test_{index}(self):\n        with Path({str(root / 'executed')!r}).open('a') as stream: stream.write({(filename + ':' + str(index) + chr(10))!r})\n"
                 body += "if __name__ == '__main__': unittest.main()\n"
                 (root / 'tests' / filename).write_text(body)
@@ -382,14 +389,14 @@ finally:
             with patch.object(runner, 'source_revision', return_value='f'*40), patch.object(runner, 'REPO', root), patch.dict(os.environ, CF_TEST_WORKERS='1'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(runner.main(['--write-plan', str(plan_path)]), 0)
                 plan = json.loads(plan_path.read_text())
-                self.assertEqual(len(plan['shards']), 4 * len(runner.SUITES))
+                self.assertEqual(len(plan['shards']), sum(map(stub_count, runner.SUITES)))
                 for shard in plan['shards']:
                     receipt = receipts / f"{shard['suite']}.{shard['partition']}.json"
                     self.assertEqual(runner.main(['--shard', shard['suite'], '--partition', str(shard['partition']),
                                                   '--plan', str(plan_path), '--receipt', str(receipt)]), 0)
                 executed = (root / 'executed').read_text().splitlines()
-                self.assertEqual(len(executed), 4 * len(runner.SUITES))
-                self.assertEqual(len(set(executed)), 4 * len(runner.SUITES))
+                self.assertEqual(len(executed), sum(map(stub_count, runner.SUITES)))
+                self.assertEqual(len(set(executed)), sum(map(stub_count, runner.SUITES)))
                 verify = ['--verify-receipts', str(receipts), '--plan', str(plan_path)]
                 self.assertEqual(runner.main(verify), 0)
                 entries = sorted(receipts.iterdir())
@@ -417,7 +424,8 @@ finally:
                 self.assertEqual(runner.main(verify), 2, 'wrong commit accepted')
                 plan_path.write_text(json.dumps(plan))
                 invalid = [[], ['--write-plan', ''], ['--verify-receipts', ''], ['--plan', ''], ['--receipt', ''], ['--shard', 'unknown.py'], ['--shard', ''], ['--partition', '0'],
-                           ['--shard', 'test-core.py', '--partition', '4'],
+                           ['--shard', 'test-core.py', '--partition', '5'],
+                           ['--shard', 'test-rpc.py', '--partition', '4'],
                            ['--shard', 'test-core.py', '--partition', '01'],
                            ['--shard', 'test-core.py', '--partition', '0']]
                 with patch.object(runner, 'run_lane') as launch:
@@ -453,15 +461,55 @@ finally:
             weights = runner.CASE_WEIGHTS.get(suite, {})
             groups = [shard['cases'] for shard in plan['shards'] if shard['suite'] == suite]
             names = [case for group in groups for case in group]
-            self.assertEqual(len(groups), 4, suite)
+            self.assertEqual(len(groups), runner.PARTITION_COUNTS.get(suite, runner.DEFAULT_PARTITIONS), suite)
             self.assertTrue(all(groups), suite)
             self.assertEqual(len(names), len(set(names)), suite)
-            self.assertEqual(groups, runner.partition_cases(sorted(names), weights), suite)
+            self.assertEqual(groups, runner.partition_cases(sorted(names), weights, len(groups)), suite)
             for stale in set(weights) - set(names):
                 self.fail(f'{suite}: weight for unknown case {stale}')
             loads = [sum(weights.get(case, runner.DEFAULT_WEIGHT) for case in group) for group in groups]
             # Greedy longest-first guarantees the spread is at most the heaviest case.
             self.assertLessEqual(max(loads) - min(loads), max([runner.DEFAULT_WEIGHT, *weights.values()]), (suite, loads))
+
+    def test_ci_matrix_and_receipt_gate_match_the_planned_partitions(self):
+        text = (REPO / ".github/workflows/ci.yml").read_text()
+        block = text.split("  fixture_shards:\n", 1)[1].split("\n  fixtures:\n", 1)[0]
+        suites = re.search(r"^        suite: \[(.*)\]$", block, re.M).group(1).replace(" ", "").split(",")
+        parts = [int(part) for part in re.search(r"^        partition: \[(.*)\]$", block, re.M).group(1).replace(" ", "").split(",")]
+        extra = re.findall(r"^          - suite: (\S+)\n            partition: (\d+)$", block, re.M)
+        matrix = {(suite, part) for suite in suites for part in parts} | {(suite, int(part)) for suite, part in extra}
+        with patch.object(runner, "source_revision", return_value="f" * 40):
+            planned = {(shard["suite"], shard["partition"]) for shard in runner.discovery_plan()["shards"]}
+        self.assertEqual(matrix, planned)
+        self.assertEqual(tuple(suites), runner.SUITES)
+        self.assertEqual(sorted({part for _, part in planned}), list(range(max(runner.PARTITION_COUNTS.values(), default=4))))
+        gate = re.search(r"Prove all (\d+) unique partitions", text)
+        self.assertEqual(int(gate.group(1)), len(planned))
+
+    def test_predicted_heaviest_partition_stays_within_seventy_percent_of_the_lane_budget(self):
+        with patch.object(runner, "source_revision", return_value="f" * 40):
+            plan = runner.discovery_plan()
+        self.assertEqual(runner.PARTITION_COUNTS["test-core.py"], 5)
+        self.assertLessEqual(runner.LANE_TIMEOUT, 1800)
+        for suite in runner.SUITES:
+            weights = runner.CASE_WEIGHTS.get(suite, {})
+            loads = [sum(weights.get(case, runner.DEFAULT_WEIGHT) for case in shard["cases"])
+                     for shard in plan["shards"] if shard["suite"] == suite]
+            self.assertLessEqual(max(loads), 0.7 * 1800, (suite, loads))
+
+    def test_heavy_ipv6_alias_case_gives_every_cfctl_call_a_load_tolerant_deadline(self):
+        # Quiet-host measurement: each of its two cfctl calls takes ~50 s of the default 60 s.
+        tree = ast.parse((REPO / "tests/test-core.py").read_text())
+        case = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                    and node.name == "test_cached_ipv6_aliases_cover_schedule_pause_guards_and_conntrack")
+        calls = [node for node in ast.walk(case) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and ((node.func.attr == "run" and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "fixture")
+                      or (node.func.attr == "sync" and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"))]
+        self.assertGreaterEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call.func.attr, "run", "self.sync uses the default 60 s deadline")
+            deadline = [kw.value for kw in call.keywords if kw.arg == "timeout"]
+            self.assertEqual([ast.unparse(item) for item in deadline], ["ALLOWANCE_DEADLINE"])
 
 
 if __name__ == "__main__":

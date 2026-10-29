@@ -623,8 +623,9 @@ class StaticTests(unittest.TestCase):
         self.assertEqual(tuple(name.strip() for name in matrix.group(1).split(',')), runner.SUITES)
         self.assertLessEqual({'test-penn-pilot-leg2.py', 'test-penn-pilot-leg2-guards.py'}, set(runner.SUITES))
         ci = (REPO / '.github/workflows/ci.yml').read_text()
-        self.assertIn(f'all {4 * len(runner.SUITES)} unique partitions', ci)
-        self.assertIn(f'({4 * len(runner.SUITES)} shards)', (REPO / 'docs/CONTRIBUTING.md').read_text())
+        shards = sum(runner.PARTITION_COUNTS.get(name, runner.DEFAULT_PARTITIONS) for name in runner.SUITES)
+        self.assertIn(f'all {shards} unique partitions', ci)
+        self.assertIn(f'({shards} shards)', (REPO / 'docs/CONTRIBUTING.md').read_text())
 
     def test_a_version_one_summary_has_no_legs_key(self):
         text = (REPO / 'tools/live/penn-pilot.py').read_text()

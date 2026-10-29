@@ -34,7 +34,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -105,6 +105,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const clock = (policy as {now?: () => number}).now ?? auth.now;
     // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
     const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
+    // Reward time: off (the manifest default), time requests off, or a parent the owner-mode gate excludes is a route that does not exist.
+    const rewardOn = (actor: Actor) => Boolean(grants && timeRequestsEnabled && mayDecide(actor) && grants.policy.store.config.rewardTime?.enabled === true);
     const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock, undefined, grants);
     // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
     const drain = requests ? null : new TimeRequestService(auth.store, policy, clock, undefined, grants);
@@ -112,7 +114,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const reconcileAlerts = alerts?.reconcile?.bind(alerts);
     const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
-    const accounts = new AccountAdmin(auth);
+    const accounts = new AccountAdmin(auth, gated && mode === 'owner' ? ownerAccountId : undefined);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
@@ -160,7 +162,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v3'", `'cf-shell-integration-${provenance.integrationScope}-v2'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v4'", `'cf-shell-integration-${provenance.integrationScope}-v3'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
@@ -235,10 +237,17 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, account.status, {...provenance, ...account.body as object});
                     return;
                 }
-                // Reward time: off (the manifest default), time requests off, or a parent the owner-mode gate excludes is a route that does not exist.
                 const reward = /^\/people\/([a-z][a-z0-9_]{0,31})\/reward$/.exec(path);
-                if (reward && grants && timeRequestsEnabled && mayDecide(session.dto.actor) && grants.policy.store.config.rewardTime?.enabled === true) {
+                if (reward && grants && rewardOn(session.dto.actor)) {
                     const result = grants.reward(session.dto.actor, reward[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
+                // Focus window: the same gates as Reward Time, plus its own flag.
+                const focus = /^\/people\/([a-z][a-z0-9_]{0,31})\/focus$/.exec(path);
+                if (focus && grants && timeRequestsEnabled && mayDecide(session.dto.actor) && grants.policy.store.config.focus?.enabled === true) {
+                    const result = grants.policy.focus(session.dto.actor, focus[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;
@@ -283,7 +292,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 return;
             }
             if (path === '/people') {
-                send(response, 200, await policy.people(session.dto.actor));
+                // rewardTime: one viewer-level boolean, present only when the reward route would answer for this viewer (never per child).
+                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {})});
                 return;
             }
             const childRead = childrenGet(children, session, path);

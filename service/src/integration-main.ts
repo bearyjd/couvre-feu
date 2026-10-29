@@ -2,7 +2,7 @@ import { integrationConfig } from './integration-config.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { Auth } from './auth.ts';
 import { SSHRouter } from './ssh-router.ts';
-import { wireIntegration } from './integration-wiring.ts';
+import { wireIntegration, checkOwnerAccount } from './integration-wiring.ts';
 import { AutomaticDispatch } from './integration-automatic.ts';
 import { loadTLS } from './tls.ts';
 import type { Server as HTTPSServer } from 'node:https';
@@ -14,6 +14,7 @@ const {worker, prune, app} = wireIntegration(config, store, new SSHRouter(config
 const automatic = config.dispatch?.enabled ? new AutomaticDispatch(worker) : null;
 if (!automatic) store.stopDispatch();
 const auth = new Auth(store, config.origin, undefined, {provenance: config.provenance, rpName: 'Couvre-feu private integration'});
+checkOwnerAccount(config, store);
 prune();
 const pruneTimer = setInterval(prune, 3600000);
 const server = app(auth, config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config);

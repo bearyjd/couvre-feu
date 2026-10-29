@@ -328,13 +328,14 @@ class CoreTests(unittest.TestCase):
         self.fixture.update_backend(neighbors=neighbors)
         document = policy()
         document["schedules"] = [{"person": "alice", "id": "night", "weekdays": ["Mon"], "start": "22:00", "stop": "06:30"}]
-        self.sync(document)
+        # Measured ~50 s per cfctl call on a quiet host: the default 60 s flaked under CI load.
+        self.success(self.fixture.run("sync", document=document, timeout=ALLOWANCE_DEADLINE))
         aliases = ("2001:db8::20", "2001:db8::21", "2001:db8::22")
         offset = 0
         for action in ("schedule", "pause"):
             if action == "pause":
                 offset = len(self.fixture.calls())
-                self.success(self.fixture.run("pause", "alice"))
+                self.success(self.fixture.run("pause", "alice", timeout=ALLOWANCE_DEADLINE))
             state = self.fixture.backend()
             calls = [row["argv"] for row in self.fixture.calls()[offset:] if row["command"] == "conntrack"]
             guards = [row["argv"] for row in self.fixture.calls()[offset:]

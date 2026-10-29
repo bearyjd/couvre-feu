@@ -241,7 +241,7 @@ const insertAudit = (db: DatabaseSync, at: number, action: string, op: string | 
 test('migration 011 on a seeded pre-011 database keeps rows and ids, the three indexes, STRICT and the CHECKs, and admits reward_add', () => {
     const m = preEleven(db => { insertAudit(db, 1, 'pause', 'op_one'); insertAudit(db, 2, 'grant_approve', null); insertAudit(db, 3, 'resume', 'op_three'); });
     try {
-        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 11);
+        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12, 'opened by the current Store, so 012 has run too');
         assert.deepEqual(m.store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), [
             {id: 1, at: 1, actor_id: 'parent', action: 'pause', person_id: 'pilot', operation_id: 'op_one', result: 'applied'},
             {id: 2, at: 2, actor_id: 'parent', action: 'grant_approve', person_id: 'pilot', operation_id: null, result: 'applied'},
@@ -344,6 +344,32 @@ test('HTTP: flag off, time requests off, out-of-scope child and the owner-mode g
             assert.equal(out.status, c.status, c.name);
             if (c.status === 404) { assert.equal(r.audit().length, 0, `${c.name}: no audit row`); assert.equal(r.ops(), 0, c.name); }
             else assert.equal(r.audit().length, 1, c.name);
+        } finally { await s.close(); r.w.f.cleanup(); }
+    }
+});
+
+test('HTTP: GET /people carries a read-only rewardTime boolean only when the reward route would answer for that viewer', async () => {
+    const cases: {name: string; reward: boolean; mode?: 'off' | 'owner' | 'parents'; account: string; expected: boolean}[] = [
+        {name: 'flag off', reward: false, mode: 'parents', account: 'operator', expected: false},
+        {name: 'time requests off', reward: true, mode: 'off', account: 'operator', expected: false},
+        {name: 'time requests absent', reward: true, account: 'operator', expected: false},
+        {name: 'owner mode, non-owner parent', reward: true, mode: 'owner', account: 'parent', expected: false},
+        {name: 'owner mode, the owner', reward: true, mode: 'owner', account: 'operator', expected: true},
+        {name: 'parents mode, a scoped parent', reward: true, mode: 'parents', account: 'parent', expected: true}];
+    for (const c of cases) {
+        const r = await rewardWorld({}, {reward: c.reward, audit: true});
+        if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
+        if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
+        const s = await serve(r, ports++);
+        try {
+            const who = await session(r.w.f, s.o, c.account);
+            const people = await who.send('GET', '/people');
+            assert.equal(people.status, 200, c.name);
+            if (c.expected) assert.equal(people.body.rewardTime, true, c.name); else assert.ok(!people.body.rewardTime, `${c.name}: absent or false`);
+            // The signal is one viewer-level boolean: nothing per child, no audit row, no operation, and the body never names the feature otherwise.
+            assert.ok(people.body.people.every((p: Record<string, unknown>) => !('rewardTime' in p)), `${c.name}: not per child`);
+            assert.equal(r.audit().length, 0, c.name); assert.equal(r.ops(), 0, c.name);
+            if (!c.expected) assert.ok(!JSON.stringify(people.body).includes('rewardTime'), `${c.name}: no trace of the feature`);
         } finally { await s.close(); r.w.f.cleanup(); }
     }
 });

@@ -38,6 +38,18 @@ test('list invariants: sorted, unique, canonical, within the per-family cap', ()
     for (const retired of [DOH_RETIRED_IPV4, DOH_RETIRED_IPV6]) assert.ok(Object.isFrozen(retired));
 });
 
+test('Mullvad resolver addresses are present (published 2026-10-28; retire after 2026-11-02)', () => {
+    const mullvad = DOH_PROVIDERS.find(p => p.name === 'Mullvad DNS');
+    assert.ok(mullvad);
+    assert.match(mullvad.source, /^https:\/\/mullvad\.net\//);
+    for (const n of [2, 3, 4, 5, 6, 9]) {
+        assert.ok(DOH_IPV4.includes(`194.242.2.${n}`), `194.242.2.${n}`);
+        assert.ok(DOH_IPV6.includes(`2a07:e340::${n}`), `2a07:e340::${n}`);
+    }
+    assert.equal(mullvad.ipv4.length, 6);
+    assert.equal(mullvad.ipv6.length, 6);
+});
+
 test('unique: removes duplicates and sorts', () => {
     assert.deepEqual([...unique(['9.9.9.9', '1.1.1.1', '9.9.9.9', '1.1.1.1'])], ['1.1.1.1', '9.9.9.9']);
     assert.ok(Object.isFrozen(unique(['a'])));
