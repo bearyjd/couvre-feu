@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# timeout-ok-file: UNMEASURED: fixture shard (too long to time here); 3-15 s bounds on single child processes, follow-up
+# timeout-ok-file: UNMEASURED: fixture shard (too long to time here); 3-15 s bounds on single child processes, follow-up expires: 2026-12-31
 """RPC acceptance fixtures. No host firewall, SSH, packets or power-cut proof."""
 import copy
 import hashlib

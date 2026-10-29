@@ -10,22 +10,27 @@ bound on the same line, the line above, or any line of a multi-line call with:
     // timeout-ok: <reason>     (TypeScript / JavaScript)
 
 A file whose short limits were all measured with large headroom may instead carry one
-`# timeout-ok-file: <reason with the measurement>` comment in its first FILE_MARKER_LINES lines.
+`# timeout-ok-file: <reason with the measurement>` comment in its first FILE_MARKER_LINES lines. The
+text must say 'measured' or 'UNMEASURED'. An UNMEASURED file must also carry `expires: YYYY-MM-DD`;
+once that date passes the audit fails until the file is measured and the marker is rewritten.
 
 Scope: Python subprocess.run/check_*/call, Popen.communicate/wait (keyword or first positional
 literal) under tests/; TypeScript/JS `timeout:` options under shared/tests, service/tests, tests/.
 Not covered (different failure mode, see docs): thread.join, socket timeouts, Playwright expectations.
 """
 import ast
+import datetime
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parents[1]
 MIN_LITERAL_SECONDS = 20
 SUBPROCESS_CALLS = {'run', 'check_output', 'check_call', 'call', 'communicate', 'wait'}
+# TODO: remove PENDING_FILES once PR #108 merges.
 # Files owned by an in-flight PR when this audit landed; burn the entries down once those merge.
 PENDING_FILES = {
     'tests/test-core.py': 'edited by the CI fifth-partition PR (#108)',
@@ -33,7 +38,10 @@ PENDING_FILES = {
     'tests/run-fixtures.py': 'edited by the CI fifth-partition PR (#108)',
 }
 FILE_MARKER_LINES = 40
-FILE_MARKER = re.compile(r'(?:#|//)\s*timeout-ok-file:\s*\S')
+FILE_MARKER = re.compile(r'(?:#|//)\s*timeout-ok-file:\s*(\S.*)')
+MEASURED_WORD = re.compile(r'\b(?:un)?measured\b', re.IGNORECASE)
+UNMEASURED_WORD = re.compile(r'\bunmeasured\b', re.IGNORECASE)
+EXPIRES = re.compile(r'\bexpires:\s*(\d{4}-\d{2}-\d{2})\b')
 MARKER = re.compile(r'(?:#|//)\s*timeout-ok:\s*\S')
 JS_TIMEOUT = re.compile(r'\btimeout\s*:\s*(\d[\d_]*)\b')
 
@@ -49,15 +57,43 @@ def justified(lines, first, last):
     return any(MARKER.search(lines[i]) for i in range(max(first - 2, 0), min(last, len(lines))))
 
 
-def file_justified(lines):
-    return any(FILE_MARKER.search(line) for line in lines[:FILE_MARKER_LINES])
+def file_marker_problem(lines, today):
+    """Return (has_marker, line_number, problem); problem is None when the file-level marker is valid."""
+    for number, line in enumerate(lines[:FILE_MARKER_LINES], 1):
+        match = FILE_MARKER.search(line)
+        if not match:
+            continue
+        text = match.group(1)
+        if not MEASURED_WORD.search(text):
+            return True, number, 'timeout-ok-file text must say "measured" or "UNMEASURED"'
+        if UNMEASURED_WORD.search(text):
+            expiry = EXPIRES.search(text)
+            if not expiry:
+                return True, number, 'UNMEASURED timeout-ok-file needs "expires: YYYY-MM-DD"'
+            try:
+                deadline = datetime.date.fromisoformat(expiry.group(1))
+            except ValueError:
+                return True, number, f'invalid expires date {expiry.group(1)}'
+            if today > deadline:
+                return True, number, f'UNMEASURED timeout-ok-file expired {deadline}; measure it and rewrite the marker'
+        return True, number, None
+    return False, 0, None
 
 
-def python_findings(path):
+def file_marker_findings(lines, today):
+    """None when the file has no file-level marker; otherwise the list of marker problems (empty when valid)."""
+    has_marker, number, problem = file_marker_problem(lines, today)
+    if not has_marker:
+        return None
+    return [(number, problem)] if problem else []
+
+
+def python_findings(path, today=None):
     source = path.read_text()
     lines = source.splitlines()
-    if file_justified(lines):
-        return []
+    marker = file_marker_findings(lines, today or datetime.date.today())
+    if marker is not None:
+        return marker
     found = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
@@ -75,10 +111,11 @@ def python_findings(path):
     return found
 
 
-def javascript_findings(path):
+def javascript_findings(path, today=None):
     lines = path.read_text().splitlines()
-    if file_justified(lines):
-        return []
+    marker = file_marker_findings(lines, today or datetime.date.today())
+    if marker is not None:
+        return marker
     found = []
     for number, line in enumerate(lines, 1):
         for match in JS_TIMEOUT.finditer(line):
@@ -113,7 +150,7 @@ class TimeoutAuditTests(unittest.TestCase):
             self.assertTrue((REPO / relative).is_file(), f'{relative} no longer exists; drop it from PENDING_FILES')
 
     def test_detector_flags_and_honours_markers(self):
-        scratch = Path(__import__('tempfile').mkdtemp())
+        scratch = Path(tempfile.mkdtemp())
         try:
             bad = scratch / 'bad.py'
             bad.write_text('import subprocess\nsubprocess.run(["x"], timeout=10)\np.wait(5)\np.communicate(timeout=19.5)\n'
@@ -130,6 +167,32 @@ class TimeoutAuditTests(unittest.TestCase):
             whole = scratch / 'whole.py'
             whole.write_text('# timeout-ok-file: measured 0.1 s\nimport subprocess\nsubprocess.run(["x"], timeout=3)\n')
             self.assertEqual(python_findings(whole), [])
+        finally:
+            for child in scratch.iterdir():
+                child.unlink()
+            scratch.rmdir()
+
+    def test_file_marker_requires_keyword_and_expiry(self):
+        scratch = Path(tempfile.mkdtemp())
+        clock = datetime.date(2026, 10, 28)
+        body = 'import subprocess\nsubprocess.run(["x"], timeout=3)\n'
+
+        def check(marker, today=clock):
+            path = scratch / 'f.py'
+            path.write_text(marker + '\n' + body)
+            return [text for _, text in python_findings(path, today)]
+        try:
+            self.assertEqual(check('# timeout-ok-file: because I said so'),
+                             ['timeout-ok-file text must say "measured" or "UNMEASURED"'])
+            self.assertEqual(check('# timeout-ok-file: UNMEASURED: follow-up'),
+                             ['UNMEASURED timeout-ok-file needs "expires: YYYY-MM-DD"'])
+            self.assertEqual(len(check('# timeout-ok-file: UNMEASURED: x expires: 2026-12-31', datetime.date(2027, 1, 1))), 1)
+            self.assertEqual(check('# timeout-ok-file: UNMEASURED: x expires: 2026-12-31'), [])
+            self.assertEqual(check('# timeout-ok-file: UNMEASURED: x expires: 2026-12-31', datetime.date(2026, 12, 31)), [])
+            self.assertEqual(check('# timeout-ok-file: measured 0.1 s'), [])
+            js = scratch / 'a.ts'
+            js.write_text('// timeout-ok-file: nope\nspawnSync(a, {timeout: 3000});\n')
+            self.assertEqual(len(javascript_findings(js, clock)), 1)
         finally:
             for child in scratch.iterdir():
                 child.unlink()
