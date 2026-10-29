@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: UNMEASURED: fixture shard (too long to time here); 10 s bounds on single shell runs, follow-up expires: 2026-12-31
 """M1d: admin-only scope-preview / scope-add / scope-remove and the per-admin cfctl-scope wrapper.
 
 Isolated fixtures only (no SSH, Dropbear, router or packets). All MACs and admin names are fictional.

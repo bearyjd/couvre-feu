@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# timeout-ok-file: UNMEASURED: one 5 s apply-fw run in the shared fixture, follow-up expires: 2026-12-31
 """Deterministic command doubles: these never exercise packet enforcement.
 
 All subprocess arguments are recorded as arrays, never evaluated as shell code.

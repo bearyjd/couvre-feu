@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: measured: cfctl-ssh shell runs <0.15 s against 5-10 s limits (load 21-22)
 """Offline checks of the service authorized_keys template and the --rpc-only forced-command boundary.
 
 Static and fixture-only: no SSH, Dropbear, router or key material is used, and nothing here proves

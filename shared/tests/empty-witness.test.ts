@@ -83,7 +83,7 @@ test('bounded input reader requires EOF and rejects total bytes, non-ASCII, abru
 });
 test('actual CLI has bounded generic output, exact positional context, ASCII/size limits and no metadata echo', () => {
     const argv = ['tests/empty-witness.ts', generation, String(context.minRouterTime), String(context.maxRouterTime)];
-    const run = (input: string | Buffer, args = argv) => spawnSync(process.execPath, args, {input, encoding: 'utf8', timeout: 15000});
+    const run = (input: string | Buffer, args = argv) => spawnSync(process.execPath, args, {input, encoding: 'utf8', timeout: 15000}); // timeout-ok: CLI run measured 0.1 s (150x headroom)
     const pass = run(JSON.stringify(sample())); assert.equal(pass.status, 0, pass.stderr); assert.equal(JSON.parse(pass.stdout).verdict, 'PASS_EMPTY_WITNESS');
     for (const failed of [run('{PRIVATE_RPC'), run(Buffer.alloc(131073, 32)), run(Buffer.from([0xff])), run(JSON.stringify({...sample(), generation: 'b'.repeat(64)})), run('', argv.slice(0, -1)), run('', [...argv, 'EXTRA_PRIVATE_ARG']), run('', [argv[0], generation, '01', argv[3]]), run('', [argv[0], generation + '\n', argv[2], argv[3]]), run('', [argv[0], generation, argv[2] + '\n', argv[3]])]) {
         assert.equal(failed.status, 1, failed.stderr); assert.ok(failed.stdout.length < 512); assert.equal(failed.stderr, ''); assert.doesNotMatch(failed.stdout, /PRIVATE|a{64}|b{64}|173620/); assert.notEqual(JSON.parse(failed.stdout).verdict, 'PASS_EMPTY_WITNESS');

@@ -1,3 +1,4 @@
+# timeout-ok-file: UNMEASURED: 5-10 s reaps after SIGKILL of a process group in the shared fixture, follow-up expires: 2026-12-31
 """Private-root fixture harness. Networking commands cannot fall through to PATH."""
 import json
 import os
