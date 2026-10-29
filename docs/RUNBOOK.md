@@ -61,7 +61,7 @@ Time requests, the audit log and Reward Time ship off. Operating notes and the t
 Couvre-feu enforces at the router. These cases are outside what a router can do:
 
 - Mobile data and hotspots: a device that leaves the home network is not enforced.
-- VPN and IP-direct traffic: traffic that avoids DNS or tunnels past the router is not reliably blocked. There is no VPN/Tor list yet (feed source, licence and size limit undecided).
+- VPN and IP-direct traffic: traffic that avoids DNS or tunnels past the router is not reliably blocked. There is no VPN/Tor list and none is planned (owner decision 2026-10-28; reasons in [ROADMAP.md](ROADMAP.md#do-not-build)). A router cannot reliably stop Tor or a VPN; on-device controls (Screen Time, Family Link) are the real answer. The DoT/DoH/853 and port-53 enforcement is unchanged.
 - Encrypted DNS: kids' port 853 and UDP 784/8853 are blocked, but DoH is blocked only for addresses in the policy `doh` arrays (at most 256 per family, supplied by hand today), so any DoH resolver not listed still works. Unverified on a live router.
 - A skilled kid: a determined child with technical knowledge may find a way around router-level controls.
 
