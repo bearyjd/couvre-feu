@@ -6,6 +6,10 @@ import type { Page, Route } from '@playwright/test';
 test.use({ serviceWorkers: 'block' });
 test.setTimeout(60000);
 
+// Drain every route handler before a test ends, also when an assertion threw: a handler still awaiting route.fetch would
+// otherwise be charged to the NEXT test ("route.fetch: Test ended") and hide the real failure behind a misleading one.
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' }); });
+
 const NOW = Math.floor(Date.now() / 1000);
 type Mock = Record<string, unknown>;
 const ID = '11111111-1111-4111-8111-111111111111';
@@ -102,8 +106,10 @@ test.describe('session hygiene', () => {
     await page.getByLabel('One-use enrollment token').fill(demo.token('jd'));
     await page.getByRole('button', { name: 'Create a demo passkey' }).click();
     await expect(card(page)).toContainText('NEW reason');
+    const late = page.waitForResponse((r) => new URL(r.url()).pathname === '/time-requests' && r.request().method() === 'GET');
     release();
-    await page.waitForTimeout(500);
+    await late; // the held OLD response has now been delivered to the page; one frame lets the page act on it
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
     await expect(card(page)).toContainText('NEW reason');
     await expect(card(page)).not.toContainText('OLD late reason');
   });
@@ -139,7 +145,7 @@ test.describe('session hygiene', () => {
     await create.click();
     await expect(create).toBeDisabled();
     await create.click({ force: true });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(300); // negative check (no second POST): there is no event for a request that must not happen
     expect(posts).toBe(1);
     release();
     await expect(page.locator('.request-link input')).toBeVisible();
@@ -277,8 +283,10 @@ test.describe('in-flight responses after a session change', () => {
     await expect.poll(() => started).toBe(1);
     await switchSession(page, demo);
     await expect(card(page)).toContainText('asks for 30 minutes');
+    const poll = page.waitForResponse((r) => new URL(r.url()).pathname === '/time-requests' && r.request().method() === 'GET', { timeout: 15000 });
     release();
-    await page.waitForTimeout(6500); // the next poll redraws the card
+    await poll; // the next poll redraws the card
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
     await expect(page.locator('.request-link input')).toHaveCount(0);
     const html = await page.evaluate(() => document.documentElement.outerHTML + [...document.querySelectorAll('input')].map((input) => input.value).join('|'));
     expect(html).not.toContain('LATE-SECRET-LINK');
@@ -295,8 +303,10 @@ test.describe('in-flight responses after a session change', () => {
     await expect.poll(() => started).toBe(1);
     await switchSession(page, demo);
     await expect(card(page)).toContainText('asks for 30 minutes');
+    const poll = page.waitForResponse((r) => new URL(r.url()).pathname === '/time-requests' && r.request().method() === 'GET', { timeout: 15000 });
     release();
-    await page.waitForTimeout(6500); // the next poll redraws the card
+    await poll; // the next poll redraws the card
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
     await expect(card(page)).not.toContainText('Request declined.');
   });
 });

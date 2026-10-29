@@ -342,7 +342,7 @@ test('L6: a button forced enabled still refuses to act while the gate is closed'
   await page.evaluate(() => {
     for (const b of Array.from(document.querySelectorAll<HTMLButtonElement>('#inventory-panel button'))) { b.disabled = false; b.click(); }
   });
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(600); // negative check (no POST from the force-clicked disabled buttons): no event exists for a request that must not happen
   expect(posts.filter((p) => p.startsWith('/admin/inventory'))).toEqual([]);
 });
 

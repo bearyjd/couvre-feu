@@ -30,13 +30,6 @@ sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parents[1]
 MIN_LITERAL_SECONDS = 20
 SUBPROCESS_CALLS = {'run', 'check_output', 'check_call', 'call', 'communicate', 'wait'}
-# TODO: remove PENDING_FILES once PR #108 merges.
-# Files owned by an in-flight PR when this audit landed; burn the entries down once those merge.
-PENDING_FILES = {
-    'tests/test-core.py': 'edited by the CI fifth-partition PR (#108)',
-    'tests/test-fixture-process.py': 'edited by the CI fifth-partition PR (#108); its short timeouts test the timeout path itself',
-    'tests/run-fixtures.py': 'edited by the CI fifth-partition PR (#108)',
-}
 FILE_MARKER_LINES = 40
 FILE_MARKER = re.compile(r'(?:#|//)\s*timeout-ok-file:\s*(\S.*)')
 MEASURED_WORD = re.compile(r'\b(?:un)?measured\b', re.IGNORECASE)
@@ -129,7 +122,7 @@ def audit():
     findings = []
     for path in sorted((REPO / 'tests').rglob('*.py')):
         relative = path.relative_to(REPO).as_posix()
-        if path.name != Path(__file__).name and relative not in PENDING_FILES:
+        if path.name != Path(__file__).name:
             findings += [(relative, number, text) for number, text in python_findings(path)]
     for root in ('shared/tests', 'service/tests', 'tests'):
         for path in sorted((REPO / root).rglob('*.ts')) + sorted((REPO / root).rglob('*.mjs')):
@@ -144,10 +137,6 @@ class TimeoutAuditTests(unittest.TestCase):
         report = '\n'.join(f'  {path}:{number}: {text}' for path, number, text in findings)
         self.assertEqual(findings, [], f'tight hard-coded timeouts (< {MIN_LITERAL_SECONDS} s) need a named constant '
                          f'or a "timeout-ok: <reason>" marker:\n{report}')
-
-    def test_pending_files_exist(self):
-        for relative in PENDING_FILES:
-            self.assertTrue((REPO / relative).is_file(), f'{relative} no longer exists; drop it from PENDING_FILES')
 
     def test_detector_flags_and_honours_markers(self):
         scratch = Path(tempfile.mkdtemp())

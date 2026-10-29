@@ -100,7 +100,7 @@ test('MOCK: buttons are disabled while a decision is in flight and a second tap 
   await expect(grant).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Decline request from Alex (fictional)' })).toBeDisabled();
   await grant.click({ force: true });
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(300); // negative check (no second POST): there is no event for a request that must not happen
   expect(posts).toBe(1);
   release();
   await expect(page.locator('#time-requests')).toContainText('Already decided');
@@ -122,7 +122,7 @@ test('MOCK: a 404 from /time-requests (feature off) hides the card and stops pol
   await expect.poll(() => gets).toBeGreaterThan(0);
   await expect(page.locator('#time-requests')).toBeHidden();
   const seen = gets;
-  await page.waitForTimeout(6500);
+  await page.waitForTimeout(6500); // deliberately outlasts the poll interval: proves no further GET arrives; no event exists for polling that stopped
   expect(gets).toBe(seen);
   await expect(page.locator('#time-requests')).toBeHidden();
 });
