@@ -11,16 +11,6 @@ import { world } from './fixtures/grant-world.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 
-// What must never reach the audit table. The minutes are 45 in these tests, so match the VALUE (a JSON number after a colon),
-// never the bare digits: a random operation id (UUID) contains '45' about one time in ten.
-const MINUTES_LEAK = /minutes|homework|:45\b/i;
-
-test('the minutes-leak check does not trip on a random id that happens to contain 45, and still catches a real leak', () => {
-    assert.doesNotMatch(JSON.stringify([{id: 1, operation_id: 'ac39e1d8-f63c-4451-bb2d-43f0ea11f99d', result: 'applied'}]), MINUTES_LEAK);
-    assert.match(JSON.stringify([{id: 1, minutes: 45}]), MINUTES_LEAK);
-    assert.match(JSON.stringify([{id: 1, detail: 45}]), MINUTES_LEAK);
-    assert.match(JSON.stringify([{id: 1, note: 'homework'}]), MINUTES_LEAK);
-});
 import { appServer } from '../src/http.ts';
 import { AUDIT_ACTIONS } from '../src/parent-audit.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
@@ -31,6 +21,18 @@ import { AppError } from '../../shared/src/errors.ts';
 const KEY = 'focus_key_12345678901';
 type W = Awaited<ReturnType<typeof world>>;
 type AuditRow = {actor_id: string; action: string; person_id: string | null; operation_id: string | null; result: string};
+
+// What must never reach the audit table. The minutes are 45 in these tests, so match the NUMBER as a standalone token (not
+// bare digits): a random operation id (UUID v4) contains '45' about 15% of the time, e.g. '...-4451-...'.
+const MINUTES_LEAK = /minutes|homework|(?<![\w-])45(?![\w-])/i;
+
+test('the minutes-leak check does not trip on a random id that contains 45, and still catches a real leak', () => {
+    assert.doesNotMatch(JSON.stringify([{id: 1, operation_id: 'ac39e1d8-f63c-4451-bb2d-43f0ea11f99d', result: 'applied'}]), MINUTES_LEAK);
+    assert.doesNotMatch(JSON.stringify([{id: 1, operation_id: '45a0b1c2-0000-4000-8000-000000000045', result: 'applied'}]), MINUTES_LEAK);
+    for (const leak of [{minutes: 45}, {detail: 45}, {x: '45'}, {x: '45 min'}, {x: [1, 45]}, {x: {y: 45}}, {note: 'homework'}]) {
+        assert.match(JSON.stringify([{id: 1, ...leak}]), MINUTES_LEAK, JSON.stringify(leak));
+    }
+});
 
 /** Flags on by default: audit log and focus window. */
 async function focusWorld(over: Partial<RouterPolicy> = {}, flags = {focus: true, audit: true}) {
