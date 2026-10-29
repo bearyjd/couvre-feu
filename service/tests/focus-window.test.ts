@@ -10,6 +10,17 @@ import { actor } from './fixtures/integration.ts';
 import { world } from './fixtures/grant-world.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
+
+// What must never reach the audit table. The minutes are 45 in these tests, so match the VALUE (a JSON number after a colon),
+// never the bare digits: a random operation id (UUID) contains '45' about one time in ten.
+const MINUTES_LEAK = /minutes|homework|:45\b/i;
+
+test('the minutes-leak check does not trip on a random id that happens to contain 45, and still catches a real leak', () => {
+    assert.doesNotMatch(JSON.stringify([{id: 1, operation_id: 'ac39e1d8-f63c-4451-bb2d-43f0ea11f99d', result: 'applied'}]), MINUTES_LEAK);
+    assert.match(JSON.stringify([{id: 1, minutes: 45}]), MINUTES_LEAK);
+    assert.match(JSON.stringify([{id: 1, detail: 45}]), MINUTES_LEAK);
+    assert.match(JSON.stringify([{id: 1, note: 'homework'}]), MINUTES_LEAK);
+});
 import { appServer } from '../src/http.ts';
 import { AUDIT_ACTIONS } from '../src/parent-audit.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
@@ -238,7 +249,7 @@ test('the audit row is written once with focus_start, the acting parent, the chi
         const out = r.focus(45);
         assert.deepEqual(r.audit(), [{actor_id: 'operator', action: 'focus_start', person_id: 'pilot', operation_id: out.result.operation.id, result: 'applied'}]);
         assert.ok((AUDIT_ACTIONS as readonly string[]).includes('focus_start'));
-        assert.doesNotMatch(JSON.stringify(r.w.f.store.all('SELECT * FROM parent_audit')), /minutes|homework|45/i);
+        assert.doesNotMatch(JSON.stringify(r.w.f.store.all('SELECT * FROM parent_audit')), MINUTES_LEAK);
     } finally { r.w.f.cleanup(); }
 });
 
