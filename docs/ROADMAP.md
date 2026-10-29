@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-27; planned additions added 2026-10-27. This is the current plan; the original proposal was an internal planning note that is no longer kept in the repository. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
+Status as of 2026-10-29; planned additions added 2026-10-27. This is the current plan; the original proposal was an internal planning note that is no longer kept in the repository. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
 
 ## Planned additions at a glance
 
@@ -9,11 +9,11 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 | # | Addition | Phase | State |
 |---|---|---|---|
 | 1 | Ask for time: web UI + parent one-tap approve | 1 | Built and merged, all behind `timeRequests.mode` (off by default): service (PR #86, #88), per-account gate off/owner/parents (F1, PR #92), parent card with Grant, Grant less, Decline and End extra time (F3, PR #94). Unverified on this router: live proof remains |
-| 5 | Reward Time (extra minutes on a grant) | 1 | Service built and merged (F4, PR #95) behind `rewardTime.enabled` (off; unverified on this router); parent UI built behind `rewardTime.enabled`, shown per viewer via the `rewardTime` field of `GET /people` (unverified on this router) |
-| 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | One-shot service built (F5) behind `focus.enabled` (off; unverified on this router); no web UI yet; recurring not started |
+| 5 | Reward Time (extra minutes on a grant) | 1 | Service built and merged (F4, PR #95) behind `rewardTime.enabled` (off; unverified on this router); parent UI built (PR #107) behind `rewardTime.enabled`, shown per viewer via the `rewardTime` field of `GET /people` (unverified on this router) |
+| 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | One-shot service built and merged (F5, PR #104) behind `focus.enabled` (off; unverified on this router); no web UI yet; recurring not started (depends on item 2) |
 | 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Audit log built and merged (F2, PR #93) behind `auditLog.enabled` (off; unverified on this router; service only, no web view); digest not started |
-| 4 | Push notifications (self-hosted ntfy or Web Push) | 2 | Sketch only ([service contract](service-contract.md#gap-notification-delivery-beyond-the-app)) |
-| 2 | Weekly schedules / bedtime with age-band templates | 3 | Designed; owner decisions recorded |
+| 4 | Push notifications (self-hosted ntfy or Web Push) | 2 | Not started; sketch only ([service contract](service-contract.md#gap-notification-delivery-beyond-the-app)) |
+| 2 | Weekly schedules / bedtime with age-band templates | 3 | Designed; owner decisions recorded; not started beyond the design |
 | 3 | Unknown-device alerts + new devices default to restricted | 4 | Alerts, device list and admin web panel built and merged (service: `inventory-store.ts`, `inventory-http.ts`, router `rpc-inventory`; web: "Devices on the network"; `new_device` and `inventory_stalled` alerts). Unverified on this router. Default-restricted for unassigned devices not started |
 | 10 | Guest / visitor profile (internet only, no LAN) | 4 | Not started |
 | 8 | Per-child daily online time, labelled an estimate | 5 | Not started |
@@ -125,7 +125,7 @@ Every PR in Phases 1-5 states in its description how it meets these; reviewers b
 
 ### Phase 1: no-router wins on built foundations (items 1, 5, 7 one-shot, 6 audit log)
 
-**Progress (2026-10-27):** steps 1 to 4 and 6 are merged behind flags, all off and unverified on this router. Step 5 (item 7, focus window) is not started. Per-item live proof waits for Phase 0.
+**Progress (2026-10-29):** steps 1 to 4 and 6 are merged behind flags, all off and unverified on this router; step 5 (item 7, focus window) is half done: the one-shot service is merged (PR #104), the web UI is not started. Per-item live proof waits for Phase 0.
 
 Can be built and merged offline behind flags before Phase 0 finishes; turning flags on waits for Phase 0.
 
@@ -133,8 +133,8 @@ Can be built and merged offline behind flags before Phase 0 finishes; turning fl
   1. Service: per-account flag gate (owner only / all parents). Tests: gate off, owner only, all. **Built (F1, PR #92, merged): `timeRequests.mode` off, owner or parents plus `ownerAccountId`; unverified on this router.**
   2. Service: audit log table (actor account, action type, child, time, operation id, result; no free text). Writes from pause, resume, bulk, move, grant. Route `GET /audit` scoped like alerts. Tests: scoping 404s, no reason text stored. **Built (F2, PR #93, merged; flag `auditLog.enabled`, off; unverified on this router; see [service contract](service-contract.md#audit-log-of-parent-actions-flagged-off)).**
   3. Web: ask-for-time parent card (applying, then confirmed or "couldn't apply"; never optimistic), Grant and End, child "starting..." state; demo router keeps the feature disabled. Tests: Playwright on the demo; update the parent PWA spec. **Built (F3, PR #94, merged): Grant, Grant less, Decline, End extra time, honest Applying/Granted states; the child "starting..." copy was not part of it. Unverified on this router.**
-  4. Service + web: Reward Time as one allowance op through `queue()` (the same path schedules S4 will reuse); cap per the owner's decision. Tests: arithmetic at the cap from router time (the 14400 s horizon is a defence-in-depth guard behind the cap), pause ends it; a paused child with no active allowance is refused, one with an allowance in force is extended. **Service built (F4, PR #95, merged; flag `rewardTime.enabled`, off; unverified on a router; reward + grant together capped at 60 min, refused not clamped; see [service contract](service-contract.md#reward-time-flagged-off)); web UI built behind `rewardTime.enabled`, unverified on this router.**
-  5. Service + web: focus window, one-shot = a timed pause with a "Focus" label. Tests: expiry, ask-for-time interaction per decision. **One-shot service built (F5; flag `focus.enabled`, off; unverified on this router; see [service contract](service-contract.md#focus-window-flagged-off)); web follows.**
+  4. Service + web: Reward Time as one allowance op through `queue()` (the same path schedules S4 will reuse); cap per the owner's decision. Tests: arithmetic at the cap from router time (the 14400 s horizon is a defence-in-depth guard behind the cap), pause ends it; a paused child with no active allowance is refused, one with an allowance in force is extended. **Service built (F4, PR #95, merged; flag `rewardTime.enabled`, off; unverified on a router; reward + grant together capped at 60 min, refused not clamped; see [service contract](service-contract.md#reward-time-flagged-off)); web UI built (PR #107, merged; per-viewer `rewardTime` field of `GET /people`) behind `rewardTime.enabled`, unverified on this router.**
+  5. Service + web: focus window, one-shot = a timed pause with a "Focus" label. Tests: expiry, ask-for-time interaction per decision. **One-shot service built (F5, PR #104, merged; flag `focus.enabled`, off; unverified on this router; see [service contract](service-contract.md#focus-window-flagged-off)); web UI not started.**
   6. Docs: service contract, operating guide. **Done (F6): [operating notes](service-contract.md#operating-notes-for-the-flagged-features).**
 - **Entry:** #86 and #88 merged.
 - **Exit / done:** all merged with flags off; CI green; each item labelled unverified until its live check (grant lift and re-block, reward arithmetic on the router, focus expiry) passes after Phase 0.

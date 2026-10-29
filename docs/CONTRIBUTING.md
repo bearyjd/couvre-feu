@@ -60,6 +60,25 @@ python3 tests/run-fixtures.py --verify-receipts "$PRIVATE_DIR/receipts" --plan "
 
 **TMPDIR.** Fixtures and the integration service require private roots. A path whose ancestors are symlinks or writable by other users (without the sticky bit, owned by root) is refused with `unsafe_private_ancestor`. Point `TMPDIR` at a directory under your home that only you can write, mode 0700, and keep evidence and manifests there, never in the repository.
 
+## Timeouts in tests
+
+CI runners are shared and often several times slower than a developer host, so a tight hard-coded timeout flakes there. `tests/test-timeout-audit.py` fails on any literal timeout below 20 seconds (`MIN_LITERAL_SECONDS`) that bounds a call:
+
+- Python under `tests/`: `subprocess.run`, `check_output`, `check_call`, `call`, `communicate` (keyword `timeout=`) and `wait` (keyword or first positional argument).
+- TypeScript or JavaScript (`.ts`, `.mjs`) under `shared/tests`, `service/tests` and `tests/`: a `timeout: <milliseconds>` option below 20000.
+
+Not covered: `thread.join`, socket timeouts and Playwright expectations. Timeouts given by a named constant or variable are not literals and pass; the usual fix is to raise the value through a named constant.
+
+To keep a tight bound on purpose (for example a test of the timeout path itself), justify it with a marker comment `# timeout-ok: <reason>` (Python) or `// timeout-ok: <reason>` (TypeScript or JavaScript), with a non-empty reason, on the line above the call or on any line of the call.
+
+A file whose short limits were all measured with large headroom may instead carry one `# timeout-ok-file: <reason>` (or `//`) comment within its first 40 lines. The text must say `measured` or `UNMEASURED`. An UNMEASURED marker must also say `expires: YYYY-MM-DD`; once that date passes the audit fails until the file is measured and the marker rewritten. A malformed marker, an invalid date or an expired one is a finding.
+
+Run it with:
+
+```sh
+python3 -B tests/test-timeout-audit.py
+```
+
 ## Environment variables
 
 <!-- AUTO-GENERATED -->
