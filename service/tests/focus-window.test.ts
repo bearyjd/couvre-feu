@@ -10,6 +10,7 @@ import { actor } from './fixtures/integration.ts';
 import { world } from './fixtures/grant-world.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
+
 import { appServer } from '../src/http.ts';
 import { AUDIT_ACTIONS } from '../src/parent-audit.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
@@ -20,6 +21,18 @@ import { AppError } from '../../shared/src/errors.ts';
 const KEY = 'focus_key_12345678901';
 type W = Awaited<ReturnType<typeof world>>;
 type AuditRow = {actor_id: string; action: string; person_id: string | null; operation_id: string | null; result: string};
+
+// What must never reach the audit table. The minutes are 45 in these tests, so match the NUMBER as a standalone token (not
+// bare digits): a random operation id (UUID v4) contains '45' about 15% of the time, e.g. '...-4451-...'.
+const MINUTES_LEAK = /minutes|homework|(?<![\w-])45(?![\w-])/i;
+
+test('the minutes-leak check does not trip on a random id that contains 45, and still catches a real leak', () => {
+    assert.doesNotMatch(JSON.stringify([{id: 1, operation_id: 'ac39e1d8-f63c-4451-bb2d-43f0ea11f99d', result: 'applied'}]), MINUTES_LEAK);
+    assert.doesNotMatch(JSON.stringify([{id: 1, operation_id: '45a0b1c2-0000-4000-8000-000000000045', result: 'applied'}]), MINUTES_LEAK);
+    for (const leak of [{minutes: 45}, {detail: 45}, {x: '45'}, {x: '45 min'}, {x: [1, 45]}, {x: {y: 45}}, {note: 'homework'}]) {
+        assert.match(JSON.stringify([{id: 1, ...leak}]), MINUTES_LEAK, JSON.stringify(leak));
+    }
+});
 
 /** Flags on by default: audit log and focus window. */
 async function focusWorld(over: Partial<RouterPolicy> = {}, flags = {focus: true, audit: true}) {
@@ -238,7 +251,7 @@ test('the audit row is written once with focus_start, the acting parent, the chi
         const out = r.focus(45);
         assert.deepEqual(r.audit(), [{actor_id: 'operator', action: 'focus_start', person_id: 'pilot', operation_id: out.result.operation.id, result: 'applied'}]);
         assert.ok((AUDIT_ACTIONS as readonly string[]).includes('focus_start'));
-        assert.doesNotMatch(JSON.stringify(r.w.f.store.all('SELECT * FROM parent_audit')), /minutes|homework|45/i);
+        assert.doesNotMatch(JSON.stringify(r.w.f.store.all('SELECT * FROM parent_audit')), MINUTES_LEAK);
     } finally { r.w.f.cleanup(); }
 });
 
