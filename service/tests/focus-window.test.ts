@@ -303,7 +303,7 @@ const insertAudit = (db: DatabaseSync, at: number, action: string, op: string | 
 test('migration 012 on a seeded pre-012 database keeps rows and ids, the three indexes, STRICT and the CHECKs, and admits focus_start', () => {
     const m = preTwelve(db => { insertAudit(db, 1, 'pause', 'op_one'); insertAudit(db, 2, 'reward_add', null); insertAudit(db, 3, 'resume', 'op_three'); });
     try {
-        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12);
+        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 13);
         assert.deepEqual(m.store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), [
             {id: 1, at: 1, actor_id: 'parent', action: 'pause', person_id: 'pilot', operation_id: 'op_one', result: 'applied'},
             {id: 2, at: 2, actor_id: 'parent', action: 'reward_add', person_id: 'pilot', operation_id: null, result: 'applied'},
