@@ -34,7 +34,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -120,6 +120,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
     // Audit log of parent actions: real-router integration only, and only when the manifest turns it on (read per request).
     const audit = policy instanceof IntegrationPolicy ? auditFor(policy.store) : null;
+    // The one gate for the audit routes and for the per-viewer auditLog signal on GET /people.
+    const auditOn = () => audit?.enabled === true;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
@@ -162,7 +164,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v4'", `'cf-shell-integration-${provenance.integrationScope}-v3'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v5'", `'cf-shell-integration-${provenance.integrationScope}-v4'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
@@ -293,7 +295,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 // rewardTime: one viewer-level boolean, present only when the reward route would answer for this viewer (never per child).
-                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {})});
+                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(auditOn() ? {auditLog: true} : {})});
                 return;
             }
             const childRead = childrenGet(children, session, path);
@@ -327,7 +329,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             // Off (the default) is indistinguishable from a route that does not exist. No query strings: the page size and cursor are path segments, like /alerts/before/:id.
             const auditPage = /^\/audit(?:\/limit\/([0-9]{1,4}))?(?:\/before\/([0-9]{1,15}))?$/.exec(path);
-            if (auditPage && audit?.enabled) {
+            if (auditPage && audit && auditOn()) {
                 const limit = auditPage[1] === undefined ? undefined : Number(auditPage[1]);
                 if (limit === 0) throw new AppError(400, 'invalid_limit');
                 send(response, 200, {...provenance, ...audit.list(session.dto.actor, {limit, before: auditPage[2] === undefined ? undefined : Number(auditPage[2])})});
