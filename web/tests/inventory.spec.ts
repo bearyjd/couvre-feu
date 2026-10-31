@@ -110,13 +110,37 @@ test('a failed first inventory load is retried by the next version bump', async 
 test('a first inventory load that fails after the version bump landed mid-flight is retried once', async ({ page, integration: f }) => {
   seed(f);
   const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
+  let peopleSeen!: () => void; const peopleLoaded = new Promise<void>((resolve) => { peopleSeen = resolve; });
+  page.on('response', (r) => { if (new URL(r.url()).pathname === '/people') peopleSeen(); });
   let calls = 0;
   await page.route('**/admin/inventory', async (route) => {
-    if (calls++ === 0) { await new Promise((resolve) => setTimeout(resolve, 400)); await route.fulfill({ status: 500, json: { error: { code: 'internal', message: 'boom' } } }); return; } // the ~25 ms people-list bump lands while this is in flight
+    if (calls++ === 0) { // hold the 500 until the people list has arrived, so the version bump is guaranteed to land while this request is in flight
+      await peopleLoaded; await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 100)));
+      await route.fulfill({ status: 500, json: { error: { code: 'internal', message: 'boom' } } }); return;
+    }
     await route.continue();
   });
   await signIn(page, f, 'operator');
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
+  await page.waitForTimeout(500);
+  expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
+});
+
+test('a later load that fails after a successful first load is not retried immediately', async ({ page, integration: f }) => {
+  seed(f);
+  const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
+  let loaded!: () => void; const firstLoaded = new Promise<void>((resolve) => { loaded = resolve; });
+  let calls = 0;
+  await page.route('**/admin/inventory', async (route) => {
+    if (calls++ === 0) { await route.continue(); loaded(); return; }
+    await route.fulfill({ status: 500, json: { error: { code: 'internal', message: 'boom' } } });
+  });
+  await page.route('**/people', async (route) => { await firstLoaded; await new Promise((resolve) => setTimeout(resolve, 100)); await route.continue(); }); // the bump lands after the first load settled
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
+  await row(page, 'new-tv').getByRole('button', { name: /^Acknowledge/ }).click(); // the reload after the acknowledge is the failing second load
+  await expect.poll(() => requests.filter((p) => p === '/admin/inventory').length).toBe(2);
+  await page.waitForTimeout(500);
   expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
 });
 
