@@ -94,6 +94,19 @@ test('sign-in loads the inventory list exactly once', async ({ page, integration
   expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(1);
 });
 
+test('a failed first inventory load is retried by the next version bump', async ({ page, integration: f }) => {
+  seed(f);
+  const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
+  let calls = 0;
+  await page.route('**/admin/inventory', async (route) => {
+    if (calls++ === 0) { await route.fulfill({ status: 500, json: { error: { code: 'internal', message: 'boom' } } }); return; }
+    await route.continue();
+  });
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
+  expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
+});
+
 test('a parent sees no inventory panel and the endpoint answers 403', async ({ page, integration: f }) => {
   seed(f);
   const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));

@@ -468,7 +468,7 @@ export function createInventory({ session, gate, offline, time, children, versio
     const seen = version();
     if (next && seen !== lastVersion) {
       // The first version seen after sign-in (the people list arrives ~25 ms after the session) must not repeat the load the session change already issued.
-      const covered = lastVersion === null && fetched;
+      const covered = lastVersion === null && fetched && !loadFailed; // a failed first load is not covered: this bump retries it
       lastVersion = seen;
       if (!covered) { void load(); return; }
     }
