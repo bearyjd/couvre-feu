@@ -107,6 +107,19 @@ test('a failed first inventory load is retried by the next version bump', async 
   expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
 });
 
+test('a first inventory load that fails after the version bump landed mid-flight is retried once', async ({ page, integration: f }) => {
+  seed(f);
+  const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
+  let calls = 0;
+  await page.route('**/admin/inventory', async (route) => {
+    if (calls++ === 0) { await new Promise((resolve) => setTimeout(resolve, 400)); await route.fulfill({ status: 500, json: { error: { code: 'internal', message: 'boom' } } }); return; } // the ~25 ms people-list bump lands while this is in flight
+    await route.continue();
+  });
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
+  expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
+});
+
 test('a parent sees no inventory panel and the endpoint answers 403', async ({ page, integration: f }) => {
   seed(f);
   const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
