@@ -1888,6 +1888,7 @@ cf_transition_inventory_check
                 time.sleep(0.02)
             else:
                 self.fail("sync never reached delayed backend call")
+            # timeout-ok: a real call that must expire against the live lock owner; 3 s is how long the contention check may wait
             second = self.fixture.run("expire", timeout=3)
             self.assertNotEqual(second.returncode, 0, "concurrent mutation ignored live owner lock")
             os.killpg(process.pid, signal.SIGTERM)
@@ -2063,6 +2064,7 @@ time.sleep(60)
                     time.sleep(0.01)
                 return raw
             with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                # timeout-ok: the behaviour under test: the 3 s bound must fire (TimeoutExpired, caught.exception.timeout == 3)
                 run_fixture_process([sys.executable, "-c", script, str(ready)], env=os.environ, timeout=3, started=started)
             self.assertEqual(caught.exception.timeout, 3)
             child_pid = int(ready.read_text())
@@ -2718,6 +2720,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                         os.kill(backend_pid, signal.SIGKILL)
                         return raw
 
+                    # timeout-ok: a real uninstall run to its interruption point; 15 s is the call's own budget, not a guess about a slow runner
                     first = run_fixture_process(fixture.shell + [str(REPO / "router/uninstall.sh")],
                                                 env=fixture.env, timeout=15, started=interrupt_core)
                     self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
