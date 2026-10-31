@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { world } from './fixtures/grant-world.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
+import { auditFor } from '../src/parent-audit.ts';
 import { appServer } from '../src/http.ts';
 
 type W = Awaited<ReturnType<typeof world>>;
@@ -37,9 +38,9 @@ test('HTTP: GET /people carries a read-only auditLog boolean exactly when GET /a
         {name: 'flag absent', audit: false, mode: 'parents', account: 'operator'},
         {name: 'flag on, admin', audit: true, mode: 'parents', account: 'operator'},
         {name: 'flag on, scoped parent', audit: true, mode: 'parents', account: 'parent'},
-        {name: 'flag on, time requests off', audit: true, mode: 'off', account: 'operator'},
+        {name: 'flag on, time requests off: audit is independent of timeRequests', audit: true, mode: 'off', account: 'operator'},
         {name: 'flag on, owner mode, the owner', audit: true, mode: 'owner', account: 'operator'},
-        {name: 'flag on, owner mode, a non-owner parent', audit: true, mode: 'owner', account: 'parent'}];
+        {name: 'flag on, owner mode, a non-owner parent: audit is not owner-gated', audit: true, mode: 'owner', account: 'parent'}];
     for (const c of cases) {
         const w = await world();
         if (c.audit) w.f.config.auditLog = {enabled: true};
@@ -65,4 +66,22 @@ test('HTTP: the audit page script and the service worker (cache name bumped, aud
         assert.match(sw.text, /cf-shell-integration-[^']*-v4'/);
         assert.match(sw.text, /'\/audit\.js'/);
     } finally { await s.close(); w.f.cleanup(); }
+});
+
+test('HTTP: audit availability is independent of timeRequests and owner mode, and only admins see no-child rows', async () => {
+    for (const mode of ['off', 'owner'] as const) {
+        for (const account of ['operator', 'parent']) {
+            const w = await world();
+            w.f.config.auditLog = {enabled: true}; w.f.config.timeRequests = {mode};
+            if (mode === 'owner') w.f.config.ownerAccountId = 'operator';
+            auditFor(w.f.store).record({actor: 'operator', action: 'pause_all', people: [], result: 'refused'});
+            const s = await serve(w, account);
+            try {
+                const r = await s.get('/audit');
+                assert.equal(r.status, 200, `${mode}/${account}: GET /audit answers`);
+                const rows = JSON.parse(r.text).entries as {personId: string | null}[];
+                assert.equal(rows.some(e => e.personId === null), account === 'operator', `${mode}/${account}: no-child rows are admin-only`);
+            } finally { await s.close(); w.f.cleanup(); }
+        }
+    }
 });

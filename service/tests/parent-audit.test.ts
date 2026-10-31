@@ -222,7 +222,7 @@ async function http(f: ReturnType<typeof world>, _auth: Auth, o: string, account
     return call;
 }
 
-test('GET /audit is scoped exactly like alerts: each actor sees only entries for their children; out of scope is an empty list', async () => {
+test('GET /audit admins see every row (incl. no-child rows); non-admin parents only their own children; no children is an empty list', async () => {
     const f = world(), port = 27000 + process.pid % 10000, o = `http://localhost:${port}`;
     const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
@@ -235,7 +235,7 @@ test('GET /audit is scoped exactly like alerts: each actor sees only entries for
         const ids = async (account: string) => { const r = await (await http(f, auth, o, account))('/audit'); assert.equal(r.status, 200); return r.body.entries.map((e: {actorId: string; personId: string | null}) => `${e.actorId}:${e.personId}`); };
         assert.deepEqual(await ids('parent'), ['parent:pilot']);
         assert.deepEqual(await ids('parent2'), ['parent2:kid2']);
-        assert.deepEqual(await ids('operator'), ['operator:null', 'parent2:kid2', 'parent:pilot'], 'an admin sees their scope plus entries with no child');
+        assert.deepEqual(await ids('operator'), ['operator:null', 'parent2:kid2', 'parent:pilot'], 'an admin sees every row: other parents\' children and rows with no child; a non-admin parent sees neither (asserted above)');
         f.store.run("INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES('parent3','Parent with no children','parent','[]','u10')");
         const none = await (await http(f, auth, o, 'parent3'))('/audit');
         assert.equal(none.status, 200); assert.deepEqual(none.body.entries, []);
