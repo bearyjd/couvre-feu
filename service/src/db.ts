@@ -6,7 +6,7 @@ export class Store {
     readonly db: DatabaseSync;
     constructor(path: string, migrationSQL?: string, internalMode?: 'integration') {
         const migrations = migrationSQL === undefined
-            ? (internalMode === 'integration' ? ['001.sql', '002.sql', '005.sql', '006.sql', '007.sql', '008.sql', '009.sql', '010.sql', '011.sql', '012.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql', '007.sql', '008.sql', '009.sql', '010.sql', '011.sql', '012.sql']).map(name => {
+            ? (internalMode === 'integration' ? ['001.sql', '002.sql', '005.sql', '006.sql', '007.sql', '008.sql', '009.sql', '010.sql', '011.sql', '012.sql', '013.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql', '007.sql', '008.sql', '009.sql', '010.sql', '011.sql', '012.sql', '013.sql']).map(name => {
                 const sql = readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8');
                 // CAS allocates base+1. An explicitly never-delivered intent cannot reserve that router revision.
                 return internalMode === 'integration' && name === '001.sql' ? sql.replace('revision INTEGER NOT NULL UNIQUE', 'revision INTEGER NOT NULL') : sql;

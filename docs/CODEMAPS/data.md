@@ -1,6 +1,6 @@
 <!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~229 -->
 # Data (SQLite, STRICT tables; db.ts `Store`, migrations in service/migrations)
-Main DB migrations 001..012 (`PRAGMA user_version`; integration mode runs 001, 002, 005..012, db.ts:9). The integration DB adds integration-001..007 (integration-db.ts).
+Main DB migrations 001..013 (`PRAGMA user_version`; integration mode runs 001, 002, 005..013, db.ts:9). The integration DB adds integration-001..007 (integration-db.ts).
 
 | Migration | Adds |
 |---|---|
@@ -14,7 +14,7 @@ Main DB migrations 001..012 (`PRAGMA user_version`; integration mode runs 001, 0
 | 008 | accounts.scope_all; people (kind child/device_group); devices (state enrolling/active/removing) |
 | 009 | time_requests.apply_via (resume/allowance), grant_operation_id |
 | 010 | parent_audit (ids and closed enums only; no free text, domains, MACs or addresses; pruned after 90 days) |
-| 011, 012 | parent_audit rebuilt to admit action `reward_add` (011) and `focus_start` (012); ids and AUTOINCREMENT counter carried over |
+| 011, 012, 013 | parent_audit rebuilt to admit action `reward_add` (011), `focus_start` (012) and `owner_guard_refused` (013); ids and AUTOINCREMENT counter carried over |
 | integration-001 | integration_state (singleton, generation, dispatch_epoch, dispatch_stopped), operation_rpc (phase queued/claimed/uncertain/resolved; delivery), dispatch_batches, dispatch_steps |
 | integration-002 | dispatch_steps rebuilt (single ordinal, kinds observe/apply/receipt/activity, states consumed/resolved/uncertain/revoked); index dispatch_live_claims |
 | integration-003 | operations.action admits device enrollment (`enroll`) |
@@ -24,5 +24,5 @@ Main DB migrations 001..012 (`PRAGMA user_version`; integration mode runs 001, 0
 | integration-007 | operations.action admits `allow` (router allowance for ask-for-time grants and Reward Time; a focus window is a labelled timed pause, not a new kind) |
 
 Also referenced: automatic_read_summary (created in integration-db.ts).
-Highest numbered migration: 012 (service/migrations). Features that write to `parent_audit` are flagged off by default (`auditLog.enabled`).
+Highest numbered migration: 013 (service/migrations). Features that write to `parent_audit` are flagged off by default (`auditLog.enabled`).
 Router-side state: see [router.md](router.md).

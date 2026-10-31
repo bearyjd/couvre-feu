@@ -4,6 +4,7 @@ import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
 import { digest, pairingCode, rejectPendingPasskeys } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
+import { auditFor } from './parent-audit.ts';
 import { ACCOUNT_LIMIT, PASSKEYS_PER_ACCOUNT } from './account-limits.ts';
 
 /** Every account/passkey change. All need a fresh step-up; only own_passkey_revoke is open to non-admins. */
@@ -11,6 +12,7 @@ export type AdminAction = 'account_create' | 'token_issue' | 'account_role' | 'a
 const ACTIONS: readonly AdminAction[] = ['account_create', 'token_issue', 'account_role', 'account_active', 'passkey_approve', 'passkey_revoke', 'own_passkey_revoke'];
 const ACCOUNT_ID = /^[a-z][a-z0-9_]{0,31}$/;
 export const CREDENTIAL_ID = /^[A-Za-z0-9_-]{1,1400}$/;
+const OWNER_GUARD_CODES = ['owner_account_protected', 'owner_self_lockout'];
 const TOKEN_SECONDS = 600;
 interface AccountRow {id: string; display_name: string; role: Role; person_ids: string; active: number; scope_all: number}
 interface CredentialRow {id: string; account_id: string; label: string; state: 'active' | 'pending'; created_at: number; last_used_at: number | null}
@@ -103,6 +105,15 @@ export class AccountAdmin {
         const {stepUp, ...rest} = input as Record<string, unknown>;
         const change = normalize(kind, target, rest, session.dto.actor);
         const proof = await this.auth.stepUpVerify(session, stepUp, bindingOf(kind, change.target, change.params));
+        try {
+            return this.transact(session, kind, change, proof);
+        } catch (error) {
+            this.auditOwnerGuardRefusal(session.dto.actor.id, error);
+            throw error;
+        }
+    }
+    /** The guard refusals throw inside this transaction, so they roll back; the audit row is written by the caller afterwards. */
+    private transact(session: AuthSession, kind: AdminAction, change: {target: string; params: Record<string, unknown>}, proof: Awaited<ReturnType<Auth['stepUpVerify']>>): unknown {
         return this.store.transaction(() => {
             const actor = this.auth.commitStepUp(session, proof);
             this.allowed(actor, kind);
@@ -112,6 +123,11 @@ export class AccountAdmin {
             this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, kind === 'own_passkey_revoke' ? 'passkey_self_revoke' : `admin_${kind}`, this.auth.now(), result.audit);
             return result.body;
         });
+    }
+    /** Records a refused owner-guard attempt (actor and enums only: the target is the owner account, never stored). Fail-safe: the 403/409 response is never changed. */
+    private auditOwnerGuardRefusal(actorId: string, error: unknown): void {
+        if (!(error instanceof AppError) || !OWNER_GUARD_CODES.includes(error.code)) return;
+        auditFor(this.store).record({actor: actorId, action: 'owner_guard_refused', people: [], result: 'refused', at: this.auth.now()});
     }
     /** At least one active admin account must keep at least one active passkey. */
     private adminsWithPasskey(): number {
