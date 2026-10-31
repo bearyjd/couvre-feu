@@ -20,6 +20,8 @@ import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
 export const OBSERVATION_FRESH_SECONDS = 30;
 /** Focus window (F5): the minutes a parent may start. */
 export const FOCUS_MINUTES: readonly number[] = [15, 30, 45, 60, 90, 120];
+/** How a pause ends: 'manual' takes the caller's `until`; 'focus' runs `minutes` from router time (F5). */
+type PauseSpec = {kind: 'manual'} | {kind: 'focus'; minutes: number};
 export interface IntegrationOperation {
     id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
@@ -108,15 +110,16 @@ export class IntegrationPolicy {
         this.authorized(actor, person);
         return audited(this.store, {actor: actor.id, action: 'focus_start', now: this.now, people: () => [person], done: r => ({operationId: r.result.operation.id})}, () => {
             if (typeof minutes !== 'number' || !FOCUS_MINUTES.includes(minutes)) throw new AppError(400, 'invalid_minutes');
-            return this.mutateAuthorized(actor, person, 'pause', {}, precondition, key, minutes);
+            return this.mutateAuthorized(actor, person, 'pause', {}, precondition, key, {kind: 'focus', minutes});
         });
     }
-    private mutateAuthorized(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, focusMinutes?: number): {status: number; result: OperationResult} {
-        const body = object(input, action === 'pause' && focusMinutes === undefined ? ['until'] : []), until = action === 'pause' && focusMinutes === undefined ? integer(body.until) : null;
+    private mutateAuthorized(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, spec: PauseSpec = {kind: 'manual'}): {status: number; result: OperationResult} {
+        const manualPause = action === 'pause' && spec.kind === 'manual';
+        const body = object(input, manualPause ? ['until'] : []), until = manualPause ? integer(body.until) : null;
         if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) throw new AppError(428, 'revision_precondition_required');
         // A focus window's deadline comes from router time inside the transaction, so it is not part of the replay identity.
-        const request = JSON.stringify({person, action, until, ...(focusMinutes === undefined ? {} : {label: 'focus', minutes: focusMinutes}), precondition, permissionVersion: actor.permissionVersion});
+        const request = JSON.stringify({person, action, until, ...(spec.kind === 'focus' ? {label: 'focus', minutes: spec.minutes} : {}), precondition, permissionVersion: actor.permissionVersion});
         const op = this.store.transaction(() => {
             this.store.assertIdentity();
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
@@ -125,10 +128,10 @@ export class IntegrationPolicy {
             return this.queue(actor, person, action, request, key, precondition, base => {
                 if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
                 let pauseUntil = until;
-                if (focusMinutes !== undefined) {
+                if (spec.kind === 'focus') {
                     const routerTime = this.store.observation().value!.routerTime;
                     if (base.pauses.some(p => p.person === person && (p.until === 0 || p.until > routerTime))) throw new AppError(409, 'child_paused');
-                    pauseUntil = routerTime + focusMinutes * 60;
+                    pauseUntil = routerTime + spec.minutes * 60;
                 }
                 // Pause wins: a pause also ends the child's time allowance (as cfctl pause does, core.sh cf_pause_edit), or the
                 // router would keep the child unblocked. Resume keeps the allowance, matching cf_resume_edit.
