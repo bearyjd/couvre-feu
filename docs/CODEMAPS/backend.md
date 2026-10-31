@@ -11,7 +11,7 @@ Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activ
 | POST /people/:id/{pause,resume}, /people/:id/schedules[/:sid[/delete]] | policy -> operation |
 | POST /people/:id/reward | Reward Time: +15/+30 min allowance (integration-allowance.ts `IntegrationGrants.reward`); 404 unless `rewardTime.enabled` and the viewer may decide (http.ts:240) |
 | POST /people/:id/focus | one-shot focus window = labelled timed pause (`IntegrationPolicy.focus`, integration-policy.ts); 404 unless `focus.enabled` and the viewer may decide (http.ts:248) |
-| GET /audit[/limit/:n][/before/:id] | parent-audit.ts `auditFor`; 404 unless `auditLog.enabled`; scoped like alerts; no web view yet (http.ts:329) |
+| GET /audit[/limit/:n][/before/:id] | parent-audit.ts `auditFor`; 404 unless `auditLog.enabled`; scoped like alerts; parent "Activity log" view: web/public/audit.js, shown per viewer via `auditLog` on `GET /people` (http.ts:332) |
 | POST /alerts/:n/acknowledge | parent-alerts.ts |
 | /child/status, /child/request (unauthenticated; capability token in POST body, Origin-checked) | time-requests-http.ts |
 | GET /admin/inventory, POST /admin/inventory/{acknowledge,refresh} | inventory-http.ts |
