@@ -492,6 +492,7 @@ finally:
         with patch.object(runner, "source_revision", return_value="f" * 40):
             plan = runner.discovery_plan()
         self.assertEqual(runner.PARTITION_COUNTS["test-core.py"], 5)
+        self.assertEqual(runner.PARTITION_COUNTS["test-penn-pilot.py"], 5)
         self.assertLessEqual(runner.LANE_TIMEOUT, 1800)
         for suite in runner.SUITES:
             weights = runner.CASE_WEIGHTS.get(suite, {})

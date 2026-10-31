@@ -41,9 +41,10 @@ SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.
 DEFAULT_WEIGHT = 5
 # Partitions per suite (default 4). test-core.py is ~3900 s of serial cases: four
 # shards ran 630-1290 s against the 1800 s lane budget; five predict about 770 s each.
-# The longest predicted shard is now test-penn-pilot.py at about 1047 s (58%).
+# test-penn-pilot.py was ~1047 s with four; five predict about 837 s each. The longest
+# predicted shard is now test-transition.py at about 904 s (50%).
 DEFAULT_PARTITIONS = 4
-PARTITION_COUNTS = {'test-core.py': 5}
+PARTITION_COUNTS = {'test-core.py': 5, 'test-penn-pilot.py': 5}
 LANE_TIMEOUT = 1800
 CASE_WEIGHTS = {
     'test-core.py': {
