@@ -234,6 +234,24 @@ test('a parent Pause during a focus window is not blocked by it and a parent Res
     } finally { w.f.cleanup(); }
 });
 
+test('the stored replay identity is byte-stable: focus carries label+minutes (no deadline), a manual pause carries its until, a resume neither', async () => {
+    const stored = (r: Awaited<ReturnType<typeof focusWorld>>, id: string) => r.w.f.store.get<{request_json: string}>('SELECT request_json FROM operations WHERE id=?', id)!.request_json;
+    const r = await focusWorld();
+    try {
+        const pre = r.token(), out = r.w.f.policy.focus(actor, 'pilot', 45, pre, KEY);
+        assert.equal(stored(r, out.result.operation.id), JSON.stringify({person: 'pilot', action: 'pause', until: null, label: 'focus', minutes: 45, precondition: pre, permissionVersion: actor.permissionVersion}));
+    } finally { r.w.f.cleanup(); }
+    const m = await focusWorld();
+    try {
+        const pre = m.token(), until = m.routerTime() + 600, out = m.w.f.policy.mutate(actor, 'pilot', 'pause', {until}, pre, KEY);
+        assert.equal(stored(m, out.result.operation.id), JSON.stringify({person: 'pilot', action: 'pause', until, precondition: pre, permissionVersion: actor.permissionVersion}));
+    } finally { m.w.f.cleanup(); }
+    const u = await focusWorld();
+    try {
+        const pre = u.token(), out = u.w.f.policy.mutate(actor, 'pilot', 'resume', {}, pre, KEY);
+        assert.equal(stored(u, out.result.operation.id), JSON.stringify({person: 'pilot', action: 'resume', until: null, precondition: pre, permissionVersion: actor.permissionVersion}));
+    } finally { u.w.f.cleanup(); }
+});
 test('replay of the same key returns the same operation, queues once and audits once; a different minutes under the key conflicts', async () => {
     const r = await focusWorld();
     try {

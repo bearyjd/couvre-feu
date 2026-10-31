@@ -333,7 +333,7 @@ export function inventoryStatus(status, nowSeconds, time) {
 export function createInventory({ session, gate, offline, time, children, version }) {
   const root = document.querySelector('#inventory-panel');
   let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null;
-  let serverNow = null, loadedPerf = 0, mounted = false; // serverNow: the service clock at the last load, advanced by this page's own elapsed time
+  let serverNow = null, loadedPerf = 0, mounted = false, fetched = false; // fetched: a list request was issued for this session key. serverNow: the service clock at the last load, advanced by this page's own elapsed time
   const title = el('h2', { id: 'inventory-title', tabindex: -1 }, 'Devices on the network');
   const live = el('p', { class: 'fine-print', role: 'status', 'aria-live': 'polite', 'data-live': '', 'data-refresh-status': '' }); // one node for the life of the panel, so screen readers hear changes
   const body = el('div');
@@ -361,6 +361,7 @@ export function createInventory({ session, gate, offline, time, children, versio
     if (!enabled()) { data = null; draw(); return; }
     if (offline()) { draw(); return; } // keep the saved list; it is labelled as saved
     const mine = key;
+    fetched = true;
     try {
       const result = await call('/admin/inventory');
       if (mine !== key) return;
@@ -461,11 +462,16 @@ export function createInventory({ session, gate, offline, time, children, versio
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
     if (next !== key) {
-      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
+      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; fetched = false; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
       draw(); if (next) void load(); return;
     }
     const seen = version();
-    if (next && seen !== lastVersion) { lastVersion = seen; void load(); return; }
+    if (next && seen !== lastVersion) {
+      // The first version seen after sign-in (the people list arrives ~25 ms after the session) must not repeat the load the session change already issued.
+      const covered = lastVersion === null && fetched && !loadFailed; // a failed first load is not covered: this bump retries it
+      lastVersion = seen;
+      if (!covered) { void load(); return; }
+    }
     draw();
   }
   return { update, load };
