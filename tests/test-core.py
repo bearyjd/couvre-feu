@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Behavioral core fixtures. Passing is not packet/OpenWrt/live-router proof."""
+# timeout-ok-file: UNMEASURED (not yet timed on a slow runner) expires: 2026-12-31. Most short limits only reap a process group that was
+# just SIGKILLed (returns at once); the rest (wait 18 s reader deadline, expire/cfctl-ssh 3-5 s calls) have not been measured.
 import copy
 import datetime
 import ipaddress

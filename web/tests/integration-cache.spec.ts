@@ -1,6 +1,10 @@
 import { test, expect } from './browser-fixture.ts';
 import type { Page } from '@playwright/test';
 
+// Drain every route handler before a test ends, also when an assertion threw: a handler still awaiting route.fetch would
+// otherwise be charged to the NEXT test ("route.fetch: Test ended") and hide the real failure behind a misleading one.
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' }); });
+
 test('real-source cached status is scoped to source, installation and authenticated account', async ({page, demo}) => {
     await page.goto(demo.origin);
     const result = await page.evaluate(async () => {

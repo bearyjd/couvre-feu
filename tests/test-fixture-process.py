@@ -93,6 +93,7 @@ class FixtureProcessTests(unittest.TestCase):
                                + " sync \"$@\"\n")
             fixture.update_backend(delays=[{"command": "sync", "seconds": 60}])
             with self.assertRaises(subprocess.TimeoutExpired):
+                # timeout-ok: the test asserts this 3 s bound fires against a 60 s backend delay, or is interrupted by the readiness callback
                 fixture.run("sync", document=policy(), timeout=3,
                             started=self.backend_started(fixture, root / "backend-pid"))
             child_pid = int((root / "backend-pid").read_text())
@@ -136,6 +137,7 @@ class FixtureProcessTests(unittest.TestCase):
             raise KeyboardInterrupt('deliberate readiness interruption')
         try:
             with self.assertRaisesRegex(KeyboardInterrupt, 'deliberate readiness interruption'):
+                # timeout-ok: the test asserts this 3 s bound fires against a 60 s backend delay, or is interrupted by the readiness callback
                 fixture.run('sync', document=policy(), timeout=3, started=started)
             self.assert_stopped(int(marker.read_text()))
         finally:
