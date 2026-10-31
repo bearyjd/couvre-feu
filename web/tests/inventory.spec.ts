@@ -57,8 +57,8 @@ test('hostile device names (markup, scripts, very long, right-to-left) render as
   seed(f);
   // The database refuses such names, so the response is rewritten: the page must stay safe even if the service were wrong.
   const hostile = [HOSTILE, '<script>window.__xss=2</script>', 'x'.repeat(300), '\u202Eevil\u05D0\u05D1\u05D2'];
-  // Sign-in loads the list twice (session change, then state version change). Hold every later response back, as a loaded CI runner does,
-  // so the test body ends with a route callback still in flight; that must not surface as a failure of the next test.
+  // Sign-in loads the list once; an explicit second load (acknowledging a device reloads the list) is triggered at the end. Hold every later
+  // response back, as a loaded CI runner does, so the test body ends with a route callback still in flight; that must not surface as a failure of the next test.
   // Do not remove the delay: it is what makes this test a regression guard for the draining below instead of a rare flake.
   let seen = 0;
   await page.route('**/admin/inventory', async (route) => {
@@ -79,9 +79,19 @@ test('hostile device names (markup, scripts, very long, right-to-left) render as
   expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
   expect(await panel(page).locator('[data-name][dir="auto"]').count()).toBe(5);
   expect(await noHorizontalScroll(page)).toBe(true);
-  await page.unrouteAll({ behavior: 'wait' }); // let the second (version-change) load finish its rewrite before the page closes
-  expect(seen).toBeGreaterThanOrEqual(2); // the guard only guards while sign-in still loads the list twice
+  await panel(page).getByRole('button', { name: /^Acknowledge/ }).first().click(); // the reload after the acknowledge is the delayed second response
+  await expect.poll(() => seen).toBeGreaterThanOrEqual(2); // the guard only guards while a second, delayed load is really in flight
+  await page.unrouteAll({ behavior: 'wait' }); // let that load finish its rewrite before the page closes
   expect(errors).toEqual([]);
+});
+
+test('sign-in loads the inventory list exactly once', async ({ page, integration: f }) => {
+  seed(f);
+  const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
+  await page.waitForTimeout(500); // a duplicate load followed ~25 ms after the first
+  expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(1);
 });
 
 test('a parent sees no inventory panel and the endpoint answers 403', async ({ page, integration: f }) => {
