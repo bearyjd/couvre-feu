@@ -13,6 +13,7 @@
 | accounts.js, children.js | passkeys and parent accounts; children, devices, Block all/Unblock all and "Devices on the network" (all behind step-up for changes) |
 | time-requests.js | parent: request links, approve/decline |
 | reward-time.js | parent: Reward +15 / +30 min buttons (shown only when `/people` says `rewardTime`; flagged off) |
+| audit.js | parent: "Activity log" panel (`GET /audit/limit/50`, "Show older" via `/before/:id`; shown only when `/people` says `auditLog`; flagged off) |
 | request.html, request.js | child page; token in URL fragment |
 | sw.js | shell-only offline cache; no API cache, no queued writes |
 | manifest.webmanifest, icon.svg | PWA metadata |

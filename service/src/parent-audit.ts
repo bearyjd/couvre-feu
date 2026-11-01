@@ -57,11 +57,11 @@ export class ParentAudit {
         return n >= REFUSED_MAX;
     }
 
-    /** Assigned children always; entries with no child only for admins (the same rule as parent alerts). */
+    /** An admin sees every row, including rows with no child; anyone else sees only their assigned children. Deliberately not the alerts rule, and not restricted by owner mode. */
     private visibility(actor: Actor): {sql: string; args: string[]} {
+        if (actor.role === 'admin') return {sql: '1', args: []};
         const people = actor.personIds.slice(0, SCOPE_MAX);
-        const parts = [...(people.length ? [`a.person_id IN (${people.map(() => '?').join(',')})`] : []), ...(actor.role === 'admin' ? ['a.person_id IS NULL'] : [])];
-        return parts.length ? {sql: `(${parts.join(' OR ')})`, args: people} : {sql: '0', args: []};
+        return people.length ? {sql: `a.person_id IN (${people.map(() => '?').join(',')})`, args: people} : {sql: '0', args: []};
     }
 
     list(actor: Actor, opts: {before?: number; limit?: number} = {}): AuditPage {

@@ -86,7 +86,7 @@ Each is a key in the private integration manifest; absent means off. Status and 
 - Ask for time: `timeRequests.mode` `off`, `owner` or `parents` (with `ownerAccountId`); service and parent card built (PR #86, #88, #92, #94). In `owner` mode other admins cannot change the owner's account and the owner cannot lock themselves out (PR #100).
 - Reward Time: `rewardTime.enabled`; service (PR #95) and parent buttons (PR #107, shown per viewer through the `rewardTime` field of `GET /people`).
 - Focus window: `focus.enabled`; one-shot service only (PR #104), no web UI yet.
-- Audit log of parent actions: `auditLog.enabled`; table `parent_audit` (migrations 010 to 013), `GET /audit`, service only (PR #93), no web view yet.
+- Audit log of parent actions: `auditLog.enabled`; table `parent_audit` (migrations 010 to 013), `GET /audit`, service (PR #93) and the parent "Activity log" view (shown per viewer through the `auditLog` field of `GET /people`; unverified on this router).
 - DNS hardening: `dnsHardening.dohList` merges the static public DoH resolver list (`service/src/doh-list.ts`) into each submitted policy; see [DNS hardening](docs/dns-hardening.md).
 
 ## Local verification
