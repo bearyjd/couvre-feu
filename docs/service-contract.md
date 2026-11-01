@@ -93,7 +93,27 @@ Entry: `id`, `at`, `actorId`, `actorName` (the account's display name, null for 
 
 **Retention.** Rows older than 90 days are deleted at startup and then hourly by the existing prune timer, in bounded batches (at most 2000 rows per call), whether or not the flag is still on.
 
-### Gap: notification delivery beyond the app
+### Push and weekly digest (B7, service-only, off)
+
+Flags `"push": {"enabled": true}` and `"digest": {"enabled": true}` in the private manifest (strict booleans; absent means **off**; `digest.enabled` without `push.enabled` is refused with `digest_requires_push`). **Unverified on a real ntfy server and phone; no web UI.** With `push` off the service makes no network call, starts no timer and creates no table.
+
+- **Provider.** A self-hosted ntfy topic (`service/src/push-sender.ts`). Settings come from the environment, never the manifest: `COUVRE_NTFY_URL` (http or https origin, no credentials, path or query), `COUVRE_NTFY_TOPIC` (8 to 64 of `A-Za-z0-9_-`), optional `COUVRE_NTFY_TOKEN` (sent as a Bearer header). With push on, a bad value stops startup with `invalid_ntfy_url`, `invalid_ntfy_topic` or `invalid_ntfy_token` (the value is never printed).
+- **Recipients.** Admins only, by topic access: the single private topic is the audience, so subscribe only admins' phones to it (and protect it with an ntfy token or ACL). The service stores no subscriptions and no per-account push address.
+- **Content-free.** Callers pass a kind, never text. Alert push: title `Couvre-feu`, body `New alert. Open the app to see it.`, `Click` link = the service's own configured origin plus `/`. No child, device, app or account names, reasons, alert kinds or audit details are ever read into a push. Sent when a new open `parent_alerts` row appears (one push per pass however many rows); enabling starts from the current newest alert, so old alerts are not replayed.
+- **Failure isolation.** The watcher runs on its own 60 s timer (unref'd), every pass is caught, and the sender never throws. Policy, requests and grants never wait on it. Each send is bounded: 5 s timeout, at most 3 attempts (1 s then 2 s back-off); 5xx, 429 and network errors retry, other 4xx do not; redirects are refused. A failed alert push is retried on the next pass while the alert stays open. Logs carry only a tag (`push_failed http_500 attempts=3`, `push_alert_pass_failed`, `digest_pass_failed`), never the URL, topic, token or response text.
+- **Weekly digest** (`service/src/digest.ts`). Sundays 18:00 America/New_York (DST-correct: 22:00Z in summer, 23:00Z in winter), body `Last 7 days: N requests, N grants, N pauses.` Counts only: time requests created, requests approved, and pause or pause-all operations accepted in the seven days before the slot (`weeklyCounts` in `service/src/push-runtime.ts`; no names, ids or text are selected). **Quiet hours 21:00 to 07:00** New York: a digest that falls due then (service down, or a failed send retrying) is deferred and sent at 07:00 (log tag `digest_deferred`); it is never dropped. A failed send leaves the slot unsent and retries each minute until the next slot supersedes it; several missed weeks collapse into one digest. Enabling does not send a catch-up digest. The last sent slot and the last pushed alert id are in the additive table `notify_state` (created only when push is on). Alert pushes are not held for quiet hours.
+- **Not delivered is not shown.** The service only knows ntfy accepted a message; it never claims a phone received or saw it, and there is no in-app delivery state yet.
+
+#### How to turn push and the digest on
+
+1. Run an ntfy server you control; make a topic with an unguessable name; create a token for the service and give your admins' phones read access only.
+2. Put `COUVRE_NTFY_URL`, `COUVRE_NTFY_TOPIC` and (if set up) `COUVRE_NTFY_TOKEN` in the service's environment file, not the manifest or the repo.
+3. Back up, add `"push": {"enabled": true}` to a copy of the private manifest, then rebind and start as in [How to turn a flag on](#how-to-turn-a-flag-on). Check there is no `invalid_ntfy_*` error at startup.
+4. Trigger a test alert and confirm the phone shows only the fixed text. Any name, MAC, domain or alert detail in a push: turn the flag off and stop.
+5. Only after push has run cleanly, add `"digest": {"enabled": true}`, rebind, and check the first two Sunday digests against the app's own numbers before trusting them (roadmap rollout rule).
+6. Turn off: set the keys to `false` or remove them, rebind, restart. Nothing else is written.
+
+### Gap: notification delivery beyond the app (browser Web Push)
 
 Alerts are visible only inside the PWA while open. Web Push is out of scope. Sketch: generate a VAPID key pair on the service (private key in an environment secret, never in the repo); `POST /push/subscriptions` stores each parent's browser `PushSubscription` (endpoint, keys) bound to the account and revoked on logout or permission change; on alert creation (not on every count increment) send an encrypted, content-free payload ("Couvre-feu: new alert") with the `web-push` protocol directly to the browser vendor's push service, the only third party involved, and have the service worker fetch the actual alert over the authenticated session when the notification is tapped. Open design points: quiet hours, per-severity opt-in, expired-subscription cleanup (HTTP 404/410), and the service needing outbound HTTPS to the push service even when its own listener is tailnet-only.
 
@@ -220,6 +240,7 @@ Everything below ships **OFF** and is **unverified on this router** until the Ph
 | Audit log (F2) | `"auditLog": {"enabled": true}` | Writes to `parent_audit` and `GET /audit` |
 | Reward Time (F4) | `"rewardTime": {"enabled": true}` | `POST /people/:id/reward` |
 | Focus window (F5) | `"focus": {"enabled": true}` | `POST /people/:id/focus` (also needs `timeRequests` on) |
+| Push and digest (B7) | `"push": {"enabled": true}`, `"digest": {"enabled": true}` (needs push); ntfy settings in `COUVRE_NTFY_*` env | Content-free ntfy push and weekly counts-only digest; no route. See [Push and weekly digest](#push-and-weekly-digest-b7-service-only-off) |
 
 **Owner mode (F1).** `timeRequests.mode` `owner` needs a top-level `ownerAccountId` naming an entry in `accounts` (`owner_account_required` and `invalid_owner_account` refuse the manifest otherwise: `service/src/integration-config.ts:157-159`). Only that account sees or decides requests and the `time_request_pending` alert (`service/src/http.ts:103-104`). Reward Time follows the same gate. **It is not a security boundary against other admins**: it hides the feature, it does not stop another admin from using other routes (for example Pause, Resume or editing devices). Tracked follow-ups, not built: protect the owner account from other admins, and a startup check that the owner account exists and is active (today the check only confirms the id is listed in `accounts`).
 

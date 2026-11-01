@@ -23,6 +23,6 @@ Main DB migrations 001..013 (`PRAGMA user_version`; integration mode runs 001, 0
 | integration-006 | network inventory tables, `inventory` step kind, `new_device` alert kind |
 | integration-007 | operations.action admits `allow` (router allowance for ask-for-time grants and Reward Time; a focus window is a labelled timed pause, not a new kind) |
 
-Also referenced: automatic_read_summary (created in integration-db.ts).
+Also referenced: automatic_read_summary (created in integration-db.ts). `notify_state` (key/value: last pushed alert id, last sent digest slot) is created by push-runtime.ts only when `push.enabled`.
 Highest numbered migration: 013 (service/migrations). Features that write to `parent_audit` are flagged off by default (`auditLog.enabled`).
 Router-side state: see [router.md](router.md).

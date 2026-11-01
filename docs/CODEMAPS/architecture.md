@@ -19,7 +19,7 @@ Entry points
 - `integration:bootstrap` issues CLI-only enrollment token (further passkeys: admin UI add-device tokens, approved by an admin, step-up bound); `integration:dispatch` operator dispatch.
 - Router: install.sh / uninstall.sh / cfctl, release pinned by router/release.sha256 (tools/freeze-router-release.py). The shipped tree is `--emit`ted: cfctl-ssh and cfctl-scope lose their CF_TEST_MODE block (tools/strip-test-mode.py); release.sha256 covers final emitted bytes; version-2 CF_RELEASE_ID binds all emitted sources, including install/uninstall/bootstrap, with generated assignments normalized to break pin cycles.
 
-Flagged-off features (manifest keys; absent = off; all unverified on this router): `timeRequests.mode` off|owner|parents (+ `ownerAccountId`), `rewardTime.enabled`, `focus.enabled`, `auditLog.enabled` (table `parent_audit`), `dnsHardening.dohList` (service/src/doh-list.ts). Details: [backend](backend.md), [data](data.md), docs/service-contract.md.
+Flagged-off features (manifest keys; absent = off; all unverified on this router): `timeRequests.mode` off|owner|parents (+ `ownerAccountId`), `rewardTime.enabled`, `focus.enabled`, `auditLog.enabled` (table `parent_audit`), `dnsHardening.dohList` (service/src/doh-list.ts), `push.enabled` and `digest.enabled` (service/src/push-*.ts, digest.ts; ntfy settings from `COUVRE_NTFY_*` env). Details: [backend](backend.md), [data](data.md), docs/service-contract.md.
 Trust boundaries
 - Service never gets a shell: cfctl-ssh accepts only `cfctl rpc-*|status|pause|resume|sync|expire|apply-fw` tokens.
 - In `owner` mode the owner account is guarded against other admins and against self-lockout (admin-accounts.ts, PR #100).
