@@ -214,6 +214,26 @@ test('error reporting never throws: throwing logger, null/undefined/non-Error th
     } finally { process.off('unhandledRejection', onRejection); down.close(); f.cleanup(); }
 });
 
+test('an async rejecting logger causes no unhandledRejection', async () => {
+    const f = integrationFixture(), down = await fakeNtfy((_s, _n, res) => { res.statusCode = 500; res.end(); });
+    const boom = async () => { throw new Error('async log boom'); }, rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    try {
+        const on = {...f.config, push: {enabled: true}};
+        assert.equal(startNotifications(on, f.store, {env: {}, options: {log: boom}}), null);
+        const n = startNotifications(on, f.store, {env: down.env, options: {sleep: noSleep, log: boom}})!;
+        f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
+        await n.tick(); await n.stop();
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.deepEqual(rejections, []);
+        const direct = new NtfyPush(ntfySettings(down.env), 'http://localhost:4273', {sleep: noSleep, log: boom});
+        assert.equal((await direct.send({kind: 'alert'})).ok, false);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.deepEqual(rejections, []);
+    } finally { process.off('unhandledRejection', onRejection); down.close(); f.cleanup(); }
+});
+
 test('digest_deferred is logged once per slot', async () => {
     const h = digestHarness(utc(2026, 11, 1, 22, 0)), deferralLogged = {slot: 0};
     h.deps.deferralLogged = deferralLogged;

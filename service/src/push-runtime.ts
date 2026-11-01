@@ -2,7 +2,7 @@ import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import { digestTick, latestDigestSlot } from './digest.ts';
 import type { DigestStateStore } from './digest.ts';
-import { NtfyPush, ntfySettings } from './push-sender.ts';
+import { NtfyPush, ntfySettings, safeLog } from './push-sender.ts';
 import type { DigestCounts, PushEnv, PushOptions } from './push-sender.ts';
 
 export const NOTIFY_POLL_MS = 60000;
@@ -40,7 +40,7 @@ export function startNotifications(config: IntegrationConfig, store: Db, deps: N
     if (config.push?.enabled !== true) return null;
     const sink = deps.options?.log ?? ((line: string) => process.stderr.write(line));
     // Reporting a problem must never be a second problem.
-    const log = (line: string) => { try { sink(line); } catch { /* nowhere left to report */ } };
+    const log = safeLog(sink);
     try { return begin(config, store, deps, log); } catch (error) {
         const code = error instanceof Error ? error.message : '';
         log(SETTING_CODE.test(code) ? `notifications_disabled ${code}\n` : 'notifications_init_failed\n');

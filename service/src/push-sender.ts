@@ -22,6 +22,12 @@ function privateHost(host: string): boolean {
     const [a, b] = [+m[1], +m[2]];
     return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
 }
+/** Wraps a log sink so reporting can never throw or leave a rejected promise behind (a sink may be async). */
+export function safeLog(sink: (line: string) => unknown): (line: string) => void {
+    return line => {
+        try { const result = sink(line); if (result !== null && typeof result === 'object' && typeof (result as PromiseLike<unknown>).then === 'function') Promise.resolve(result).catch(() => undefined); } catch { /* nowhere left to report */ }
+    };
+}
 const bad = (code: string): never => { throw new Error(code); };
 
 /** Startup validation when push is enabled. Throws a code only; the values are never echoed. */
@@ -52,7 +58,7 @@ export class NtfyPush {
     /** `origin` is the service's own configured origin; it is the link target, never derived from data. */
     constructor(settings: NtfySettings, origin: string, options: PushOptions = {}) {
         this.settings = settings; this.click = origin + '/';
-        this.o = {fetch: options.fetch ?? fetch, sleep: options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))), log: options.log ?? (line => process.stderr.write(line)),
+        this.o = {fetch: options.fetch ?? fetch, sleep: options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))), log: safeLog(options.log ?? (line => process.stderr.write(line))),
             timeoutMs: options.timeoutMs ?? PUSH_TIMEOUT_MS, maxAttempts: options.maxAttempts ?? PUSH_MAX_ATTEMPTS, backoffMs: options.backoffMs ?? PUSH_BACKOFF_MS};
     }
     /** Bounded: at most maxAttempts tries, each cut off at timeoutMs. 5xx, 429 and network errors retry; any other refusal does not. */
