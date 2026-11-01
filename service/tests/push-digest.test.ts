@@ -10,7 +10,7 @@ import { digestTick, inQuietHours, latestDigestSlot } from '../src/digest.ts';
 import type { DigestDeps } from '../src/digest.ts';
 
 const HOSTILE = 'Zed<script>alert(1)</script>Bobby';
-const TOKEN = 'tk_secrettoken123456', TOPIC = 'couvre_topic_abc123';
+const TOKEN = 'tk_secrettoken123456', TOPIC = 'couvre_topic_abc123456789';
 interface Seen { url: string; headers: IncomingMessage['headers']; body: string }
 async function fakeNtfy(handler: (seen: Seen, n: number, res: ServerResponse) => void = (_s, _n, res) => { res.statusCode = 200; res.end('{}'); }) {
     const seen: Seen[] = [];
@@ -28,9 +28,20 @@ const noSleep = async () => undefined;
 test('ntfy settings are validated and never echoed', () => {
     assert.deepEqual(ntfySettings({COUVRE_NTFY_URL: 'http://127.0.0.1:2586', COUVRE_NTFY_TOPIC: TOPIC}), {baseUrl: 'http://127.0.0.1:2586', topic: TOPIC, token: null});
     for (const env of [{}, {COUVRE_NTFY_URL: 'ftp://x', COUVRE_NTFY_TOPIC: TOPIC}, {COUVRE_NTFY_URL: 'https://u:p@h/', COUVRE_NTFY_TOPIC: TOPIC}, {COUVRE_NTFY_URL: 'https://h/x', COUVRE_NTFY_TOPIC: TOPIC},
-        {COUVRE_NTFY_URL: 'https://h', COUVRE_NTFY_TOPIC: 'a/b'}, {COUVRE_NTFY_URL: 'https://h', COUVRE_NTFY_TOPIC: 'short'}, {COUVRE_NTFY_URL: 'https://h', COUVRE_NTFY_TOPIC: TOPIC, COUVRE_NTFY_TOKEN: 'bad token\n'}]) {
+        {COUVRE_NTFY_URL: 'https://h', COUVRE_NTFY_TOPIC: 'a/b'}, {COUVRE_NTFY_URL: 'https://h', COUVRE_NTFY_TOPIC: 'only_nineteen_chars'}, {COUVRE_NTFY_URL: 'https://h', COUVRE_NTFY_TOPIC: TOPIC, COUVRE_NTFY_TOKEN: 'bad token\n'}]) {
         assert.throws(() => ntfySettings(env), error => /^invalid_ntfy_(url|topic|token)$/.test((error as Error).message) && !(error as Error).message.includes(TOPIC));
     }
+});
+
+test('a token never travels over plain http to a non-private host', () => {
+    const base = {COUVRE_NTFY_TOPIC: TOPIC, COUVRE_NTFY_TOKEN: TOKEN};
+    for (const url of ['http://ntfy.example.com', 'http://8.8.8.8:80', 'http://172.32.0.1', 'http://100.128.0.1', 'http://ntfy.lan']) {
+        assert.throws(() => ntfySettings({...base, COUVRE_NTFY_URL: url}), /^Error: ntfy_token_requires_https$/);
+    }
+    for (const url of ['https://ntfy.example.com', 'http://127.0.0.1:2586', 'http://localhost', 'http://10.1.2.3', 'http://172.16.0.9', 'http://192.168.1.5', 'http://100.64.0.1']) {
+        assert.equal(ntfySettings({...base, COUVRE_NTFY_URL: url}).token, TOKEN);
+    }
+    assert.equal(ntfySettings({COUVRE_NTFY_URL: 'http://ntfy.example.com', COUVRE_NTFY_TOPIC: TOPIC}).token, null, 'without a token plain http is allowed');
 });
 
 test('payloads are content-free: fixed alert text, digest numbers only', async () => {
@@ -40,7 +51,7 @@ test('payloads are content-free: fixed alert text, digest numbers only', async (
         f.store.run('INSERT INTO request_links(id,person_id,token_hash,created_by,created_at) VALUES(?,?,?,?,?)', 'l1', 'pilot', 'h', 'operator', f.now());
         f.store.run("INSERT INTO time_requests(id,link_id,person_id,minutes,reason,state,created_at,expires_at,decided_at) VALUES('r1','l1','pilot',15,?,'approved',?,?,?)", HOSTILE, f.now() - 10, f.now() + 900, f.now() - 5);
         f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','enforcement_unhealthy','warning',?,?,?,1,'open',?)", f.now(), f.now(), f.now(), JSON.stringify({note: HOSTILE}));
-        const n = startNotifications({...f.config, push: {enabled: true}, digest: {enabled: false}}, f.store, {env: ntfy.env, options: {sleep: noSleep, log: () => undefined}})!;
+        const n = startNotifications({...f.config, push: {enabled: true}}, f.store, {env: ntfy.env, options: {sleep: noSleep, log: () => undefined}})!;
         // Enabling starts from the current alert high-water mark: the existing alert is history, not a push.
         await n.tick(); assert.equal(ntfy.seen.length, 0);
         f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open',?)", f.now(), f.now(), f.now(), JSON.stringify({note: HOSTILE}));
@@ -113,9 +124,92 @@ test('flags off: no network call, no timer, no table', async () => {
     } finally { globalThis.fetch = real; ntfy.close(); f.cleanup(); }
 });
 
-test('push enabled with a bad ntfy setting refuses at startup', () => {
-    const f = integrationFixture();
-    try { assert.throws(() => startNotifications({...f.config, push: {enabled: true}}, f.store, {env: {}}), /invalid_ntfy_url/); } finally { f.cleanup(); }
+test('any notification init failure is logged by tag and leaves notifications off', () => {
+    const f = integrationFixture(), logs: string[] = [], options = {log: (line: string) => logs.push(line)};
+    try {
+        assert.equal(startNotifications({...f.config, push: {enabled: true}}, f.store, {env: {}, options}), null);
+        assert.equal(startNotifications({...f.config, push: {enabled: true}, digest: {enabled: true}}, f.store, {env: {COUVRE_NTFY_URL: 'http://127.0.0.1:1', COUVRE_NTFY_TOPIC: TOPIC}, options, slot: () => { throw new Error('secret detail 127.0.0.1'); }}), null);
+        assert.deepEqual(logs, ['notifications_disabled invalid_ntfy_url\n', 'notifications_init_failed\n']);
+    } finally { f.cleanup(); }
+});
+
+test('digest wiring: first enable sends nothing, the next slot sends once with digits only', async () => {
+    const f = integrationFixture(), ntfy = await fakeNtfy(), slot = utc(2026, 11, 1, 23, 0);
+    let clock = utc(2026, 11, 1, 22, 0);
+    try {
+        const n = startNotifications({...f.config, push: {enabled: true}, digest: {enabled: true}}, f.store, {env: ntfy.env, now: () => clock, options: {sleep: noSleep, log: () => undefined}})!;
+        // Hostile rows inside the window: the digest may only count them.
+        f.store.run('INSERT INTO request_links(id,person_id,token_hash,created_by,created_at) VALUES(?,?,?,?,?)', 'l1', 'pilot', 'h', 'operator', slot - 500);
+        f.store.run("INSERT INTO time_requests(id,link_id,person_id,minutes,reason,state,created_at,expires_at,decided_at) VALUES('r1','l1','pilot',15,?,'approved',?,?,?)", HOSTILE, slot - 400, slot + 900, slot - 300);
+        f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'resolved',?)", slot, slot, slot, JSON.stringify({note: HOSTILE}));
+        await n.tick(); assert.equal(ntfy.seen.length, 0, 'first enable: no catch-up digest');
+        clock = slot; await n.tick(); await n.tick();
+        assert.equal(ntfy.seen.length, 1);
+        assert.equal(ntfy.seen[0].body, 'Last 7 days: 1 requests, 1 grants, 0 pauses.');
+        assert.match(ntfy.seen[0].body, /^Last 7 days: \d+ requests, \d+ grants, \d+ pauses\.$/);
+        const wire = JSON.stringify(ntfy.seen[0]);
+        for (const forbidden of [HOSTILE, 'Zed', 'Bobby', 'script', 'pilot', 'operator', 'Explicit test']) assert.ok(!wire.includes(forbidden), forbidden);
+        clock = slot + 7 * 86400; await n.tick();
+        assert.equal(ntfy.seen.length, 2, 'the following Sunday sends one more');
+        await n.stop();
+    } finally { ntfy.close(); f.cleanup(); }
+});
+
+test('push on, digest off: no digest state and no digest ever runs', async () => {
+    const f = integrationFixture(), ntfy = await fakeNtfy();
+    let slotCalls = 0;
+    try {
+        const n = startNotifications({...f.config, push: {enabled: true}}, f.store, {env: ntfy.env, now: () => utc(2026, 11, 1, 23, 0), slot: epoch => { slotCalls++; return epoch; }, options: {sleep: noSleep, log: () => undefined}})!;
+        await n.tick(); await n.stop();
+        assert.equal(slotCalls, 0); assert.equal(ntfy.seen.length, 0);
+        assert.equal(f.store.get("SELECT key FROM notify_state WHERE key='digest_slot'"), undefined);
+    } finally { ntfy.close(); f.cleanup(); }
+});
+
+test('stop() waits for a pass in flight and a pass always clears the guard', async () => {
+    const f = integrationFixture(), slow = await fakeNtfy((_s, _n, res) => { setTimeout(() => { res.statusCode = 200; res.end(); }, 150); });
+    try {
+        const n = startNotifications({...f.config, push: {enabled: true}}, f.store, {env: slow.env, options: {sleep: noSleep, log: () => undefined}})!;
+        f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
+        void n.tick();
+        await n.stop();
+        assert.equal(slow.seen.length, 1, 'the in-flight send finished before stop() returned');
+        await n.tick(); // not stuck behind a stale guard
+    } finally { slow.close(); f.cleanup(); }
+});
+
+test('digest_deferred is logged once per slot', async () => {
+    const h = digestHarness(utc(2026, 11, 1, 22, 0)), deferralLogged = {slot: 0};
+    h.deps.deferralLogged = deferralLogged;
+    h.set(utc(2026, 11, 2, 3, 0)); await digestTick(h.deps);
+    h.set(utc(2026, 11, 2, 5, 0)); await digestTick(h.deps);
+    assert.equal(h.logs.filter(l => /digest_deferred/.test(l)).length, 1);
+});
+
+/** Independent oracle: every Sunday 18:00 New York wall time, found by trying both UTC offsets and checking the zone's own clock. */
+const wall = new Intl.DateTimeFormat('en-US', {timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'});
+function oracle(t: number): number {
+    let best = -Infinity;
+    for (let day = -9; day <= 1; day++) {
+        const d = new Date((Math.floor(t / 86400) + day) * 86400000);
+        for (const offsetHours of [4, 5]) {
+            const candidate = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 18 + offsetHours) / 1000;
+            const parts = Object.fromEntries(wall.formatToParts(new Date(candidate * 1000)).map(p => [p.type, p.value]));
+            if (parts.weekday === 'Sun' && parts.hour === '18' && parts.minute === '00' && candidate <= t && candidate > best) best = candidate;
+        }
+    }
+    return best;
+}
+test('latestDigestSlot is the most recent Sunday 18:00 ET across DST weeks (2026 and 2027), every 15 minutes', () => {
+    const firstSunday = (year: number, month: number, nth: number) => { const d = new Date(Date.UTC(year, month, 1)); return 1 + ((7 - d.getUTCDay()) % 7) + 7 * (nth - 1); };
+    for (const year of [2026, 2027]) {
+        for (const [month, nth] of [[2, 2], [10, 1]] as const) { // second Sunday of March, first Sunday of November
+            const start = Date.UTC(year, month, firstSunday(year, month, nth)) / 1000 - 86400;
+            for (let t = start; t < start + 12 * 86400; t += 900) assert.equal(latestDigestSlot(t), oracle(t), new Date(t * 1000).toISOString());
+        }
+    }
+    assert.equal(latestDigestSlot(utc(2026, 3, 9, 4, 30)), utc(2026, 3, 8, 22, 0));
+    assert.equal(latestDigestSlot(utc(2026, 3, 15, 4, 30)), utc(2026, 3, 8, 22, 0));
 });
 
 test('quiet hours: 21:00 to 07:00 New York, across DST', () => {
@@ -157,7 +251,7 @@ test('digest sends once at Sunday 18:00, not before, not twice', async () => {
     assert.equal(await digestTick(h.deps), 'not_due'); // the previous Sunday's slot is already recorded
     h.set(utc(2026, 11, 1, 23, 0)); assert.equal(await digestTick(h.deps), 'sent');
     assert.equal(h.sent.length, 1);
-    assert.deepEqual(h.windows[0], [utc(2026, 11, 1, 23, 0) - 7 * 86400, utc(2026, 11, 1, 23, 0)]);
+    assert.deepEqual(h.windows[0], [utc(2026, 10, 25, 22, 0), utc(2026, 11, 1, 23, 0)], 'window starts at the previous slot (a 169-hour week)');
     h.set(utc(2026, 11, 1, 23, 30)); assert.equal(await digestTick(h.deps), 'not_due');
     assert.equal(h.sent.length, 1);
 });

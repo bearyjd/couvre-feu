@@ -14,6 +14,14 @@ export interface PushOptions { fetch?: typeof fetch; sleep?: (ms: number) => Pro
 export const PUSH_TIMEOUT_MS = 5000;
 export const PUSH_MAX_ATTEMPTS = 3;
 export const PUSH_BACKOFF_MS = 1000;
+/** Loopback, RFC 1918 and Tailscale CGNAT (100.64.0.0/10) IPv4 literals, plus localhost and ::1. */
+function privateHost(host: string): boolean {
+    if (host === 'localhost' || host === '[::1]') return true;
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    if (!m) return false;
+    const [a, b] = [+m[1], +m[2]];
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+}
 const bad = (code: string): never => { throw new Error(code); };
 
 /** Startup validation when push is enabled. Throws a code only; the values are never echoed. */
@@ -21,9 +29,11 @@ export function ntfySettings(env: PushEnv = process.env): NtfySettings {
     let url: URL;
     try { url = new URL(env.COUVRE_NTFY_URL ?? ''); } catch { return bad('invalid_ntfy_url'); }
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') bad('invalid_ntfy_url');
-    if (!/^[A-Za-z0-9_-]{8,64}$/.test(env.COUVRE_NTFY_TOPIC ?? '')) bad('invalid_ntfy_topic');
+    if (!/^[A-Za-z0-9_-]{20,64}$/.test(env.COUVRE_NTFY_TOPIC ?? '')) bad('invalid_ntfy_topic');
     const token = env.COUVRE_NTFY_TOKEN;
     if (token !== undefined && token !== '' && !/^[A-Za-z0-9_-]{8,256}$/.test(token)) bad('invalid_ntfy_token');
+    // A bearer token must not cross an untrusted network in clear text.
+    if (token && url.protocol === 'http:' && !privateHost(url.hostname)) bad('ntfy_token_requires_https');
     return {baseUrl: url.origin, topic: env.COUVRE_NTFY_TOPIC as string, token: token ? token : null};
 }
 

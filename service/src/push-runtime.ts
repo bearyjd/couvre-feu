@@ -24,36 +24,52 @@ export function weeklyCounts(db: Pick<IntegrationStore, 'get'>, from: number, to
         pauses: n("SELECT count(*) n FROM operations WHERE action IN ('pause','pause_all') AND state IN ('pending','confirmed','unknown') AND created_at > ? AND created_at <= ?")};
 }
 
-export interface Notifications { tick(): Promise<void>; stop(): void }
-export interface NotificationDeps { env?: PushEnv; options?: PushOptions; now?: () => number }
+export interface Notifications { tick(): Promise<void>; stop(): Promise<void> }
+export interface NotificationDeps { env?: PushEnv; options?: PushOptions; now?: () => number; slot?: (epoch: number) => number }
+/** Setup errors with these fixed codes (from ntfySettings) may be named in the log; anything else is logged by tag only. */
+const SETTING_CODE = /^(invalid_ntfy_(url|topic|token)|ntfy_token_requires_https)$/;
 
 /**
  * Starts the push watcher and (if digest.enabled) the weekly digest. Returns null, creating no timer, table or connection, unless push.enabled.
- * Settings are validated here, so a bad topic or URL stops startup. Afterwards nothing here can throw into request handling: every pass is caught.
- * Recipients are whoever the owner subscribes to the private ntfy topic; keep that topic to admins.
+ * Any initialisation failure (bad ntfy settings, unreadable state) is logged as a fixed tag and leaves notifications disabled: it never blocks policy startup.
+ * Afterwards nothing here can throw into request handling: every pass is caught. Recipients are whoever holds the private ntfy topic; keep it to admins.
  */
 export function startNotifications(config: IntegrationConfig, store: Db, deps: NotificationDeps = {}): Notifications | null {
     if (config.push?.enabled !== true) return null;
+    const log = deps.options?.log ?? ((line: string) => process.stderr.write(line));
+    try { return begin(config, store, deps, log); } catch (error) {
+        const code = (error as Error).message;
+        log(SETTING_CODE.test(code) ? `notifications_disabled ${code}\n` : 'notifications_init_failed\n');
+        return null;
+    }
+}
+
+function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log: (line: string) => unknown): Notifications {
     const push = new NtfyPush(ntfySettings(deps.env ?? process.env), config.origin, deps.options);
-    const now = deps.now ?? (() => Math.floor(Date.now() / 1000)), log = deps.options?.log ?? (line => process.stderr.write(line));
-    const alerts = stateStore(store, 'alert_push_id'), digest = stateStore(store, 'digest_slot');
-    // Enabling starts from now: no backlog of old alerts and no catch-up digest for the week before the flag was turned on.
+    const now = deps.now ?? (() => Math.floor(Date.now() / 1000)), slotOf = deps.slot ?? latestDigestSlot, digestOn = config.digest?.enabled === true;
+    const alerts = stateStore(store, 'alert_push_id'), digest = digestOn ? stateStore(store, 'digest_slot') : null;
+    // First enable starts from now: no backlog of old alerts and no catch-up digest for the week before. (Turning push or digest off and on again later keeps the old marks, so it sends one backlog push and one catch-up digest.)
     if (!alerts.exists()) alerts.write(store.get<{m: number}>('SELECT COALESCE(MAX(id),0) m FROM parent_alerts')!.m);
-    if (config.digest?.enabled === true && !digest.exists()) digest.write(latestDigestSlot(now()));
+    if (digest && !digest.exists()) digest.write(slotOf(now()));
     const alertPass = async () => {
         const last = alerts.read(), top = store.get<{m: number | null}>("SELECT MAX(id) m FROM parent_alerts WHERE id > ? AND state='open'", last)!.m;
         if (top === null) return;
         if ((await push.send({kind: 'alert'})).ok) alerts.write(top);
     };
-    let running = false;
-    const tick = async () => {
-        if (running) return;
-        running = true;
+    const deferralLogged = {slot: 0};
+    let flight: Promise<void> | null = null;
+    const pass = async () => {
         try { await alertPass(); } catch { log('push_alert_pass_failed\n'); }
-        try { if (config.digest?.enabled === true) await digestTick({now, counts: (from, to) => weeklyCounts(store, from, to), send: m => push.send(m), state: digest, log}); } catch { log('digest_pass_failed\n'); }
-        running = false;
+        try { if (digest) await digestTick({now, slot: slotOf, counts: (from, to) => weeklyCounts(store, from, to), send: m => push.send(m), state: digest, log, deferralLogged}); } catch { log('digest_pass_failed\n'); }
+    };
+    const tick = (): Promise<void> => {
+        if (flight) return flight;
+        const current = pass().finally(() => { if (flight === current) flight = null; });
+        flight = current;
+        return current;
     };
     const timer = setInterval(() => { void tick(); }, NOTIFY_POLL_MS);
     timer.unref();
-    return {tick, stop: () => clearInterval(timer)};
+    // Waits for a pass in progress, so the store can be closed right after.
+    return {tick, stop: async () => { clearInterval(timer); await flight; }};
 }

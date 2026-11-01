@@ -18,7 +18,7 @@ const auth = new Auth(store, config.origin, undefined, {provenance: config.prove
 checkOwnerAccount(config, store);
 prune();
 const pruneTimer = setInterval(prune, 3600000);
-// Off unless push.enabled; a bad ntfy setting refuses startup here, and no later failure reaches request handling.
+// Off unless push.enabled; a bad ntfy setting or any init failure is logged and leaves notifications off, and no later failure reaches request handling.
 const notifications = startNotifications(config, store);
 const server = app(auth, config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config);
 server.listen(config.port, config.listen?.host ?? '127.0.0.1', () => {
@@ -30,7 +30,7 @@ let stopping = false;
 async function stop() {
     if (stopping) return; stopping = true;
     clearInterval(pruneTimer);
-    notifications?.stop();
+    await notifications?.stop();
     const closed = new Promise<void>(resolve => server.close(() => resolve()));
     if (automatic) await automatic.stop(); else store.stopDispatch();
     await closed;
