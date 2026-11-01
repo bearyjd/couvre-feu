@@ -28,6 +28,7 @@ jobs:
           busybox 2>&1 | awk 'NR == 1 { print }'
           python3 tools/freeze-router-release.py --check
           sh tests/run.sh --static-only
+          python3 -B tests/test-timeout-audit.py
           sh tests/acceptance.sh --preflight
           python3 tests/run-fixtures.py --write-plan "$RUNNER_TEMP/couvre-feu-plan.json"
       - name: Publish complete source-bound partition plan
@@ -73,6 +74,8 @@ jobs:
         partition: [0, 1, 2, 3]
         include:
           - suite: test-core.py
+            partition: 4
+          - suite: test-penn-pilot.py
             partition: 4
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +129,7 @@ jobs:
           pattern: fixture-receipt-*
           merge-multiple: true
           path: .ci-fixture-receipts
-      - name: Prove all 37 unique partitions match complete source discovery
+      - name: Prove all 38 unique partitions match complete source discovery
         env:
           CF_TEST_SHELL: busybox ash
         run: python3 tests/run-fixtures.py --verify-receipts .ci-fixture-receipts --plan .ci-fixture-plan/couvre-feu-plan.json
