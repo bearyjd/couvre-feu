@@ -170,10 +170,10 @@ test('overlapping ticks share one pass and the guard clears afterwards', async (
     const f = integrationFixture(), slow = await fakeNtfy((_s, _n, res) => { setTimeout(() => { res.statusCode = 200; res.end(); }, 100); });
     try {
         const n = startNotifications({...f.config, push: {enabled: true}}, f.store, {env: slow.env, options: {sleep: noSleep, log: () => undefined}})!;
-        const insert = () => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
-        insert(); await Promise.all([n.tick(), n.tick()]);
+        const insert = (kind: string) => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot',?,'warning',?,?,?,1,'open','{}')", kind, f.now(), f.now(), f.now());
+        insert('possible_bypass'); await Promise.all([n.tick(), n.tick()]);
         assert.equal(slow.seen.length, 1);
-        insert(); await n.tick(); await n.stop();
+        insert('repeated_blocked_attempts'); await n.tick(); await n.stop();
         assert.equal(slow.seen.length, 2, 'not stuck behind a stale guard');
     } finally { slow.close(); f.cleanup(); }
 });
