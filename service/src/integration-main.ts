@@ -30,10 +30,12 @@ let stopping = false;
 async function stop() {
     if (stopping) return; stopping = true;
     clearInterval(pruneTimer);
-    await notifications?.stop();
+    // Notifications abort their sends and are waited for at most two seconds, in parallel with the listener closing.
+    const quiet = notifications?.stop();
     const closed = new Promise<void>(resolve => server.close(() => resolve()));
     if (automatic) await automatic.stop(); else store.stopDispatch();
     await closed;
+    await quiet;
     store.close();
 }
 // Reload renewed certificates in place; a bad pair keeps the previous one.

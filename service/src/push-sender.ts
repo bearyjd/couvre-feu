@@ -56,21 +56,25 @@ export class NtfyPush {
             timeoutMs: options.timeoutMs ?? PUSH_TIMEOUT_MS, maxAttempts: options.maxAttempts ?? PUSH_MAX_ATTEMPTS, backoffMs: options.backoffMs ?? PUSH_BACKOFF_MS};
     }
     /** Bounded: at most maxAttempts tries, each cut off at timeoutMs. 5xx, 429 and network errors retry; any other refusal does not. */
-    async send(message: PushMessage): Promise<PushResult> {
+    async send(message: PushMessage, abort?: AbortSignal): Promise<PushResult> {
         const {title, body} = pushText(message), s = this.settings;
         const headers: Record<string, string> = {Title: title, Click: this.click, 'Content-Type': 'text/plain; charset=utf-8', ...(s.token ? {Authorization: `Bearer ${s.token}`} : {})};
         let reason = 'not_sent', attempts = 0;
         while (attempts < this.o.maxAttempts) {
             if (attempts > 0) await this.o.sleep(this.o.backoffMs * 2 ** (attempts - 1));
+            if (abort?.aborted) { reason = 'aborted'; break; }
             attempts++;
             try {
-                const response = await this.o.fetch(`${s.baseUrl}/${s.topic}`, {method: 'POST', headers, body, redirect: 'error', signal: AbortSignal.timeout(this.o.timeoutMs)});
+                const timeout = AbortSignal.timeout(this.o.timeoutMs);
+                const response = await this.o.fetch(`${s.baseUrl}/${s.topic}`, {method: 'POST', headers, body, redirect: 'error', signal: abort ? AbortSignal.any([timeout, abort]) : timeout});
                 await response.body?.cancel().catch(() => undefined);
                 if (response.ok) return {ok: true, attempts, reason: 'sent'};
                 reason = `http_${response.status}`;
                 if (response.status < 500 && response.status !== 429) break;
             } catch (error) {
-                reason = (error as Error).name === 'TimeoutError' ? 'timeout' : 'network_error';
+                // Shutdown aborts a send: a clean result, never retried.
+                if (abort?.aborted) { reason = 'aborted'; break; }
+                reason = (error as Error | null)?.name === 'TimeoutError' ? 'timeout' : 'network_error';
             }
         }
         // Tag and status only: the URL, topic, token and any response text stay out of the log.

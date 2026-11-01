@@ -25,7 +25,7 @@ export function inQuietHours(epoch: number): boolean {
     const hour = local(epoch).hour;
     return hour >= QUIET_START_HOUR || hour < QUIET_END_HOUR;
 }
-/** The latest Sunday 18:00 New York time at or before `epoch`. Walks local calendar days, so a 23 or 25 hour day cannot skip or repeat one. */
+/** The latest Sunday 18:00 New York time at or before `epoch`. Specified for modern dates only (years 1970 and later). Walks local calendar days, so a 23 or 25 hour day cannot skip or repeat one. */
 export function latestDigestSlot(epoch: number): number {
     const today = local(epoch);
     for (let back = 0; back <= 7; back++) {

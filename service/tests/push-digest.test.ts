@@ -166,16 +166,52 @@ test('push on, digest off: no digest state and no digest ever runs', async () =>
     } finally { ntfy.close(); f.cleanup(); }
 });
 
-test('stop() waits for a pass in flight and a pass always clears the guard', async () => {
-    const f = integrationFixture(), slow = await fakeNtfy((_s, _n, res) => { setTimeout(() => { res.statusCode = 200; res.end(); }, 150); });
+test('overlapping ticks share one pass and the guard clears afterwards', async () => {
+    const f = integrationFixture(), slow = await fakeNtfy((_s, _n, res) => { setTimeout(() => { res.statusCode = 200; res.end(); }, 100); });
     try {
         const n = startNotifications({...f.config, push: {enabled: true}}, f.store, {env: slow.env, options: {sleep: noSleep, log: () => undefined}})!;
-        f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
-        void n.tick();
-        await n.stop();
-        assert.equal(slow.seen.length, 1, 'the in-flight send finished before stop() returned');
-        await n.tick(); // not stuck behind a stale guard
+        const insert = () => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
+        insert(); await Promise.all([n.tick(), n.tick()]);
+        assert.equal(slow.seen.length, 1);
+        insert(); await n.tick(); await n.stop();
+        assert.equal(slow.seen.length, 2, 'not stuck behind a stale guard');
     } finally { slow.close(); f.cleanup(); }
+});
+
+test('stop() aborts a send to a hung endpoint and returns promptly, logging no secrets', async () => {
+    const f = integrationFixture(), hang = await fakeNtfy(() => undefined), logs: string[] = [];
+    try {
+        const n = startNotifications({...f.config, push: {enabled: true}}, f.store, {env: hang.env, options: {sleep: noSleep, log: line => logs.push(line)}})!;
+        f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
+        const pass = n.tick();
+        while (hang.seen.length === 0) await new Promise(resolve => setTimeout(resolve, 10));
+        const began = Date.now();
+        await n.stop(); await pass;
+        assert.ok(Date.now() - began < 3000, 'stop returned within the bound');
+        assert.equal(hang.seen.length, 1, 'an aborted send is not retried');
+        const out = logs.join('');
+        assert.match(out, /push_failed aborted attempts=1/);
+        for (const secret of [TOKEN, TOPIC, '127.0.0.1']) assert.ok(!out.includes(secret));
+    } finally { hang.close(); f.cleanup(); }
+});
+
+test('error reporting never throws: throwing logger, null/undefined/non-Error throws, no rejected tick', async () => {
+    const f = integrationFixture(), down = await fakeNtfy((_s, _n, res) => { res.statusCode = 500; res.end(); });
+    const boom = () => { throw new Error('log boom'); }, rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    try {
+        const on = {...f.config, push: {enabled: true}, digest: {enabled: true}};
+        assert.equal(startNotifications(on, f.store, {env: {}, options: {log: boom}}), null, 'bad settings with a throwing logger');
+        for (const thrown of [null, undefined, 'text', 42]) {
+            assert.equal(startNotifications(on, f.store, {env: down.env, options: {log: boom}, slot: () => { throw thrown; }}), null);
+        }
+        const n = startNotifications(on, f.store, {env: down.env, options: {sleep: noSleep, log: boom}})!;
+        f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','possible_bypass','warning',?,?,?,1,'open','{}')", f.now(), f.now(), f.now());
+        await n.tick(); await n.stop();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(rejections, []);
+    } finally { process.off('unhandledRejection', onRejection); down.close(); f.cleanup(); }
 });
 
 test('digest_deferred is logged once per slot', async () => {
