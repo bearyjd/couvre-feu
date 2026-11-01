@@ -333,7 +333,7 @@ export function inventoryStatus(status, nowSeconds, time) {
 export function createInventory({ session, gate, offline, time, children, version }) {
   const root = document.querySelector('#inventory-panel');
   let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null;
-  let serverNow = null, loadedPerf = 0, mounted = false, fetched = false; // fetched: a list request was issued for this session key. serverNow: the service clock at the last load, advanced by this page's own elapsed time
+  let serverNow = null, loadedPerf = 0, mounted = false, fetched = false, inFlight = false, swallowed = false; // swallowed: the first version bump was dropped as a duplicate of the in-flight first load, so a failure of that load must retry itself. fetched: a list request was issued for this session key. serverNow: the service clock at the last load, advanced by this page's own elapsed time
   const title = el('h2', { id: 'inventory-title', tabindex: -1 }, 'Devices on the network');
   const live = el('p', { class: 'fine-print', role: 'status', 'aria-live': 'polite', 'data-live': '', 'data-refresh-status': '' }); // one node for the life of the panel, so screen readers hear changes
   const body = el('div');
@@ -358,21 +358,27 @@ export function createInventory({ session, gate, offline, time, children, versio
     return result;
   }
   async function load() {
-    if (!enabled()) { data = null; draw(); return; }
-    if (offline()) { draw(); return; } // keep the saved list; it is labelled as saved
+    if (!enabled()) { data = null; swallowed = false; draw(); return; }
+    if (offline()) { swallowed = false; draw(); return; } // keep the saved list; it is labelled as saved
     const mine = key;
-    fetched = true;
+    fetched = true; inFlight = true;
+    let retry = false;
     try {
       const result = await call('/admin/inventory');
       if (mine !== key) return;
-      data = result.inventory; loadFailed = false;
+      data = result.inventory; loadFailed = false; swallowed = false;
       serverNow = Number.isFinite(result.now) ? result.now : null; loadedPerf = performance.now(); loadedAt = serverNow ?? Math.floor(Date.now() / 1000);
       refreshNote = ''; clearTimeout(noteTimer); // a request note is stale once a newer list has arrived
     } catch (error) {
       if (mine !== key) return;
-      if (error.status === 401 || error.status === 403) data = null; else loadFailed = true;
-    }
+      if (error.status === 401 || error.status === 403) { data = null; swallowed = false; }
+      else {
+        loadFailed = true;
+        if (swallowed) { swallowed = false; retry = true; } // the bump that would have retried this was swallowed while it was in flight
+      }
+    } finally { if (mine === key) inFlight = false; }
     draw();
+    if (retry) void load();
   }
   async function acknowledge(device) {
     if (closed()) { draw(); return; }
@@ -462,7 +468,7 @@ export function createInventory({ session, gate, offline, time, children, versio
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
     if (next !== key) {
-      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; fetched = false; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
+      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; fetched = false; inFlight = false; swallowed = false; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
       draw(); if (next) void load(); return;
     }
     const seen = version();
@@ -470,7 +476,7 @@ export function createInventory({ session, gate, offline, time, children, versio
       // The first version seen after sign-in (the people list arrives ~25 ms after the session) must not repeat the load the session change already issued.
       const covered = lastVersion === null && fetched && !loadFailed; // a failed first load is not covered: this bump retries it
       lastVersion = seen;
-      if (!covered) { void load(); return; }
+      if (covered) swallowed = inFlight; else { void load(); return; }
     }
     draw();
   }
