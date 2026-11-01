@@ -58,6 +58,14 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.auditLog, undefined, 'the audit log is off unless explicitly enabled');
         for (const enabled of [true, false]) { save({...manifest, auditLog: {enabled}}); assert.deepEqual(integrationConfig(path).auditLog, {enabled}); }
         for (const auditLog of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, auditLog}); assert.throws(() => integrationConfig(path)); }
+        // push and digest (B7): absent is OFF; strict {enabled: boolean}; the digest is delivered by push, so it needs push on.
+        assert.equal(c.push, undefined); assert.equal(c.digest, undefined);
+        for (const enabled of [true, false]) { save({...manifest, push: {enabled}}); assert.deepEqual(integrationConfig(path).push, {enabled}); }
+        for (const push of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, topic: 'x'}, true, null, []]) { save({...manifest, push}); assert.throws(() => integrationConfig(path)); }
+        for (const digest of [{enabled: 'true'}, {}, {enabled: true, day: 1}, null]) { save({...manifest, push: {enabled: true}, digest}); assert.throws(() => integrationConfig(path)); }
+        save({...manifest, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
+        save({...manifest, push: {enabled: false}, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
+        save({...manifest, push: {enabled: true}, digest: {enabled: true}}); assert.deepEqual(integrationConfig(path).digest, {enabled: true});
         // rewardTime (F4): absent is OFF; strict {enabled: boolean}.
         assert.equal(c.rewardTime, undefined, 'reward time is off unless explicitly enabled');
         for (const enabled of [true, false]) { save({...manifest, rewardTime: {enabled}}); assert.deepEqual(integrationConfig(path).rewardTime, {enabled}); }
