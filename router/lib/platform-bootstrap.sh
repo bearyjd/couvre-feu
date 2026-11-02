@@ -3,20 +3,21 @@
 # A transaction-local admission boundary. Never source from an unverified entry.
 # Release entry hashes are authenticated by the reviewed external release, not
 # recursively by the entry itself. The manifest preserves that outer closure.
+CF_SETSID_HELPER_SHA256=c25f66e5ac29ea3e373b8fb2d3549a59d058fbef9ed11b67fdaba1dc37bf75f5
 CF_PLATFORM_PROFILE=strict
 CF_PLATFORM_ADMITTED=0
 CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=a3419b275106444b12801f419de68e28d759fe9cd61ca9fa45e023e634a7bfde
+CF_RELEASE_ID=abcc29dcb3e0533bb35663eb80458f9e4e6f840b571b0c643c2ce74b39bc58f8
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
 # The single platform lock path: acquire, release, recover, the compatibility fence and
 # explicit recovery (install-common.sh) all name it through this variable.
 platform_lock_path=/tmp/couvrefeu-platform.lock
-CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:4881b3b9d44fc95d22158048feeb91435f8dc1b0f74b605424fed77dfbc1c200 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:349b71a250b9387f2390f0bf6764f560583b44c4d71f31b5b262f3d87d12afb0 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:6c86e4da31f14bcb3f2f4046114840faa3ecd0a7efb520840d16add3ba6c17dd state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:349b71a250b9387f2390f0bf6764f560583b44c4d71f31b5b262f3d87d12afb0 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -127,7 +128,28 @@ platform_process_identity() {
         NF>=20 && length($20)<=20 && $20~/^[0-9]+$/ && $3~/^[0-9]+$/ && $4~/^[0-9]+$/ {print $20 ":" $3 ":" $4; good=1}
         END {exit !good || NR!=1}'
 }
+# Always use the reviewed payload, including before the installed copy exists or
+# after uninstall has restored it. No environment-selected executable is trusted.
+platform_setsid_helper() {
+    # Authenticated entry scripts set this path before sourcing the bootstrap.
+    # shellcheck disable=SC2154
+    platform_helper=${platform_bootstrap_path%/*}/busybox-static
+    platform_hash "$platform_helper" "$CF_SETSID_HELPER_SHA256"
+    platform_canonical "$platform_helper"
+    # The target's stat alternative needs vendor loader setup not yet admitted.
+    # This first helper execution follows the SHA-256 check above; static stat
+    # avoids trusting the target dynamic loader before its separate admission.
+    [ "$("$platform_helper" stat -c '%u:%g:%a' "$platform_helper")" = "$CF_PLATFORM_OWNER:755" ] || platform_fail helper_metadata
+    for platform_helper_parent in "${platform_helper%/*}" "${platform_helper%/*/*}"; do
+        platform_canonical "$platform_helper_parent/."
+        case $("$platform_helper" stat -c '%u:%g:%a' "$platform_helper_parent") in
+            "$CF_PLATFORM_OWNER:700"|"$CF_PLATFORM_OWNER:750"|"$CF_PLATFORM_OWNER:755") ;;
+            *) platform_fail helper_parent_metadata;;
+        esac
+    done
+}
 platform_transaction_session() {
+    platform_setsid_helper
     platform_session=$(platform_process_identity "$$") || platform_fail transaction_process_identity
     if [ -n "${CF_ENTRY_SESSION_PID:-}" ]; then
         [ "$CF_ENTRY_SESSION_PID" = "$$" ] || platform_fail transaction_session_forked
@@ -139,8 +161,8 @@ platform_transaction_session() {
     # writes; normal direct script invocation is a nonleader and execs in place.
     case "$platform_session" in *:"$$":*) platform_fail transaction_group_leader;; esac
     platform_transaction_shell=$(readlink "/proc/$$/exe") || platform_fail transaction_shell
-    case "$platform_transaction_shell" in */busybox) exec setsid "$platform_transaction_shell" ash "$0" --cf-transaction-session "$$" "$@";;
-        *) exec setsid "$platform_transaction_shell" "$0" --cf-transaction-session "$$" "$@";; esac
+    case "$platform_transaction_shell" in */busybox) exec "$platform_helper" setsid "$platform_transaction_shell" ash "$0" --cf-transaction-session "$$" "$@";;
+        *) exec "$platform_helper" setsid "$platform_transaction_shell" "$0" --cf-transaction-session "$$" "$@";; esac
 }
 platform_transaction_mutex_check() {
     platform_regular "$CF_TRANSACTION_MUTEX"
@@ -535,10 +557,10 @@ platform_external_closure() {
     platform_verify_modules "$platform_release/lib"
     platform_private "$platform_release/release.sha256" 600
     # Outer reviewed manifest has exactly these direct files, no path escapes.
-    awk 'NF!=2||length($1)!=64||$1~/[^0-9a-f]/||$2!~/^(install.sh|uninstall.sh|cfctl|cfctl-ssh|cfctl-scope|lib\/(platform-bootstrap.sh|vendor-platform.sh|install-common.sh|core.sh|rpc.sh|firewall.sh|state.awk|rules.awk|json.awk|activity.sh))$/||seen[$2]++ {bad=1}END{exit bad||NR!=15}' "$platform_release/release.sha256" || platform_fail release_manifest
+    awk 'NF!=2||length($1)!=64||$1~/[^0-9a-f]/||$2!~/^(install.sh|uninstall.sh|cfctl|cfctl-ssh|cfctl-scope|lib\/(platform-bootstrap.sh|vendor-platform.sh|install-common.sh|core.sh|rpc.sh|firewall.sh|state.awk|rules.awk|json.awk|activity.sh|busybox-static))$/||seen[$2]++ {bad=1}END{exit bad||NR!=16}' "$platform_release/release.sha256" || platform_fail release_manifest
     while read -r platform_digest platform_file; do
         platform_hash "$platform_release/$platform_file" "$platform_digest"
-        case "$platform_file" in lib/*) platform_mode=644;; *) platform_mode=755;; esac
+        case "$platform_file" in lib/busybox-static) platform_mode=755;; lib/*) platform_mode=644;; *) platform_mode=755;; esac
         [ "$(platform_stat -c '%u:%g:%a' "$platform_release/$platform_file")" = "$CF_PLATFORM_OWNER:$platform_mode" ] || platform_fail release_metadata
     done < "$platform_release/release.sha256"
 }
@@ -750,7 +772,7 @@ platform_recovery_prepare() {
     if [ ! -e "$platform_release_candidate/lib" ]; then mkdir -m 700 "$platform_release_candidate/lib" || platform_fail release_directory; fi
     while read -r platform_digest platform_file; do
         cp "$platform_source_release/$platform_file" "$platform_release_candidate/$platform_file" || platform_fail release_copy
-        case "$platform_file" in lib/*) platform_mode=644;; *) platform_mode=755;; esac
+        case "$platform_file" in lib/busybox-static) platform_mode=755;; lib/*) platform_mode=644;; *) platform_mode=755;; esac
         chmod "$platform_mode" "$platform_release_candidate/$platform_file" || platform_fail release_copy_metadata
     done < "$platform_source_release/release.sha256"
     cp "$platform_source_release/release.sha256" "$platform_release_candidate/release.sha256"
@@ -795,7 +817,7 @@ platform_release_candidate_check() (
         [ "$platform_candidate_name" != lib ] || continue
         case "$platform_candidate_name" in release.sha256) platform_candidate_mode=600;;
             *) printf '%s\n' "$platform_candidate_names" | awk -v name="$platform_candidate_name" '$0==name{found=1}END{exit !found}' || platform_fail foreign_release_candidate_entry
-                case "$platform_candidate_name" in lib/*) platform_candidate_mode=644;; *) platform_candidate_mode=755;; esac;;
+                case "$platform_candidate_name" in lib/busybox-static) platform_candidate_mode=755;; lib/*) platform_candidate_mode=644;; *) platform_candidate_mode=755;; esac;;
         esac
         platform_regular "$platform_candidate_entry"
         platform_candidate_meta=$(platform_stat -c '%u:%g:%a:%h' "$platform_candidate_entry")

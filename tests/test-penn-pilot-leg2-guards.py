@@ -160,6 +160,16 @@ class BusyboxAckCommandTests(AckCommandTests):
 
 @unittest.skipUnless(local_busybox(), 'local BusyBox required for foreground-child signal semantics')
 class RemoteLegSupervisionTests(L2.DriverBase):
+    def test_wrong_installed_helper_hash_refuses_without_execution(self):
+        helper, executed = self.work / 'bad-helper', self.work / 'executed'
+        helper.write_text('#!/bin/sh\n: > ' + shlex.quote(str(executed)) + '\n')
+        helper.chmod(0o755)
+        command = self.details['legs'][0]['commandTemplate'].replace(
+            '/usr/lib/couvrefeu/busybox-static', str(helper))
+        done = subprocess.run(['sh', '-c', command], capture_output=True, check=False)
+        self.assertEqual(done.returncode, 126)
+        self.assertFalse(executed.exists())
+
     def test_foreground_child_receives_term_and_the_lock_is_released_before_teardown(self):
         busybox = local_busybox()
         lock, owner, descendant = (self.work / name for name in ('scope.lock', 'owner.pid', 'foreground.pid'))
@@ -176,6 +186,8 @@ trap 'rm -f {shlex.quote(str(lock))}; echo exit > {shlex.quote(str(exited))}' EX
         with mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 1), mock.patch.object(self.tool.V2, 'SCOPE_LEG_KILL_GRACE_SECONDS', 2):
             leg = self.tool.V2.scope_legs(self.tool.load_config(self.config_path), self.details['sshArgv'])[0]
         command = leg['commandTemplate'].replace('/usr/sbin/cfctl', shlex.quote(str(fixture)))
+        command = command.replace('/usr/lib/couvrefeu/busybox-static', str(Path(busybox).resolve()))
+        command = command.replace(self.tool.V2.SETSID_HELPER_SHA256, __import__('hashlib').sha256(Path(busybox).read_bytes()).hexdigest())
         command = command.replace('timeout -s', f'{busybox} timeout -s')
         command = command.replace('/bin/sh', f'{busybox} ash').replace('{MAC}', PHONE['mac']).replace('{BASE}', BASE)
         process = subprocess.Popen([busybox, 'ash', '-c', command], start_new_session=True,
@@ -216,6 +228,8 @@ trap 'rm -f {shlex.quote(str(lock))}; echo exit > {shlex.quote(str(exited))}' EX
         for leg in (self.details['legs'][0], self.details['legs'][2]):
             command = leg['commandTemplate'].replace('/usr/sbin/cfctl-scope', shlex.quote(str(fixture)))
             command = command.replace('/usr/sbin/cfctl', shlex.quote(str(fixture))).replace('/bin/sh', f'{busybox} ash')
+            command = command.replace('/usr/lib/couvrefeu/busybox-static', str(Path(busybox).resolve()))
+            command = command.replace(self.tool.V2.SETSID_HELPER_SHA256, __import__('hashlib').sha256(Path(busybox).read_bytes()).hexdigest())
             master, slave = os.openpty()
             process = subprocess.Popen([busybox, 'ash', '-c', command], stdin=slave, stdout=slave, stderr=slave,
                                        start_new_session=True)

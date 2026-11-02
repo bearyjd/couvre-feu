@@ -25,6 +25,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
+from pinned_helper import prepare_helper_release
 from harness import RouterFixture  # noqa: E402
 
 MGMT = {'ip': '192.0.2.10', 'mac': '02:00:00:00:00:10'}
@@ -79,10 +80,14 @@ class SourceCopy:
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-live-src-')
         self.root = Path(self.tmp.name)
-        shutil.copytree(REPO / 'router', self.root / 'router')
-        shutil.copytree(REPO / 'tools/live', self.root / 'tools/live',
+        source = globals().get('SOURCE')
+        source_root = source.root if source is not None else REPO
+        shutil.copytree(source_root / 'router', self.root / 'router')
+        shutil.copytree(source_root / 'tools/live', self.root / 'tools/live',
                         ignore=shutil.ignore_patterns('__pycache__'))
-        shutil.copyfile(REPO / 'tools/strip-test-mode.py', self.root / 'tools/strip-test-mode.py')
+        for name in ('strip-test-mode.py', 'freeze-router-release.py'):
+            shutil.copyfile(source_root / 'tools' / name, self.root / 'tools' / name)
+        prepare_helper_release(self.root)
         quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'check': True}
         git = ['git', '-C', str(self.root), '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid']
         subprocess.run(git + ['init', '-q'], **quiet)
@@ -102,6 +107,26 @@ def setUpModule():
 
 def tearDownModule():
     SOURCE.tmp.cleanup()
+
+
+class HelperPrerequisiteTests(unittest.TestCase):
+    def test_wrong_helper_hash_refuses_before_execution_or_mutation(self):
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        functions = template[template.index('cfr_helper_verify() {'):template.index('cfr_prereq() {')]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-prereq-') as temp:
+            stage = Path(temp)
+            helper = stage / 'router/lib/busybox-static'
+            helper.parent.mkdir(parents=True)
+            executed = stage / 'executed'
+            helper.write_text('#!/bin/sh\n: > ' + shlex.quote(str(executed)) + '\n')
+            helper.chmod(0o755)
+            script = ('cfr_refuse() { echo "$1 $2"; exit 10; }\n' + functions
+                      + 'CFR_STAGE=' + shlex.quote(str(stage)) + '\nCFR_SETSID_HELPER_SHA256=' + '0' * 64
+                      + '\ncfr_helper_probe PREREQ\necho MUTATION_BEGIN\n')
+            done = subprocess.run(['sh', '-c', script], text=True, capture_output=True, check=False)
+            self.assertEqual(done.returncode, 10)
+            self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+            self.assertFalse(executed.exists())
 
 
 class VersionedIdentityTests(unittest.TestCase):
@@ -136,7 +161,7 @@ class VersionedIdentityTests(unittest.TestCase):
         self.tool.verify_release_identity(self.shipped)
 
     def test_identity_covers_direct_installer_and_bootstrap_edits_despite_consistent_pins(self):
-        for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+        for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             with self.subTest(rel=rel):
                 blobs = dict(self.shipped)
                 blobs['router/' + rel] += b'# direct source edit\n'
@@ -867,13 +892,13 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assert_head_source_refused(copy, 'not in release.sha256')
 
     def test_manifest_must_list_exactly_the_routers_fixed_file_set(self):
-        # Mirrors platform-bootstrap.sh platform_external_closure: 15 fixed entries, nothing else.
+        # Mirrors platform-bootstrap.sh platform_external_closure: 16 fixed entries, nothing else.
         boot = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
         pattern = re.search(r'\$2!~/\^\((install\.sh.*?)\)\$/', boot).group(1)
         fixed = {'install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'}
         fixed |= {'lib/' + name for name in re.search(r'lib\\/\((.*?)\)', pattern).group(1).replace('\\.', '.').split('|')}
         self.assertEqual(set(self.tool.MANIFEST_FILES), fixed)
-        self.assertEqual(len(self.tool.MANIFEST_FILES), 15)
+        self.assertEqual(len(self.tool.MANIFEST_FILES), 16)
         manifest = (SOURCE.root / 'router/release.sha256').read_text()
         extra = b'echo extra\n'
         line = hashlib.sha256(extra).hexdigest() + '  extra.sh\n'
@@ -915,7 +940,7 @@ class LiveRehearsalTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp(prefix='couvre-feu-emit-'))
         self.addCleanup(shutil.rmtree, out, True)
         emitted = out / 'tree'
-        freezer = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+        freezer = subprocess.run([sys.executable, str(SOURCE.root / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
                                  capture_output=True, text=True, check=True, cwd=out)
         entries = {}
         for path in sorted(emitted.rglob('*')):
@@ -936,13 +961,13 @@ class LiveRehearsalTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp(prefix='couvre-feu-emit-'))
         self.addCleanup(shutil.rmtree, out, True)
         emitted = out / 'tree'
-        freezer = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+        freezer = subprocess.run([sys.executable, str(SOURCE.root / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
                                  capture_output=True, text=True, check=True, cwd=out)
         # The freezer's formula, applied to the files it wrote (not to anything the tool declares).
         sha = lambda data: hashlib.sha256(data).hexdigest()
         lines = ['couvrefeu-router-release-v2'] + [
             'lib/' + name + ':' + sha((emitted / 'lib' / name).read_bytes()) for name in self.tool.RELEASE_MODULES]
-        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             data = (emitted / name).read_bytes()
             if name in ('cfctl', 'install.sh', 'uninstall.sh'):
                 data = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data)

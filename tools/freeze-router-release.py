@@ -62,6 +62,10 @@ try:
     normalized = {name: generated_field((router / name).read_bytes(), name, 'CF_BOOTSTRAP_PIN', rb'[0-9a-f]{64}')
                   for name in ('install.sh', 'uninstall.sh', 'cfctl')}
     bootstrap = (router / 'lib/platform-bootstrap.sh').read_bytes()
+    generated_field(bootstrap, 'lib/platform-bootstrap.sh', 'CF_SETSID_HELPER_SHA256', rb'[0-9a-f]{64}')
+    helper_pin = re.search(rb'^CF_SETSID_HELPER_SHA256=([0-9a-f]{64})$', bootstrap, re.M).group(1).decode()
+    if hashlib.sha256((router / 'lib/busybox-static').read_bytes()).hexdigest() != helper_pin:
+        raise ValueError('lib/busybox-static: pinned helper hash mismatch')
     bootstrap_identity = generated_field(bootstrap, 'lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
     module_pattern = b"'" + b' '.join(re.escape(name.encode()) + rb':[0-9a-f]{64}' for name in names) + b"'"
     normalized['lib/platform-bootstrap.sh'] = generated_field(
@@ -69,7 +73,7 @@ try:
 except ValueError as error:
     sys.exit('refused: ' + str(error))
 identity_paths = ['lib/' + name for name in names] + [
-    'cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh']
+    'cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static']
 identity_lines = [IDENTITY_FORMAT] + [name + ':' + hashlib.sha256(
     normalized[name] if name in normalized else expected[name] if name in expected else (router / name).read_bytes()
 ).hexdigest() for name in identity_paths]
@@ -82,7 +86,7 @@ for name in ['install.sh', 'uninstall.sh', 'cfctl']:
     s = (router / name).read_bytes()
     s = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=' + pin.encode(), s, flags=re.M)
     expected[name] = s
-files = ['install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'] + ['lib/' + name for name in names] + ['lib/platform-bootstrap.sh']
+files = ['install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'] + ['lib/' + name for name in names] + ['lib/platform-bootstrap.sh', 'lib/busybox-static']
 expected['release.sha256'] = ''.join(
     hashlib.sha256(expected[name] if name in expected else (router / name).read_bytes()).hexdigest() + '  ' + name + '\n'
     for name in files).encode()
@@ -111,7 +115,7 @@ if emit is not None:
         for name in files:
             data = expected[name] if name in expected else (router / name).read_bytes()
             (staging / name).write_bytes(data)
-            (staging / name).chmod(0o644 if name.startswith('lib/') else 0o755)
+            (staging / name).chmod(0o644 if name.startswith('lib/') and name != 'lib/busybox-static' else 0o755)
         (staging / 'release.sha256').write_bytes(expected['release.sha256'])
         (staging / 'release.sha256').chmod(0o600)
         staging.chmod(0o700)

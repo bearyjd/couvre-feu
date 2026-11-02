@@ -13,6 +13,7 @@
 # @CF_GENERATED_PARAMETERS_BEGIN@
 CFR_SOURCE_COMMIT=
 CFR_RELEASE_ID=
+CFR_SETSID_HELPER_SHA256=
 CFR_PROFILE=
 CFR_MGMT_IP=
 CFR_MGMT_MAC=
@@ -31,9 +32,9 @@ CFR_LIVE_STATES='REACHABLE STALE DELAY'
 CFR_PRESENT_STATES='REACHABLE STALE DELAY PROBE PERMANENT'
 # Every path the installer may create or modify (router/install.sh and
 # router/lib/install-common.sh FILES, scoped and profile inventory).
-CFR_FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh usr/lib/couvrefeu/activity.sh usr/sbin/cfctl usr/sbin/cfctl-ssh usr/sbin/cfctl-scope etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state etc/couvrefeu/platform-profile etc/couvrefeu/rpc-allowed'
+CFR_FILES='usr/lib/couvrefeu/busybox-static usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh usr/lib/couvrefeu/activity.sh usr/sbin/cfctl usr/sbin/cfctl-ssh usr/sbin/cfctl-scope etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state etc/couvrefeu/platform-profile etc/couvrefeu/rpc-allowed'
 CFR_DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu etc/couvrefeu/backup etc/couvrefeu/runtime'
-CFR_RELEASE_FILES='install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh lib/activity.sh'
+CFR_RELEASE_FILES='lib/busybox-static install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh lib/activity.sh'
 
 # Durable phase log first, then best-effort stdout (EPIPE never aborts).
 cfr_out() {
@@ -133,6 +134,7 @@ cfr_extract() {
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) CFR_STAGE=; cfr_refuse PAYLOAD staging_path_unexpected;; esac
     cfr_info "staging $CFR_STAGE"
     chmod 700 "$CFR_STAGE" || cfr_refuse PAYLOAD staging_mode
+    command -v base64 >/dev/null 2>&1 || cfr_refuse PAYLOAD missing_base64
     cfr_payload_extract || cfr_refuse PAYLOAD extraction_failed
     cfr_count=0
     while read -r cfr_sum cfr_mode cfr_path; do
@@ -232,10 +234,26 @@ cfr_glob_count() {
     printf '%s\n' "$cfr_n"
 }
 
+# Verify before every execution, including each supervisor launch. Never run a bare PATH setsid.
+cfr_helper_verify() {
+    [ -f "$CFR_SETSID_HELPER" ] && [ ! -L "$CFR_SETSID_HELPER" ] && [ -x "$CFR_SETSID_HELPER" ] || return 1
+    cfr_helper_sum=$(sha256sum < "$CFR_SETSID_HELPER") || return 1
+    [ "${cfr_helper_sum%% *}" = "$CFR_SETSID_HELPER_SHA256" ]
+}
+cfr_helper_probe() {
+    CFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static
+    [ -f "$CFR_SETSID_HELPER" ] && [ -x "$CFR_SETSID_HELPER" ] && [ ! -L "$CFR_SETSID_HELPER" ] || cfr_refuse "$1" helper_missing
+    cfr_helper_verify || cfr_refuse "$1" helper_hash
+    ( exec "$CFR_SETSID_HELPER" setsid /bin/sh -c 'exit 7' ) </dev/null >/dev/null 2>&1 5>&- &
+    wait "$!"
+    [ "$?" = 7 ] || cfr_refuse "$1" helper_setsid_forks
+}
+
 cfr_prereq() {
     for cfr_tool in sha256sum awk sed sort cmp mktemp iptables-save ip6tables-save ipset uci ip; do
         command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
     done
+    cfr_helper_probe PREREQ
     cfr_od=$(command -v od) || cfr_refuse PREREQ od_missing
     cfr_stat_path=$(command -v stat) || cfr_refuse PREREQ stat_missing
     cfr_info "tools stat=$cfr_stat_path od=$cfr_od"

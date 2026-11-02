@@ -30,7 +30,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=b7c8c195fe376ff049a9f98881ec3eae6c2c3be8c1af1ec74e8d6b33b886dc47
+CF_BOOTSTRAP_PIN=d78d2ccbf8c5fb8528881e5c5d4d61d8c57d76bea3c32ae6b40f5f94f381330d
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -157,7 +157,7 @@ release_retire_check() {
             else
                 release_hash=$(printf '%s\n' "$RETIRE_TARGET_PAIRS" | awk -v n="$name" '{for(i=1;i<=NF;i++){split($i,p,":");if(p[1]==n)print p[2]}}')
                 [ -n "$release_hash" ] || fail "unexpected recovery release entry: $name; preserved"
-                case "$name" in lib/*) release_mode=644;; *) release_mode=755;; esac
+                case "$name" in lib/busybox-static) release_mode=755;; lib/*) release_mode=644;; *) release_mode=755;; esac
             fi
             platform_regular "$entry"
             platform_private "$entry" "$release_mode"

@@ -19,6 +19,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 import overlay  # noqa: E402
+from pinned_helper import fixture_router
 FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/rpc.sh', 'usr/lib/couvrefeu/state.awk', 'usr/lib/couvrefeu/firewall.sh', 'usr/lib/couvrefeu/json.awk', 'usr/lib/couvrefeu/rules.awk', 'usr/lib/couvrefeu/install-common.sh', 'usr/sbin/cfctl', 'usr/sbin/cfctl-ssh', 'etc/firewall.couvrefeu',
          'etc/config/firewall', 'etc/sysupgrade.conf', 'etc/crontabs/root',
          'etc/couvrefeu/protected', 'etc/couvrefeu/state')
@@ -34,8 +35,7 @@ def emitted_router():
         tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-emitted-')
         atexit.register(tmp.cleanup)
         tree = Path(tmp.name) / 'router'
-        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(tree)],
-                       check=True, capture_output=True)
+        fixture_router(REPO, tree)
         _EMITTED.append(tree)
     return _EMITTED[0]
 
@@ -392,7 +392,7 @@ class LiveScopeRecoveryTests(unittest.TestCase):
         self.assertIn('invalid RPC scope', result.stderr)
 
 
-NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh')
+NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh', 'usr/lib/couvrefeu/busybox-static')
 
 
 class InstallerTests(unittest.TestCase):
@@ -435,6 +435,9 @@ esac
         (self.source / 'lib/core.sh').write_text('cf_check() { [ "${CF_TEST_CHECK_FAIL:-0}" != 1 ]; }\n')
         for lib in ('install-common.sh', 'platform-bootstrap.sh', 'vendor-platform.sh'):
             shutil.copy2(REPO / 'router/lib' / lib, self.source / 'lib' / lib)
+        shutil.copy2(emitted_router() / 'lib/busybox-static', self.source / 'lib/busybox-static')
+        # Fake source fixtures still use the host helper pin in their bootstrap.
+        shutil.copy2(emitted_router() / 'lib/platform-bootstrap.sh', self.source / 'lib/platform-bootstrap.sh')
         backend = self.root / 'bin'
         backend.mkdir()
         (backend / '.couvrefeu-test-backend').touch()
@@ -609,7 +612,7 @@ esac
     def enable_release(self):
         self.env['CF_TEST_RELEASE_DIR'] = '1'
         (self.root / 'etc').mkdir(mode=0o755, exist_ok=True)
-        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        bootstrap = (emitted_router() / 'lib/platform-bootstrap.sh').read_text()
         release_id = next(line.split('=', 1)[1] for line in bootstrap.splitlines() if line.startswith('CF_RELEASE_ID='))
         return self.root / ('etc/.couvrefeu-release-' + release_id)
 
@@ -1348,7 +1351,7 @@ exec ''' + shlex.quote(real_hash) + ''' "$@"
         signal = self.root / 'hash-blocked'
         block.touch()
         command = [*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')),
-                   str(REPO / 'router/uninstall.sh')]
+                   str(emitted_router() / 'uninstall.sh')]
         process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         try:
@@ -2157,7 +2160,7 @@ class ReleaseRetirementTests(unittest.TestCase):
         self.env['CF_TEST_RELEASE_DIR'] = '1'
         # Production /etc always exists before the release is created.
         (self.root / 'etc').mkdir(mode=0o755, exist_ok=True)
-        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        bootstrap = (emitted_router() / 'lib/platform-bootstrap.sh').read_text()
         release_id = next(line.split('=', 1)[1] for line in bootstrap.splitlines() if line.startswith('CF_RELEASE_ID='))
         return self.root / ('etc/.couvrefeu-release-' + release_id)
 
@@ -2193,12 +2196,11 @@ class ReleaseRetirementTests(unittest.TestCase):
         (release / 'lib').mkdir(parents=True, mode=0o700)
         release.chmod(0o700)
         emitted = self.root / 'emitted-release'
-        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
-                       check=True, capture_output=True)
+        shutil.copytree(emitted_router(), emitted)
         for line in (emitted / 'release.sha256').read_text().splitlines():
             name = line.split()[1]
             shutil.copyfile(emitted / name, release / name)
-            (release / name).chmod(0o644 if name.startswith('lib/') else 0o755)
+            (release / name).chmod(0o644 if name.startswith('lib/') and name != 'lib/busybox-static' else 0o755)
         shutil.copyfile(emitted / 'release.sha256', release / 'release.sha256')
         (release / 'release.sha256').chmod(0o600)
         before = self.snapshot()
@@ -2342,7 +2344,7 @@ class ReleaseRetirementTests(unittest.TestCase):
         self.legacy_runtime_lock()
         before = full_snapshot(self.root)
         result = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')),
-                                 str(REPO / 'router/uninstall.sh')], env=self.env,
+                                 str(emitted_router() / 'uninstall.sh')], env=self.env,
                                 capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('runtime lock present', result.stderr)
@@ -2677,6 +2679,71 @@ class CrondPickupTests(unittest.TestCase):
         self.assertEqual(self.cron_log(), ['enabled', 'reload', 'started', 'reload', 'started'])
         self.assertEqual(self.crond_table(), vendor)
         self.assertEqual(self.restorable(), before)
+
+
+class PinnedHelperTests(unittest.TestCase):
+    setUp = InstallerTests.setUp
+    tearDown = InstallerTests.tearDown
+    run_script = InstallerTests.run_script
+    install = InstallerTests.install
+    snapshot = InstallerTests.snapshot
+
+    def test_helper_hash_refused_before_mutation(self):
+        (self.source / 'lib/busybox-static').write_bytes(b'foreign helper')
+        before = full_snapshot(self.root)
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('hash_mismatch', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+
+    def test_entry_helper_hash_refuses_before_execution_or_mutation(self):
+        tree = Path(self.tmp.name) / 'corrupted-release'
+        shutil.copytree(emitted_router(), tree)
+        marker = self.root / 'untrusted-helper-executed'
+        helper = tree / 'lib/busybox-static'
+        helper.write_text('#!/bin/sh\n: > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+        helper.chmod(0o755)
+        before = full_snapshot(self.root)
+        original = _EMITTED[:]
+        _EMITTED[:] = [tree]
+        try:
+            result = self.install('--activate')
+        finally:
+            _EMITTED[:] = original
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('hash_mismatch', result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(full_snapshot(self.root), before)
+
+    def test_helper_restores_original_exactly_without_bare_setsid(self):
+        isolated = Path(self.tmp.name) / 'without-setsid'
+        isolated.mkdir()
+        for directory in self.env['PATH'].split(os.pathsep):
+            path = Path(directory)
+            if not path.is_dir():
+                continue
+            for command in path.iterdir():
+                target = isolated / command.name
+                if command.name != 'setsid' and not target.exists() and command.is_file() and os.access(command, os.X_OK):
+                    target.symlink_to(command.absolute())
+        self.env['PATH'] = str(isolated)
+        self.assertIsNone(shutil.which('setsid', path=self.env['PATH']))
+        probe = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), '-c',
+                                'command -v setsid'], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        original = self.root / 'usr/lib/couvrefeu/busybox-static'
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(b'preexisting helper bytes')
+        original.chmod(0o640)
+        os.utime(original, ns=(FRACTIONAL, FRACTIONAL))
+        before = exact_signature(original)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(original.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(original.read_bytes(), (self.source / 'lib/busybox-static').read_bytes())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(exact_signature(original), before)
 
 
 if __name__ == '__main__':

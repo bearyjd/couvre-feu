@@ -231,10 +231,16 @@ def pilot_policies(config, base, candidates=candidate_policies):
             for name, policy in candidates(config, base)]
 
 
+SETSID_HELPER_SHA256 = 'c25f66e5ac29ea3e373b8fb2d3549a59d058fbef9ed11b67fdaba1dc37bf75f5'
+
 LEG_SUPERVISOR = '''seconds=$1; grace=$2; shift 2
+helper=/usr/lib/couvrefeu/busybox-static
+[ -f "$helper" ] && [ ! -L "$helper" ] && [ -x "$helper" ] || exit 126
+sum=$(sha256sum < "$helper") || exit 126
+[ "${sum%% *}" = "@CF_SETSID_HELPER_SHA256@" ] || exit 126
 exec 3<&0
 trap '' HUP INT TERM
-( trap - HUP INT TERM; exec setsid "$@" ) <&3 3<&- &
+( trap - HUP INT TERM; exec "$helper" setsid "$@" ) <&3 3<&- &
 p=$!
 exec 3<&-
 ( n=0
@@ -256,11 +262,11 @@ wait "$p" 2>/dev/null; rc=$?
 wait "$w" 2>/dev/null
 kill -KILL "-$p" 2>/dev/null
 exit "$rc"
-'''
+'''.replace('@CF_SETSID_HELPER_SHA256@', SETSID_HELPER_SHA256)
 
 
 def remote_leg_command(form, op, seconds, grace=SCOPE_LEG_KILL_GRACE_SECONDS):
-    """Fixed supervisor plus positional argv: no config value becomes shell syntax. The baseline requires setsid
+    """Fixed supervisor plus positional argv: no config value becomes shell syntax. The baseline requires the pinned helper setsid applet
     to exec without forking. Preserve the tty on fd 0; signal the entire child group, including a foreground sync
     that would defer ash's TERM trap. Ignore disconnect signals in the supervisor so its watchdog survives ssh."""
     inner = f'{op} {{MAC}} --base {{BASE}}'

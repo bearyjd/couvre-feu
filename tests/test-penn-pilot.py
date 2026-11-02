@@ -260,7 +260,7 @@ class PilotBase(unittest.TestCase):
     def plan_details(self, config_path):
         code, out, err = self.invoke('plan', config_path)
         self.assertEqual(code, 0, err)
-        return json.loads(out[:out.rindex('}') + 1])
+        return json.JSONDecoder().raw_decode(out)[0]
 
     def refused_before_ssh(self, config_path, reason):
         code, _, err = self.invoke('plan', config_path)
@@ -2007,6 +2007,7 @@ CFR_STAGE=$H/stage
 mkdir -p "$CFR_STAGE/pilot" "$H/root"
 CFP_DIR=$CFR_STAGE/pilot
 CFR_SH=sh
+CFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static
 CFR_FIXTURE=1
 CFR_ROOT=$H/root
 CFR_START=$(date +%%s)
@@ -2097,6 +2098,12 @@ class PilotShellBase(PilotBase):
         home.mkdir()
         for name, text in (files or {}).items():
             (home / name).write_text(text)
+        helper = Path(shutil.which('busybox')).resolve()
+        stage_helper = home / 'stage/router/lib/busybox-static'
+        stage_helper.parent.mkdir(parents=True)
+        shutil.copyfile(helper, stage_helper)
+        stage_helper.chmod(0o755)
+        head += '\nCFR_SETSID_HELPER_SHA256=' + hashlib.sha256(helper.read_bytes()).hexdigest()
         (home / 'script.sh').write_text(head + '\n' + PRELUDE % {'h': shlex.quote(str(home)), 'driver': driver,
                                                                   'stop': self.STUB_STOP if stub_stop else ':'})
         env = {'PATH': os.environ['PATH'], 'LC_ALL': 'C', 'HOME': str(home)}
@@ -2677,7 +2684,7 @@ class PilotReviewFixTests(PilotShellBase):
         text = (REPO / 'tools/live/penn-pilot.sh').read_text()
         loose = [line for line in text.splitlines()
                  if not line.lstrip().startswith('#') and ('cfr_run_sh' in line or '$CFR_SH' in line)
-                 and 'exec setsid $CFR_SH' not in line]
+                 and 'exec "$CFR_SETSID_HELPER" setsid $CFR_SH' not in line]
         self.assertEqual(loose, [])
 
     UNINSTALL_DRIVER = r'''
@@ -3465,11 +3472,30 @@ class PilotHardeningT3cTests(PilotShellBase):
         return self.run_driver(driver, timeout=60)
 
     def test_a_forking_setsid_is_refused_before_any_mutation(self):
-        fake = 'printf "#!/bin/sh\\n( \\"\\$@\\" ) </dev/null >/dev/null 2>&1 &\\nexit 0\\n" > "$H/bin/setsid"; chmod +x "$H/bin/setsid"\n'
+        fake = ('printf \'#!/bin/sh\\nshift\\n( "$@" ) </dev/null >/dev/null 2>&1 &\\nexit 0\\n\' > "$CFR_SETSID_HELPER"\n'
+                'CFR_SETSID_HELPER_SHA256=$(sha256sum < "$CFR_SETSID_HELPER"); CFR_SETSID_HELPER_SHA256=${CFR_SETSID_HELPER_SHA256%% *}\n')
         done = self.baseline_run(fake)
-        self.assertIn('PHASE BASELINE FAIL setsid_forks', done.stdout, done.stdout + done.stderr)
+        self.assertIn('PHASE BASELINE FAIL helper_setsid_forks', done.stdout, done.stdout + done.stderr)
         self.assertIn('REFUSED_BEFORE_MUTATION BASELINE', done.stdout)
         self.assertEqual(done.returncode, 10)
+
+    def test_bad_helper_hash_refuses_before_execution_or_mutation(self):
+        done = self.baseline_run('echo bad >> "$CFR_SETSID_HELPER"\n')
+        self.assertEqual(done.returncode, 10)
+        self.assertIn('PHASE BASELINE FAIL helper_hash', done.stdout)
+        self.assertIn('REFUSED_BEFORE_MUTATION BASELINE', done.stdout)
+
+    def test_bad_helper_hash_leaves_no_live_child_state(self):
+        driver = ('echo bad >> "$CFR_SETSID_HELPER"\n'
+                  'cfp_run /dev/null 1 -c \'echo should_not_run\'; echo "RC:$? LIVE:$CFP_RUN_LIVE"\n')
+        done = self.run_driver(driver)
+        self.assertIn('RC:126 LIVE:', done.stdout)
+        self.assertNotIn('LIVE:starting', done.stdout)
+        self.assertNotIn('should_not_run', done.stdout)
+
+    def test_bare_setsid_is_never_used(self):
+        done = self.baseline_run('printf \'#!/bin/sh\\nexit 99\\n\' > "$H/bin/setsid"; chmod +x "$H/bin/setsid"\n')
+        self.assertIn('PHASE BASELINE OK', done.stdout, done.stdout + done.stderr)
 
     def test_an_in_place_setsid_passes_the_baseline_self_test(self):
         shells = [('sh', ''), ('sh', 'system')]
@@ -3480,7 +3506,7 @@ class PilotHardeningT3cTests(PilotShellBase):
                 setup = 'ln -sf "$(command -v busybox)" "$H/bin/setsid"\n' if applet == 'busybox' else ''
                 done = self.baseline_run(setup, shell=shell)
                 self.assertIn('PHASE BASELINE OK', done.stdout, done.stdout + done.stderr)
-                self.assertNotIn('setsid_forks', done.stdout)
+                self.assertNotIn('helper_setsid_forks', done.stdout)
 
     LOCK_NO_PID = '#!/bin/sh\ntrap \'\' TERM\nmkdir "$PLOCK"\nwhile :; do sleep 1; done >/dev/null 2>&1\n'
 

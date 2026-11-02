@@ -67,7 +67,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=b7c8c195fe376ff049a9f98881ec3eae6c2c3be8c1af1ec74e8d6b33b886dc47
+CF_BOOTSTRAP_PIN=d78d2ccbf8c5fb8528881e5c5d4d61d8c57d76bea3c32ae6b40f5f94f381330d
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -77,6 +77,7 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
+platform_setsid_helper
 if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"; fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then
     case "$SOURCE" in "$CF_ROOT"/*|"$HERE") ;; *) fail 'fixture source outside isolated root';; esac
@@ -96,12 +97,13 @@ fi
 if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
 fi
-for file in cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh; do
+for file in cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh lib/busybox-static; do
     if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
         fail "missing/unsafe source: $file"
     fi
-    case "$file" in *.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
+    case "$file" in lib/busybox-static|*.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
 done
+platform_hash "$SOURCE/lib/busybox-static" "$CF_SETSID_HELPER_SHA256"
 
 backend() {
     name=$1; shift
@@ -396,6 +398,7 @@ if [ ! -e "$BACKUP" ]; then
         cp "$STAGE/$k.mtime" "$BACKUP/$k.mtime"
         journal_crash "$k.mtime"
         case "$rel" in
+            usr/lib/couvrefeu/busybox-static) staged=lib/busybox-static;;
             usr/lib/couvrefeu/platform-bootstrap.sh) staged=lib/platform-bootstrap.sh;;
             usr/lib/couvrefeu/vendor-platform.sh) staged=lib/vendor-platform.sh;;
             etc/couvrefeu/platform-profile) staged=platform-profile;;
@@ -413,7 +416,8 @@ if [ ! -e "$BACKUP" ]; then
             etc/sysupgrade.conf) staged=sysupgrade;; etc/crontabs/root) staged=cron;;
             etc/couvrefeu/protected) staged=protected;; etc/couvrefeu/state) staged=state;;
         esac
-        case "$staged" in lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 644 "$BACKUP/$k.staged";;
+        case "$staged" in lib/busybox-static) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 755 "$BACKUP/$k.staged";;
+            lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 644 "$BACKUP/$k.staged";;
             *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
         journal_crash "$k.staged"
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"

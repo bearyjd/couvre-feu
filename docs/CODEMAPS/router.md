@@ -6,7 +6,8 @@
 | cfctl | root-only entry; test mode only under /tmp/couvre-feu-* roots |
 | cfctl-ssh | dropbear forced command; `--rpc-only` limits to rpc-sync/status/activity |
 | generated cron / firewall include | immutable `/etc/.couvrefeu-release-<id>/cfctl --installation-generation <generation> expire\|apply-fw`; stale generations refuse |
-| release.sha256 | frozen manifest (tools/freeze-router-release.py [--check \| --emit DIR]); `--emit` refuses unless router/ is frozen, then writes the shippable tree (cfctl-ssh and cfctl-scope stripped of their CF_TEST_MODE block) to a new DIR. Emitted files are operator-owned (dirs 0700, scripts 0755, lib 0644, release.sha256 0600): copy them to the router as root. Only these two wrappers are stripped; other CF_TEST_MODE gates remain in the tree but are unreachable over SSH because the wrappers `exec env -i` |
+| release.sha256 | frozen manifest (tools/freeze-router-release.py [--check \| --emit DIR]); `--emit` refuses unless router/ is frozen, then writes the shippable tree (cfctl-ssh and cfctl-scope stripped of their CF_TEST_MODE block) to a new DIR. Emitted files are operator-owned (dirs 0700, scripts and static helper 0755, other lib 0644, release.sha256 0600): copy them to the router as root. Only these two wrappers are stripped; other CF_TEST_MODE gates remain in the tree but are unreachable over SSH because the wrappers `exec env -i` |
+| lib/busybox-static | pinned aarch64 static BusyBox setsid launcher; installed root:root0755 under /usr/lib/couvrefeu; journaled exact restore/removal, verified before execution |
 | lib/core.sh | validation, backend wrappers, state load/edit, pause/resume, CLI dispatch |
 | lib/firewall.sh | plan/apply/verify, slots, transition journal, guards, cleanup |
 | lib/rpc.sh | rpc-sync/status envelope, checkpoints, receipts, scope check |
