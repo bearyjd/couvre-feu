@@ -360,14 +360,68 @@ fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
             # Production dispatch has the same immediate primitive boundary.
             self.assertIn('else platform_initial_write; env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /etc/init.d/firewall reload; fi',fn)
 
+class HelperParentTrustTests(unittest.TestCase):
+    def test_helper_ancestry_uses_the_selected_platform_trust(self):
+        # Both predicates see identical metadata for real isolated directory
+        # paths. Only the six absolute exception names are mapped into /tmp.
+        allowed=['/lib/config','/etc','/etc/opkg','/usr/libexec','/sbin','/etc/init.d']
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-trust-') as folder:
+            root=Path(folder)
+            bootstrap=(REPO/'router/lib/platform-bootstrap.sh').read_text()
+            vendor=(REPO/'router/lib/vendor-platform.sh').read_text()
+            for path in allowed:
+                mapped=root/path.lstrip('/');mapped.mkdir(parents=True,exist_ok=True)
+                bootstrap=bootstrap.replace(path+':0:0:775',str(mapped)+':0:0:775')
+                vendor=vendor.replace(path+':0:0:775',str(mapped)+':0:0:775')
+            bootstrap_path=root/'bootstrap.sh';bootstrap_path.write_text(bootstrap)
+            vendor_path=root/'vendor.sh';vendor_path.write_text(vendor)
+            for path in allowed:
+                target=root/path.lstrip('/')
+                for profile in ['strict',platform.PROFILE,PROFILE]:
+                    for metadata in ['0:0:755','0:0:0755','0:0:775','0:0:777','0:0:1775',
+                                     '0:0:2755','0:0:4755','0:0:75','0:0:000755','7:0:775','0:7:775']:
+                        with self.subTest(path=path,profile=profile,metadata=metadata):
+                            body=f''' . "{bootstrap_path}"
+. "{vendor_path}"
+CF_PLATFORM_PROFILE={profile};vp_profile={profile}
+platform_helper_stat() {{
+    case "$3" in '{target}') printf '%s\\n' '{metadata}';; /tmp) printf '0:0:1777\\n';; *) printf '0:0:755\\n';; esac
+}}
+stat_private() {{ platform_helper_stat "$@"; }}
+fail() {{ exit 2; }}
+(platform_helper_parents '{target}') >/dev/null 2>&1; helper_status=$?
+(vp_metadata '{target}') >/dev/null 2>&1; vendor_status=$?
+printf '%s:%s' "$helper_status" "$vendor_status"'''
+                            result=subprocess.run(SHELL+['-c',body],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
+                            self.assertEqual(result.returncode,0,result.stderr)
+                            expected=metadata in ['0:0:755','0:0:0755'] or (metadata=='0:0:775' and profile!='strict')
+                            self.assertEqual(result.stdout,'0:0' if expected else '2:2',result.stderr)
+
+    def test_helper_ancestry_rejects_unlisted_group_write_and_symlinks(self):
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-parents-') as folder:
+            root=Path(folder);directory=root/'directory';directory.mkdir()
+            alias=root/'alias';alias.symlink_to(directory,target_is_directory=True)
+            for ancestor,metadata in [(directory,'0:0:775'),(alias,'0:0:755')]:
+                with self.subTest(ancestor=ancestor.name):
+                    body=f'''. "{REPO}/router/lib/platform-bootstrap.sh"
+CF_PLATFORM_PROFILE={PROFILE}
+platform_helper_stat() {{ printf '%s\\n' '{metadata}'; }}
+platform_helper_parents '{ancestor}'
+printf unsafe'''
+                    result=subprocess.run(SHELL+['-c',body],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertIn('helper_missing',result.stderr)
+                    self.assertNotIn('unsafe',result.stdout)
+
 class OperationalFlowTests(unittest.TestCase):
-    def os_trust_release(self,f,stat_payload=None):
+    def os_trust_release(self,f,stat_payload=None,etc_release=False):
         # The genuine ash/router code uses the isolated JSON backend. Hardware
         # admission is the same explicit inert adapter as recovery fixtures.
         # stat_payload keeps the genuine vendor platform_stat (env -i + timeout -s KILL)
         # with only its payload path replaced, so its children can be observed.
         (f.root/'tmp').chmod(0o1777)
-        release=f.root/'release';shutil.copytree(REPO/'router',release)
+        release=f.root/('release-source' if etc_release else 'release')
+        shutil.copytree(platform.fixture_source(REPO)/'router',release)
         bootstrap=release/'lib/platform-bootstrap.sh';text=bootstrap.read_text()
         start=text.index('platform_bootstrap_vendor() {');stop=text.index('platform_verify_modules()',start)
         adapter='platform_bootstrap_vendor() { :; }\n'
@@ -379,10 +433,64 @@ class OperationalFlowTests(unittest.TestCase):
         text=text.replace('/tmp/couvrefeu-platform.lock',str(f.root/'tmp/couvrefeu-platform.lock'))
         text=text.replace("'%u:%g:%a' /tmp)","'%u:%g:%a' "+str(f.root/'tmp')+')').replace('0:0:1777',f'{os.getuid()}:{os.getgid()}:1777')
         text=text.replace('        vp_transaction_check >/dev/null','        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
+        if etc_release:
+            # Map the production /etc root:GID0 exception onto this unprivileged
+            # fixture only. The real ancestor walk and mode checks still run.
+            text=text.replace('/etc:0:0:775|',str(f.root/'etc')+f':{os.getuid()}:{os.getgid()}:775|')
+            core=release/'lib/core.sh'
+            core.write_text(core.read_text().replace('[ "$cf_dir" = /etc ]',f'[ "$cf_dir" = "{f.root}/etc" ]'))
         bootstrap.write_text(text)
         compiler=(REPO/'tools/freeze-router-release.py').read_text().replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'",'router = Path('+repr(str(release))+')')
         subprocess.run(['python3','-c',compiler],capture_output=True,check=True)
+        if etc_release:
+            # Retention validates every manifest byte, including wrappers
+            # emitted with their fixture blocks stripped.
+            # Emit the complete adapted tree through the production compiler.
+            emitted=f.root/'etc/external-release'
+            subprocess.run(['python3','-c',compiler,'--emit',str(emitted)],capture_output=True,check=True)
+            return emitted
         return release
+
+    def test_root_group_writable_etc_release_installs_and_uninstalls(self):
+        from harness import RouterFixture,PROTECTED,KID
+        f=RouterFixture()
+        try:
+            private=f.root/'etc/couvrefeu'
+            (private/'state').unlink();(private/'protected').unlink();private.rmdir()
+            release=self.os_trust_release(f,etc_release=True)
+            etc=f.root/'etc';etc.chmod(0o775)
+            env=dict(f.env,CF_TEST_INSTALL_KERNEL='1',CF_TEST_RELEASE_DIR='1')
+            installed=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,
+                                     '--activate','--protect',PROTECTED,'--rpc-allow',KID],
+                                     env=env,capture_output=True,text=True,timeout=120)
+            self.assertEqual(installed.returncode,0,installed.stderr+installed.stdout)
+            retained=list(etc.glob('.couvrefeu-release-*'))
+            self.assertEqual(len(retained),1)
+            saved=retained[0]
+            self.assertEqual(saved.stat().st_mode&0o777,0o700)
+            self.assertEqual((saved/'lib').stat().st_mode&0o777,0o700)
+            result=subprocess.run(f.shell+[str(saved/'uninstall.sh')],env=env,capture_output=True,text=True,timeout=120)
+            self.assertEqual(result.returncode,0,result.stderr+result.stdout)
+            self.assertFalse(saved.exists(),'the executing external release must retire safely')
+            self.assertFalse((etc/'couvrefeu').exists())
+            self.assertFalse((f.root/'usr/lib/couvrefeu/busybox-static').exists())
+            self.assertFalse((f.root/'.couvrefeu-transaction').exists())
+            self.assertFalse((f.root/'tmp/couvrefeu-platform.lock').exists())
+        finally:f.close()
+
+    def test_world_writable_etc_release_refuses_before_managed_writes(self):
+        from harness import RouterFixture,PROTECTED
+        f=RouterFixture()
+        try:
+            release=self.os_trust_release(f,etc_release=True)
+            (f.root/'etc').chmod(0o777)
+            before=platform.fixtures.full_snapshot(f.root)
+            result=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,
+                                  '--activate','--protect',PROTECTED],env=f.env,capture_output=True,text=True,timeout=60)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('helper_missing',result.stderr)
+            self.assertEqual(platform.fixtures.full_snapshot(f.root),before)
+        finally:f.close()
 
     def test_native_complete_flows_record_latency_without_target_claim(self):
         sys.path.insert(0,str(REPO/'tests/fixtures'))

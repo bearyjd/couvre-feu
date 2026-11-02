@@ -22,6 +22,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import REPO, RouterFixture
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 FIXED_OPTIONS = ['command="/usr/sbin/cfctl-ssh --rpc-only"', 'restrict', 'no-port-forwarding', 'no-agent-forwarding',
                  'no-X11-forwarding', 'no-pty']
@@ -108,7 +111,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
 
     def run_wrapper(self, command, *flags):
         environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND=command)
-        return subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), *flags],
+        return subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), *flags],
                               env=environment, text=True, capture_output=True, timeout=5)
 
     def service_commands(self):
@@ -157,7 +160,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
     def test_missing_original_command_is_an_interactive_shell_request(self):
         self.log.unlink(missing_ok=True)
         environment = {key: value for key, value in self.fixture.env.items() if key != 'SSH_ORIGINAL_COMMAND'}
-        result = subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), '--rpc-only'],
+        result = subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), '--rpc-only'],
                                 env=environment, text=True, capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.log.exists())
@@ -166,7 +169,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
         self.log.unlink(missing_ok=True)
         environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND='cfctl rpc-sync', CF_INHERITED_PROBE='leak',
                            SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22', SSH_CLIENT='192.0.2.1 1 22', ENV='/x', BASH_ENV='/x')
-        result = subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), '--rpc-only'],
+        result = subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), '--rpc-only'],
                                 env=environment, text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         child = json.loads(self.log.read_text())['env']
@@ -187,7 +190,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.log.unlink(missing_ok=True)
                 environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND='cfctl rpc-sync', **override)
-                result = subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), '--rpc-only'],
+                result = subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), '--rpc-only'],
                                         env=environment, text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(self.log.exists())
@@ -350,7 +353,7 @@ class EmittedReleaseTreeTests(unittest.TestCase):
         for name in ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'):
             self.assertEqual(mode(self.out / name), 0o755, name)
         for path in sorted((self.out / 'lib').iterdir()):
-            self.assertEqual(mode(path), 0o644, path.name)
+            self.assertEqual(mode(path), 0o755 if path.name == 'busybox-static' else 0o644, path.name)
         self.assertEqual(mode(self.out / 'release.sha256'), 0o600)
 
 

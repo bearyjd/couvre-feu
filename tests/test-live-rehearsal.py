@@ -25,7 +25,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
-from pinned_helper import prepare_helper_release
+from pinned_helper import helper_binary, prepare_helper_release
 from harness import RouterFixture  # noqa: E402
 
 MGMT = {'ip': '192.0.2.10', 'mac': '02:00:00:00:00:10'}
@@ -119,7 +119,7 @@ class HelperPrerequisiteTests(unittest.TestCase):
             helper.parent.mkdir(parents=True)
             for directory in (stage, helper.parent.parent, helper.parent):
                 directory.chmod(0o700)
-            helper.write_bytes(helper_bytes if helper_bytes is not None else Path(shutil.which('busybox')).read_bytes())
+            helper.write_bytes(helper_bytes if helper_bytes is not None else helper_binary()[0].read_bytes())
             helper.chmod(0o755)
             script = ('cfr_refuse() { echo "$1 $2"; exit 10; }\n' + functions
                       + 'CFR_FIXTURE=1\nCFR_STAGE=' + shlex.quote(str(stage))

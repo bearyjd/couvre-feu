@@ -68,7 +68,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=a4da50d5f5c217607595ee8ef8b19c151e1d15070ae4fd938a3d2990e31b4647
+CF_BOOTSTRAP_PIN=5f22c56445bd111c820ee3a67513a9f8d1d5755cbf62708025d171931060a721
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -78,6 +78,12 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
+# Refuse helperless or pending recovery baselines before parsing their profile
+# records; old completion formats cannot authorize a helper-aware upgrade.
+platform_install_helper_inventory
+# Provisional selection applies the same ancestry trust model to session setup.
+# Admission reselects and validates all evidence before any protected write.
+platform_choose "$PLATFORM_SELECTION" "${CF_ROOT:-}"
 if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"
 else platform_setsid_helper; platform_helper_cleanup; fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then
@@ -89,7 +95,6 @@ fi
 if ! { [ -f "$SOURCE/lib/busybox-static" ] && [ ! -L "$SOURCE/lib/busybox-static" ]; }; then platform_fail helper_missing; fi
 source_helper_digest=$(timeout -s KILL 6 sha256sum "$SOURCE/lib/busybox-static") || platform_fail helper_hash
 [ "${source_helper_digest%% *}" = "$CF_SETSID_HELPER_SHA256" ] || platform_fail helper_hash
-platform_install_helper_inventory
 platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # shellcheck disable=SC1091

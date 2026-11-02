@@ -10,7 +10,7 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=fb9842242868842e8c517f206a7834b499c420457b8ae994c5a17bee095ad946
+CF_RELEASE_ID=710a91e071e2747f037e04c871290836797503431cf5c6faf971dc5572395f02
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
@@ -205,10 +205,23 @@ platform_helper_parents() {
         platform_helper_mode=${platform_helper_metadata##*:}
         platform_helper_owner=${platform_helper_metadata%:*}
         case "$platform_helper_mode" in ''|*[!0-7]*) platform_fail helper_missing;; esac
+        if ! { [ "${#platform_helper_mode}" -ge 3 ] && [ "${#platform_helper_mode}" -le 4 ]; }; then platform_fail helper_missing; fi
         if ! { [ "$platform_helper_owner" = "$CF_PLATFORM_OWNER" ] || [ "$platform_helper_owner" = "$platform_helper_root_owner" ]; }; then platform_fail helper_missing; fi
-        if [ "$((0$platform_helper_mode & 022))" != 0 ]; then
+        if [ "$platform_helper_parent:$platform_helper_metadata" = "/tmp:$platform_helper_root_owner:1777" ]; then
             # Sticky /tmp protects every checked, privately owned child name.
-            if ! { [ "$platform_helper_parent" = /tmp ] && [ "$platform_helper_owner" = "$platform_helper_root_owner" ] && [ "$platform_helper_mode" = 1777 ]; }; then platform_fail helper_missing; fi
+            :
+        else
+            # Match vp_metadata's directory trust predicate. These exact GID0
+            # writers are part of the selected vendor profile's trust model;
+            # private child directories do not exclude those trusted writers.
+            [ "$((0$platform_helper_mode & 07002))" = 0 ] || platform_fail helper_missing
+            if [ "$((0$platform_helper_mode & 020))" != 0 ]; then
+                platform_vendor_selected || platform_fail helper_missing
+                case "$platform_helper_parent:$platform_helper_metadata" in
+                    /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775) ;;
+                    *) platform_fail helper_missing;;
+                esac
+            fi
         fi
         [ "$platform_helper_parent" != / ] || break
         platform_helper_parent=${platform_helper_parent%/*}

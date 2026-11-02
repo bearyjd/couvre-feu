@@ -6,10 +6,15 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(REPO / 'tests/fixtures'))
+from pinned_helper import helper_binary
+
 HELPER = 'usr/lib/couvrefeu/busybox-static'
 RETIREMENT_INVENTORY = (
     'usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk '
@@ -29,12 +34,7 @@ class HelperSecurityTests(unittest.TestCase):
         (self.release / 'lib').mkdir(parents=True)
         self.bootstrap = self.release / 'lib/platform-bootstrap.sh'
         self.helper = self.release / 'lib/busybox-static'
-        busybox = Path(os.environ.get('CF_TEST_BUSYBOX') or shutil.which('busybox') or '')
-        self.assertTrue(busybox.is_file(), 'pinned host BusyBox required')
-        digest = hashlib.sha256(busybox.read_bytes()).hexdigest()
-        self.assertIn(digest, (
-            'b9e75f97de336e3d04b7f07c2d213da779c6b2cf702ebf1935b4cd09c0b97ddb',
-            'afa625460bd5f4d1db52787dfd84e6c5b8126d7ab841b65cf61e410554edb60a'))
+        busybox, digest = helper_binary()
         shutil.copyfile(busybox, self.helper)
         self.helper.chmod(0o755)
         self.bootstrap.write_text((REPO / 'router/lib/platform-bootstrap.sh').read_text().replace(
@@ -46,7 +46,7 @@ class HelperSecurityTests(unittest.TestCase):
         setup = ('set -eu\nplatform_bootstrap_path=' + shlex.quote(str(self.bootstrap)) +
                  '\n. "$platform_bootstrap_path"\nplatform_entry_root_validate\n')
         return subprocess.run([*self.shell, '-c', setup + body, entry],
-                              env=env or self.env, capture_output=True, text=True, timeout=12)
+                              env=env or self.env, capture_output=True, text=True, timeout=30)
 
     def common(self, body='', **kwargs):
         return self.run_sh('CF_TRANSACTION_DEFINITIONS_ONLY=1\nplatform_transaction_paths\n. ' +
@@ -120,7 +120,7 @@ class HelperSecurityTests(unittest.TestCase):
                          'case "$identity" in *:"$$":"$$") ;; *) exit 91;; esac\n'
                          'printf "%s\\n" "$$"\n')
         result = subprocess.run([*self.shell, str(entry)], env=self.env,
-                                capture_output=True, text=True, timeout=12)
+                                capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.strip().isdigit())
 

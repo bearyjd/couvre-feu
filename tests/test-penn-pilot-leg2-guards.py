@@ -23,6 +23,7 @@ _spec = importlib.util.spec_from_file_location('test_penn_pilot_leg2', REPO / 't
 L2 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(L2)
 PP, PHONE = L2.PP, L2.PHONE
+from pinned_helper import helper_binary  # noqa: E402
 BASE, BASE2, ACK_PATH, BOUND, LEG_SECONDS, AFTER = L2.BASE, L2.BASE2, L2.ACK_PATH, L2.BOUND, L2.LEG_SECONDS, L2.AFTER
 marker, settled, gone, wait_dead = L2.marker, L2.settled, L2.gone, L2.wait_dead
 import unittest  # noqa: E402
@@ -164,7 +165,7 @@ class RemoteLegSupervisionTests(L2.DriverBase):
         """Keep production metadata checks, with a private fixture-owned source."""
         if helper is None:
             helper = self.work / 'busybox-static'
-            helper.write_bytes(Path(local_busybox()).read_bytes())
+            helper.write_bytes(helper_binary()[0].read_bytes())
             helper.chmod(0o755)
         command = command.replace('/usr/lib/couvrefeu/busybox-static', str(helper))
         command = command.replace('/tmp/couvrefeu-leg.', str(self.work / 'couvrefeu-leg.'))

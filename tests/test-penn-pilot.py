@@ -31,6 +31,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 from harness import RouterFixture  # noqa: E402
+from pinned_helper import helper_binary
 
 
 def load(name, path):
@@ -2164,7 +2165,7 @@ class PilotShellBase(PilotBase):
         home.mkdir()
         for name, text in (files or {}).items():
             (home / name).write_text(text)
-        helper = Path(shutil.which('busybox')).resolve()
+        helper, _ = helper_binary()
         stage_helper = home / 'stage/router/lib/busybox-static'
         stage_helper.parent.mkdir(parents=True)
         shutil.copyfile(helper, stage_helper)
@@ -3020,8 +3021,8 @@ class PilotV2FixtureTests(PilotShellBase):
                          + f'{os.environ.get("CF_TEST_SHELL", "sh")} {shlex.quote(str(self.root / "usr/sbin/cfctl"))} "$@"\n')
         target.chmod(0o700)
         self.leg_log = self.work / 'legs.jsonl'
-        self.spec['env'].update(CFP_WRAPPER_DIR=str(REPO / 'router'))
-        self.spec['leg2'] = {'mode': 'fixture', 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['env'].update(CFP_WRAPPER_DIR=str(self.fixture.router))
+        self.spec['leg2'] = {'mode': 'fixture', 'wrapper_scope': str(self.fixture.router / 'cfctl-scope'), 'log': str(self.leg_log)}
         self.spec['leg_helper'] = str(REPO / 'tests/fake-leg-ssh.py')
         self.spec['cfctl'] = str(self.root / 'usr/sbin/cfctl')
 

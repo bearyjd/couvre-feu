@@ -29,8 +29,11 @@ exact mtime. Uninstall removes or restores the helper. Session launches check
 every source ancestor through `/` with the system metadata reader, then copy
 the helper into a fresh private directory under sticky `/tmp`. Only that copy
 is hashed, probed and executed, so uninstall cannot replace the executable
-between verification and launch. Unsafe writable ancestry is refused; this
-includes a release staged below a group-writable `/etc`. Install upgrades with
+between verification and launch. Ancestors use the selected platform profile's
+directory trust rules: root ownership, no world write or symlinks, and group
+write only for the profile's exact admitted paths and modes. Vendor `/etc`
+root:root0775 therefore supports teardown from its retained release tree.
+Install upgrades with
 an existing inventory that lacks helper backup records are refused before
 persistent admission; finish the old release's uninstall before a fresh install.
 Committed helper-aware installs can be reinstalled using their retained before

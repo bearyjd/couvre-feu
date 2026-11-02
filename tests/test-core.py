@@ -20,6 +20,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy, run_owned_process
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 
 def run_fixture_process(command, *, env, raw=None, timeout=60, started=None):
@@ -1204,7 +1207,7 @@ class CoreTests(unittest.TestCase):
         self.fixture.env["CF_NOW"] = str(initial + 31)
         desired = policy(2)
         desired["pauses"] = [{"person": "alice", "until": 0}]
-        process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "sync"],
+        process = subprocess.Popen(self.fixture.shell + [str(TEST_ROUTER / 'cfctl'), "sync"],
                                    env=self.fixture.env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
@@ -1227,7 +1230,7 @@ class CoreTests(unittest.TestCase):
             expiry_log = self.fixture.root / "expiry-work.jsonl"
             expiry_env = dict(self.fixture.env, CF_BACKEND_LOG=str(expiry_log))
             expiry_started = time.monotonic()
-            expiry_process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "expire"],
+            expiry_process = subprocess.Popen(self.fixture.shell + [str(TEST_ROUTER / 'cfctl'), "expire"],
                                               env=expiry_env, text=True, stdout=subprocess.PIPE,
                                               stderr=subprocess.PIPE, start_new_session=True)
             deadline = time.monotonic() + 20
@@ -1283,9 +1286,9 @@ class CoreTests(unittest.TestCase):
     def test_sync_stage_parser_replacement_during_wait_is_never_executed(self):
         self.sync()
         release = self.fixture.root / "release"
-        shutil.copytree(REPO / "router", release)
+        shutil.copytree(self.fixture.router, release)
         for path in (release / "lib").iterdir():
-            path.chmod(0o644)
+            path.chmod(0o755 if path.name == "busybox-static" else 0o644)
         before = self.fixture.durable_snapshot()
         calls = len(self.fixture.mutation_calls())
         witness = self.fixture.root / "foreign-parser-ran"
@@ -1376,7 +1379,7 @@ class CoreTests(unittest.TestCase):
                   'esac')
         for case in ("zero", "one", "failed"):
             with self.subTest(case=case):
-                result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"), case],
+                result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'), case],
                                         env=self.fixture.env, capture_output=True, text=True, timeout=60)
                 lines = [line.split(" ") for line in result.stdout.splitlines()]
                 if case == "failed":
@@ -1415,7 +1418,7 @@ class CoreTests(unittest.TestCase):
         script = ('set -f; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
                   '. "$CF_LIB/core.sh"; cf_sync_stage 0 < "$2"; '
                   'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"; printf "%s\\n" "$CF_STAGED_POLICY"')
-        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'),
                                                       str(self.fixture.root / "trunc.json")],
                                 env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.stdout.splitlines()[0], "1|invalid_policy|0", result.stdout + result.stderr)
@@ -1430,7 +1433,7 @@ class CoreTests(unittest.TestCase):
         script = ('set -f; CF_TEST_STAGE_SHELL=$$; export CF_TEST_STAGE_SHELL; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; '
                   'CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; . "$CF_LIB/core.sh"; '
                   'cf_sync_stage 0 < "$2"; printf "reached\\n"')
-        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'),
                                                       str(self.fixture.root / "p1.json")],
                                 env=env, capture_output=True, text=True, timeout=60)
         self.assertNotIn("reached", result.stdout)
@@ -1446,7 +1449,7 @@ class CoreTests(unittest.TestCase):
                   'ln -s / "$CF_ROOT/tmp/couvrefeu-input.$$/x"; cf_sync_stage 0 < "$2"; '
                   'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"; rm -f "$CF_ROOT/tmp/couvrefeu-input.$$/x"; '
                   'rmdir "$CF_ROOT/tmp/couvrefeu-input.$$"')
-        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+        result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'),
                                                       str(self.fixture.root / "p1.json")],
                                 env=self.fixture.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.stdout.splitlines()[0], "0||1", result.stdout + result.stderr)
@@ -1457,7 +1460,7 @@ class CoreTests(unittest.TestCase):
         script = (f'set -f; CF_LOCAL_TEST={local_test}; CF_BASE=$CF_ROOT; CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; '
                   '. "$CF_LIB/core.sh"; cf_sync_stage 0 < "$2"; '
                   'printf "%s|%s|%s\\n" "$?" "$CF_ERROR" "$CF_SYNC_STAGED"')
-        return subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+        return subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'),
                                                     str(self.fixture.root / "p1.json")],
                               env=env, capture_output=True, text=True, timeout=60)
 
@@ -1516,7 +1519,7 @@ class CoreTests(unittest.TestCase):
             script = ('set -f; CF_TEST_STAGE_SHELL=$$; export CF_TEST_STAGE_SHELL; CF_LOCAL_TEST=1; CF_BASE=$CF_ROOT; '
                       'CF_LIB=$1; . "$CF_LIB/platform-bootstrap.sh"; . "$CF_LIB/core.sh"; '
                       'cf_sync_stage 0 < "$2"; printf "reached\\n"')
-            result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+            result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'),
                                                           str(self.fixture.root / "p1.json")],
                                     env=env, capture_output=True, text=True, timeout=60)
             self.assertNotIn("reached", result.stdout)
@@ -1554,7 +1557,7 @@ class CoreTests(unittest.TestCase):
                 with self.subTest(report=report):
                     stage.mkdir(mode=0o700, exist_ok=True)
                     env = self.stage_shims(mktemp=f'printf "%s\\n" {shlex.quote(report)}\n')
-                    result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(REPO / "router/lib"),
+                    result = subprocess.run(self.fixture.shell + ["-c", script, "stage", str(TEST_ROUTER / 'lib'),
                                                                   str(self.fixture.root / "p1.json")],
                                             env=env, capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.stdout.splitlines()[0], "1|unsafe_input_directory|0",
@@ -1685,7 +1688,7 @@ class CoreTests(unittest.TestCase):
     def stopped_sync(self, checkpoint, document=None):
         marker = self.fixture.root / "rpc-stopped"
         marker.unlink(missing_ok=True)
-        process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "sync"],
+        process = subprocess.Popen(self.fixture.shell + [str(TEST_ROUTER / 'cfctl'), "sync"],
                                    env=dict(self.fixture.env, CF_TEST_RPC_STOP=checkpoint),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
@@ -1864,7 +1867,7 @@ cf_transition_inventory_check
         transition = "PHASE staging\nAFTER " + record
         for snapshot, valid in (("", True), (record, True), ("\n" + record, False), ("UNKNOWN owned\n" + record, False)):
             with self.subTest(snapshot=repr(snapshot)):
-                result = subprocess.run(self.fixture.shell + ["-c", script, "fixture", str(REPO / "router/lib/firewall.sh")],
+                result = subprocess.run(self.fixture.shell + ["-c", script, "fixture", str(TEST_ROUTER / 'lib/firewall.sh')],
                                         env=dict(self.fixture.env, CF_TEST_SNAPSHOT=snapshot, CF_TEST_TRANSITION=transition), capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, valid, result.stdout + result.stderr)
                 if not valid:
@@ -1872,7 +1875,7 @@ cf_transition_inventory_check
 
     def test_alive_lock_refuses_concurrent_mutation_then_interruption_recovers(self):
         self.fixture.update_backend(delays=[{"command": "ipset", "contains": ["create"], "seconds": 10}])
-        process = subprocess.Popen(self.fixture.shell + [str(REPO / "router/cfctl"), "sync"],
+        process = subprocess.Popen(self.fixture.shell + [str(TEST_ROUTER / 'cfctl'), "sync"],
                                    env=self.fixture.env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
@@ -1962,8 +1965,8 @@ class AddressBindingTests(unittest.TestCase):
 CF_POLICY=$(printf 'P\\talice\\t%s\\nP\\talice\\t%s\\n' "$3" "$4")
 cf_clock && cf_addresses
 '''
-        result = subprocess.run(self.fixture.shell + ["-c", script, "bindings", str(REPO / "router/lib/core.sh"),
-                                                     str(REPO / "router/lib/firewall.sh"), KID, OTHER_KID],
+        result = subprocess.run(self.fixture.shell + ["-c", script, "bindings", str(TEST_ROUTER / 'lib/core.sh'),
+                                                     str(TEST_ROUTER / 'lib/firewall.sh'), KID, OTHER_KID],
                                 env=self.fixture.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.fixture.mutation_calls(), [])
@@ -1979,7 +1982,7 @@ cf_mac_valid "$2"
                            ("03:00:00:00:00:01", False), ("00:00:5e:00:53:01", True),
                            ("00:00:00:00:00:00", False), ("02:AA:BB:CC:DD:EE", False)):
             with self.subTest(mac=mac):
-                result = subprocess.run(self.fixture.shell + ["-c", script, "mac", str(REPO / "router/lib/core.sh"), mac],
+                result = subprocess.run(self.fixture.shell + ["-c", script, "mac", str(TEST_ROUTER / 'lib/core.sh'), mac],
                                         env=self.fixture.env, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode == 0, valid, result.stdout + result.stderr)
 
@@ -2135,7 +2138,7 @@ class RestrictedCommandTests(unittest.TestCase):
     def run_wrapper(self, command):
         environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND=command, CF_SNEAK="injected")
         environment["CF_BAD-NAME"] = "injected"
-        return subprocess.run(self.fixture.shell + [str(REPO / "router/cfctl-ssh")],
+        return subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh')],
                               env=environment, text=True, capture_output=True, timeout=5)
 
     def test_allowlisted_commands_and_environment_clearing(self):
@@ -2469,7 +2472,7 @@ class ZeroOwnedRuntimeTokenTests(unittest.TestCase):
                   'CF_TRANSACTION_TOKEN=$3; CF_TRANSACTION_OWNED=$4; CF_LOCKED=$5; '
                   'cf_zero_owned_runtime')
         result = run_owned_process(fixture.shell + ['-c', script, 'zero-token-fixture',
-                                   str(fixture.root), str(REPO / 'router/lib'), expected,
+                                   str(fixture.root), str(TEST_ROUTER / 'lib'), expected,
                                    str(owned), str(locked)], env=fixture.env, input='continue\n',
                                    started=ready, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, timeout=10)
@@ -2515,7 +2518,7 @@ class InstalledPackageTests(unittest.TestCase):
     def package_command(self, fixture, name, *args):
         # Match the existing private-backend fixture budget and owned cleanup.
         # Router input/SSH deadlines and explicit interruption bounds stay fixed.
-        return run_fixture_process(fixture.shell + [str(REPO / "router" / name), *args],
+        return run_fixture_process(fixture.shell + [str(TEST_ROUTER / name), *args],
                                    env=fixture.env, timeout=60)
 
     def assert_restored(self, fixture, original):
@@ -2721,7 +2724,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                         return raw
 
                     # timeout-ok: a real uninstall run to its interruption point; 15 s is the call's own budget, not a guess about a slow runner
-                    first = run_fixture_process(fixture.shell + [str(REPO / "router/uninstall.sh")],
+                    first = run_fixture_process(fixture.shell + [str(TEST_ROUTER / 'uninstall.sh')],
                                                 env=fixture.env, timeout=15, started=interrupt_core)
                     self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
                     self.assertFalse((fixture.root / ".couvrefeu-install.lock").exists())
@@ -2739,7 +2742,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                     self.assertIn("platform explicit_install_recovery_required", reconcile.stderr)
                     self.assertEqual(ZeroOwnedRuntimeTokenTests.snapshot(self, fixture.root), held_raw)
                     recovered = run_fixture_process(
-                        fixture.shell + [str(REPO / "router/cfctl"), "recover-install-lock"],
+                        fixture.shell + [str(TEST_ROUTER / 'cfctl'), "recover-install-lock"],
                         env=fixture.env, timeout=60)
                     self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
                     self.assertEqual(json.loads(recovered.stdout),
@@ -2767,12 +2770,12 @@ os.kill(os.getpid(), signal.SIGSTOP)
             private.rmdir()
             firewall = fixture.root / "etc/config/firewall"
             original_firewall = (firewall.read_bytes(), firewall.stat().st_mode & 0o7777)
-            install = subprocess.run(fixture.shell + [str(REPO / "router/install.sh"),
+            install = subprocess.run(fixture.shell + [str(TEST_ROUTER / 'install.sh'),
                                      "--activate", "--protect", PROTECTED],
                                      env=fixture.env, capture_output=True, text=True, timeout=20)
             self.assertEqual(install.returncode, 0, install.stderr + install.stdout)
             installed = fixture.root / "usr/sbin/cfctl"
-            self.assertEqual(installed.read_bytes(), (REPO / "router/cfctl").read_bytes())
+            self.assertEqual(installed.read_bytes(), (fixture.router / "cfctl").read_bytes())
             for helper in ("core.sh", "firewall.sh", "json.awk", "rules.awk", "install-common.sh", "activity.sh"):
                 self.assertEqual((fixture.root / "usr/lib/couvrefeu" / helper).read_bytes(),
                                  (REPO / "router/lib" / helper).read_bytes())
@@ -2805,7 +2808,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             self.assertIn("cf_input", partially_removed)
             run_installed("remove-fw")
             self.assertEqual(fixture.backend()["sets"], {})
-            uninstall = subprocess.run(fixture.shell + [str(REPO / "router/uninstall.sh")],
+            uninstall = subprocess.run(fixture.shell + [str(TEST_ROUTER / 'uninstall.sh')],
                                        env=fixture.env, capture_output=True, text=True, timeout=20)
             self.assertEqual(uninstall.returncode, 0, uninstall.stderr + uninstall.stdout)
             self.assertEqual((firewall.read_bytes(), firewall.stat().st_mode & 0o7777), original_firewall)

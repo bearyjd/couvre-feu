@@ -30,7 +30,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=a4da50d5f5c217607595ee8ef8b19c151e1d15070ae4fd938a3d2990e31b4647
+CF_BOOTSTRAP_PIN=5f22c56445bd111c820ee3a67513a9f8d1d5755cbf62708025d171931060a721
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -40,7 +40,6 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
-platform_transaction_session "$@"
 # The durable transaction owner names the profile it was admitted under, as
 # for `cfctl recover-install-lock`: a kill before the profile journal record
 # leaves no other evidence. Explicit selection still refuses any staged,
@@ -55,6 +54,8 @@ if [ -e "$platform_uninstall_owner" ] || [ -L "$platform_uninstall_owner" ]; the
     case "$platform_uninstall_selection" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;;
         *) platform_fail transaction_owner_profile;; esac
 fi
+platform_choose "$platform_uninstall_selection" "${CF_ROOT:-}"
+platform_transaction_session "$@"
 platform_admit "$platform_uninstall_selection" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # Any complete authenticated external release is usable after a partial install.
