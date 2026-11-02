@@ -6,7 +6,6 @@ Imports cleanly on its own. penn-pilot.py calls `bind(first_rehearsal_module)` r
 Everything here is pure: configuration validation, the v2 policy validator and its independent per-stage
 expectation, the Leg-2 commit command table, the v2 phase worst cases and the digest/disclosure rules."""
 import json
-from pathlib import Path
 import re
 import shlex
 from typing import Any
@@ -70,7 +69,7 @@ SCOPE_LEGS = (('2a', 'cfctl', 'scope-add'), ('2b', 'cfctl', 'scope-remove'),
               ('2c', 'cfctl-scope', 'scope-add'), ('2d', 'cfctl-scope', 'scope-remove'))
 POLICY_KEYS = {'version', 'revision', 'people', 'pauses', 'schedules', 'doh'}
 # Bound into the plan digest of every v2 plan; a missing one is a refusal, never a silent drop.
-V2_ONLY_DIGEST_FIELDS = ('configSchemaVersion', 'legs', 'pilotPolicies', 'failedBlockAllWording',
+V2_ONLY_DIGEST_FIELDS = ('configSchemaVersion', 'setsidHelperSha256', 'legs', 'pilotPolicies', 'failedBlockAllWording',
                          'failedBlockAllWordingDecidedBy', 'selfAbortPercent', 'operationIds', 'derivedSyncs')
 V2_DIGEST_FIELDS = V2_ONLY_DIGEST_FIELDS + ('roles', 'protectedHistoricalMacs', 'platformProfile', 'sourceCommit')
 
@@ -232,13 +231,6 @@ def pilot_policies(config, base, candidates=candidate_policies):
             for name, policy in candidates(config, base)]
 
 
-# Read the same reviewed declaration as the payload builder; never duplicate the pin.
-_bootstrap = (Path(__file__).resolve().parents[2] / 'router/lib/platform-bootstrap.sh').read_text()
-_helper_pins = re.findall(r'^CF_SETSID_HELPER_SHA256=([0-9a-f]{64})$', _bootstrap, re.M)
-if len(_helper_pins) != 1:
-    raise ValueError('bootstrap must declare exactly one helper pin')
-SETSID_HELPER_SHA256 = _helper_pins[0]
-
 LEG_SUPERVISOR = '''seconds=$1; grace=$2; shift 2
 trap '' HUP INT TERM
 refuse() { printf 'HELPER_REFUSED %s\\n' "$1" >&2; exit 10; }
@@ -253,17 +245,35 @@ for parent in / /usr /usr/lib /usr/lib/couvrefeu; do
 done
 if [ ! -e "$source" ] && [ ! -L "$source" ]; then refuse helper_missing; fi
 [ -f "$source" ] && [ ! -L "$source" ] && [ -x "$source" ] || refuse helper_hash
-[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$source")" = "$owner:755" ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a:%h' "$source")" = "$owner:755:1" ] || refuse helper_hash
 [ -d /tmp ] && [ ! -L /tmp ] || refuse helper_hash
 [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ] || refuse helper_hash
-stage=$(mktemp -d /tmp/couvrefeu-leg.XXXXXX) || refuse helper_hash
+# Reclaim only PID-tagged stages whose owning supervisor has exited. Preserve
+# live owners, legacy names, symlinks, hardlinks and unrecognized entries.
+for stale in /tmp/couvrefeu-leg.*.*; do
+    [ -d "$stale" ] && [ ! -L "$stale" ] || continue
+    name=${stale##*/couvrefeu-leg.}; pid=${name%%.*}; suffix=${name#*.}
+    case "$pid" in ''|0*|*[!0-9]*) continue;; esac
+    [ "${#pid}" -le 10 ] || continue
+    case "$suffix" in *[!a-zA-Z0-9]*) continue;; esac
+    [ "${#suffix}" = 6 ] || continue
+    [ ! -d "/proc/$pid" ] || continue
+    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stale")" = "$owner:700" ] || continue
+    if [ -e "$stale/busybox-static" ] || [ -L "$stale/busybox-static" ]; then
+        [ -f "$stale/busybox-static" ] && [ ! -L "$stale/busybox-static" ] || continue
+        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%h' "$stale/busybox-static")" = "$owner:1" ] || continue
+        rm -f "$stale/busybox-static" || continue
+    fi
+    rmdir "$stale" 2>/dev/null || :
+done
+stage=$(mktemp -d /tmp/couvrefeu-leg.$$.XXXXXX) || refuse helper_hash
 helper=$stage/busybox-static
 trap 'rm -f "$helper"; rmdir "$stage"' 0
 [ -d "$stage" ] && [ ! -L "$stage" ] || refuse helper_hash
 [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stage")" = "$owner:700" ] || refuse helper_hash
 cp "$source" "$helper" && chmod 755 "$helper" || refuse helper_hash
 [ -f "$helper" ] && [ ! -L "$helper" ] || refuse helper_hash
-[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$helper")" = "$owner:755" ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a:%h' "$helper")" = "$owner:755:1" ] || refuse helper_hash
 sum=$(sha256sum < "$helper") || refuse helper_hash
 [ "${sum%% *}" = "@CF_SETSID_HELPER_SHA256@" ] || refuse helper_hash
 "$helper" true </dev/null >/dev/null 2>&1 || refuse helper_exec
@@ -291,27 +301,31 @@ wait "$p" 2>/dev/null; rc=$?
 wait "$w" 2>/dev/null
 kill -KILL "-$p" 2>/dev/null
 exit "$rc"
-'''.replace('@CF_SETSID_HELPER_SHA256@', SETSID_HELPER_SHA256)
+'''
 
 
-def remote_leg_command(form, op, seconds, grace=SCOPE_LEG_KILL_GRACE_SECONDS):
+def remote_leg_command(form, op, seconds, helper_pin, grace=SCOPE_LEG_KILL_GRACE_SECONDS):
     """Fixed supervisor plus positional argv: no config value becomes shell syntax. The baseline requires the pinned helper setsid applet
     to exec without forking. Preserve the tty on fd 0; signal the entire child group, including a foreground sync
     that would defer ash's TERM trap. Ignore disconnect signals in the supervisor so its watchdog survives ssh."""
+    if not re.fullmatch(r'[0-9a-f]{64}', helper_pin):
+        raise Refusal('invalid scope leg helper pin')
+    supervisor = LEG_SUPERVISOR.replace('@CF_SETSID_HELPER_SHA256@', helper_pin)
     inner = f'{op} {{MAC}} --base {{BASE}}'
     command = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
                else f"/usr/bin/env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
-    return f'/bin/sh -c {shlex.quote(LEG_SUPERVISOR)} pilot-leg {seconds} {grace} {command}'
+    return f'/bin/sh -c {shlex.quote(supervisor)} pilot-leg {seconds} {grace} {command}'
 
 
-def scope_legs(config, ssh_argv):
+def scope_legs(config, ssh_argv, blobs):
     """Leg-2 commands use a fixed process-group supervisor, TERM at the allowance then KILL after the grace. Each binds its whole ssh
     argv: the leg-1 argv with `-e none -tt` for `-T` (no ssh escape character on the pty) and the template last."""
     if len(ssh_argv) < 4 or ssh_argv[-3] != '-T':
         raise Refusal('leg-1 ssh argv has no -T to turn into -tt')
+    helper_pin = FR.setsid_helper_pin(blobs['router/lib/platform-bootstrap.sh'])
     legs = []
     for leg, form, op in SCOPE_LEGS:
-        template = remote_leg_command(form, op, SCOPE_LEG_SECONDS, SCOPE_LEG_KILL_GRACE_SECONDS)
+        template = remote_leg_command(form, op, SCOPE_LEG_SECONDS, helper_pin, SCOPE_LEG_KILL_GRACE_SECONDS)
         legs.append({'leg': leg, 'form': form, 'op': op, 'commandTemplate': template,
                      'sshArgv': ssh_argv[:-3] + ['-e', 'none', '-tt', ssh_argv[-2], template], 'pty': True,
                      'timeoutSeconds': SCOPE_LEG_SECONDS, 'retry': False, 'confirmation': 'last6hex',

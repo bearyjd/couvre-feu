@@ -79,20 +79,18 @@ elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1;
 if [ "$PROFILE_INVENTORY" = 1 ]; then
     FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
-# Ownership comes from an exact inventory field, never a substring match.
-# PREPARED and receipt claims are authenticated by their complete validation
-# before they can authorize a write or restoration.
+# Infer helper ownership from the same journal/PREPARED predicate used by
+# installer admission. Receipt inventory is selected only by retirement_validate.
 HELPER_INVENTORY=0
 if { [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; } ||
-    { [ -f "$BACKUP/usr_lib_couvrefeu_busybox-static.before" ] && [ -f "$BACKUP/usr_lib_couvrefeu_busybox-static.after" ]; } ||
-    { [ -f "${CF_TRANSACTION_PREPARED:-/nonexistent}/inventory" ] &&
-        awk '{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$CF_TRANSACTION_PREPARED/inventory"; } ||
-    { [ -f "${CF_TRANSACTION_RETIREMENT:-/nonexistent}" ] &&
-        awk 'NR==8{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$CF_TRANSACTION_RETIREMENT"; }; then
+    platform_helper_inventory_evidence "$BACKUP" "${CF_TRANSACTION_PREPARED:-/nonexistent}"; then
     HELPER_INVENTORY=1
 fi
 if [ "$HELPER_INVENTORY" = 1 ]; then FILES="$FILES usr/lib/couvrefeu/busybox-static"
-elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then fail helper_inventory_upgrade_refused; fi
+elif [ "${CF_ENTRY:-}" = install ] || {
+    [ -e "$DONE" ] && ! platform_done_legacy "$DONE" &&
+    [ ! -e "${CF_TRANSACTION_RETIREMENT:-/nonexistent}" ] && [ ! -L "${CF_TRANSACTION_RETIREMENT:-/nonexistent}" ]
+}; then fail helper_inventory_upgrade_refused; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
 for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
@@ -262,9 +260,9 @@ prepared_validate() {
         case "$prepared_optional" in "$prepared_option"*) prepared_optional=${prepared_optional#"$prepared_option"};; esac
     done
     [ -z "$prepared_optional" ] || fail 'invalid PREPARED inventory'
-    case "$0" in */install.sh)
-        awk '{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$prepared_tree/inventory" || fail helper_inventory_upgrade_refused;;
-    esac
+    if [ "${CF_ENTRY:-}" = install ]; then
+        platform_helper_inventory_record "$prepared_tree/inventory" || fail helper_inventory_upgrade_refused
+    fi
     FILES=$prepared_inventory
     prepared_records
     for prepared_record in inventory directories profile release-absent manifest $PREPARED_RECORDS; do
@@ -694,6 +692,7 @@ retirement_validate() {
         NR==3{if($0!~/^(strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1)$/)exit 1}
         NR==6{if(length($0)>42||$0!~/^[0-9]+:[0-9]+$/)exit 1}
         NR==7{if($0!~/^[01]$/)exit 1}
+        NR==8{if(length($0)>8192||$0!~/^[a-z0-9_.\/-]+( [a-z0-9_.\/-]+)*$/)exit 1}
         NR==13{n=split($0,p," ");if(n!=target_count)exit 1;for(i=1;i<=n;i++){if(split(p[i],a,":")!=2||length(a[2])!=64||a[2]~/[^0-9a-f]/)exit 1}}
         NR>13{if(NF!=3||$1~/[^a-z0-9_.-]/||length($2)!=64||$2~/[^0-9a-f]/||length($3)>8192)exit 1}
         END{if(NR<18)exit 1}' "$CF_TRANSACTION_RETIREMENT" || fail 'invalid retirement receipt; preserved'

@@ -4,6 +4,7 @@
 import atexit
 import contextlib
 import hashlib
+import io
 import os
 import re
 import selectors
@@ -12,6 +13,7 @@ import shutil
 import shlex
 import subprocess
 import tempfile
+import tarfile
 import sys
 import time
 import unittest
@@ -142,7 +144,9 @@ def full_snapshot(root, *, completed_provenance=False):
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-install-')
+        # The fixture admission contract requires /tmp/couvre-feu-* even when
+        # a caller selects a persistent TMPDIR for other test artifacts.
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-install-', dir='/tmp')
         self.root = Path(self.tmp.name)
         # Permanent exclusion infrastructure survives ordinary uninstall.
         (self.root / '.couvrefeu-mutex').touch(mode=0o600)
@@ -2687,6 +2691,166 @@ class PinnedHelperTests(unittest.TestCase):
     run_script = InstallerTests.run_script
     install = InstallerTests.install
     snapshot = InstallerTests.snapshot
+
+    def common(self, body):
+        lib = emitted_router() / 'lib'
+        script = ('. ' + shlex.quote(str(lib / 'platform-bootstrap.sh')) + '\n'
+                  'CF_PLATFORM_OWNER=$(id -u):$(id -g)\n'
+                  'CF_TRANSACTION_DEFINITIONS_ONLY=1\nplatform_transaction_paths\n'
+                  '. ' + shlex.quote(str(lib / 'install-common.sh')) + '\n' + body)
+        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), '-c', script],
+                              env=self.env, capture_output=True, text=True, timeout=15)
+
+    def test_committed_install_reinstalls_with_original_or_explicit_absence(self):
+        from harness import RouterFixture, PROTECTED, run_owned_process
+        shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                fixture = RouterFixture()
+                self.addCleanup(fixture.close)
+                helper = fixture.root / 'usr/lib/couvrefeu/busybox-static'
+                if existing:
+                    helper.parent.mkdir(parents=True)
+                    helper.write_bytes(b'original helper')
+                command = [*shell, str(emitted_router() / 'install.sh'), '--activate', '--protect', PROTECTED]
+                result = run_owned_process(command, env=fixture.env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                backup = fixture.root / 'etc/couvrefeu/backup'
+                before = (backup / 'usr_lib_couvrefeu_busybox-static.before').read_text()
+                self.assertEqual(before == 'absent\n', not existing)
+                journal = {p.name: p.read_bytes() for p in backup.iterdir() if p.is_file()}
+                # Exercise the committed-journal evidence independently of the
+                # optional PREPARED evidence, using actual release install records.
+                script = ('. ' + shlex.quote(str(emitted_router() / 'lib/platform-bootstrap.sh')) + '\n'
+                          'platform_helper_inventory_evidence ' + shlex.quote(str(backup)) + ' /nonexistent')
+                evidence = subprocess.run([*shell, '-c', script], env=fixture.env,
+                                          capture_output=True, text=True, timeout=15)
+                self.assertEqual(evidence.returncode, 0, evidence.stderr)
+                result = run_owned_process(command, env=fixture.env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual({p.name: p.read_bytes() for p in backup.iterdir() if p.is_file()}, journal)
+                result = run_owned_process([*shell, str(emitted_router() / 'uninstall.sh')],
+                                           env=fixture.env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_legacy_helperless_install_refuses_before_mutation_and_old_expire_runs(self):
+        from harness import RouterFixture, PROTECTED, run_owned_process
+        fixture = RouterFixture()
+        self.addCleanup(fixture.close)
+        legacy = fixture.root / 'captured-main4ff'
+        archive = (REPO / 'tests/fixtures/m4b-legacy-main4ff.tar.gz').read_bytes()
+        self.assertEqual(hashlib.sha256(archive).hexdigest(),
+                         'd355296fbd2d020a30ea3a52d8b1496c0fac965f92de6c0feeabe518d9ee20da')
+        legacy.mkdir(mode=0o700)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
+            bundle.extractall(legacy, filter='data')
+        shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        installed = subprocess.run([*shell, str(legacy / 'install.sh'), '--activate',
+                                    '--protect', PROTECTED], env=fixture.env,
+                                   capture_output=True, text=True, timeout=45, start_new_session=True)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        before = full_snapshot(fixture.root)
+        attempted = subprocess.run([*shell, str(emitted_router() / 'install.sh'), '--activate',
+                                    '--protect', PROTECTED], env=fixture.env,
+                                   capture_output=True, text=True, timeout=45, start_new_session=True)
+        self.assertNotEqual(attempted.returncode, 0, attempted.stdout + attempted.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', attempted.stderr)
+        self.assertEqual(full_snapshot(fixture.root), before)
+        installed_cfctl = fixture.root / 'usr/sbin/cfctl'
+        self.assertEqual(installed_cfctl.read_bytes(), (legacy / 'cfctl').read_bytes())
+        installed_hash = signature(installed_cfctl)
+        expired = run_owned_process([*shell, str(installed_cfctl), 'expire'], env=fixture.env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+        self.assertEqual(expired.returncode, 0, expired.stdout + expired.stderr)
+        self.assertEqual(signature(installed_cfctl), installed_hash)
+
+    def test_retirement_helper_claim_is_ignored_until_validation(self):
+        backup = self.root / 'etc/couvrefeu/backup'
+        backup.mkdir(parents=True)
+        receipt = self.root / '.couvrefeu-retirement'
+        # A malformed receipt cannot add helper ownership while definitions load.
+        receipt.write_text('\n' * 7 + 'usr/lib/couvrefeu/busybox-static\n')
+        result = self.common('printf "%s\\n" "$HELPER_INVENTORY"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '0\n')
+        # DONE cleanup may already have retired all other inventory evidence;
+        # definitions must still load so the receipt validator can decide.
+        shutil.rmtree(self.root / 'etc')
+        (self.root / '.couvrefeu-recovery.done').write_text('3\nstrict\n' + 'a' * 64 + '\n')
+        result = self.common('printf "%s\\n" "$HELPER_INVENTORY"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '0\n')
+
+    def test_retirement_inventory_rejects_empty_and_control_bytes(self):
+        receipt = self.root / '.couvrefeu-retirement'
+        pin = 'a' * 64
+        for inventory in ('', 'usr/lib/couvrefeu/busybox-static\t',
+                          'usr/lib/couvrefeu/busybox-static\r'):
+            with self.subTest(inventory=repr(inventory)):
+                lines = ['CFRETIREMENT 2', pin, 'strict', pin, pin, '1:1', '1',
+                         inventory, 'etc', pin, pin, pin,
+                         ' '.join(f'item{i}:{pin}' for i in range(16))]
+                lines += [f'item{i}\t{pin}\tvalue' for i in range(5)]
+                receipt.write_text('\n'.join(lines) + '\n')
+                receipt.chmod(0o600)
+                before = full_snapshot(self.root)
+                result = self.common('platform_transaction_mutex_check() { :; }\nretirement_validate')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('invalid retirement receipt', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+
+    def test_helperless_backup_and_legacy_done_refuse_without_mutex_creation(self):
+        mutex = self.root / '.couvrefeu-mutex'
+        mutex.unlink()
+        backup = self.root / 'etc/couvrefeu/backup'
+        backup.mkdir(parents=True)
+        (backup / 'usr_lib_couvrefeu_busybox-static.after').write_text('a' * 64 + ':755:0:0\n')
+        # A missing .before must never be confused with an explicit absence.
+        before = full_snapshot(self.root)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+        shutil.rmtree(self.root / 'etc')
+        done = self.root / '.couvrefeu-recovery.done'
+        for version in ('1\n', '2\n'):
+            with self.subTest(version=version):
+                done.write_text(version)
+                done.chmod(0o600)
+                before = full_snapshot(self.root)
+                result = self.install('--activate')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+        done.unlink()
+
+    def test_prepared_helper_evidence_requires_complete_inventory_shape(self):
+        (self.root / '.couvrefeu-mutex').unlink()
+        prepared = self.root / '.couvrefeu-prepared'
+        prepared.mkdir()
+        for inventory in ('usr/lib/couvrefeu/busybox-static\n',
+                          ' '.join(FILES) + ' usr/lib/couvrefeu/busybox-static\nforeign\n',
+                          ' '.join(FILES) + ' usr/lib/couvrefeu/busybox-static foreign\n'):
+            with self.subTest(inventory=inventory):
+                (prepared / 'inventory').write_text(inventory)
+                before = full_snapshot(self.root)
+                result = self.install('--activate')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+
+    def test_explicit_install_entry_rejects_legacy_inventory_in_shell_wrapper(self):
+        backup = self.root / 'etc/couvrefeu/backup'
+        backup.mkdir(parents=True)
+        self.env['CF_ENTRY'] = 'install'
+        before = full_snapshot(self.root)
+        result = self.common(':')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
 
     def test_helper_hash_refused_before_mutation(self):
         (self.source / 'lib/busybox-static').write_bytes(b'foreign helper')

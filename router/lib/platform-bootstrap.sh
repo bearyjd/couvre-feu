@@ -10,14 +10,14 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=eaff5da150102f1e80de516d498cddc3a7c506ed69e1fd92a62d65ca3822412b
+CF_RELEASE_ID=fb9842242868842e8c517f206a7834b499c420457b8ae994c5a17bee095ad946
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
 # The single platform lock path: acquire, release, recover, the compatibility fence and
 # explicit recovery (install-common.sh) all name it through this variable.
 platform_lock_path=/tmp/couvrefeu-platform.lock
-CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:baa18e34407b96379ed15719d0c3d9c60fcdfde7532e1ada1b349bca5a9d572a state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:349b71a250b9387f2390f0bf6764f560583b44c4d71f31b5b262f3d87d12afb0 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:0fc5151f5bb1ef4382ffb8be8b14cb630d5be584a59f12e96e9bd4358cbf23a5 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:349b71a250b9387f2390f0bf6764f560583b44c4d71f31b5b262f3d87d12afb0 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -132,14 +132,55 @@ platform_process_identity() {
 # after uninstall has restored it. No environment-selected executable is trusted.
 platform_helper_cleanup() {
     [ -n "${platform_helper_directory:-}" ] || return 0
-    rm -f "$platform_helper_directory/busybox-static"
-    rmdir "$platform_helper_directory" || platform_fail helper_exec
+    # Clear first: a failed removal or a signal must never recurse on this name.
+    platform_helper_cleanup_directory=$platform_helper_directory
     platform_helper_directory=
+    rm -f "$platform_helper_cleanup_directory/busybox-static" || return 1
+    rmdir "$platform_helper_cleanup_directory"
 }
 platform_helper_fail() {
-    platform_helper_cleanup
+    # Preserve the original refusal even when cleanup itself cannot complete.
+    platform_helper_cleanup || :
     platform_fail "$1"
 }
+platform_helper_exit() {
+    # Some host shells inherit EXIT traps in command substitutions while $$
+    # still names the parent. Only the actual directory owner may clean up.
+    IFS=' ' read -r platform_helper_exit_pid platform_helper_exit_unused < /proc/self/stat || platform_fail helper_exec
+    [ "$platform_helper_exit_pid" = "$$" ] || return "$1"
+    platform_helper_exit_status=$1
+    if ! platform_helper_cleanup; then
+        [ "$platform_helper_exit_status" != 0 ] || platform_fail helper_exec
+    fi
+    [ "${platform_helper_exec_pending:-0}" != 1 ] || platform_fail helper_exec
+    exit "$platform_helper_exit_status"
+}
+platform_helper_sweep() (
+    # Entrypoints disable globbing; only this isolated sweep enables it.
+    set +f
+    # A PID in the private name proves which process must have exited. Legacy
+    # random-only names have no liveness evidence and are deliberately retained.
+    for platform_helper_stale in /tmp/.couvrefeu-helper.*.*; do
+        [ -d "$platform_helper_stale" ] && [ ! -L "$platform_helper_stale" ] || continue
+        platform_helper_stale_name=${platform_helper_stale##*/.couvrefeu-helper.}
+        platform_helper_stale_pid=${platform_helper_stale_name%%.*}
+        platform_helper_stale_suffix=${platform_helper_stale_name#*.}
+        case "$platform_helper_stale_pid" in ''|0*|*[!0-9]*) continue;; esac
+        [ "${#platform_helper_stale_pid}" -le 10 ] || continue
+        case "$platform_helper_stale_suffix" in *[!a-zA-Z0-9]*) continue;; esac
+        [ "${#platform_helper_stale_suffix}" = 6 ] || continue
+        [ ! -d "/proc/$platform_helper_stale_pid" ] || continue
+        [ "$(platform_helper_stat -c '%u:%g:%a' "$platform_helper_stale")" = "$CF_PLATFORM_OWNER:700" ] || continue
+        # Remove only our known regular payload; rmdir preserves unknown entries.
+        if [ -e "$platform_helper_stale/busybox-static" ] || [ -L "$platform_helper_stale/busybox-static" ]; then
+            [ -f "$platform_helper_stale/busybox-static" ] && [ ! -L "$platform_helper_stale/busybox-static" ] || continue
+            [ "$(platform_helper_stat -c '%u:%g:%h' "$platform_helper_stale/busybox-static")" = "$CF_PLATFORM_OWNER:1" ] || continue
+            rm -f "$platform_helper_stale/busybox-static" || continue
+        fi
+        rmdir "$platform_helper_stale" 2>/dev/null || :
+    done
+)
+
 platform_helper_stat() {
     # Use the system metadata reader, never an applet in the untrusted payload.
     # The vendor stat alternative needs this system loader directory even before
@@ -149,6 +190,11 @@ platform_helper_stat() {
 }
 platform_helper_parents() {
     platform_helper_parent=$1
+    case "$platform_helper_parent" in
+        /) ;;
+        /*) case "$platform_helper_parent/" in *//*|*/./*|*/../*) platform_fail helper_missing;; esac;;
+        *) platform_fail helper_missing;;
+    esac
     platform_helper_root_owner=0:0
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
         platform_helper_root_owner=$(platform_helper_stat -c '%u:%g' /) || platform_fail helper_missing
@@ -174,6 +220,8 @@ platform_setsid_helper() {
     # shellcheck disable=SC2154
     platform_helper_source=${platform_bootstrap_path%/*}/busybox-static
     platform_helper_directory=
+    platform_helper_exec_pending=0
+    platform_helper_sweep
     case "$platform_helper_source" in /*) ;; *) platform_fail helper_missing;; esac
     platform_helper_parents "${platform_helper_source%/*}"
     if ! { [ -f "$platform_helper_source" ] && [ ! -L "$platform_helper_source" ]; }; then platform_fail helper_missing; fi
@@ -181,12 +229,20 @@ platform_setsid_helper() {
     # A private inode survives replacement/restoration of the installed helper.
     # Hash and execute this same copy; never execute the checked source pathname.
     platform_helper_parents /tmp
-    platform_helper_directory=$(mktemp -d /tmp/.couvrefeu-helper.XXXXXX) || platform_fail helper_exec
+    platform_helper_directory=$(mktemp -d "/tmp/.couvrefeu-helper.$$.XXXXXX") || platform_fail helper_exec
+    trap 'platform_helper_exit "$?"' 0
+    trap 'platform_helper_exec_pending=0; exit 129' HUP
+    trap 'platform_helper_exec_pending=0; exit 130' INT
+    trap 'platform_helper_exec_pending=0; exit 143' TERM
     chmod 700 "$platform_helper_directory" || platform_helper_fail helper_exec
     [ "$(platform_helper_stat -c '%u:%g:%a' "$platform_helper_directory")" = "$CF_PLATFORM_OWNER:700" ] || platform_helper_fail helper_exec
     platform_helper=$platform_helper_directory/busybox-static
     cp "$platform_helper_source" "$platform_helper" || platform_helper_fail helper_missing
     chmod 755 "$platform_helper" || platform_helper_fail helper_exec
+    if ! { [ -f "$platform_helper" ] && [ ! -L "$platform_helper" ] &&
+        [ "$(platform_helper_stat -c '%u:%g:%a:%h' "$platform_helper")" = "$CF_PLATFORM_OWNER:755:1" ]; }; then
+        platform_helper_fail helper_missing
+    fi
     platform_helper_digest=$(timeout -s KILL 6 sha256sum "$platform_helper") || platform_helper_fail helper_hash
     [ "${platform_helper_digest%% *}" = "$CF_SETSID_HELPER_SHA256" ] || platform_helper_fail helper_hash
     "$platform_helper" true 9>&- || platform_helper_fail helper_exec
@@ -198,9 +254,9 @@ platform_transaction_session() {
     if [ -n "${CF_ENTRY_SESSION_PID:-}" ]; then
         [ "$CF_ENTRY_SESSION_PID" = "$$" ] || platform_helper_fail transaction_session_forked
         unset CF_ENTRY_SESSION_PID
-        case "$platform_session" in *:"$$":"$$") platform_helper_cleanup; return 0;; *) platform_helper_fail transaction_session_launch;; esac
+        case "$platform_session" in *:"$$":"$$") platform_helper_cleanup || platform_fail helper_exec; return 0;; *) platform_helper_fail transaction_session_launch;; esac
     fi
-    case "$platform_session" in *:"$$":"$$") platform_helper_cleanup; return 0;; esac
+    case "$platform_session" in *:"$$":"$$") platform_helper_cleanup || platform_fail helper_exec; return 0;; esac
     # setsid silently forks for a process-group leader. Refuse that case before
     # writes; normal direct script invocation is a nonleader and execs in place.
     case "$platform_session" in *:"$$":*) platform_helper_fail transaction_group_leader;; esac
@@ -208,7 +264,16 @@ platform_transaction_session() {
     # The session shell unlinks its already-executed private copy, then execs
     # the original entry. Every exec retains the original PID, PGID and SID.
     # shellcheck disable=SC2016
-    platform_helper_reexec='helper_directory=$1; shift; rm -f "$helper_directory/busybox-static" && rmdir "$helper_directory" || exit 2; exec "$@"'
+    platform_helper_reexec='helper_directory=$1; shift
+helper_fail() { printf "%s\n" "couvre-feu: platform helper_exec" >&2; exit 2; }
+helper_cleanup() { helper_saved_directory=$helper_directory; helper_directory=; [ -z "$helper_saved_directory" ] || { rm -f "$helper_saved_directory/busybox-static" && rmdir "$helper_saved_directory"; }; }
+trap "helper_cleanup || :; helper_fail" 0
+trap "exit 129" HUP
+trap "exit 130" INT
+trap "exit 143" TERM
+helper_cleanup || helper_fail
+exec "$@"'
+    platform_helper_exec_pending=1
     case "$platform_transaction_shell" in */busybox)
         exec "$platform_helper" setsid "$platform_transaction_shell" ash -c "$platform_helper_reexec" sh "$platform_helper_directory" "$platform_transaction_shell" ash "$0" --cf-transaction-session "$$" "$@";;
         *) exec "$platform_helper" setsid "$platform_transaction_shell" -c "$platform_helper_reexec" sh "$platform_helper_directory" "$platform_transaction_shell" "$0" --cf-transaction-session "$$" "$@";; esac
@@ -358,6 +423,42 @@ platform_transaction_readonly_preflight() {
     recovery_fence_check
     recover_private_scratch check
 }
+# Inventory evidence accepts only the canonical ordered file list. The complete
+# PREPARED validator still authenticates its digest and records before use.
+platform_helper_inventory_record() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    awk -v line="${2:-1}" '
+        NR==line {
+            fixed="usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state"
+            if(length($0)>8192||index($0,fixed)!=1)exit 1
+            rest=substr($0,length(fixed)+1)
+            scope=" etc/couvrefeu/rpc-allowed"
+            wrapper=" usr/sbin/cfctl-scope"
+            profile=" usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
+            if(index(rest,scope)==1)rest=substr(rest,length(scope)+1)
+            if(index(rest,wrapper)==1)rest=substr(rest,length(wrapper)+1)
+            if(index(rest,profile)==1)rest=substr(rest,length(profile)+1)
+            if(rest!=" usr/lib/couvrefeu/busybox-static")exit 1
+            found=1
+        }
+        NR>line && line==1 {bad=1}
+        END{exit !found||bad}' "$1"
+}
+platform_helper_inventory_evidence() {
+    # Both signatures are durable journal evidence, including an explicit
+    # `absent` before record. A missing original record proves nothing.
+    if [ -d "$1" ] && [ ! -L "$1" ] &&
+        [ -f "$1/usr_lib_couvrefeu_busybox-static.before" ] && [ ! -L "$1/usr_lib_couvrefeu_busybox-static.before" ] &&
+        [ -f "$1/usr_lib_couvrefeu_busybox-static.after" ] && [ ! -L "$1/usr_lib_couvrefeu_busybox-static.after" ]; then
+        awk -F: '
+            {if(FNR!=1 || !(NF==4 && length($1)==64 && $1!~/[^0-9a-f]/ &&
+                length($2)>=3 && length($2)<=4 && $2!~/[^0-7]/ &&
+                $3~/^[0-9]+$/ && $4~/^[0-9]+$/) &&
+                !(FILENAME==ARGV[1] && $0=="absent"))bad=1}
+            END{exit bad||NR!=2}' "$1/usr_lib_couvrefeu_busybox-static.before" "$1/usr_lib_couvrefeu_busybox-static.after" && return 0
+    fi
+    [ -d "$2" ] && [ ! -L "$2" ] && platform_helper_inventory_record "$2/inventory"
+}
 platform_install_helper_inventory() {
     # A new runtime must not inherit a baseline that cannot restore its helper.
     # This refusal gate runs before admission can create even the mutex inode.
@@ -372,8 +473,7 @@ platform_install_helper_inventory() {
     fi
     if [ -e "$platform_helper_inventory_backup" ] || [ -L "$platform_helper_inventory_backup" ] ||
         [ -e "$platform_helper_inventory_prepared" ] || [ -L "$platform_helper_inventory_prepared" ]; then
-        if ! { [ -f "$platform_helper_inventory_prepared/inventory" ] && [ ! -L "$platform_helper_inventory_prepared/inventory" ] &&
-            awk '{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$platform_helper_inventory_prepared/inventory"; }; then
+        if ! platform_helper_inventory_evidence "$platform_helper_inventory_backup" "$platform_helper_inventory_prepared"; then
             platform_fail helper_inventory_upgrade_refused
         fi
     fi

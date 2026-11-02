@@ -290,6 +290,32 @@ class PilotBase(unittest.TestCase):
         return runs[0]
 
 
+class HelperPinBindingTests(unittest.TestCase):
+    def test_scope_legs_bind_the_payload_bootstrap_blob_without_import_time_reads(self):
+        with mock.patch.object(Path, 'read_text', side_effect=AssertionError('unexpected working-tree read')):
+            v2 = load('isolated_penn_v2', REPO / 'tools/live/penn_pilot_v2.py')
+        v2.bind(SOURCE.tool.FR)
+        config = {'roles': {v2.SCOPE_TARGET_ROLE: PHONE}}
+        argv = ['ssh', '-T', HOST, 'command']
+        for pin in ('1' * 64, '2' * 64):
+            blobs = {'router/lib/platform-bootstrap.sh': ('CF_SETSID_HELPER_SHA256=' + pin + '\n').encode()}
+            legs = v2.scope_legs(config, argv, blobs)
+            self.assertEqual(len(legs), len(v2.SCOPE_LEGS))
+            for leg in legs:
+                self.assertIn(pin, leg['commandTemplate'])
+                self.assertNotIn('@CF_SETSID_HELPER_SHA256@', leg['commandTemplate'])
+                self.assertEqual(leg['sshArgv'][-1], leg['commandTemplate'])
+
+    def test_scope_legs_refuse_malformed_payload_bootstrap_pin(self):
+        v2 = SOURCE.tool.V2
+        config = {'roles': {v2.SCOPE_TARGET_ROLE: PHONE}}
+        for declaration in ('CF_SETSID_HELPER_SHA256=bad\n',
+                            ('CF_SETSID_HELPER_SHA256=' + '1' * 64 + '\n') * 2):
+            with self.subTest(declaration=declaration), self.assertRaises(SOURCE.tool.Refusal):
+                v2.scope_legs(config, ['ssh', '-T', HOST, 'command'],
+                              {'router/lib/platform-bootstrap.sh': declaration.encode()})
+
+
 class PilotPlanTests(PilotBase):
     """Pure plan/policy/classification checks; nothing is executed."""
 

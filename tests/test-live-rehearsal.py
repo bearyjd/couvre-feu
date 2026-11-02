@@ -227,23 +227,33 @@ class VersionedIdentityTests(unittest.TestCase):
                                self.shipped['router/release.sha256'].decode().splitlines())
         self.assertEqual(self.tool.MANIFEST_FILES, manifest_order)
 
-    def test_freezer_refuses_drift_in_either_live_helper_pin(self):
+    def test_freezer_does_not_execute_live_tools(self):
         live_dir = self.root / 'tools/live'
-        shutil.copytree(REPO / 'tools/live', live_dir)
+        live_dir.mkdir()
+        executed = self.root / 'live-tool-executed'
         try:
-            for name, override in (
-                    ('first-rehearsal.py', '\nsetsid_helper_pin = lambda bootstrap: "0" * 64\n'),
-                    ('penn_pilot_v2.py', '\nSETSID_HELPER_SHA256 = "0" * 64\n')):
-                path = live_dir / name
-                original = path.read_text()
-                path.write_text(original + override)
-                done = subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), '--check'],
-                                      capture_output=True, text=True, check=False)
-                path.write_text(original)
-                self.assertNotEqual(done.returncode, 0)
-                self.assertIn(name + ': helper pin differs from bootstrap', done.stderr)
+            for name in ('first-rehearsal.py', 'penn_pilot_v2.py'):
+                (live_dir / name).write_text('from pathlib import Path\nPath(' + repr(str(executed))
+                                             + ').touch()\nraise RuntimeError("live tool executed")\n')
+            done = subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), '--check'],
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertFalse(executed.exists())
         finally:
             shutil.rmtree(live_dir)
+
+    def test_freezer_textually_refuses_duplicate_helper_pin(self):
+        path = self.root / 'router/lib/platform-bootstrap.sh'
+        original = path.read_bytes()
+        try:
+            pin = self.tool.setsid_helper_pin(original)
+            path.write_bytes(original + ('CF_SETSID_HELPER_SHA256=' + pin + '\n').encode())
+            done = subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), '--check'],
+                                  capture_output=True, text=True, check=False)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn('exactly one well-formed CF_SETSID_HELPER_SHA256 assignment', done.stderr)
+        finally:
+            path.write_bytes(original)
 
     def test_identity_covers_direct_installer_and_bootstrap_edits_despite_consistent_pins(self):
         for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static'):

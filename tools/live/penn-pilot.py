@@ -481,7 +481,8 @@ def plan(config, env):
                         'selfAbortSeconds': V2.self_abort_seconds(config['remoteTimeoutSeconds']),
                         'operationIds': dict(V2.OPERATION_IDS),
                         'derivedSyncs': V2.derived_syncs(config, pilot_policies(config))})
-        details.update({'legs': scope_legs(config, argv), 'pilotPolicies': stages,
+        details.update({'setsidHelperSha256': FR.setsid_helper_pin(blobs['router/lib/platform-bootstrap.sh']),
+                        'legs': scope_legs(config, argv, blobs), 'pilotPolicies': stages,
                         'failedBlockAllWording': FAILED_BLOCK_ALL_WORDING,
                         'failedBlockAllWordingDecidedBy': FAILED_BLOCK_ALL_DECIDED_BY})
     details['planSha256'] = plan_digest(details)

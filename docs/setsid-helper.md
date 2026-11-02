@@ -33,6 +33,12 @@ between verification and launch. Unsafe writable ancestry is refused; this
 includes a release staged below a group-writable `/etc`. Install upgrades with
 an existing inventory that lacks helper backup records are refused before
 persistent admission; finish the old release's uninstall before a fresh install.
+Committed helper-aware installs can be reinstalled using their retained before
+and after records, including an explicit prior-absence record. Pending uninstall
+recovery must finish first. Private copies use PID-tagged directories: exit and
+signal traps remove them, and a later entry sweeps owned copies whose PID has
+exited after an untrappable kill. Older random-only names have no liveness proof
+and are retained rather than risking deletion of another active launch's copy.
 The 16-entry release closure binds the binary,
 and a helper change requires a new release identity and review.
 

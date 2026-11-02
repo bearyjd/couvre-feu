@@ -11,6 +11,12 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 HELPER = 'usr/lib/couvrefeu/busybox-static'
+RETIREMENT_INVENTORY = (
+    'usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk '
+    'usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk '
+    'usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh '
+    'etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root '
+    'etc/couvrefeu/protected etc/couvrefeu/state')
 
 
 class HelperSecurityTests(unittest.TestCase):
@@ -118,6 +124,126 @@ class HelperSecurityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.strip().isdigit())
 
+    def helper_recording(self):
+        record = self.root / 'private-directory'
+        setup = ('mktemp() { candidate=$(command mktemp "$@") || return; '
+                 'printf "%s\\n" "$candidate" > ' + shlex.quote(str(record)) +
+                 '; printf "%s\\n" "$candidate"; }\n')
+        return record, setup
+
+    def assert_private_removed(self, record):
+        self.assertTrue(record.exists(), 'helper private directory was allocated')
+        self.assertFalse(Path(record.read_text().strip()).exists())
+
+    def test_host_shell_substitutions_cannot_cleanup_parent_helper(self):
+        record, setup = self.helper_recording()
+        self.shell = ['sh']
+        result = self.run_sh(setup + 'platform_setsid_helper\n'
+                             'value=$(printf checked)\n[ "$value" = checked ]\n'
+                             '[ -f "$platform_helper" ]\nplatform_helper_cleanup')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_private_removed(record)
+
+    def test_noncanonical_parent_spellings_refuse(self):
+        parent = str(self.release / 'lib')
+        for spelling in (parent + '/', parent + '//', parent + '/.', parent + '/../lib',
+                         parent.replace('/release/', '//release/')):
+            with self.subTest(spelling=spelling):
+                result = self.run_sh('platform_helper_parents ' + shlex.quote(spelling))
+                self.assert_refused(result, 'helper_missing')
+
+    def test_private_copy_shape_refuses_before_hash(self):
+        record, setup = self.helper_recording()
+        for replacement in ('ln -s "$1" "$2"', 'ln "$1" "$2"', 'mkfifo "$2"',
+                            'command cp "$@"; command chmod 777 "$2"'):
+            with self.subTest(replacement=replacement):
+                body = setup + 'cp() { ' + replacement + '; }\n'
+                if 'chmod 777' in replacement:
+                    body += 'chmod() { [ "$1" = 755 ] || command chmod "$@"; }\n'
+                result = self.run_sh(body + 'platform_setsid_helper')
+                self.assert_refused(result, 'helper_missing')
+                self.assert_private_removed(record)
+
+    def test_private_copy_wrong_owner_or_group_refuses(self):
+        record, setup = self.helper_recording()
+        for metadata in ('999:0:755:1', '0:999:755:1'):
+            with self.subTest(metadata=metadata):
+                result = self.run_sh(setup +
+                    'platform_helper_stat() { if [ "$3" = "${platform_helper:-}" ]; then '
+                    'printf "%s\\n" ' + shlex.quote(metadata) +
+                    '; else command stat "$@"; fi; }\nplatform_setsid_helper')
+                self.assert_refused(result, 'helper_missing')
+                self.assert_private_removed(record)
+
+    def test_exit_signal_and_deadline_remove_private_directory(self):
+        for body, code, refusal in (
+                ('platform_setsid_helper\nexit 37', 37, None),
+                ('cp() { kill -TERM "$$"; }\nplatform_setsid_helper', 143, None),
+                ('CF_PLATFORM_PROFILE=$CF_OS_TRUST_PROFILE\nCF_PLATFORM_ENTRY_TICK=0\n'
+                 'platform_setsid_helper', 2, 'admission_deadline')):
+            with self.subTest(body=body):
+                record, setup = self.helper_recording()
+                result = self.run_sh(setup + body)
+                self.assertEqual(result.returncode, code, result.stderr)
+                if refusal:
+                    self.assertIn(refusal, result.stderr)
+                self.assert_private_removed(record)
+
+    def test_failed_session_exec_cleans_and_has_fixed_code(self):
+        record, setup = self.helper_recording()
+        result = self.run_sh(setup +
+            'platform_process_identity() { printf "1:2:3\\n"; }\n'
+            'readlink() { rm -f "$platform_helper"; command readlink "$@"; }\n'
+            'platform_transaction_session')
+        self.assert_refused(result, 'helper_exec')
+        self.assert_private_removed(record)
+
+    def test_failed_reexec_cleans_and_has_fixed_code(self):
+        record, setup = self.helper_recording()
+        shell = self.root / 'one-shot-shell'
+        shell.write_text('#!/bin/sh\nrm -f "$0"\nexec ' +
+                         shlex.join(self.shell) + ' "$@"\n')
+        shell.chmod(0o755)
+        result = self.run_sh(setup +
+            'platform_process_identity() { printf "1:2:3\\n"; }\n'
+            'readlink() { printf "%s\\n" ' + shlex.quote(str(shell)) + '; }\n'
+            'platform_transaction_session')
+        self.assert_refused(result, 'helper_exec')
+        self.assert_private_removed(record)
+
+    def test_cleanup_failure_does_not_recurse_or_replace_original_refusal(self):
+        for command in ('rm', 'rmdir'):
+            with self.subTest(command=command):
+                record, setup = self.helper_recording()
+                calls = self.root / 'cleanup-calls'
+                calls.write_text('')
+                result = self.run_sh(setup + 'platform_setsid_helper\n' + command +
+                    '() { printf "call\\n" >> ' + shlex.quote(str(calls)) +
+                    '; return 1; }\nplatform_helper_fail original_refusal')
+                self.assert_refused(result, 'original_refusal')
+                self.assertEqual(calls.read_text().splitlines(), ['call'])
+                directory = Path(record.read_text().strip())
+                shutil.rmtree(directory)
+
+    def test_sweep_removes_only_dead_owned_pid_directories(self):
+        paths = []
+        for pid in ('9999999999', str(os.getpid())):
+            allocated = subprocess.run(['mktemp', '-d',
+                '/tmp/.couvrefeu-helper.' + pid + '.XXXXXX'],
+                capture_output=True, text=True, check=True)
+            canonical = Path(allocated.stdout.strip())
+            shutil.copyfile(self.helper, canonical / 'busybox-static')
+            paths.append(canonical)
+            self.addCleanup(lambda p=canonical: shutil.rmtree(p, ignore_errors=True))
+        legacy = Path(tempfile.mkdtemp(prefix='.couvrefeu-helper.', dir='/tmp'))
+        self.addCleanup(lambda: shutil.rmtree(legacy, ignore_errors=True))
+        result = self.run_sh('set -f\nplatform_setsid_helper\nplatform_helper_cleanup\n'
+                             'case $- in *f*) ;; *) exit 91;; esac')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(paths[0].exists())
+        self.assertTrue(paths[1].exists())
+        self.assertTrue(legacy.exists())
+
     def test_old_and_lookalike_inventories_refuse_before_mutex_creation(self):
         (self.root / 'etc/couvrefeu/backup').mkdir(parents=True)
         prepared = self.root / '.couvrefeu-prepared'
@@ -166,11 +292,30 @@ class HelperSecurityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('invalid retirement receipt', result.stderr)
 
+    def test_receipt_rejects_malformed_line_eight_before_bindings(self):
+        receipt = self.root / '.couvrefeu-retirement'
+        pin = 'a' * 64
+        for malformed in ('', 'usr/lib/couvrefeu/core.sh\tforeign',
+                          'usr/lib/couvrefeu/core.sh;touch /tmp/foreign',
+                          'usr/lib/couvrefeu/core.sh  etc/config/firewall'):
+            with self.subTest(inventory=malformed):
+                lines = ['CFRETIREMENT 2', pin, 'strict', pin, pin, '1:1', '1',
+                         malformed, '', pin, pin, pin,
+                         ' '.join(f'item{i}:{pin}' for i in range(16))]
+                lines += [f'item{i}\t{pin}\tvalue' for i in range(5)]
+                receipt.write_text('\n'.join(lines) + '\n')
+                receipt.chmod(0o600)
+                result = self.common('platform_transaction_mutex_check() { :; }\nretirement_validate')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('invalid retirement receipt', result.stderr)
+                self.assertNotIn('retirement release/profile mismatch', result.stderr)
+
     def test_receipt_selects_legacy_target_from_receipt_before_count_check(self):
         receipt = self.root / '.couvrefeu-retirement'
         pin = 'a' * 64
         legacy = '28b3278555e61239471497b7e806b05c8f5eed82b7cabca7ad8264d22cf6e539'
-        lines = ['CFRETIREMENT 2', legacy, 'strict', pin, 'none', '1:1', '1', '', '', pin, pin, pin,
+        lines = ['CFRETIREMENT 2', legacy, 'strict', pin, 'none', '1:1', '1',
+                 RETIREMENT_INVENTORY, '', pin, pin, pin,
                  ' '.join(f'item{i}:{pin}' for i in range(15))]
         lines += [f'item{i}\t{pin}\tvalue' for i in range(5)]
         receipt.write_text('\n'.join(lines) + '\n')
