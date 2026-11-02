@@ -2690,11 +2690,14 @@ class PinnedHelperTests(unittest.TestCase):
 
     def test_helper_hash_refused_before_mutation(self):
         (self.source / 'lib/busybox-static').write_bytes(b'foreign helper')
+        (self.root / '.couvrefeu-mutex').unlink(missing_ok=True)
         before = full_snapshot(self.root)
         result = self.install('--activate')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('hash_mismatch', result.stderr)
+        self.assertIn('helper_hash', result.stderr)
         self.assertEqual(full_snapshot(self.root), before)
+        self.assertFalse((self.root / '.couvrefeu-mutex').exists())
+        self.assertFalse((self.root / '.couvrefeu-transaction').exists())
 
     def test_entry_helper_hash_refuses_before_execution_or_mutation(self):
         tree = Path(self.tmp.name) / 'corrupted-release'
@@ -2711,9 +2714,35 @@ class PinnedHelperTests(unittest.TestCase):
         finally:
             _EMITTED[:] = original
         self.assertEqual(result.returncode, 2)
-        self.assertIn('hash_mismatch', result.stderr)
+        self.assertIn('helper_hash', result.stderr)
         self.assertFalse(marker.exists())
         self.assertEqual(full_snapshot(self.root), before)
+
+    def test_old_inventory_and_pending_recovery_refuse_before_transaction_writes(self):
+        mutex = self.root / '.couvrefeu-mutex'
+        mutex.unlink()
+        backup = self.root / 'etc/couvrefeu/backup'
+        prepared = self.root / '.couvrefeu-prepared'
+        backup.mkdir(parents=True)
+        prepared.mkdir()
+        (prepared / 'inventory').write_text('usr/lib/couvrefeu/busybox-static.evil\n')
+        before = full_snapshot(self.root)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+        shutil.rmtree(self.root / 'etc')
+        shutil.rmtree(prepared)
+        for name in ('.couvrefeu-recovery', '.couvrefeu-recovery.done'):
+            with self.subTest(name=name):
+                pending = self.root / name
+                pending.write_text('3\nstrict\nlegacy or modern pending journal\n')
+                before = full_snapshot(self.root)
+                result = self.install('--activate')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+                pending.unlink()
 
     def test_helper_restores_original_exactly_without_bare_setsid(self):
         isolated = Path(self.tmp.name) / 'without-setsid'

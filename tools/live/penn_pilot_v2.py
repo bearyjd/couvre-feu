@@ -6,6 +6,7 @@ Imports cleanly on its own. penn-pilot.py calls `bind(first_rehearsal_module)` r
 Everything here is pure: configuration validation, the v2 policy validator and its independent per-stage
 expectation, the Leg-2 commit command table, the v2 phase worst cases and the digest/disclosure rules."""
 import json
+from pathlib import Path
 import re
 import shlex
 from typing import Any
@@ -231,13 +232,41 @@ def pilot_policies(config, base, candidates=candidate_policies):
             for name, policy in candidates(config, base)]
 
 
-SETSID_HELPER_SHA256 = 'c25f66e5ac29ea3e373b8fb2d3549a59d058fbef9ed11b67fdaba1dc37bf75f5'
+# Read the same reviewed declaration as the payload builder; never duplicate the pin.
+_bootstrap = (Path(__file__).resolve().parents[2] / 'router/lib/platform-bootstrap.sh').read_text()
+_helper_pins = re.findall(r'^CF_SETSID_HELPER_SHA256=([0-9a-f]{64})$', _bootstrap, re.M)
+if len(_helper_pins) != 1:
+    raise ValueError('bootstrap must declare exactly one helper pin')
+SETSID_HELPER_SHA256 = _helper_pins[0]
 
 LEG_SUPERVISOR = '''seconds=$1; grace=$2; shift 2
-helper=/usr/lib/couvrefeu/busybox-static
-[ -f "$helper" ] && [ ! -L "$helper" ] && [ -x "$helper" ] || exit 126
-sum=$(sha256sum < "$helper") || exit 126
-[ "${sum%% *}" = "@CF_SETSID_HELPER_SHA256@" ] || exit 126
+trap '' HUP INT TERM
+refuse() { printf 'HELPER_REFUSED %s\\n' "$1" >&2; exit 10; }
+source=/usr/lib/couvrefeu/busybox-static
+owner=0:0
+# Check every source ancestor with a non-helper primitive before reading bytes.
+for parent in / /usr /usr/lib /usr/lib/couvrefeu; do
+    [ -d "$parent" ] && [ ! -L "$parent" ] || refuse helper_hash
+    case $(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$parent") in
+        "$owner:700"|"$owner:750"|"$owner:755") ;; *) refuse helper_hash;;
+    esac
+done
+if [ ! -e "$source" ] && [ ! -L "$source" ]; then refuse helper_missing; fi
+[ -f "$source" ] && [ ! -L "$source" ] && [ -x "$source" ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$source")" = "$owner:755" ] || refuse helper_hash
+[ -d /tmp ] && [ ! -L /tmp ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ] || refuse helper_hash
+stage=$(mktemp -d /tmp/couvrefeu-leg.XXXXXX) || refuse helper_hash
+helper=$stage/busybox-static
+trap 'rm -f "$helper"; rmdir "$stage"' 0
+[ -d "$stage" ] && [ ! -L "$stage" ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stage")" = "$owner:700" ] || refuse helper_hash
+cp "$source" "$helper" && chmod 755 "$helper" || refuse helper_hash
+[ -f "$helper" ] && [ ! -L "$helper" ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$helper")" = "$owner:755" ] || refuse helper_hash
+sum=$(sha256sum < "$helper") || refuse helper_hash
+[ "${sum%% *}" = "@CF_SETSID_HELPER_SHA256@" ] || refuse helper_hash
+"$helper" true </dev/null >/dev/null 2>&1 || refuse helper_exec
 exec 3<&0
 trap '' HUP INT TERM
 ( trap - HUP INT TERM; exec "$helper" setsid "$@" ) <&3 3<&- &
@@ -271,7 +300,7 @@ def remote_leg_command(form, op, seconds, grace=SCOPE_LEG_KILL_GRACE_SECONDS):
     that would defer ash's TERM trap. Ignore disconnect signals in the supervisor so its watchdog survives ssh."""
     inner = f'{op} {{MAC}} --base {{BASE}}'
     command = (f'/usr/sbin/cfctl {inner}' if form == 'cfctl'
-               else f"env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
+               else f"/usr/bin/env SSH_ORIGINAL_COMMAND='cfctl {inner}' /usr/sbin/cfctl-scope pilot")
     return f'/bin/sh -c {shlex.quote(LEG_SUPERVISOR)} pilot-leg {seconds} {grace} {command}'
 
 

@@ -66,6 +66,19 @@ try:
     helper_pin = re.search(rb'^CF_SETSID_HELPER_SHA256=([0-9a-f]{64})$', bootstrap, re.M).group(1).decode()
     if hashlib.sha256((router / 'lib/busybox-static').read_bytes()).hexdigest() != helper_pin:
         raise ValueError('lib/busybox-static: pinned helper hash mismatch')
+    # Disposable router-only fixtures omit live tools. A full source tree must
+    # agree with both independently loaded host tools before it can be frozen.
+    for live_name in ('first-rehearsal.py', 'penn_pilot_v2.py'):
+        live_path = router.parent / 'tools/live' / live_name
+        if not live_path.exists():
+            continue
+        live_spec = importlib.util.spec_from_file_location('freeze_live_' + live_path.stem, live_path)
+        live_tool = importlib.util.module_from_spec(live_spec)
+        live_spec.loader.exec_module(live_tool)
+        live_pin = (live_tool.setsid_helper_pin(bootstrap) if live_name == 'first-rehearsal.py'
+                    else live_tool.SETSID_HELPER_SHA256)
+        if live_pin != helper_pin:
+            raise ValueError(live_name + ': helper pin differs from bootstrap')
     bootstrap_identity = generated_field(bootstrap, 'lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
     module_pattern = b"'" + b' '.join(re.escape(name.encode()) + rb':[0-9a-f]{64}' for name in names) + b"'"
     normalized['lib/platform-bootstrap.sh'] = generated_field(

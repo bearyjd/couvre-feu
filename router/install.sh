@@ -67,7 +67,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=d78d2ccbf8c5fb8528881e5c5d4d61d8c57d76bea3c32ae6b40f5f94f381330d
+CF_BOOTSTRAP_PIN=c2299a1dcae1b86456c9639de674e319e19be73475908309615d56c5c20f209a
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -77,14 +77,18 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
-platform_setsid_helper
-if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"; fi
+if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"
+else platform_setsid_helper; platform_helper_cleanup; fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then
     case "$SOURCE" in "$CF_ROOT"/*|"$HERE") ;; *) fail 'fixture source outside isolated root';; esac
     [ "$(CDPATH='' cd -- "$SOURCE" && pwd -P)" = "$SOURCE" ] || fail 'fixture source must be canonical'
 else
     [ "$SOURCE" = "$HERE" ] || fail 'source must equal the verified release directory'
 fi
+if ! { [ -f "$SOURCE/lib/busybox-static" ] && [ ! -L "$SOURCE/lib/busybox-static" ]; }; then platform_fail helper_missing; fi
+source_helper_digest=$(timeout -s KILL 6 sha256sum "$SOURCE/lib/busybox-static") || platform_fail helper_hash
+[ "${source_helper_digest%% *}" = "$CF_SETSID_HELPER_SHA256" ] || platform_fail helper_hash
+platform_install_helper_inventory
 platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # shellcheck disable=SC1091
@@ -103,8 +107,6 @@ for file in cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/state.awk lib
     fi
     case "$file" in lib/busybox-static|*.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
 done
-platform_hash "$SOURCE/lib/busybox-static" "$CF_SETSID_HELPER_SHA256"
-
 backend() {
     name=$1; shift
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then

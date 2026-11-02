@@ -134,6 +134,7 @@ def good_probe(host):
 
 class PilotBase(unittest.TestCase):
     model_fresh_router = TLR.LiveRehearsalTests.model_fresh_router
+    model_tmp_namespace_owner = TLR.LiveRehearsalTests.model_tmp_namespace_owner
     truncating_cp = TLR.LiveRehearsalTests.truncating_cp
     write_agent = TLR.LiveRehearsalTests.write_agent
     provision_mutex = TLR.LiveRehearsalTests.provision_mutex
@@ -1316,7 +1317,7 @@ class PilotConfigV2Tests(PilotBase):
             if leg['form'] == 'cfctl':
                 self.assertEqual(argv[6:], ['/usr/sbin/cfctl', leg['op'], '{MAC}', '--base', '{BASE}'])
             else:
-                self.assertEqual(argv[6:], ['env', f'SSH_ORIGINAL_COMMAND=cfctl {leg["op"]} {{MAC}} --base {{BASE}}',
+                self.assertEqual(argv[6:], ['/usr/bin/env', f'SSH_ORIGINAL_COMMAND=cfctl {leg["op"]} {{MAC}} --base {{BASE}}',
                                            '/usr/sbin/cfctl-scope', 'pilot'])
         base = details['sshArgv']
         for leg in legs:  # the leg-1 argv with `-e none -tt` for `-T`: no ssh escape character on the pty
@@ -1861,26 +1862,64 @@ class PilotFixtureTests(PilotBase):
         path.chmod(0o700)
 
     def status_double(self, rewrite, count, skip=0):
-        """Double of the fixture's CFR_SH program from PATH (`sh`, or `busybox` for `busybox ash`): logs every
-        `cfctl rpc-sync` and pipes `count` `cfctl status --json` replies after the first rpc-sync, from the
-        one after the first `skip`, through sed `rewrite`. Every call still runs the real cfctl exactly once."""
-        program = shlex.split(self.spec['shell'])[0]
+        """Instrument the disposable pilot's supervisor, preserving absolute shell execution.
+
+        Each real call runs once in the supervising shell; only the captured status
+        reply changes. No production hook or PATH-selected shell is involved.
+        """
+        source = SourceCopy()
+        self.addCleanup(source.tmp.cleanup)
+        self.tool = source.tool
+        self.model_tmp_namespace_owner()
         q = shlex.quote
-        real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
-        self.rpc_log, count_file = self.work / 'rpc-sync.log', self.work / 'status-rewrites'
-        self.router_double(program, (
-            f'case " $* " in\n'
-            f'  *{q(" " + cfctl + " rpc-sync ")}*) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
-            f'  *{q(" " + cfctl + " status --json ")}*)\n'
-            f'    n=$(cat {q(str(count_file))} 2>/dev/null || echo 0)\n'
-            f'    [ -s {q(str(self.rpc_log))} ] && echo $((n + 1)) > {q(str(count_file))}\n'
-            f'    if [ -s {q(str(self.rpc_log))} ] && [ "$n" -ge {skip} ] && [ "$n" -lt {skip + count} ]; then\n'
-            f'      out=$({real} "$@"); rc=$?\n'
-            f'      printf "%s\\n" "$out" | sed {q(rewrite)}\n'
-            f'      exit $rc\n'
-            f'    fi;;\n'
-            f'esac\n'
-            f'exec {real} "$@"\n'))
+        self.rpc_log = self.work / 'rpc-sync.log'
+        self.status_rewrite_log = self.work / 'rewritten-statuses'
+        count_file, response = self.work / 'status-rewrites', self.work / 'status-response'
+        self.status_wrapper = (
+            'cfp_run() {\n'
+            '    if [ "$3" = "$CFR_CFCTL" ]; then\n'
+            '        case ${4:-} in\n'
+            f'            rpc-sync) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
+            '            status)\n'
+            f'                n=$(cat {q(str(count_file))} 2>/dev/null || echo 0)\n'
+            f'                [ ! -s {q(str(self.rpc_log))} ] || echo $((n + 1)) > {q(str(count_file))}\n'
+            f'                if [ -s {q(str(self.rpc_log))} ] && [ "$n" -ge {skip} ] && [ "$n" -lt {skip + count} ]; then\n'
+            f'                    echo "$n" >> {q(str(self.status_rewrite_log))}\n'
+            f'                    cfp_fixture_run "$@" > {q(str(response))}\n'
+            '                    cfp_fixture_rc=$?\n'
+            f'                    sed {q(rewrite)} {q(str(response))}\n'
+            '                    return "$cfp_fixture_rc"\n'
+            '                fi;;\n'
+            '        esac\n'
+            '    fi\n'
+            '    cfp_fixture_run "$@"\n'
+            '}\n')
+        path = source.root / 'tools/live/penn-pilot.sh'
+        text = path.read_text().replace('cfp_run() {\n', 'cfp_fixture_run() {\n', 1)
+        self.assertEqual(text.count('cfp_main </dev/null'), 1)
+        path.write_text(text.replace('cfp_main </dev/null', self.status_wrapper + '\ncfp_main </dev/null'))
+        subprocess.run(['git', '-C', str(source.root), '-c', 'user.name=fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qam', 'instrument fixture status'],
+                       check=True, capture_output=True)
+
+    def test_status_double_intercepts_once_and_preserves_supervisor_state_and_exit(self):
+        self.status_double(self.DRIFT, 1)
+        calls = self.work / 'real-status-calls'
+        script = ('CFR_CFCTL=/fixture/cfctl\nCFP_FIXTURE_CALLS=0\n'
+                  'cfp_fixture_run() { CFP_FIXTURE_CALLS=$((CFP_FIXTURE_CALLS + 1)); '
+                  + 'printf "%s\\n" ' + shlex.quote('{"ok":true,"drift":false,}') + '; return 7; }\n'
+                  + self.status_wrapper
+                  + 'cfp_run /dev/null 1 "$CFR_CFCTL" rpc-sync >/dev/null\n'
+                  + 'cfp_run /dev/null 1 "$CFR_CFCTL" status --json; echo RC:$?\n'
+                  + 'cfp_run /dev/null 1 "$CFR_CFCTL" status --json; echo RC:$?\n'
+                  + 'printf "%s" "$CFP_FIXTURE_CALLS" > ' + shlex.quote(str(calls)) + '\n')
+        done = subprocess.run(shlex.split(self.spec['shell']) + ['-c', script], capture_output=True, text=True, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), ['{"ok":false,"drift":true,}', 'RC:7',
+                                                  '{"ok":true,"drift":false,}', 'RC:7'])
+        self.assertEqual(calls.read_text(), '3')
+        self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertEqual(self.status_rewrite_log.read_text().splitlines(), ['0'])
 
     DRIFT = 's/"ok":true,/"ok":false,/;s/"drift":false,/"drift":true,/'
 
@@ -1910,6 +1949,7 @@ class PilotFixtureTests(PilotBase):
         self.assertEqual(code, 0, out + err + '\n'.join(stdout[-40:]))
         self.assertEqual(stdout[-1], 'PENN_PILOT_PASS')
         self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertEqual(self.status_rewrite_log.read_text().splitlines(), ['0'])
         self.assertTrue(any('"drift":true,' in line and line.startswith('INFO status ') for line in stdout))
         self.assertTrue(any(re.fullmatch(r'INFO status_settle ENROLL attempts=2 waited_s=[0-9]+', line) for line in stdout))
         self.assertTrue(any(line.startswith('INFO status_settle_neigh ENROLL attempt=2 ') for line in stdout))
@@ -2006,7 +2046,7 @@ H=%(h)s
 CFR_STAGE=$H/stage
 mkdir -p "$CFR_STAGE/pilot" "$H/root"
 CFP_DIR=$CFR_STAGE/pilot
-CFR_SH=sh
+CFR_SH=/bin/sh
 CFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static
 CFR_FIXTURE=1
 CFR_ROOT=$H/root
@@ -2103,6 +2143,12 @@ class PilotShellBase(PilotBase):
         stage_helper.parent.mkdir(parents=True)
         shutil.copyfile(helper, stage_helper)
         stage_helper.chmod(0o755)
+        for directory in (home / 'stage', stage_helper.parent.parent, stage_helper.parent):
+            directory.chmod(0o700)
+        (home / 'ash').symlink_to(helper)
+        # Supervision accepts one absolute executable, including in ash fixtures.
+        driver = re.sub(r"CFR_SH='busybox ash'", 'CFR_SH=' + shlex.quote(str(home / 'ash')), driver)
+        driver = re.sub(r'CFR_SH=sh(?=[\n;])', 'CFR_SH=/bin/sh', driver)
         head += '\nCFR_SETSID_HELPER_SHA256=' + hashlib.sha256(helper.read_bytes()).hexdigest()
         (home / 'script.sh').write_text(head + '\n' + PRELUDE % {'h': shlex.quote(str(home)), 'driver': driver,
                                                                   'stop': self.STUB_STOP if stub_stop else ':'})
@@ -2684,7 +2730,7 @@ class PilotReviewFixTests(PilotShellBase):
         text = (REPO / 'tools/live/penn-pilot.sh').read_text()
         loose = [line for line in text.splitlines()
                  if not line.lstrip().startswith('#') and ('cfr_run_sh' in line or '$CFR_SH' in line)
-                 and 'exec "$CFR_SETSID_HELPER" setsid $CFR_SH' not in line]
+                 and 'exec "$CFR_SETSID_HELPER" setsid "$CFR_SH"' not in line]
         self.assertEqual(loose, [])
 
     UNINSTALL_DRIVER = r'''
@@ -3489,9 +3535,28 @@ class PilotHardeningT3cTests(PilotShellBase):
         driver = ('echo bad >> "$CFR_SETSID_HELPER"\n'
                   'cfp_run /dev/null 1 -c \'echo should_not_run\'; echo "RC:$? LIVE:$CFP_RUN_LIVE"\n')
         done = self.run_driver(driver)
-        self.assertIn('RC:126 LIVE:', done.stdout)
+        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+        self.assertIn('PHASE SUPERVISOR FAIL helper_hash', done.stdout)
         self.assertNotIn('LIVE:starting', done.stdout)
         self.assertNotIn('should_not_run', done.stdout)
+
+    def test_bad_helper_during_optional_call_stops_the_phase(self):
+        driver = ('CFP_MUTATED=1\necho bad >> "$CFR_SETSID_HELPER"\n'
+                  'cfp_run /dev/null 1 -c \'echo CHILD_STARTED\' || echo OPTIONAL_FAILURE_IGNORED\n'
+                  'echo NEXT_MUTATION\n')
+        done = self.run_driver(driver)
+        self.assertEqual(done.returncode, 77, done.stdout + done.stderr)
+        self.assertIn('STOP SUPERVISOR helper_hash', done.stdout)
+        self.assertNotIn('OPTIONAL_FAILURE_IGNORED', done.stdout)
+        self.assertNotIn('NEXT_MUTATION', done.stdout)
+        self.assertNotIn('CHILD_STARTED', done.stdout)
+
+    def test_helper_stage_drift_during_mutation_stops_before_launch(self):
+        done = self.run_driver('CFP_MUTATED=1\nchmod 777 "$CFR_STAGE"\n'
+                               'cfp_run /dev/null 1 -c \'echo CHILD_STARTED\'\n')
+        self.assertEqual(done.returncode, 77)
+        self.assertIn('STOP SUPERVISOR helper_hash', done.stdout)
+        self.assertNotIn('CHILD_STARTED', done.stdout)
 
     def test_bare_setsid_is_never_used(self):
         done = self.baseline_run('printf \'#!/bin/sh\\nexit 99\\n\' > "$H/bin/setsid"; chmod +x "$H/bin/setsid"\n')

@@ -11,6 +11,7 @@ cd "$REPO"
 preflight_suites() {
     printf '%s\n' \
         test-install-recovery-primitives.py \
+        test-pinned-helper-security.py \
         test-install.py \
         test-install-recovery.py \
         test-install-retirement-recovery.py \

@@ -37,8 +37,8 @@ RELEASE_MODULES = ('core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'sta
 IDENTITY_FORMAT = 'couvrefeu-router-release-v2'
 BOUNDARY_PIN_FILES = ('install.sh', 'uninstall.sh', 'cfctl')
 # The router accepts exactly these manifest entries (platform-bootstrap.sh platform_external_closure).
-MANIFEST_FILES = ('lib/busybox-static', 'install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope', 'lib/platform-bootstrap.sh',
-                  *('lib/' + name for name in RELEASE_MODULES))
+MANIFEST_FILES = ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope',
+                  *('lib/' + name for name in RELEASE_MODULES), 'lib/platform-bootstrap.sh', 'lib/busybox-static')
 # Tracked under router/ but neither in release.sha256 nor used by install.sh: never shipped.
 UNSHIPPED_ROUTER_FILES = ('router/cron', 'router/firewall.include')
 PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
@@ -326,6 +326,13 @@ def normalize_generated_field(data, path, field, value_pattern):
     return re.sub(rb'^' + key + rb'=.*$', key + b'=', data, flags=re.M)
 
 
+def setsid_helper_pin(bootstrap):
+    """The bootstrap declaration is the sole reviewed helper pin."""
+    normalize_generated_field(bootstrap, 'router/lib/platform-bootstrap.sh',
+                              'CF_SETSID_HELPER_SHA256', rb'[0-9a-f]{64}')
+    return re.search(rb'^CF_SETSID_HELPER_SHA256=([0-9a-f]{64})$', bootstrap, re.M)[1].decode('ascii')
+
+
 def verify_release_identity(shipped):
     """Independently verify version 2 identity and pins. Legacy identities cannot ship in new plans.
 
@@ -334,6 +341,8 @@ def verify_release_identity(shipped):
     try:
         pairs = [name + ':' + hashlib.sha256(shipped['router/lib/' + name]).hexdigest() for name in RELEASE_MODULES]
         bootstrap = shipped['router/lib/platform-bootstrap.sh']
+        if hashlib.sha256(shipped['router/lib/busybox-static']).hexdigest() != setsid_helper_pin(bootstrap):
+            raise Refusal('lib/busybox-static: pinned helper hash mismatch')
         normalized = {name: normalize_generated_field(shipped['router/' + name], 'router/' + name,
                       'CF_BOOTSTRAP_PIN', rb'[0-9a-f]{64}') for name in BOUNDARY_PIN_FILES}
         blanked = normalize_generated_field(bootstrap, 'router/lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
@@ -427,7 +436,7 @@ def build_payload(config, commit, blobs):
     roles = config['roles']
     values = {'CFR_SOURCE_COMMIT': commit, 'CFR_RELEASE_ID': release_id(blobs),
               'CFR_PROFILE': config['platformProfile'],
-              'CFR_SETSID_HELPER_SHA256': hashlib.sha256(blobs['router/lib/busybox-static']).hexdigest(),
+              'CFR_SETSID_HELPER_SHA256': setsid_helper_pin(blobs['router/lib/platform-bootstrap.sh']),
               'CFR_MGMT_IP': roles['management']['ip'], 'CFR_MGMT_MAC': roles['management']['mac'],
               'CFR_JD_IP': roles['jd_adult']['ip'], 'CFR_JD_MAC': roles['jd_adult']['mac'],
               'CFR_PENN_IP': roles['penn_child']['ip'], 'CFR_PENN_MAC': roles['penn_child']['mac'],

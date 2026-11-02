@@ -79,13 +79,20 @@ elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1;
 if [ "$PROFILE_INVENTORY" = 1 ]; then
     FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
-# Include only fresh installs or inventories proving ownership of this helper.
+# Ownership comes from an exact inventory field, never a substring match.
+# PREPARED and receipt claims are authenticated by their complete validation
+# before they can authorize a write or restoration.
+HELPER_INVENTORY=0
 if { [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; } ||
-    [ -e "$BACKUP/usr_lib_couvrefeu_busybox-static.after" ] ||
-    { [ -f "${CF_TRANSACTION_PREPARED:-/nonexistent}/inventory" ] && grep -q 'usr/lib/couvrefeu/busybox-static' "$CF_TRANSACTION_PREPARED/inventory"; } ||
-    { [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; }; then
-    FILES="$FILES usr/lib/couvrefeu/busybox-static"
+    { [ -f "$BACKUP/usr_lib_couvrefeu_busybox-static.before" ] && [ -f "$BACKUP/usr_lib_couvrefeu_busybox-static.after" ]; } ||
+    { [ -f "${CF_TRANSACTION_PREPARED:-/nonexistent}/inventory" ] &&
+        awk '{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$CF_TRANSACTION_PREPARED/inventory"; } ||
+    { [ -f "${CF_TRANSACTION_RETIREMENT:-/nonexistent}" ] &&
+        awk 'NR==8{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$CF_TRANSACTION_RETIREMENT"; }; then
+    HELPER_INVENTORY=1
 fi
+if [ "$HELPER_INVENTORY" = 1 ]; then FILES="$FILES usr/lib/couvrefeu/busybox-static"
+elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then fail helper_inventory_upgrade_refused; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
 for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
@@ -255,6 +262,9 @@ prepared_validate() {
         case "$prepared_optional" in "$prepared_option"*) prepared_optional=${prepared_optional#"$prepared_option"};; esac
     done
     [ -z "$prepared_optional" ] || fail 'invalid PREPARED inventory'
+    case "$0" in */install.sh)
+        awk '{for(i=1;i<=NF;i++)if($i=="usr/lib/couvrefeu/busybox-static")found=1}END{exit !found}' "$prepared_tree/inventory" || fail helper_inventory_upgrade_refused;;
+    esac
     FILES=$prepared_inventory
     prepared_records
     for prepared_record in inventory directories profile release-absent manifest $PREPARED_RECORDS; do
@@ -674,13 +684,17 @@ retirement_validate() {
         fail 'legacy callback quiescence is unproven; legacy receipt preserved for separately authorized recovery'
     fi
     [ "$(stat -c '%h:%s' "$CF_TRANSACTION_RETIREMENT" | awk -F: '$1==1&&$2<=32768{print "ok"}')" = ok ] || fail 'unsafe retirement receipt; preserved'
-    awk -F '\t' 'NR==1{if($0!="CFRETIREMENT 2")exit 1}
+    RETIRE_TARGET=$(sed -n '2p' "$CF_TRANSACTION_RETIREMENT")
+    RETIRE_LEGACY=0
+    [ "$RETIRE_TARGET" != "$(retirement_legacy_id)" ] || RETIRE_LEGACY=1
+    retirement_target_count=$(retirement_target_names | awk '{print NF}')
+    awk -F '\t' -v target_count="$retirement_target_count" 'NR==1{if($0!="CFRETIREMENT 2")exit 1}
         NR==2||NR==4||NR==10||NR==11||NR==12{if(length($0)!=64||$0~/[^0-9a-f]/)exit 1}
         NR==5{if($0!="none"&&(length($0)!=64||$0~/[^0-9a-f]/))exit 1}
         NR==3{if($0!~/^(strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1)$/)exit 1}
         NR==6{if(length($0)>42||$0!~/^[0-9]+:[0-9]+$/)exit 1}
         NR==7{if($0!~/^[01]$/)exit 1}
-        NR==13{n=split($0,p," ");if(n!=15&&n!=16)exit 1;for(i=1;i<=n;i++){if(split(p[i],a,":")!=2||length(a[2])!=64||a[2]~/[^0-9a-f]/)exit 1}}
+        NR==13{n=split($0,p," ");if(n!=target_count)exit 1;for(i=1;i<=n;i++){if(split(p[i],a,":")!=2||length(a[2])!=64||a[2]~/[^0-9a-f]/)exit 1}}
         NR>13{if(NF!=3||$1~/[^a-z0-9_.-]/||length($2)!=64||$2~/[^0-9a-f]/||length($3)>8192)exit 1}
         END{if(NR<18)exit 1}' "$CF_TRANSACTION_RETIREMENT" || fail 'invalid retirement receipt; preserved'
     RETIRE_TARGET=$(sed -n '2p' "$CF_TRANSACTION_RETIREMENT")

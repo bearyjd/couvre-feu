@@ -160,15 +160,80 @@ class BusyboxAckCommandTests(AckCommandTests):
 
 @unittest.skipUnless(local_busybox(), 'local BusyBox required for foreground-child signal semantics')
 class RemoteLegSupervisionTests(L2.DriverBase):
+    def helper_command(self, command, helper=None):
+        """Keep production metadata checks, with a private fixture-owned source."""
+        if helper is None:
+            helper = self.work / 'busybox-static'
+            helper.write_bytes(Path(local_busybox()).read_bytes())
+            helper.chmod(0o755)
+        command = command.replace('/usr/lib/couvrefeu/busybox-static', str(helper))
+        command = command.replace('for parent in / /usr /usr/lib /usr/lib/couvrefeu; do',
+                                  'for parent in ' + shlex.quote(str(self.work)) + '; do')
+        command = command.replace('owner=0:0', f'owner={os.getuid()}:{os.getgid()}')
+        tmp_owner = Path('/tmp').stat()
+        command = command.replace('= 0:0:1777 ]', f'= {tmp_owner.st_uid}:{tmp_owner.st_gid}:1777 ]')
+        return command.replace(self.tool.V2.SETSID_HELPER_SHA256,
+                               __import__('hashlib').sha256(helper.read_bytes()).hexdigest())
+
     def test_wrong_installed_helper_hash_refuses_without_execution(self):
         helper, executed = self.work / 'bad-helper', self.work / 'executed'
         helper.write_text('#!/bin/sh\n: > ' + shlex.quote(str(executed)) + '\n')
         helper.chmod(0o755)
-        command = self.details['legs'][0]['commandTemplate'].replace(
-            '/usr/lib/couvrefeu/busybox-static', str(helper))
+        command = self.helper_command(self.details['legs'][0]['commandTemplate'], helper)
+        command = command.replace(__import__('hashlib').sha256(helper.read_bytes()).hexdigest(), '0' * 64)
         done = subprocess.run(['sh', '-c', command], capture_output=True, check=False)
-        self.assertEqual(done.returncode, 126)
+        self.assertEqual(done.returncode, 10)
+        self.assertIn(b'HELPER_REFUSED helper_hash', done.stderr)
         self.assertFalse(executed.exists())
+
+    def test_unsafe_source_parent_refuses_before_hash_or_execution(self):
+        command = self.helper_command(self.details['legs'][0]['commandTemplate'])
+        bindir = self.work / 'hash-bin'
+        bindir.mkdir()
+        hashed = self.work / 'hashed'
+        hasher = bindir / 'sha256sum'
+        hasher.write_text('#!/bin/sh\n: > ' + shlex.quote(str(hashed)) + '\nexit 1\n')
+        hasher.chmod(0o700)
+        self.work.chmod(0o777)
+        try:
+            done = subprocess.run(['sh', '-c', command],
+                                  env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH']),
+                                  capture_output=True, check=False)
+        finally:
+            self.work.chmod(0o700)
+        self.assertEqual(done.returncode, 10)
+        self.assertIn(b'HELPER_REFUSED helper_hash', done.stderr)
+        self.assertFalse(hashed.exists(), 'unsafe ancestry reached the helper hash')
+
+    def test_wrong_architecture_is_an_explicit_helper_execution_refusal(self):
+        helper = self.work / 'wrong-arch'
+        helper.write_bytes(b'\x7fELF\x00invalid-machine\n')
+        helper.chmod(0o755)
+        done = subprocess.run(['sh', '-c', self.helper_command(self.details['legs'][0]['commandTemplate'], helper)],
+                              capture_output=True, check=False)
+        self.assertEqual(done.returncode, 10)
+        self.assertIn(b'HELPER_REFUSED helper_exec', done.stderr)
+
+    def test_private_helper_survives_source_replacement_and_is_cleaned(self):
+        command = self.helper_command(self.details['legs'][0]['commandTemplate'])
+        command = command.replace('/usr/sbin/cfctl', '/bin/true')
+        bindir = self.work / 'hash-bin'
+        bindir.mkdir()
+        hashed = self.work / 'hashed-path'
+        hasher = bindir / 'sha256sum'
+        hasher.write_text('#!/bin/sh\nreadlink /proc/$$/fd/0 > ' + shlex.quote(str(hashed))
+                          + '\n' + shlex.quote(shutil.which('sha256sum')) + ' "$@"\nrc=$?\n'
+                          + 'printf corrupt > ' + shlex.quote(str(self.work / 'busybox-static'))
+                          + '\nexit "$rc"\n')
+        hasher.chmod(0o700)
+        done = subprocess.run(['sh', '-c', command], env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH']),
+                              capture_output=True, check=False)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual((self.work / 'busybox-static').read_text(), 'corrupt')
+        private_helper = Path(hashed.read_text().strip())
+        self.assertEqual(private_helper.name, 'busybox-static')
+        self.assertNotEqual(private_helper, self.work / 'busybox-static')
+        self.assertFalse(private_helper.parent.exists(), 'private helper directory leaked')
 
     def test_foreground_child_receives_term_and_the_lock_is_released_before_teardown(self):
         busybox = local_busybox()
@@ -186,8 +251,7 @@ trap 'rm -f {shlex.quote(str(lock))}; echo exit > {shlex.quote(str(exited))}' EX
         with mock.patch.object(self.tool.V2, 'SCOPE_LEG_SECONDS', 1), mock.patch.object(self.tool.V2, 'SCOPE_LEG_KILL_GRACE_SECONDS', 2):
             leg = self.tool.V2.scope_legs(self.tool.load_config(self.config_path), self.details['sshArgv'])[0]
         command = leg['commandTemplate'].replace('/usr/sbin/cfctl', shlex.quote(str(fixture)))
-        command = command.replace('/usr/lib/couvrefeu/busybox-static', str(Path(busybox).resolve()))
-        command = command.replace(self.tool.V2.SETSID_HELPER_SHA256, __import__('hashlib').sha256(Path(busybox).read_bytes()).hexdigest())
+        command = self.helper_command(command)
         command = command.replace('timeout -s', f'{busybox} timeout -s')
         command = command.replace('/bin/sh', f'{busybox} ash').replace('{MAC}', PHONE['mac']).replace('{BASE}', BASE)
         process = subprocess.Popen([busybox, 'ash', '-c', command], start_new_session=True,
@@ -228,8 +292,7 @@ trap 'rm -f {shlex.quote(str(lock))}; echo exit > {shlex.quote(str(exited))}' EX
         for leg in (self.details['legs'][0], self.details['legs'][2]):
             command = leg['commandTemplate'].replace('/usr/sbin/cfctl-scope', shlex.quote(str(fixture)))
             command = command.replace('/usr/sbin/cfctl', shlex.quote(str(fixture))).replace('/bin/sh', f'{busybox} ash')
-            command = command.replace('/usr/lib/couvrefeu/busybox-static', str(Path(busybox).resolve()))
-            command = command.replace(self.tool.V2.SETSID_HELPER_SHA256, __import__('hashlib').sha256(Path(busybox).read_bytes()).hexdigest())
+            command = self.helper_command(command)
             master, slave = os.openpty()
             process = subprocess.Popen([busybox, 'ash', '-c', command], stdin=slave, stdout=slave, stderr=slave,
                                        start_new_session=True)
@@ -509,7 +572,7 @@ class BindingTests(L2.DriverBase):
         self.refused(self.resign(details), resigned=True)
 
     def test_a_resigned_plan_with_a_foreign_command_bound_or_mac_is_refused(self):
-        scope = "env SSH_ORIGINAL_COMMAND='cfctl scope-add {MAC} --base {BASE}' /usr/sbin/cfctl-scope"
+        scope = "/usr/bin/env SSH_ORIGINAL_COMMAND='cfctl scope-add {MAC} --base {BASE}' /usr/sbin/cfctl-scope"
         for index, template in ((0, BOUND + '/usr/sbin/cfctl scope-add {MAC} --base {BASE} && id'),
                                 (1, BOUND + '/usr/sbin/cfctl scope-add {MAC} --base {BASE}'),
                                 (2, f'{BOUND}{scope} root'),

@@ -26,7 +26,7 @@ def prepare_helper_release(root):
         raise AssertionError('tests require the hash-pinned x86_64 BusyBox 1.33.1 helper')
     shutil.copyfile(helper, root / 'router/lib/busybox-static')
     (root / 'router/lib/busybox-static').chmod(0o755)
-    for rel in ('router/lib/platform-bootstrap.sh', 'tools/live/penn_pilot_v2.py'):
+    for rel in ('router/lib/platform-bootstrap.sh',):
         path = root / rel
         if path.exists():
             path.write_text(path.read_text().replace(PRODUCTION_HELPER_SHA256, digest))

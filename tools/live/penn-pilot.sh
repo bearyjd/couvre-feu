@@ -254,10 +254,16 @@ cfp_run() {
     cfp_run_clock_failed=0
     cfp_run_mark=$CFR_STAGE/run.signalled
     rm -f "$cfp_run_mark"
-    cfr_helper_verify || return 126
+    if ! cfr_helper_verify; then
+        if [ "$CFP_MUTATED" = 1 ]; then cfp_stop SUPERVISOR "$CFR_HELPER_ERROR"
+        else cfr_refuse SUPERVISOR "$CFR_HELPER_ERROR"; fi
+    fi
+    case $CFR_SH in /*) ;; *)
+        if [ "$CFP_MUTATED" = 1 ]; then cfp_stop SUPERVISOR helper_shell_path
+        else cfr_refuse SUPERVISOR helper_shell_path; fi;;
+    esac
     CFP_RUN_LIVE=starting
-    # shellcheck disable=SC2086
-    ( trap - TERM; exec "$CFR_SETSID_HELPER" setsid $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
+    ( trap - TERM; exec "$CFR_SETSID_HELPER" setsid "$CFR_SH" "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
     cfp_run_pid=$!
     CFP_RUN_LIVE=$cfp_run_pid
     # Supervise in this shell: a watcher fork would briefly inherit default TERM before installing its trap.

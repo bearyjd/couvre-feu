@@ -110,6 +110,68 @@ def tearDownModule():
 
 
 class HelperPrerequisiteTests(unittest.TestCase):
+    def probe(self, setup='', helper_bytes=None, shell='/bin/sh'):
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        functions = template[template.index('cfr_helper_verify() {'):template.index('cfr_prereq() {')]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-prereq-') as temp:
+            stage = Path(temp)
+            helper = stage / 'router/lib/busybox-static'
+            helper.parent.mkdir(parents=True)
+            for directory in (stage, helper.parent.parent, helper.parent):
+                directory.chmod(0o700)
+            helper.write_bytes(helper_bytes if helper_bytes is not None else Path(shutil.which('busybox')).read_bytes())
+            helper.chmod(0o755)
+            script = ('cfr_refuse() { echo "$1 $2"; exit 10; }\n' + functions
+                      + 'CFR_FIXTURE=1\nCFR_STAGE=' + shlex.quote(str(stage))
+                      + '\nCFR_SH=' + shlex.quote(shell)
+                      + '\nCFR_SETSID_HELPER_SHA256=' + hashlib.sha256(helper.read_bytes()).hexdigest()
+                      + '\nCFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static\n' + setup
+                      + '\ncfr_helper_probe PREREQ\necho MUTATION_BEGIN\n')
+            return subprocess.run(['sh', '-c', script], text=True, capture_output=True, check=False)
+
+    def test_stage_and_ancestors_are_checked_before_hashing_every_time(self):
+        for directory, mode in (('$CFR_STAGE', '755'), ('$CFR_STAGE', '777'),
+                                ('$CFR_STAGE/router', '777'), ('$CFR_STAGE/router/lib', '755')):
+            with self.subTest(directory=directory, mode=mode):
+                done = self.probe('cfr_helper_verify || exit 90\n'
+                                  + f'chmod {mode} "{directory}"\n'
+                                  + 'sha256sum() { echo HASH_EXECUTED; return 1; }\n')
+                self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+
+    def test_unsafe_owner_is_refused_before_hashing(self):
+        done = self.probe('stat() { printf "99999:99999:700\\n"; }\n'
+                          'sha256sum() { echo HASH_EXECUTED; return 1; }\n')
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+
+    def test_symlinks_share_the_helper_hash_refusal(self):
+        for target in ('busybox-real', 'missing'):
+            done = self.probe('mv "$CFR_SETSID_HELPER" "$CFR_STAGE/router/lib/busybox-real"\n'
+                              + f'ln -s {target} "$CFR_SETSID_HELPER"\n')
+            self.assertEqual(done.returncode, 10)
+            self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+
+    def test_absent_helper_and_unexecutable_payload_have_distinct_refusals(self):
+        done = self.probe('rm "$CFR_SETSID_HELPER"\n')
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_missing')
+        done = self.probe(helper_bytes=b'\x7fELF\x00invalid-machine\n')
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_exec')
+
+    def test_absolute_shell_and_actual_proc_executable_are_required(self):
+        done = self.probe(shell='sh')
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_shell_path')
+        wrong_shell = b'#!/bin/sh\n[ "$1" != true ] || exit 0\nshift 2\nexec /bin/sh "$@"\n'
+        done = self.probe(helper_bytes=wrong_shell, shell=str(Path(shutil.which('busybox')).resolve()))
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_shell_executable')
+
+    def test_native_helper_uses_expected_shell(self):
+        done = self.probe()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.strip(), 'MUTATION_BEGIN')
+
     def test_wrong_helper_hash_refuses_before_execution_or_mutation(self):
         template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
         functions = template[template.index('cfr_helper_verify() {'):template.index('cfr_prereq() {')]
@@ -160,6 +222,29 @@ class VersionedIdentityTests(unittest.TestCase):
     def test_independent_live_verifier_accepts_version_two_emitted_bytes(self):
         self.tool.verify_release_identity(self.shipped)
 
+    def test_fixed_manifest_order_matches_the_freezer(self):
+        manifest_order = tuple(line.split('  ')[1] for line in
+                               self.shipped['router/release.sha256'].decode().splitlines())
+        self.assertEqual(self.tool.MANIFEST_FILES, manifest_order)
+
+    def test_freezer_refuses_drift_in_either_live_helper_pin(self):
+        live_dir = self.root / 'tools/live'
+        shutil.copytree(REPO / 'tools/live', live_dir)
+        try:
+            for name, override in (
+                    ('first-rehearsal.py', '\nsetsid_helper_pin = lambda bootstrap: "0" * 64\n'),
+                    ('penn_pilot_v2.py', '\nSETSID_HELPER_SHA256 = "0" * 64\n')):
+                path = live_dir / name
+                original = path.read_text()
+                path.write_text(original + override)
+                done = subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), '--check'],
+                                      capture_output=True, text=True, check=False)
+                path.write_text(original)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(name + ': helper pin differs from bootstrap', done.stderr)
+        finally:
+            shutil.rmtree(live_dir)
+
     def test_identity_covers_direct_installer_and_bootstrap_edits_despite_consistent_pins(self):
         for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             with self.subTest(rel=rel):
@@ -167,7 +252,7 @@ class VersionedIdentityTests(unittest.TestCase):
                 blobs['router/' + rel] += b'# direct source edit\n'
                 with self.assertRaises(self.tool.Refusal) as caught:
                     self.tool.verify_release_identity(self.repin(blobs))
-                self.assertIn('release id', str(caught.exception))
+                self.assertIn('helper hash' if rel == 'lib/busybox-static' else 'release id', str(caught.exception))
 
     def test_live_generated_fields_require_exactly_one_valid_assignment(self):
         fields = [(name, 'CF_BOOTSTRAP_PIN') for name in ('install.sh', 'uninstall.sh', 'cfctl')]
@@ -384,10 +469,28 @@ class LiveRehearsalTests(unittest.TestCase):
         # The installer alone resolves the SSH client with `ip neigh show ADDRESS`.
         return any(call['command'] == 'ip' and MGMT['ip'] in call['argv'] for call in self.fixture.calls())
 
+    def model_tmp_namespace_owner(self):
+        # Some namespaces map /tmp's owner differently from /. Model the
+        # target's root-owned sticky /tmp only in selected workflow fixtures.
+        # All other metadata and the dedicated unsafe-parent regressions stay real.
+        tmp, root = Path('/tmp').stat(), Path('/').stat()
+        if (tmp.st_uid, tmp.st_gid) != (root.st_uid, root.st_gid):
+            self.assertEqual(tmp.st_mode & 0o7777, 0o1777)
+            real_stat = shlex.quote(shutil.which('stat'))
+            stat_double = self.work / 'metadata-bin'
+            stat_double.mkdir()
+            program = stat_double / 'stat'
+            program.write_text('#!/bin/sh\n'
+                               'if [ "$#" = 3 ] && [ "$1" = -c ] && [ "$2" = "%u:%g:%a" ] && [ "$3" = /tmp ]; then\n'
+                               + f'    echo {root.st_uid}:{root.st_gid}:1777\nelse exec {real_stat} "$@"; fi\n')
+            program.chmod(0o700)
+            self.spec['env']['PATH'] = str(stat_double) + ':' + self.spec['env']['PATH']
+
     def test_happy_path_passes_and_restores_exactly(self):
+        self.model_tmp_namespace_owner()
         before = self.router_snapshot()
         code, out, err = self.execute()
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 0, out + err + (self.evidence() / 'stderr.log').read_text())
         self.assertEqual(self.router_snapshot(), before)
         run = self.evidence()
         self.assertEqual(run.stat().st_mode & 0o777, 0o700)

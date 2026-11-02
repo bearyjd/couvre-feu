@@ -25,9 +25,15 @@ fulfilment were not verified during this offline change.
 The fixed installed path is `/usr/lib/couvrefeu/busybox-static`, root:root0755,
 under the existing non-world-writable owned directory on persistent overlay.
 The install journal records prior absence or original bytes, mode, owner and
-exact mtime. Uninstall removes or restores the helper. Session launches use the
-release copy, which remains available until release retirement. SHA-256 is
-checked before helper execution. The 16-entry release closure binds the binary,
+exact mtime. Uninstall removes or restores the helper. Session launches check
+every source ancestor through `/` with the system metadata reader, then copy
+the helper into a fresh private directory under sticky `/tmp`. Only that copy
+is hashed, probed and executed, so uninstall cannot replace the executable
+between verification and launch. Unsafe writable ancestry is refused; this
+includes a release staged below a group-writable `/etc`. Install upgrades with
+an existing inventory that lacks helper backup records are refused before
+persistent admission; finish the old release's uninstall before a fresh install.
+The 16-entry release closure binds the binary,
 and a helper change requires a new release identity and review.
 
 Local/CI fixtures substitute an x86_64 BusyBox only in temporary staged source
