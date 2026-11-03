@@ -19,16 +19,45 @@ PRODUCTION_HELPER_SHA256 = 'c25f66e5ac29ea3e373b8fb2d3549a59d058fbef9ed11b67fdab
 LOCAL_HELPER_SHA256 = 'b9e75f97de336e3d04b7f07c2d213da779c6b2cf702ebf1935b4cd09c0b97ddb'
 X86_HELPER_SHA256 = 'afa625460bd5f4d1db52787dfd84e6c5b8126d7ab841b65cf61e410554edb60a'
 _SOURCES = {}
+_ADAPTER_HELPERS = {}
 
 
-def helper_binary():
+def helper_binary(environment=None):
     """Select an exact reviewed host artifact, never an arbitrary PATH wrapper."""
-    helper = Path(os.environ.get('CF_TEST_BUSYBOX') or shutil.which('busybox') or '')
+    environment = os.environ if environment is None else environment
+    helper = Path(environment.get('CF_TEST_BUSYBOX') or
+                  shutil.which('busybox', path=environment.get('PATH')) or '')
     digest = hashlib.sha256(helper.read_bytes()).hexdigest() if helper.is_file() else ''
     if digest not in (X86_HELPER_SHA256, LOCAL_HELPER_SHA256):
         raise AssertionError('tests require the hash-pinned x86_64 BusyBox 1.33.1 helper')
     subprocess.run([str(helper), 'true'], check=True, capture_output=True)
     return helper, digest
+
+
+def fixture_environment(environment):
+    """Bind requested CI applets before router entries replace the caller PATH."""
+    result = dict(environment)
+    requested = [(name, applet) for name, applet in
+                 (('CF_TEST_AWK', 'awk'), ('CF_TEST_TIMEOUT', 'timeout'))
+                 if result.get(name) == 'busybox ' + applet]
+    if not requested:
+        return result
+    selected = result.get('CF_TEST_BUSYBOX') or shutil.which('busybox', path=result.get('PATH'))
+    if not selected:
+        raise AssertionError('requested genuine BusyBox runtime is unavailable')
+    if selected not in _ADAPTER_HELPERS:
+        source, digest = helper_binary(result)
+        temporary = tempfile.TemporaryDirectory(prefix='couvre-feu-fixture-runtime-', dir='/tmp')
+        atexit.register(temporary.cleanup)
+        helper = Path(temporary.name) / 'busybox'
+        shutil.copyfile(source, helper)
+        helper.chmod(0o755)
+        if hashlib.sha256(helper.read_bytes()).hexdigest() != digest:
+            raise AssertionError('fixture runtime copy differs from the pinned BusyBox')
+        _ADAPTER_HELPERS[selected] = helper
+    for name, applet in requested:
+        result[name] = str(_ADAPTER_HELPERS[selected]) + ' ' + applet
+    return result
 
 
 def prepare_helper_release(root):

@@ -10,7 +10,7 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=710a91e071e2747f037e04c871290836797503431cf5c6faf971dc5572395f02
+CF_RELEASE_ID=7735cba86f2ca6486afd59e262cec71ee4dbfdc03a94336c9561d822155e5dee
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
@@ -287,7 +287,7 @@ trap "exit 143" TERM
 helper_cleanup || helper_fail
 exec "$@"'
     platform_helper_exec_pending=1
-    case "$platform_transaction_shell" in */busybox)
+    case "$platform_transaction_shell" in */busybox|*/busybox.static)
         exec "$platform_helper" setsid "$platform_transaction_shell" ash -c "$platform_helper_reexec" sh "$platform_helper_directory" "$platform_transaction_shell" ash "$0" --cf-transaction-session "$$" "$@";;
         *) exec "$platform_helper" setsid "$platform_transaction_shell" -c "$platform_helper_reexec" sh "$platform_helper_directory" "$platform_transaction_shell" "$0" --cf-transaction-session "$$" "$@";; esac
 }

@@ -323,7 +323,8 @@ class EmittedReleaseTreeTests(unittest.TestCase):
         self.assertEqual(self.result.stdout.strip(), release_id)
         # Independent version 2 oracle: explicit domain and path order, normalized generated fields.
         entries = ['couvrefeu-router-release-v2'] + ['lib/' + pair for pair in modules]
-        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh',
+                     'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             data = (self.out / name).read_bytes()
             if name in ('cfctl', 'install.sh', 'uninstall.sh'):
                 data = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data, flags=re.M)
@@ -491,10 +492,28 @@ class VersionedReleaseIdentityTests(unittest.TestCase):
             for rel in paths:
                 with self.subTest(rel=rel):
                     scratch.append('router/' + rel, '# identity perturbation\n')
-                    changed = scratch.run()
-                    self.assertEqual(changed.returncode, 0, changed.stderr)
-                    self.assertNotEqual(changed.stdout.strip(), baseline, rel)
-                    scratch.restore('router/' + rel)
+                    try:
+                        if rel == 'lib/busybox-static':
+                            # A changed helper must first fail its independent pin.
+                            # Repin only this disposable tree to then exercise the
+                            # release identity; these altered bytes are never run.
+                            refused = scratch.run()
+                            self.assertNotEqual(refused.returncode, 0)
+                            self.assertIn('pinned helper hash mismatch', refused.stderr)
+                            helper = scratch.root / 'router' / rel
+                            bootstrap = scratch.root / 'router/lib/platform-bootstrap.sh'
+                            pin = re.search(rb'^CF_SETSID_HELPER_SHA256=[0-9a-f]{64}$',
+                                            bootstrap.read_bytes(), re.M).group(0)
+                            scratch.replace('router/lib/platform-bootstrap.sh', pin,
+                                            b'CF_SETSID_HELPER_SHA256=' +
+                                            hashlib.sha256(helper.read_bytes()).hexdigest().encode())
+                        changed = scratch.run()
+                        self.assertEqual(changed.returncode, 0, changed.stderr)
+                        self.assertNotEqual(changed.stdout.strip(), baseline, rel)
+                    finally:
+                        scratch.restore('router/' + rel)
+                        if rel == 'lib/busybox-static' and 'router/lib/platform-bootstrap.sh' in scratch.originals:
+                            scratch.restore('router/lib/platform-bootstrap.sh')
                     self.assertEqual(scratch.run().stdout.strip(), baseline)
 
     def test_generated_fields_are_strict_before_any_write(self):

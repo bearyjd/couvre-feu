@@ -138,6 +138,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Install router-matching BusyBox for the marked runtime fixture
+        uses: ./.github/actions/pinned-busybox
       - uses: actions/setup-node@v4
         with:
           node-version: '26.8.1'

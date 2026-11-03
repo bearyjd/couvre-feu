@@ -21,7 +21,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 import overlay  # noqa: E402
-from pinned_helper import fixture_router
+from pinned_helper import fixture_environment, fixture_router
 FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/rpc.sh', 'usr/lib/couvrefeu/state.awk', 'usr/lib/couvrefeu/firewall.sh', 'usr/lib/couvrefeu/json.awk', 'usr/lib/couvrefeu/rules.awk', 'usr/lib/couvrefeu/install-common.sh', 'usr/sbin/cfctl', 'usr/sbin/cfctl-ssh', 'etc/firewall.couvrefeu',
          'etc/config/firewall', 'etc/sysupgrade.conf', 'etc/crontabs/root',
          'etc/couvrefeu/protected', 'etc/couvrefeu/state')
@@ -150,7 +150,7 @@ class RecoveryTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         # Permanent exclusion infrastructure survives ordinary uninstall.
         (self.root / '.couvrefeu-mutex').touch(mode=0o600)
-        self.env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root))
+        self.env = dict(fixture_environment(os.environ), CF_TEST_MODE='1', CF_ROOT=str(self.root))
         self.env.pop('SSH_CONNECTION', None)
         self.env.pop('SSH_CLIENT', None)
 
@@ -396,7 +396,7 @@ class LiveScopeRecoveryTests(unittest.TestCase):
         self.assertIn('invalid RPC scope', result.stderr)
 
 
-NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh', 'usr/lib/couvrefeu/busybox-static')
+NEW_FILES = FILES + ('usr/sbin/cfctl-scope', 'usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh', 'usr/lib/couvrefeu/busybox-static')
 
 
 class InstallerTests(unittest.TestCase):
@@ -1814,8 +1814,10 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
                          'usr/lib/couvrefeu/vendor-platform.sh',
                          'etc/couvrefeu/platform-profile',
                          'usr/lib/couvrefeu/activity.sh',
-                         # A legacy journal also predates the M1d per-admin scope wrapper.
-                         'usr/sbin/cfctl-scope')
+                         # A legacy journal also predates the M1d scope wrapper
+                         # and the journaled static session helper.
+                         'usr/sbin/cfctl-scope',
+                         'usr/lib/couvrefeu/busybox-static')
         for rel in FILES + adapter_files:
             key = rel.replace('/', '_')
             original = backup / (key + '.original')
@@ -1889,7 +1891,7 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
                 before_refusal = full_snapshot(self.root)
                 result = self.install('--activate')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn('recovery required; run ordinary uninstall', result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
                 self.assertEqual(full_snapshot(self.root), before_refusal)
                 self.env.pop('CF_TEST_UNINSTALL_FAIL_AFTER')
                 result = self.run_script('uninstall.sh')
@@ -2260,7 +2262,7 @@ class ReleaseRetirementTests(unittest.TestCase):
                 contextlib.closing(RouterFixture()) as fixture, contextlib.ExitStack() as stack:
             control = Path(folder)
             env = dict(fixture.env, CF_LOCK_PROBE=str(control), CF_TEST_INSTALL_KERNEL='1')
-            managed = (*NEW_FILES, 'usr/sbin/cfctl-scope', 'etc/couvrefeu/rpc-allowed')
+            managed = (*NEW_FILES, 'etc/couvrefeu/rpc-allowed')
             originals = {rel: exact_signature(fixture.root / rel) for rel in managed}
             kernel_before = fixture.backend()
             directories = {rel: (path.stat().st_mode & 0o7777, path.stat().st_uid, path.stat().st_gid)

@@ -26,7 +26,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
-from pinned_helper import fixture_source
+from pinned_helper import fixture_environment, fixture_source
 BB = shutil.which('busybox')
 if not BB and not os.environ.get('CF_TEST_SHELL'):
     raise SystemExit('Native BusyBox ash required: set CF_TEST_SHELL to its absolute binary and ash')
@@ -42,7 +42,7 @@ class StrictEntryTests(unittest.TestCase):
         self.expected_profile = 'strict'
         self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-platform-entry-')
         self.root = Path(self.tmp.name)
-        self.env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root))
+        self.env = fixture_environment(dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root)))
         for key in ['SSH_CONNECTION', 'SSH_CLIENT', 'LD_LIBRARY_PATH', 'LD_PRELOAD', 'LD_AUDIT']:
             self.env.pop(key, None)
         self.source = self.root / 'release'

@@ -119,10 +119,19 @@ class HelperSecurityTests(unittest.TestCase):
                          'identity=$(platform_process_identity "$$")\n'
                          'case "$identity" in *:"$$":"$$") ;; *) exit 91;; esac\n'
                          'printf "%s\\n" "$$"\n')
-        result = subprocess.run([*self.shell, str(entry)], env=self.env,
-                                capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().isdigit())
+        # /proc/PID/exe resolves the symlink to the upstream static artifact
+        # basename; reexec must still select its ash applet and preserve PID.
+        static_shell = self.root / 'busybox.static'
+        shutil.copyfile(self.helper, static_shell)
+        static_shell.chmod(0o755)
+        shell_link = self.root / 'busybox'
+        shell_link.symlink_to(static_shell)
+        for shell in (self.shell, [str(shell_link), 'ash']):
+            with self.subTest(shell=shell):
+                result = subprocess.run([*shell, str(entry)], env=self.env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.strip().isdigit())
 
     def helper_recording(self):
         record = self.root / 'private-directory'
