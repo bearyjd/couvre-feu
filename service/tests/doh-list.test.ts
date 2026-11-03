@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { createServer } from 'node:net';
+import { createServer, isIP } from 'node:net';
 import { once } from 'node:events';
 import { DOH_IPV4, DOH_IPV6, DOH_PROVIDERS, DOH_RETIRED_IPV4, DOH_RETIRED_IPV6, mergeStaticDoh, protectedAddressesOf, reconcileStaticDoh, unique } from '../src/doh-list.ts';
 import { integrationConfig } from '../src/integration-config.ts';
@@ -38,16 +38,17 @@ test('list invariants: sorted, unique, canonical, within the per-family cap', ()
     for (const retired of [DOH_RETIRED_IPV4, DOH_RETIRED_IPV6]) assert.ok(Object.isFrozen(retired));
 });
 
-test('Mullvad resolver addresses are present (published 2026-10-28; retire after 2026-11-02)', () => {
-    const mullvad = DOH_PROVIDERS.find(p => p.name === 'Mullvad DNS');
-    assert.ok(mullvad);
-    assert.match(mullvad.source, /^https:\/\/mullvad\.net\//);
-    for (const n of [2, 3, 4, 5, 6, 9]) {
-        assert.ok(DOH_IPV4.includes(`194.242.2.${n}`), `194.242.2.${n}`);
-        assert.ok(DOH_IPV6.includes(`2a07:e340::${n}`), `2a07:e340::${n}`);
+test('Mullvad resolver addresses are retired, valid, unique and absent from the active list', () => {
+    assert.ok(!DOH_PROVIDERS.some(p => p.name === 'Mullvad DNS'));
+    assert.deepEqual(DOH_RETIRED_IPV4, [2, 3, 4, 5, 6, 9].map(n => `194.242.2.${n}`));
+    assert.deepEqual(DOH_RETIRED_IPV6, [2, 3, 4, 5, 6, 9].map(n => `2a07:e340::${n}`));
+    for (const [retired, active, family] of [[DOH_RETIRED_IPV4, DOH_IPV4, 4], [DOH_RETIRED_IPV6, DOH_IPV6, 6]] as const) {
+        assert.equal(new Set(retired).size, retired.length);
+        for (const ip of retired) {
+            assert.equal(isIP(ip), family, ip);
+            assert.ok(!active.includes(ip), ip);
+        }
     }
-    assert.equal(mullvad.ipv4.length, 6);
-    assert.equal(mullvad.ipv6.length, 6);
 });
 
 test('unique: removes duplicates and sorts', () => {
@@ -153,8 +154,6 @@ test('reconcile: retired addresses are stripped whenever the flag is present, wh
         assert.ok(!out.ipv4.includes('198.51.100.9') && !out.ipv6.includes('2001:db8::9'), String(enabled));
         assert.ok(out.ipv4.includes('192.0.2.53'));
     }
-    assert.deepEqual(DOH_RETIRED_IPV4, []);
-    assert.deepEqual(DOH_RETIRED_IPV6, []);
 });
 
 function policyWith(doh: RouterPolicy['doh']): RouterPolicy {
@@ -191,6 +190,25 @@ test('flag on: the submitted policy and RPC envelope carry existing doh plus the
         }
         assert.equal(on.payload.pauses.length, 1, 'the requested change is still made');
     } finally { on.f.cleanup(); }
+});
+
+test('shipped Mullvad retirement reaches submitted policies and RPC envelopes only when the flag is present', async () => {
+    const unrelated = {ipv4: ['192.0.2.53'], ipv6: ['2001:db8::53']};
+    const held = {ipv4: [...DOH_RETIRED_IPV4, ...unrelated.ipv4], ipv6: [...DOH_RETIRED_IPV6, ...unrelated.ipv6]};
+    for (const enabled of [true, false, undefined]) {
+        const result = await queued(enabled === undefined ? undefined : {dohList: enabled}, held);
+        try {
+            const expectedDoh = enabled === undefined ? policyWith(held).doh : enabled ? {
+                ipv4: [...DOH_IPV4, ...unrelated.ipv4].sort(),
+                ipv6: [...DOH_IPV6, ...unrelated.ipv6].sort()
+            } : unrelated;
+            const expected = {...policyWith(held), revision: 2, pauses: [{person: 'pilot', until: 0}], doh: expectedDoh};
+            for (const policy of [result.payload, result.envelope.policy]) {
+                assert.deepEqual(policy, expected, `dohList=${String(enabled)}`);
+                assert.deepEqual(normalizePolicy(policy), policy);
+            }
+        } finally { result.f.cleanup(); }
+    }
 });
 
 test('flag on with a router-protected address equal to a list entry: that entry is not merged', async () => {
