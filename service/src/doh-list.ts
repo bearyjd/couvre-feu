@@ -32,14 +32,7 @@ export const DOH_PROVIDERS: readonly DohProvider[] = Object.freeze([
         ipv4: ['45.90.28.0', '45.90.30.0'], ipv6: ['2a07:a8c0::', '2a07:a8c1::']},
     {name: 'CleanBrowsing', source: 'https://cleanbrowsing.org/filters/', verified: '2026-10-27',
         ipv4: ['185.228.168.168', '185.228.169.168', '185.228.168.10', '185.228.169.11', '185.228.168.9', '185.228.169.9'],
-        ipv6: ['2a0d:2a00:1::', '2a0d:2a00:2::', '2a0d:2a00:1::1', '2a0d:2a00:2::1', '2a0d:2a00:1::2', '2a0d:2a00:2::2']},
-    // Mullvad's page says: "Please note that the public encrypted DNS service will be discontinued on November 2, 2026." (page last
-    // updated 2026-09-03). RETIRE after 2026-11-02: from 2026-11-03 move these into DOH_RETIRED_* (see docs/dns-hardening.md,
-    // "Planned retirement"), since a released address may be reused. The page lists exactly these six resolvers (dns, adblock, base,
-    // extended, family, all); 194.242.2.7/.8 are not listed.
-    {name: 'Mullvad DNS', source: 'https://mullvad.net/en/help/dns-over-https-and-dns-over-tls', verified: '2026-10-28',
-        ipv4: ['194.242.2.2', '194.242.2.3', '194.242.2.4', '194.242.2.5', '194.242.2.6', '194.242.2.9'],
-        ipv6: ['2a07:e340::2', '2a07:e340::3', '2a07:e340::4', '2a07:e340::5', '2a07:e340::6', '2a07:e340::9']}
+        ipv6: ['2a0d:2a00:1::', '2a0d:2a00:2::', '2a0d:2a00:1::1', '2a0d:2a00:2::1', '2a0d:2a00:1::2', '2a0d:2a00:2::2']}
 ].map(p => Object.freeze({...p, ipv4: Object.freeze([...p.ipv4]), ipv6: Object.freeze([...p.ipv6])})));
 
 export const unique = (items: readonly string[]): readonly string[] => Object.freeze([...new Set(items)].sort());
@@ -49,9 +42,11 @@ export const DOH_IPV6: readonly string[] = unique(DOH_PROVIDERS.flatMap(p => p.i
 /**
  * Every address this list ever shipped and later removed from the code. Append here (never delete) when an entry is dropped from
  * DOH_PROVIDERS, so the next policy operation with the flag present strips it from the router.
+ * Mullvad DNS retired 2026-11-03 after its announced 2026-11-02 shutdown; source verified 2026-10-28:
+ * https://mullvad.net/en/help/dns-over-https-and-dns-over-tls (see docs/dns-hardening.md).
  */
-export const DOH_RETIRED_IPV4: readonly string[] = Object.freeze([]);
-export const DOH_RETIRED_IPV6: readonly string[] = Object.freeze([]);
+export const DOH_RETIRED_IPV4: readonly string[] = Object.freeze(['194.242.2.2', '194.242.2.3', '194.242.2.4', '194.242.2.5', '194.242.2.6', '194.242.2.9']);
+export const DOH_RETIRED_IPV6: readonly string[] = Object.freeze(['2a07:e340::2', '2a07:e340::3', '2a07:e340::4', '2a07:e340::5', '2a07:e340::6', '2a07:e340::9']);
 
 const FAMILY_CAP = 256;
 export const DOH_CONFLICT_TAG = 'doh_list_protected_conflict';

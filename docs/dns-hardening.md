@@ -17,7 +17,7 @@ Not touched: dnsmasq, WAN, DHCP, adult or management traffic. The service refuse
 
 ## What is blocked
 
-NextDNS publishes no resolver addresses on a documentation page; its row below is vendor client source, not documentation. Exact resolver addresses (no ranges) of these providers, including their filtering variants and secondary addresses. NextDNS is blocked like the others (owner decision 2026-10-27).
+NextDNS publishes no resolver addresses on a documentation page; its row below is vendor client source, not documentation. Exact resolver addresses (no ranges) from seven providers: 32 IPv4 and 28 IPv6, including their filtering variants and secondary addresses. NextDNS is blocked like the others (owner decision 2026-10-27).
 
 | Provider | Source (official) | Verified |
 |---|---|---|
@@ -28,16 +28,15 @@ NextDNS publishes no resolver addresses on a documentation page; its row below i
 | AdGuard DNS default, non-filtering, family (IPv4 + IPv6) | https://adguard-dns.io/en/public-dns.html | 2026-10-27 |
 | NextDNS anycast 45.90.28.0, 45.90.30.0, 2a07:a8c0::, 2a07:a8c1:: | vendor client source: https://github.com/nextdns/nextdns/blob/9b004cccbccf01b0a3a4f502cd2b4298e88870c3/run.go (lines 612, 622, 623, 626; also config/config.go:141) | 2026-10-27 |
 | CleanBrowsing family, adult, security (IPv4 + IPv6) | https://cleanbrowsing.org/filters/ | 2026-10-27 |
-| Mullvad DNS dns, adblock, base, extended, family, all (IPv4 + IPv6; owner decision 2026-10-28) | https://mullvad.net/en/help/dns-over-https-and-dns-over-tls (shutdown announcement: https://mullvad.net/en/blog/shutting-down-our-public-encrypted-dns-servers-and-sponsoring-quad9-instead, 2026-09-03) | 2026-10-28 |
 
 Dropped, not included:
 
 - OpenDNS IPv6 (2620:119:35::35 and similar): the official support article now redirects and no current official page could be read.
 - NextDNS addresses seen only in forum posts (for example the `.63` addresses), and any /22 or /24 range.
 
-## Planned retirement: Mullvad
+## Retired: Mullvad (2026-11-03)
 
-Mullvad's page says: "Please note that the public encrypted DNS service will be discontinued on November 2, 2026." The addresses are listed anyway (owner decision 2026-10-28). After 2026-11-02, from 2026-11-03, move the twelve Mullvad addresses (194.242.2.{2,3,4,5,6,9} and 2a07:e340::{2,3,4,5,6,9}) out of `DOH_PROVIDERS` and into `DOH_RETIRED_IPV4/IPV6`, so the removal path strips them from routers: a released address that is reused by someone else would otherwise stay blocked for the kids. The removal only runs while the `dnsHardening` key is present in the manifest (`dohList:true` or `dohList:false`): with the key absent the policy is returned untouched, so a router that never had the key keeps whatever its `doh` list already holds. Mullvad's pages say nothing about what happens to the addresses after the shutdown, so the reuse risk is an assumption, not a statement from Mullvad. Add a retirement test when the move is made. Add a retirement test in that change (the retired addresses are absent from the list, present in `DOH_RETIRED_*`, and removed by `reconcileStaticDoh`).
+The twelve Mullvad resolver addresses (194.242.2.{2,3,4,5,6,9} and 2a07:e340::{2,3,4,5,6,9}) moved from `DOH_PROVIDERS` to `DOH_RETIRED_IPV4/IPV6` on 2026-11-03, after the announced 2026-11-02 shutdown. Sources, verified 2026-10-28: [resolver documentation](https://mullvad.net/en/help/dns-over-https-and-dns-over-tls) and [shutdown announcement](https://mullvad.net/en/blog/shutting-down-our-public-encrypted-dns-servers-and-sponsoring-quad9-instead) (2026-09-03). These addresses are no longer added to policies. With `dnsHardening.dohList` explicitly `true` or `false`, the next policy operation strips all twelve; with the key absent, existing `doh` entries remain untouched. This avoids continuing to block addresses that might later be reused; reuse is a risk assumption, not a statement from Mullvad.
 
 ## Turn on, turn off, rollback
 
@@ -47,9 +46,9 @@ Rollback: set `{"dohList": false}`. **Do not remove the key**: an absent key mea
 
 When an entry is dropped from the code, add it to the retired arrays in the same change, otherwise it stays on the router for good.
 
-The shipped `DOH_RETIRED_IPV4` / `DOH_RETIRED_IPV6` lists are empty today. Retired-entry stripping is therefore untested end-to-end until a first address is retired (the tests inject a retired set).
+The shipped `DOH_RETIRED_IPV4` / `DOH_RETIRED_IPV6` lists contain the six Mullvad addresses per family. Integration regressions use these shipped lists and check exact submitted policies and RPC envelopes with the flag on, off and absent, including preservation of unrelated addresses and policy fields. These local fixtures do not establish live packet behavior.
 
-Overlap with a hand-added entry: the router's `doh` list has no record of who added an entry. An address that was hand-added and is also equal to a list entry is indistinguishable from a list entry. With `dohList:false`, it is stripped like any list entry (`reconcileStaticDoh` drops every current list address, `service/src/doh-list.ts`). While the flag is on it is never removed. Do not hand-add resolver addresses that are on the static list; hand-add only addresses that are not on it, since those are the only ones the service never removes.
+Overlap with a hand-added entry: the router's `doh` list has no record of who added an entry. An address that was hand-added and is also equal to a list entry is indistinguishable from a list entry. With `dohList:false`, it is stripped like any list entry (`reconcileStaticDoh` drops every current list address, `service/src/doh-list.ts`). A retired address is stripped with either explicit flag value, even if it was hand-added. Do not hand-add resolver addresses that are on the static or retired lists; only addresses in neither list are preserved with either explicit flag value.
 
 The pilot tool `tools/live/penn-pilot.sh` does not interact with this list in normal use. Its measurement policy (`cfp_stage_json`, line ~1306) submits `"doh":{"ipv4":[],"ipv6":[]}` straight through `cfctl rpc-sync`, not through the service, so during its stages the `doh` list is empty by construction. The tool refuses to start unless the router reports revision 0 and no people (`activation_not_fresh`), so it cannot run against a router that carries a service-merged list in its accepted policy. Every path ends in `uninstall.sh`, an exact snapshot comparison and a teardown proof, so the pilot's install and policy state are removed afterwards. After that the router is a fresh install at revision 0, and the next service operation with the flag on merges the static list from an empty base (hand-added entries are not restored).
 
@@ -78,4 +77,4 @@ Kids' devices cannot ping or open web pages at the listed addresses (for example
 
 ## Before turning it on (enable gate)
 
-Do NOT turn the flag on until a live check on the real router shows that a policy of about 64 `doh` entries is accepted and that the rule applies to the kids' devices only. The owner decides when. The router must be re-measured live first: confirm that a policy with a full `doh` set (256 + 256 entries) is accepted, that the entries are enforced for the kids' devices only, and that adult and management traffic, DHCP and the WAN are unaffected. Until that is recorded, this feature is unverified on this router.
+Do NOT turn the flag on until a live check on the real router shows that a policy with the 60 active `doh` entries is accepted and that the rule applies to the kids' devices only. The owner decides when. The router must be re-measured live first: confirm that a policy with a full `doh` set (256 + 256 entries) is accepted, that the entries are enforced for the kids' devices only, and that adult and management traffic, DHCP and the WAN are unaffected. Until that is recorded, this feature is unverified on this router.
