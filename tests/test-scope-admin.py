@@ -782,7 +782,8 @@ class InstallerTests(ScopeCommon, unittest.TestCase):
     def test_release_manifest_lists_the_wrapper_and_is_frozen(self):
         names = [line.split()[1] for line in (REPO / 'router/release.sha256').read_text().splitlines()]
         self.assertIn('cfctl-scope', names)
-        self.assertEqual(len(names), 15)
+        self.assertIn('lib/busybox-static', names)
+        self.assertEqual(len(names), 16)
         result = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--check'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 

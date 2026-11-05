@@ -1651,20 +1651,31 @@ class PilotFixtureTests(PilotBase):
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
                                                dict(PENN, state='DELAY'), ipv6,
                                                dict(ip='2001:db8::99', mac='02:00:00:00:00:99', state='STALE')])
-        shell = shlex.split(self.spec['shell'])
-        program = shell[0]
         q = shlex.quote
-        real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
-        real_shell = ' '.join([real, *map(q, shell[1:])])
         rpc_log, accepted = self.work / 'rpc-count', self.work / 'accepted.json'
         reply = q('{"ok":false,"errors":["incomplete_transition_address_coverage"],"receipt":null}')
-        self.router_double(program, (
-            f'case " $* " in *{q(" " + cfctl + " rpc-sync ")}*)\n'
-            f'  cat >/dev/null; echo rpc-sync >> {q(str(rpc_log))}\n'
-            f'  {real_shell} {q(cfctl)} rpc-status --json > {q(str(accepted))}\n'
-            f'  echo {reply}\n'
-            '  exit 1;; esac\n'
-            f'exec {real} "$@"\n'))
+        # Children run as one absolute "$CFR_SH" under the pinned helper, never a PATH-selected shell, so a PATH
+        # double of the shell is never reached: instrument the disposable source's supervisor as status_double does.
+        source = SourceCopy()
+        self.addCleanup(source.tmp.cleanup)
+        self.tool = source.tool
+        self.model_tmp_namespace_owner()
+        wrapper = ('cfp_run() {\n'
+                   '    if [ "$3" = "$CFR_CFCTL" ] && [ "${4:-}" = rpc-sync ]; then\n'
+                   f'        echo rpc-sync >> {q(str(rpc_log))}\n'
+                   f'        cfp_fixture_run /dev/null "$2" "$CFR_CFCTL" rpc-status --json > {q(str(accepted))}\n'
+                   f'        echo {reply}\n'
+                   '        return 1\n'
+                   '    fi\n'
+                   '    cfp_fixture_run "$@"\n'
+                   '}\n')
+        path = source.root / 'tools/live/penn-pilot.sh'
+        text = path.read_text().replace('cfp_run() {\n', 'cfp_fixture_run() {\n', 1)
+        self.assertEqual(text.count('cfp_main </dev/null'), 1)
+        path.write_text(text.replace('cfp_main </dev/null', wrapper + '\ncfp_main </dev/null'))
+        subprocess.run(['git', '-C', str(source.root), '-c', 'user.name=fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qam', 'instrument fixture rpc-sync'],
+                       check=True, capture_output=True)
         before = self.router_snapshot()
         code, out, err = self.execute()
         stdout = (self.evidence() / 'stdout.log').read_text()
@@ -2174,7 +2185,8 @@ class PilotShellBase(PilotBase):
             directory.chmod(0o700)
         (home / 'ash').symlink_to(helper)
         # Supervision accepts one absolute executable, including in ash fixtures.
-        driver = re.sub(r"CFR_SH='busybox ash'", 'CFR_SH=' + shlex.quote(str(home / 'ash')), driver)
+        # sig_driver quotes `<path>/busybox ash` whole; it is the same pinned BusyBox, so it maps to $H/ash too.
+        driver = re.sub(r"CFR_SH='(?:[^'\n]*/)?busybox ash'", 'CFR_SH=' + shlex.quote(str(home / 'ash')), driver)
         driver = re.sub(r'CFR_SH=sh(?=[\n;])', 'CFR_SH=/bin/sh', driver)
         head += '\nCFR_SETSID_HELPER_SHA256=' + hashlib.sha256(helper.read_bytes()).hexdigest()
         (home / 'script.sh').write_text(head + '\n' + PRELUDE % {'h': shlex.quote(str(home)), 'driver': driver,
@@ -2757,7 +2769,8 @@ class PilotReviewFixTests(PilotShellBase):
         text = (REPO / 'tools/live/penn-pilot.sh').read_text()
         loose = [line for line in text.splitlines()
                  if not line.lstrip().startswith('#') and ('cfr_run_sh' in line or '$CFR_SH' in line)
-                 and 'exec "$CFR_SETSID_HELPER" setsid "$CFR_SH"' not in line]
+                 and 'exec "$CFR_SETSID_HELPER" setsid "$CFR_SH"' not in line
+                 and line.strip() != 'case $CFR_SH in /*) ;; *)']  # the absolute-path guard starts nothing
         self.assertEqual(loose, [])
 
     UNINSTALL_DRIVER = r'''
