@@ -159,7 +159,28 @@ def translate(command):
     command = re.sub(r'(^| )timeout (?=-s )', lambda m: m.group(1) + timeout + ' ', command)
     cfctl = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['cfctl']])
     wrapper = ' '.join(shlex.split(spec.get('shell', 'sh')) + [spec['leg2']['wrapper_scope']])
+    command = pin_helper_to_fixture(command)
     return command.replace('/usr/sbin/cfctl-scope', wrapper).replace('/usr/sbin/cfctl', cfctl)
+
+
+def pin_helper_to_fixture(command):
+    """Point the fixed leg supervisor's pinned-helper admission at the fixture root, as a remote sshd would see it.
+
+    The router's helper is /usr/lib/couvrefeu/busybox-static under root-owned ancestors; the fixture installs it (with
+    its test-only pin) under spec['cfctl']'s root, owned by this user. Only those paths and the owner change: the hash,
+    mode, link-count, /tmp and exec checks run unchanged (a namespace-mapped /tmp is modelled by the caller's
+    model_tmp_namespace_owner stat double). Every literal must match exactly once, so supervisor drift fails."""
+    if 'source=/usr/lib/couvrefeu/busybox-static' not in command:
+        return command
+    root = spec['cfctl'][:-len('/usr/sbin/cfctl')]
+    for old, new in (('source=/usr/lib/couvrefeu/busybox-static', f'source={root}/usr/lib/couvrefeu/busybox-static'),
+                     ('for parent in / /usr /usr/lib /usr/lib/couvrefeu;',
+                      f'for parent in {root} {root}/usr {root}/usr/lib {root}/usr/lib/couvrefeu;'),
+                     ('owner=0:0', f'owner={os.getuid()}:{os.getgid()}')):
+        if command.count(old) != 1:
+            sys.exit(f'fake-leg-ssh: leg supervisor literal changed: {old}')
+        command = command.replace(old, new)
+    return command
 
 
 def bridge(cfg, command):  # noqa: C901

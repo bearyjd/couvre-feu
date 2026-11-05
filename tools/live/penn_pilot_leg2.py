@@ -116,7 +116,7 @@ def check_leg(entry, expected, details, base):
         raise Refusal(f'leg {leg} timeout is not 1-120 seconds')
     template = entry.get('commandTemplate')
     argv = entry.get('sshArgv')
-    if (template != V2.remote_leg_command(form, op, seconds, LEG_KILL_GRACE_SECONDS) or not isinstance(argv, list)
+    if (template != V2.remote_leg_command(form, op, seconds, details['setsidHelperSha256'], LEG_KILL_GRACE_SECONDS) or not isinstance(argv, list)
             or argv[-1:] != [template]):
         raise Refusal(f'leg {leg} command is not the fixed text')
     if argv[:-1] != base[:-3] + ['-e', 'none', '-tt', base[-2]]:

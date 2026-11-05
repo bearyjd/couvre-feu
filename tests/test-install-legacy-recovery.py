@@ -85,7 +85,7 @@ class LegacyCompleteRecoveryTests(unittest.TestCase):
         attempted = self.run_current('install.sh', '--activate', '--source-dir', str(self.source),
                                      '--protect', '02:00:00:00:00:01')
         self.assertNotEqual(attempted.returncode, 0, attempted.stdout + attempted.stderr)
-        self.assertIn('legacy_installation_resume_refused', attempted.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', attempted.stderr)
         self.assertFalse((self.root / '.couvrefeu-prepared').exists())
         self.assertFalse((self.root / '.couvrefeu-transaction').exists())
         self.assertEqual(support.full_snapshot(self.root), before)

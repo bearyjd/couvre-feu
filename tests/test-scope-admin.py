@@ -33,6 +33,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, drain_full_stdout, policy, start_with_full_stdout  # noqa: E402
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 NEW = '02:00:00:00:00:03'
 NEW2 = '02:00:00:00:00:04'
@@ -82,7 +85,7 @@ class ScopeCommon:
         script_env = env or self.f.env
         if name == 'uninstall.sh':
             script_env = dict(script_env, CF_TEST_INSTALL_KERNEL='1')
-        return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *args],
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / name), *args],
                               env=script_env, capture_output=True, text=True, timeout=120)
 
     def install(self, *floor, unscoped=False):
@@ -116,7 +119,7 @@ class ScopeCommon:
         the child starts, so the read returns at once; stdout/stderr stay pipes so output is captured whole.
         It is not the child's controlling terminal (no job control, no XOFF): those are tested separately.
         """
-        command = self.f.shell + [str(REPO / 'router/cfctl'), *args]
+        command = self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args]
         if not tty:
             return subprocess.run(command, env=env or self.f.env, input=(confirm or '') + '\n',
                                   capture_output=True, text=True, timeout=timeout)
@@ -138,7 +141,7 @@ class ScopeCommon:
     def core_shell(self, body, *args, env=None, tty=True):
         """Source the real router modules over this fixture and run `body`, bypassing cfctl's early block."""
         prelude = ('set -f;PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;umask 077;CF_LOCAL_TEST=1;CF_BASE=$CF_ROOT\n'
-                   'CF_LIB=' + str(REPO / 'router/lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
+                   'CF_LIB=' + str(TEST_ROUTER / 'lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
                    'platform_entry_root_validate;platform_choose runtime "$CF_BASE"\n. "$CF_LIB/core.sh"\n'
                    'platform_admit runtime "$CF_BASE" "$CF_LIB"\n. "$CF_LIB/rpc.sh";. "$CF_LIB/firewall.sh";. "$CF_LIB/activity.sh"\n')
         command = self.f.shell + ['-c', prelude + body, 'core', *args]
@@ -451,7 +454,7 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
             master, slave = pty.openpty()
             os.write(master, (confirm + '\n').encode())
             self.addCleanup(os.close, master);self.addCleanup(os.close, slave)
-        child = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), *args],
+        child = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args],
                                  env=dict(env or self.f.env, CF_TEST_RPC_STOP=checkpoint),
                                  stdin=slave if slave is not None else subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -587,7 +590,7 @@ class FakeTargetMixin:
             environment.pop('SSH_ORIGINAL_COMMAND', None)
         else:
             environment['SSH_ORIGINAL_COMMAND'] = command
-        return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *argv], env=environment,
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / name), *argv], env=environment,
                               text=True, capture_output=True, timeout=10)
 
 
@@ -711,7 +714,7 @@ class AdminWrapperEndToEndTests(ScopeCommon, unittest.TestCase):
         target = self.f.bin / 'cfctl'
         keep = {k: v for k, v in self.f.env.items() if k.startswith('CF_') and k != 'CF_TEST_RPC_STOP'}
         exports = ''.join('export {}={}\n'.format(k, json.dumps(v)) for k, v in sorted(keep.items()))
-        target.write_text('#!/bin/sh\n' + exports + 'exec ' + ' '.join(self.f.shell) + ' ' + str(REPO / 'router/cfctl') + ' "$@"\n')
+        target.write_text('#!/bin/sh\n' + exports + 'exec ' + ' '.join(self.f.shell) + ' ' + str(TEST_ROUTER / 'cfctl') + ' "$@"\n')
         target.chmod(0o700)
 
     def via_wrapper(self, command, confirm=None):
@@ -720,7 +723,7 @@ class AdminWrapperEndToEndTests(ScopeCommon, unittest.TestCase):
         try:
             if confirm is not None:
                 os.write(master, (confirm + '\n').encode())
-            return subprocess.run(self.f.shell + [str(REPO / 'router/cfctl-scope'), ADMIN], env=env, stdin=slave,
+            return subprocess.run(self.f.shell + [str(TEST_ROUTER / 'cfctl-scope'), ADMIN], env=env, stdin=slave,
                                   capture_output=True, text=True, timeout=120)
         finally:
             os.close(slave);os.close(master)
@@ -779,7 +782,8 @@ class InstallerTests(ScopeCommon, unittest.TestCase):
     def test_release_manifest_lists_the_wrapper_and_is_frozen(self):
         names = [line.split()[1] for line in (REPO / 'router/release.sha256').read_text().splitlines()]
         self.assertIn('cfctl-scope', names)
-        self.assertEqual(len(names), 15)
+        self.assertIn('lib/busybox-static', names)
+        self.assertEqual(len(names), 16)
         result = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--check'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -805,7 +809,7 @@ class ScopeReviewFixTests(ScopeCommon, unittest.TestCase):
         self.before = self.f.durable_snapshot()
 
     def cfctl(self, *args):
-        return self.f.shell + [str(REPO / 'router/cfctl'), *args]
+        return self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args]
 
     def test_add_and_remove_are_refused_when_the_intent_cannot_be_logged(self):
         self.ok(self.add(NEW))
@@ -1083,7 +1087,7 @@ class ScopeStaticTests(unittest.TestCase):
                    'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00', '02:00:00:00:00:0A', '02:00:00:00:00:003', '2:00:00:00:00:03',
                    '02-00-00-00-00-03', '02:00:00:00:00', '02:00:00:00:00:03:', '', 'zz:00:00:00:00:00']
         valid = subprocess.run(['sh', '-c', 'CF_BASE=;. "$0";for s;do if cf_mac_valid "$s";then echo 1;else echo 0;fi;done',
-                                str(REPO / 'router/lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
+                                str(TEST_ROUTER / 'lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
         expected = valid.stdout.split()
         self.assertEqual(len(expected), len(samples), valid.stderr)
         self.assertEqual(expected[:3], ['1', '1', '1'])
@@ -1116,7 +1120,7 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
             os.write(master, (confirm + '\n').encode())
             stdin = slave
         try:
-            child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), *args], self.f.env, stdin)
+            child, read_end = start_with_full_stdout(self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args], self.f.env, stdin)
         finally:
             if slave is not None:
                 os.close(slave)
@@ -1163,7 +1167,7 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
             self.assertEqual(synced.returncode, 0, synced.stdout + synced.stderr)
         marker = self.f.root / 'rpc-stopped'
         marker.unlink(missing_ok=True)
-        parked = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'pause', 'alice'],
+        parked = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'pause', 'alice'],
                                   env=dict(self.f.env, CF_TEST_RPC_STOP='before_write'), stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.addCleanup(lambda: parked.poll() is None and (os.killpg(parked.pid, signal.SIGKILL), parked.wait()))
@@ -1192,7 +1196,7 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
         # HUP/TERM to the blocked one must not remove the other's cf_lock (nor close its flock).
         for signum, code in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
             with self.subTest(signal=signum):
-                child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), 'expire'], self.f.env)
+                child, read_end = start_with_full_stdout(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'expire'], self.f.env)
                 self.addCleanup(lambda c=child: c.poll() is None and (os.killpg(c.pid, signal.SIGKILL), c.wait()))
                 parked = self.parked_pause(first=signum == signal.SIGHUP)
                 held = (self.runtime / 'lock/pid').read_text()

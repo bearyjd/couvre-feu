@@ -26,6 +26,7 @@ spec = importlib.util.spec_from_file_location("install_fixture_support", REPO / 
 support = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(support)
 from harness import KID, PROTECTED, RouterFixture, dead_prefix
+from pinned_helper import fixture_environment
 primitive_spec = importlib.util.spec_from_file_location(
     "recovery_primitive_support", REPO / "tests/test-install-recovery-primitives.py")
 primitives = importlib.util.module_from_spec(primitive_spec)
@@ -984,6 +985,32 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assert_refused_without_changes(self.recover)
         self.assert_refused_without_changes(lambda: self.run_script("uninstall.sh"))
 
+    def test_ci_busybox_symlink_adapters_survive_pinned_path(self):
+        runtime_bin = self.root / "runtime-bin"
+        runtime_bin.mkdir()
+        (runtime_bin / "busybox").symlink_to(Path(self.busybox).resolve())
+        supplied = dict(self.env, PATH=str(runtime_bin),
+                        CF_TEST_AWK="busybox awk", CF_TEST_TIMEOUT="busybox timeout")
+        supplied.pop("CF_TEST_BUSYBOX", None)
+        normalized = fixture_environment(supplied)
+        for variable, arguments, output in (
+                ("CF_TEST_AWK", ["BEGIN {print 7}"], "7\n"),
+                ("CF_TEST_TIMEOUT", ["1", "true"], "")):
+            with self.subTest(variable=variable):
+                command = shlex.split(normalized[variable])
+                executable = Path(command[0])
+                self.assertEqual(executable.name, "busybox")
+                self.assertFalse(executable.is_symlink())
+                self.assertEqual(hashlib.sha256(executable.read_bytes()).digest(),
+                                 hashlib.sha256(Path(self.busybox).read_bytes()).digest())
+                result = subprocess.run(
+                    ["/bin/sh", "-c", 'PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; exec "$@"',
+                     "pinned-path", *command, *arguments],
+                    env=normalized, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, output)
+                self.assertEqual(supplied[variable], "busybox " + command[1])
+
     def test_killed_parent_with_live_copy_worker_refuses_until_worker_drains(self):
         before = self.originals_and_directories()
         entered_read, entered_write = os.pipe()
@@ -1001,8 +1028,14 @@ class InstallRecoveryTests(unittest.TestCase):
             "assert os.read(int(os.environ['CF_COPY_RELEASE']),1)==b'R'\n"
             "os.execv(" + repr(str(original_copy)) + ",['copy-original',*sys.argv[1:]])\n")
         wrapper = self.root / "bin/cp"
-        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -B "
-                           + shlex.quote(str(worker_script)) + ' "$@"\n')
+        # Helper admission copies its binary before acquiring the transaction
+        # mutex. Hold an installer staging copy, whose worker must inherit fd 9.
+        wrapper.write_text("#!/bin/sh\nfor destination do :; done\n"
+                           'case "$destination" in\n'
+                           '"$CF_ROOT"/.couvrefeu-stage.*/cfctl) exec '
+                           + shlex.quote(sys.executable) + " -B "
+                           + shlex.quote(str(worker_script)) + ' "$@";;\n'
+                           '*) exec ' + shlex.quote(str(original_copy)) + ' "$@";;\nesac\n')
         wrapper.chmod(0o700)
         self.env.update(CF_COPY_ENTERED=str(entered_write), CF_COPY_RELEASE=str(release_read))
         stream = os.fdopen(os.dup(entered_read), "rb", buffering=0)
@@ -1010,6 +1043,10 @@ class InstallRecoveryTests(unittest.TestCase):
         with self.running("install.sh", *self.install_arguments(),
                           pass_fds=(entered_write, release_read)) as (owner, workers):
             event = json.loads(primitives.Barrier(stream).line())
+            destination = Path(event["destination"])
+            self.assertEqual(destination.name, "cfctl")
+            self.assertEqual(destination.parent.parent, self.root)
+            self.assertTrue(destination.parent.name.startswith(".couvrefeu-stage."))
             worker_pid = event["pid"]
             identity = primitives.proc_identity(worker_pid)
             workers[worker_pid] = identity

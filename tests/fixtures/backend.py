@@ -135,7 +135,7 @@ def dispatch(command, args, state):
             reload_firewall(state)
             include_installed = state["uci"].get("firewall.couvrefeu.path") == "/etc/firewall.couvrefeu"
             if state.get("reload_include") and (command == "fw3" or include_installed):
-                core = Path(__file__).resolve().parents[2] / "router/cfctl"
+                core = Path(os.environ["CF_FIXTURE_ROUTER"]) / "cfctl"
                 shell = shlex.split(os.environ.get("CF_TEST_SHELL", "sh"))
                 result = subprocess.run(shell + [str(core), "apply-fw"], env=os.environ,
                                         text=True, capture_output=True, timeout=5)

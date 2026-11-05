@@ -2,6 +2,7 @@
 # shellcheck disable=SC2034,SC1090,SC1091
 # Default: validate/stage only. Installation requires explicit --activate.
 set -eu
+CF_ENTRY=install
 CF_ENTRY_SESSION_PID=
 if [ "${1:-}" = --cf-transaction-session ]; then
     [ "$#" -ge 2 ] || exit 2
@@ -67,7 +68,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=b7c8c195fe376ff049a9f98881ec3eae6c2c3be8c1af1ec74e8d6b33b886dc47
+CF_BOOTSTRAP_PIN=323dab4aee616df1b73d7fb94ab0b1782008b96ee7a903e85428817ba0a4398f
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -77,13 +78,23 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
-if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"; fi
+# Refuse helperless or pending recovery baselines before parsing their profile
+# records; old completion formats cannot authorize a helper-aware upgrade.
+platform_install_helper_inventory
+# Provisional selection applies the same ancestry trust model to session setup.
+# Admission reselects and validates all evidence before any protected write.
+platform_choose "$PLATFORM_SELECTION" "${CF_ROOT:-}"
+if [ "$ACTIVATE" = 1 ]; then platform_transaction_session "$@"
+else platform_setsid_helper; platform_helper_cleanup; fi
 if [ "${CF_TEST_MODE:-0}" = 1 ]; then
     case "$SOURCE" in "$CF_ROOT"/*|"$HERE") ;; *) fail 'fixture source outside isolated root';; esac
     [ "$(CDPATH='' cd -- "$SOURCE" && pwd -P)" = "$SOURCE" ] || fail 'fixture source must be canonical'
 else
     [ "$SOURCE" = "$HERE" ] || fail 'source must equal the verified release directory'
 fi
+if ! { [ -f "$SOURCE/lib/busybox-static" ] && [ ! -L "$SOURCE/lib/busybox-static" ]; }; then platform_fail helper_missing; fi
+source_helper_digest=$(timeout -s KILL 6 sha256sum "$SOURCE/lib/busybox-static") || platform_fail helper_hash
+[ "${source_helper_digest%% *}" = "$CF_SETSID_HELPER_SHA256" ] || platform_fail helper_hash
 platform_admit "$PLATFORM_SELECTION" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # shellcheck disable=SC1091
@@ -96,13 +107,12 @@ fi
 if ! { [ ! -f "$BACKUP/restoring" ] && [ ! -f "$BACKUP/restoring.next" ] && [ ! -f "$BACKUP/kernel-cleaned" ] && [ ! -f "$BACKUP/kernel-cleaned.next" ]; }; then
     fail 'uninstallation recovery is pending; finish uninstall before reinstalling'
 fi
-for file in cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh; do
+for file in cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/state.awk lib/firewall.sh lib/json.awk lib/rules.awk lib/install-common.sh lib/platform-bootstrap.sh lib/vendor-platform.sh lib/activity.sh lib/busybox-static; do
     if ! { [ -f "$SOURCE/$file" ] && [ ! -L "$SOURCE/$file" ]; }; then
         fail "missing/unsafe source: $file"
     fi
-    case "$file" in *.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
+    case "$file" in lib/busybox-static|*.awk) ;; *) sh -n "$SOURCE/$file" || fail "source shell syntax: $file";; esac
 done
-
 backend() {
     name=$1; shift
     if [ "${CF_TEST_MODE:-0}" = 1 ]; then
@@ -396,6 +406,7 @@ if [ ! -e "$BACKUP" ]; then
         cp "$STAGE/$k.mtime" "$BACKUP/$k.mtime"
         journal_crash "$k.mtime"
         case "$rel" in
+            usr/lib/couvrefeu/busybox-static) staged=lib/busybox-static;;
             usr/lib/couvrefeu/platform-bootstrap.sh) staged=lib/platform-bootstrap.sh;;
             usr/lib/couvrefeu/vendor-platform.sh) staged=lib/vendor-platform.sh;;
             etc/couvrefeu/platform-profile) staged=platform-profile;;
@@ -413,7 +424,8 @@ if [ ! -e "$BACKUP" ]; then
             etc/sysupgrade.conf) staged=sysupgrade;; etc/crontabs/root) staged=cron;;
             etc/couvrefeu/protected) staged=protected;; etc/couvrefeu/state) staged=state;;
         esac
-        case "$staged" in lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 644 "$BACKUP/$k.staged";;
+        case "$staged" in lib/busybox-static) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 755 "$BACKUP/$k.staged";;
+            lib/*) cp "$SOURCE/$staged" "$BACKUP/$k.staged"; journal_crash "$k.copied"; chmod 644 "$BACKUP/$k.staged";;
             *) cp -p "$STAGE/$staged" "$BACKUP/$k.staged";; esac
         journal_crash "$k.staged"
         signature "$BACKUP/$k.staged" > "$BACKUP/$k.after"

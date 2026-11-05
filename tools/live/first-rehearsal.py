@@ -37,8 +37,8 @@ RELEASE_MODULES = ('core.sh', 'rpc.sh', 'firewall.sh', 'install-common.sh', 'sta
 IDENTITY_FORMAT = 'couvrefeu-router-release-v2'
 BOUNDARY_PIN_FILES = ('install.sh', 'uninstall.sh', 'cfctl')
 # The router accepts exactly these manifest entries (platform-bootstrap.sh platform_external_closure).
-MANIFEST_FILES = ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope', 'lib/platform-bootstrap.sh',
-                  *('lib/' + name for name in RELEASE_MODULES))
+MANIFEST_FILES = ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope',
+                  *('lib/' + name for name in RELEASE_MODULES), 'lib/platform-bootstrap.sh', 'lib/busybox-static')
 # Tracked under router/ but neither in release.sha256 nor used by install.sh: never shipped.
 UNSHIPPED_ROUTER_FILES = ('router/cron', 'router/firewall.include')
 PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
@@ -326,6 +326,13 @@ def normalize_generated_field(data, path, field, value_pattern):
     return re.sub(rb'^' + key + rb'=.*$', key + b'=', data, flags=re.M)
 
 
+def setsid_helper_pin(bootstrap):
+    """The bootstrap declaration is the sole reviewed helper pin."""
+    normalize_generated_field(bootstrap, 'router/lib/platform-bootstrap.sh',
+                              'CF_SETSID_HELPER_SHA256', rb'[0-9a-f]{64}')
+    return re.search(rb'^CF_SETSID_HELPER_SHA256=([0-9a-f]{64})$', bootstrap, re.M)[1].decode('ascii')
+
+
 def verify_release_identity(shipped):
     """Independently verify version 2 identity and pins. Legacy identities cannot ship in new plans.
 
@@ -334,6 +341,8 @@ def verify_release_identity(shipped):
     try:
         pairs = [name + ':' + hashlib.sha256(shipped['router/lib/' + name]).hexdigest() for name in RELEASE_MODULES]
         bootstrap = shipped['router/lib/platform-bootstrap.sh']
+        if hashlib.sha256(shipped['router/lib/busybox-static']).hexdigest() != setsid_helper_pin(bootstrap):
+            raise Refusal('lib/busybox-static: pinned helper hash mismatch')
         normalized = {name: normalize_generated_field(shipped['router/' + name], 'router/' + name,
                       'CF_BOOTSTRAP_PIN', rb'[0-9a-f]{64}') for name in BOUNDARY_PIN_FILES}
         blanked = normalize_generated_field(bootstrap, 'router/lib/platform-bootstrap.sh', 'CF_RELEASE_ID', rb'[0-9a-f]{64}')
@@ -341,7 +350,7 @@ def verify_release_identity(shipped):
         normalized['lib/platform-bootstrap.sh'] = normalize_generated_field(
             blanked, 'router/lib/platform-bootstrap.sh', 'CF_RELEASE_MODULES', module_pattern)
         paths = ['lib/' + name for name in RELEASE_MODULES] + [
-            'cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh']
+            'cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static']
         lines = [IDENTITY_FORMAT] + [name + ':' + hashlib.sha256(
             normalized[name] if name in normalized else shipped['router/' + name]
         ).hexdigest() for name in paths]
@@ -374,7 +383,7 @@ def release_id(blobs):
 def payload_mode(rel):
     if rel == 'release.sha256':
         return '600'
-    if rel in ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'):
+    if rel in ('lib/busybox-static', 'install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'):
         return '755'
     return '644'
 
@@ -393,13 +402,17 @@ def payload_region(blobs):
     for path in files:
         data = tree[path[len('router/'):]][1]
         rel = path[len('router/'):]
-        if b'\0' in data or not data.endswith(b'\n') or not re.fullmatch(r'[A-Za-z0-9._/-]+', rel):
+        if (rel != 'lib/busybox-static' and (b'\0' in data or not data.endswith(b'\n'))) or not re.fullmatch(r'[A-Za-z0-9._/-]+', rel):
             raise Refusal(f'{path} cannot be embedded safely')
         digest = hashlib.sha256(data).hexdigest()
         delimiter = 'CF_FIRST_PAYLOAD_EOF_' + digest[:24]
         if delimiter.encode() in data:
             raise Refusal(f'{path} contains its delimiter')
         manifest.append(f'{digest} {payload_mode(rel)} {path}')
+        if rel == 'lib/busybox-static':
+            bodies.append(f'base64 -d > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
+                          + base64.encodebytes(data).decode('ascii') + delimiter + '\n')
+            continue
         bodies.append(f'cat > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
                       + data.decode('utf-8') + delimiter + '\n')
     text = '\n'.join(manifest) + '\n'
@@ -423,6 +436,7 @@ def build_payload(config, commit, blobs):
     roles = config['roles']
     values = {'CFR_SOURCE_COMMIT': commit, 'CFR_RELEASE_ID': release_id(blobs),
               'CFR_PROFILE': config['platformProfile'],
+              'CFR_SETSID_HELPER_SHA256': setsid_helper_pin(blobs['router/lib/platform-bootstrap.sh']),
               'CFR_MGMT_IP': roles['management']['ip'], 'CFR_MGMT_MAC': roles['management']['mac'],
               'CFR_JD_IP': roles['jd_adult']['ip'], 'CFR_JD_MAC': roles['jd_adult']['mac'],
               'CFR_PENN_IP': roles['penn_child']['ip'], 'CFR_PENN_MAC': roles['penn_child']['mac'],

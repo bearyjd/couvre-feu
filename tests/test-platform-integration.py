@@ -25,6 +25,8 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / 'tests/fixtures'))
+from pinned_helper import fixture_environment, fixture_source
 BB = shutil.which('busybox')
 if not BB and not os.environ.get('CF_TEST_SHELL'):
     raise SystemExit('Native BusyBox ash required: set CF_TEST_SHELL to its absolute binary and ash')
@@ -40,11 +42,11 @@ class StrictEntryTests(unittest.TestCase):
         self.expected_profile = 'strict'
         self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-platform-entry-')
         self.root = Path(self.tmp.name)
-        self.env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root))
+        self.env = fixture_environment(dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root)))
         for key in ['SSH_CONNECTION', 'SSH_CLIENT', 'LD_LIBRARY_PATH', 'LD_PRELOAD', 'LD_AUDIT']:
             self.env.pop(key, None)
         self.source = self.root / 'release'
-        shutil.copytree(REPO / 'router', self.source)
+        shutil.copytree(fixture_source(REPO) / 'router', self.source)
         self.backend = self.root / 'backend'
         self.backend.mkdir(mode=0o700)
         (self.backend / '.couvrefeu-test-backend').touch()
@@ -142,6 +144,7 @@ class StrictEntryTests(unittest.TestCase):
         os.mkfifo(fifo, 0o600)
         for symlink in [False, True]:
             with self.subTest(symlink=symlink):
+                done.unlink(missing_ok=True)
                 if symlink: done.symlink_to(fifo)
                 else: os.mkfifo(done, 0o600)
                 result = subprocess.run(SHELL+[str(self.source/'uninstall.sh')],
@@ -582,7 +585,7 @@ class OwnedRuntimeLockKillTests(unittest.TestCase):
         private = self.root / 'etc/couvrefeu'
         (private / 'state').unlink(); (private / 'protected').unlink(); private.rmdir()
         self.current = self.root / 'immutable-current-release'
-        shutil.copytree(REPO / 'router', self.current)
+        shutil.copytree(fixture_source(REPO) / 'router', self.current)
         self.current.chmod(0o700); (self.current / 'lib').chmod(0o700)
         self.fixture.env['CF_TEST_INSTALL_KERNEL'] = '1'
 
@@ -658,7 +661,7 @@ class SyntheticLegacyDowngradeRefusalTests(unittest.TestCase):
         self.firewall = self.root / 'etc/config/firewall'
         self.original = fixtures.exact_signature(self.firewall)
         self.current = self.root / 'immutable-current-release'
-        shutil.copytree(REPO/'router', self.current)
+        shutil.copytree(fixture_source(REPO)/'router', self.current)
         self.current.chmod(0o700); (self.current/'lib').chmod(0o700)
         self.fixture.env['CF_TEST_INSTALL_KERNEL'] = '1'
         options=['--activate','--protect',PROTECTED]
@@ -754,14 +757,14 @@ class VendorAdmissionTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.lib = self.root / 'lib'
         self.lib.mkdir(mode=0o700)
-        shutil.copytree(REPO / 'router/lib', self.lib, dirs_exist_ok=True)
+        shutil.copytree(fixture_source(REPO) / 'router/lib', self.lib, dirs_exist_ok=True)
         (self.root / 'tmp').mkdir(mode=0o1777)
         (self.root / 'tmp').chmod(0o1777)
         calls_dir = tempfile.TemporaryDirectory(prefix='couvre-feu-admission-calls-')
         self.addCleanup(calls_dir.cleanup)
         self.calls = Path(calls_dir.name) / 'calls'
         self.adapter = self.root / 'independent-adapter.sh'
-        source = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        source = (fixture_source(REPO) / 'router/lib/platform-bootstrap.sh').read_text()
         # Explicit fixture boundary changes are private to this copied adapter.
         # Production has no root/path/payload/attestation override variable.
         source = source.replace('/tmp/couvrefeu-platform.lock', str(self.root/'tmp/couvrefeu-platform.lock'))
@@ -792,7 +795,7 @@ class VendorAdmissionTests(unittest.TestCase):
 
     def test_actual_installed_core_subshell_reuses_one_admission(self):
         installed = self.root / 'usr/lib/couvrefeu'
-        shutil.copytree(REPO / 'router/lib', installed)
+        shutil.copytree(fixture_source(REPO) / 'router/lib', installed)
         installed.chmod(0o700)
         backend = self.root / 'backend'
         backend.mkdir(mode=0o700); (backend / '.couvrefeu-test-backend').touch()

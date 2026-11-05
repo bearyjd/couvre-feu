@@ -22,6 +22,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import REPO, RouterFixture
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 FIXED_OPTIONS = ['command="/usr/sbin/cfctl-ssh --rpc-only"', 'restrict', 'no-port-forwarding', 'no-agent-forwarding',
                  'no-X11-forwarding', 'no-pty']
@@ -108,7 +111,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
 
     def run_wrapper(self, command, *flags):
         environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND=command)
-        return subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), *flags],
+        return subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), *flags],
                               env=environment, text=True, capture_output=True, timeout=5)
 
     def service_commands(self):
@@ -157,7 +160,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
     def test_missing_original_command_is_an_interactive_shell_request(self):
         self.log.unlink(missing_ok=True)
         environment = {key: value for key, value in self.fixture.env.items() if key != 'SSH_ORIGINAL_COMMAND'}
-        result = subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), '--rpc-only'],
+        result = subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), '--rpc-only'],
                                 env=environment, text=True, capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.log.exists())
@@ -166,7 +169,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
         self.log.unlink(missing_ok=True)
         environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND='cfctl rpc-sync', CF_INHERITED_PROBE='leak',
                            SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22', SSH_CLIENT='192.0.2.1 1 22', ENV='/x', BASH_ENV='/x')
-        result = subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), '--rpc-only'],
+        result = subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), '--rpc-only'],
                                 env=environment, text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         child = json.loads(self.log.read_text())['env']
@@ -187,7 +190,7 @@ class RpcOnlyWrapperTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.log.unlink(missing_ok=True)
                 environment = dict(self.fixture.env, SSH_ORIGINAL_COMMAND='cfctl rpc-sync', **override)
-                result = subprocess.run(self.fixture.shell + [str(REPO / 'router/cfctl-ssh'), '--rpc-only'],
+                result = subprocess.run(self.fixture.shell + [str(TEST_ROUTER / 'cfctl-ssh'), '--rpc-only'],
                                         env=environment, text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(self.log.exists())
@@ -320,7 +323,8 @@ class EmittedReleaseTreeTests(unittest.TestCase):
         self.assertEqual(self.result.stdout.strip(), release_id)
         # Independent version 2 oracle: explicit domain and path order, normalized generated fields.
         entries = ['couvrefeu-router-release-v2'] + ['lib/' + pair for pair in modules]
-        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh',
+                     'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             data = (self.out / name).read_bytes()
             if name in ('cfctl', 'install.sh', 'uninstall.sh'):
                 data = re.sub(rb'^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data, flags=re.M)
@@ -350,7 +354,7 @@ class EmittedReleaseTreeTests(unittest.TestCase):
         for name in ('install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'):
             self.assertEqual(mode(self.out / name), 0o755, name)
         for path in sorted((self.out / 'lib').iterdir()):
-            self.assertEqual(mode(path), 0o644, path.name)
+            self.assertEqual(mode(path), 0o755 if path.name == 'busybox-static' else 0o644, path.name)
         self.assertEqual(mode(self.out / 'release.sha256'), 0o600)
 
 
@@ -488,10 +492,28 @@ class VersionedReleaseIdentityTests(unittest.TestCase):
             for rel in paths:
                 with self.subTest(rel=rel):
                     scratch.append('router/' + rel, '# identity perturbation\n')
-                    changed = scratch.run()
-                    self.assertEqual(changed.returncode, 0, changed.stderr)
-                    self.assertNotEqual(changed.stdout.strip(), baseline, rel)
-                    scratch.restore('router/' + rel)
+                    try:
+                        if rel == 'lib/busybox-static':
+                            # A changed helper must first fail its independent pin.
+                            # Repin only this disposable tree to then exercise the
+                            # release identity; these altered bytes are never run.
+                            refused = scratch.run()
+                            self.assertNotEqual(refused.returncode, 0)
+                            self.assertIn('pinned helper hash mismatch', refused.stderr)
+                            helper = scratch.root / 'router' / rel
+                            bootstrap = scratch.root / 'router/lib/platform-bootstrap.sh'
+                            pin = re.search(rb'^CF_SETSID_HELPER_SHA256=[0-9a-f]{64}$',
+                                            bootstrap.read_bytes(), re.M).group(0)
+                            scratch.replace('router/lib/platform-bootstrap.sh', pin,
+                                            b'CF_SETSID_HELPER_SHA256=' +
+                                            hashlib.sha256(helper.read_bytes()).hexdigest().encode())
+                        changed = scratch.run()
+                        self.assertEqual(changed.returncode, 0, changed.stderr)
+                        self.assertNotEqual(changed.stdout.strip(), baseline, rel)
+                    finally:
+                        scratch.restore('router/' + rel)
+                        if rel == 'lib/busybox-static' and 'router/lib/platform-bootstrap.sh' in scratch.originals:
+                            scratch.restore('router/lib/platform-bootstrap.sh')
                     self.assertEqual(scratch.run().stdout.strip(), baseline)
 
     def test_generated_fields_are_strict_before_any_write(self):

@@ -17,6 +17,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 spec = importlib.util.spec_from_file_location('core_model', Path(__file__).with_name('test-core.py'))
 model = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(model)
@@ -107,7 +110,7 @@ class TransitionTests(unittest.TestCase):
 
     def stop_at(self, checkpoint, args, raw=None):
         env = dict(self.f.env, CF_TEST_RPC_STOP=checkpoint)
-        process = subprocess.Popen(self.f.shell + [str(REPO / 'router' / args[0]), *args[1:]], env=env,
+        process = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / args[0]), *args[1:]], env=env,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         try:
@@ -129,12 +132,12 @@ class TransitionTests(unittest.TestCase):
 
     def install(self):
         env = dict(self.f.env, CF_TEST_INSTALL_KERNEL='1')
-        result = subprocess.run(self.f.shell + [str(REPO / 'router/install.sh'), '--activate', '--protect', PROTECTED],
+        result = subprocess.run(self.f.shell + [str(TEST_ROUTER / 'install.sh'), '--activate', '--protect', PROTECTED],
                                 env=env, capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def uninstall(self):
-        return subprocess.run(self.f.shell + [str(REPO / 'router/uninstall.sh')],
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / 'uninstall.sh')],
                               env=dict(self.f.env, CF_TEST_INSTALL_KERNEL='1'), capture_output=True, text=True, timeout=90)
 
     def test_corrupt_marker_blocks_uninstall_and_exact_retry_cleans_kernel(self):
@@ -210,7 +213,7 @@ class TransitionTests(unittest.TestCase):
                                '  fi\n done\nfi\n' + shlex.quote(busybox) + ' sync "$@" || exit $?\n'
                                'exec ' + ' '.join(map(shlex.quote, [*self.f.shell, str(delegate)])) + ' "$@"\n')
             wrapper.chmod(0o700)
-            result = subprocess.run(self.f.shell + [str(REPO / 'router/install.sh'), '--activate', '--protect', PROTECTED],
+            result = subprocess.run(self.f.shell + [str(TEST_ROUTER / 'install.sh'), '--activate', '--protect', PROTECTED],
                                     env=self.f.env, capture_output=True, text=True, timeout=90)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(fired.exists(), result.stdout + result.stderr)
@@ -280,8 +283,8 @@ class TransitionTests(unittest.TestCase):
                            'S\talice\tnoon\tTue\t12:00\t12:01\n'
                            'D4\t1.1.1.1\nD4\t9.9.9.9\nD6\t2001:db8::1\nD6\t2001:db8::2\n')
         env = dict(self.f.env, CF_PROBE_BUSYBOX=command[0], CF_PROBE_RECORD=str(records),
-                   CF_PROBE_CORE=str(REPO / 'router/lib/core.sh'), CF_PROBE_FIREWALL=str(REPO / 'router/lib/firewall.sh'),
-                   CF_PROBE_JSON=str(REPO / 'router/lib/json.awk'))
+                   CF_PROBE_CORE=str(TEST_ROUTER / 'lib/core.sh'), CF_PROBE_FIREWALL=str(TEST_ROUTER / 'lib/firewall.sh'),
+                   CF_PROBE_JSON=str(TEST_ROUTER / 'lib/json.awk'))
         script = '''awk() { "$CF_PROBE_BUSYBOX" awk "$@"; }
 . "$CF_PROBE_CORE"
 . "$CF_PROBE_FIREWALL"
@@ -465,7 +468,7 @@ printf '%s\\n' '-A example -m time --weekdays Sun,Wed,Mon --kerneltz -j DROP' | 
         doc = self.paused_policy(2)
         doc['doh']['ipv4'] = ['1.1.1.1']
         env = dict(self.f.env, CF_TEST_RPC_STOP='after_4_cf_fwd_R')
-        process = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'sync'], env=env,
+        process = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'sync'], env=env,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             process.stdin.write(json.dumps(doc)); process.stdin.close()

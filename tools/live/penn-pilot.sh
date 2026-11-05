@@ -223,12 +223,12 @@ cfp_elapsed_ok() {
 # (iptables -w, ipset, uci) that would otherwise defer the child's trap. Only if the child is still alive
 # CFP_KILL_GRACE seconds later is the group KILLed (exit 137), which skips those traps and can leave
 # /tmp/couvrefeu-platform.lock behind (cfp_stale_lock_check). Busybox timeout signals only its direct child and has no
-# -k, so this shell supervises the child with real uptime and one-second polls (up to 2 s total polling slack). The child is started by `exec setsid`: in a non-interactive shell the background
+# -k, so this shell supervises the child with real uptime and one-second polls (up to 2 s total polling slack). The child is started by `exec "$helper" setsid`: in a non-interactive shell the background
 # subshell is not a process-group leader, so setsid execs in place instead of forking (checked with util-linux and
 # busybox 1.33 setsid), the child keeps the pid $! reports and the pid cfctl records in the lock ($$), and the pid is
 # also the new group id. A setsid that did fork returns 0 in the parent at once while the child runs on detached:
 # cfp_run would lose the child group and cfctl would run unbounded, so cfp_baseline refuses such a
-# setsid before any mutation (setsid_forks). The group signal is `kill -TERM -PID` with no `--` (busybox 1.33 kill
+# setsid before any mutation (helper_setsid_forks). The group signal is `kill -TERM -PID` with no `--` (busybox 1.33 kill
 # rejects `--` as an invalid number and fails although it signals, so the fallback to the bare pid would always run
 # and deliver a second TERM that cuts the child's EXIT trap); the bare-pid fallback is only for a group that does not
 # exist. The subshell resets TERM because the teardown
@@ -254,9 +254,16 @@ cfp_run() {
     cfp_run_clock_failed=0
     cfp_run_mark=$CFR_STAGE/run.signalled
     rm -f "$cfp_run_mark"
+    if ! cfr_helper_verify; then
+        if [ "$CFP_MUTATED" = 1 ]; then cfp_stop SUPERVISOR "$CFR_HELPER_ERROR"
+        else cfr_refuse SUPERVISOR "$CFR_HELPER_ERROR"; fi
+    fi
+    case $CFR_SH in /*) ;; *)
+        if [ "$CFP_MUTATED" = 1 ]; then cfp_stop SUPERVISOR helper_shell_path
+        else cfr_refuse SUPERVISOR helper_shell_path; fi;;
+    esac
     CFP_RUN_LIVE=starting
-    # shellcheck disable=SC2086
-    ( trap - TERM; exec setsid $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
+    ( trap - TERM; exec "$CFR_SETSID_HELPER" setsid "$CFR_SH" "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
     cfp_run_pid=$!
     CFP_RUN_LIVE=$cfp_run_pid
     # Supervise in this shell: a watcher fork would briefly inherit default TERM before installing its trap.
@@ -362,15 +369,11 @@ cfp_dns() {
     printf '%s %s\n' "$cfp_r" "$((cfp_t1 - cfp_t0))"
 }
 cfp_baseline() {
-    for cfp_tool in ping nslookup timeout date setsid; do
+    for cfp_tool in ping nslookup timeout date; do
         command -v "$cfp_tool" >/dev/null 2>&1 || cfr_refuse BASELINE "missing_tool $cfp_tool"
     done
     cfp_cs >/dev/null || cfr_refuse BASELINE uptime_unreadable
-    # A forking setsid would let cfp_run return 0 at once with the child detached and unbounded: it must exec in place.
-    # shellcheck disable=SC2086
-    ( exec setsid $CFR_SH -c 'exit 7' ) </dev/null >/dev/null 2>&1 5>&- &
-    wait "$!"
-    [ "$?" = 7 ] || cfr_refuse BASELINE setsid_forks
+    cfr_helper_probe BASELINE
     cfp_crond_count baseline
     CFP_BASE_DNS_CS=0
     for cfp_i in 1 2 3; do

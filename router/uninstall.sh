@@ -30,7 +30,7 @@ cf_capture_entry_tick() {
     printf '%s\n' "$((cf_entry_seconds * 100 + cf_entry_fraction))"
 }
 CF_PLATFORM_ENTRY_TICK=$(cf_capture_entry_tick) || CF_PLATFORM_ENTRY_TICK=
-CF_BOOTSTRAP_PIN=b7c8c195fe376ff049a9f98881ec3eae6c2c3be8c1af1ec74e8d6b33b886dc47
+CF_BOOTSTRAP_PIN=323dab4aee616df1b73d7fb94ab0b1782008b96ee7a903e85428817ba0a4398f
 platform_bootstrap_path=$HERE/lib/platform-bootstrap.sh
 [ -f "$platform_bootstrap_path" ] && [ ! -L "$platform_bootstrap_path" ] && [ "$(CDPATH='' cd -- "${platform_bootstrap_path%/*}" && pwd -P)" = "${platform_bootstrap_path%/*}" ] || exit 2
 platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_path") || exit 2
@@ -40,7 +40,6 @@ platform_bootstrap_digest=$(timeout -s KILL 6 sha256sum "$platform_bootstrap_pat
 platform_deadline_check
 # END authenticated bootstrap boundary
 platform_entry_root_validate
-platform_transaction_session "$@"
 # The durable transaction owner names the profile it was admitted under, as
 # for `cfctl recover-install-lock`: a kill before the profile journal record
 # leaves no other evidence. Explicit selection still refuses any staged,
@@ -55,6 +54,8 @@ if [ -e "$platform_uninstall_owner" ] || [ -L "$platform_uninstall_owner" ]; the
     case "$platform_uninstall_selection" in strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1) ;;
         *) platform_fail transaction_owner_profile;; esac
 fi
+platform_choose "$platform_uninstall_selection" "${CF_ROOT:-}"
+platform_transaction_session "$@"
 platform_admit "$platform_uninstall_selection" "${CF_ROOT:-}" "$HERE/lib"
 [ "${CF_TEST_MODE:-0}" = 1 ] || platform_external_closure "$HERE"
 # Any complete authenticated external release is usable after a partial install.
@@ -157,7 +158,7 @@ release_retire_check() {
             else
                 release_hash=$(printf '%s\n' "$RETIRE_TARGET_PAIRS" | awk -v n="$name" '{for(i=1;i<=NF;i++){split($i,p,":");if(p[1]==n)print p[2]}}')
                 [ -n "$release_hash" ] || fail "unexpected recovery release entry: $name; preserved"
-                case "$name" in lib/*) release_mode=644;; *) release_mode=755;; esac
+                case "$name" in lib/busybox-static) release_mode=755;; lib/*) release_mode=644;; *) release_mode=755;; esac
             fi
             platform_regular "$entry"
             platform_private "$entry" "$release_mode"

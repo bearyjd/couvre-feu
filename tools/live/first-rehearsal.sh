@@ -13,6 +13,7 @@
 # @CF_GENERATED_PARAMETERS_BEGIN@
 CFR_SOURCE_COMMIT=
 CFR_RELEASE_ID=
+CFR_SETSID_HELPER_SHA256=
 CFR_PROFILE=
 CFR_MGMT_IP=
 CFR_MGMT_MAC=
@@ -31,9 +32,9 @@ CFR_LIVE_STATES='REACHABLE STALE DELAY'
 CFR_PRESENT_STATES='REACHABLE STALE DELAY PROBE PERMANENT'
 # Every path the installer may create or modify (router/install.sh and
 # router/lib/install-common.sh FILES, scoped and profile inventory).
-CFR_FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh usr/lib/couvrefeu/activity.sh usr/sbin/cfctl usr/sbin/cfctl-ssh usr/sbin/cfctl-scope etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state etc/couvrefeu/platform-profile etc/couvrefeu/rpc-allowed'
+CFR_FILES='usr/lib/couvrefeu/busybox-static usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh usr/lib/couvrefeu/activity.sh usr/sbin/cfctl usr/sbin/cfctl-ssh usr/sbin/cfctl-scope etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state etc/couvrefeu/platform-profile etc/couvrefeu/rpc-allowed'
 CFR_DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu etc/couvrefeu/backup etc/couvrefeu/runtime'
-CFR_RELEASE_FILES='install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh lib/activity.sh'
+CFR_RELEASE_FILES='lib/busybox-static install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh lib/activity.sh'
 
 # Durable phase log first, then best-effort stdout (EPIPE never aborts).
 cfr_out() {
@@ -79,7 +80,7 @@ cfr_cleanup() {
         done < "$CFR_STAGE/manifest"
     fi
     for cfr_name in manifest mtime-probe identity.neigh connectivity.neigh status.json snapshot.before snapshot.after \
-        phase.log child.log diff.txt \
+        phase.log child.log diff.txt ash busybox helper-shell \
         text.before.iptables text.before.ip6tables text.before.ipset text.before.ipsetsave text.before.uci text.before.cron \
         text.after.iptables text.after.ip6tables text.after.ipset text.after.ipsetsave text.after.uci text.after.cron; do
         rm -f "$CFR_STAGE/$cfr_name"
@@ -102,7 +103,7 @@ cfr_setup_paths() {
         CFR_INSTALL_LOCK=$CF_ROOT/.couvrefeu-install.lock
         CFR_STAGE_PARENT=$CF_ROOT
         CFR_STAGE_PREFIX=.couvrefeu-stage.
-        case "${CF_TEST_SHELL:-sh}" in sh) CFR_SH='sh';; 'busybox ash') CFR_SH='busybox ash';; *) return 1;; esac
+        case "${CF_TEST_SHELL:-sh}" in sh|'busybox ash') CFR_SH=/bin/sh;; *) return 1;; esac
     else
         [ -z "${CF_ROOT:-}${CF_BACKEND_DIR:-}" ] || return 1
         CFR_FIXTURE=0
@@ -122,10 +123,9 @@ cfr_setup_paths() {
 # Normal-PATH stat (coreutils-stat on the target); PREREQ proves its format.
 cfr_stat() { stat "$@"; }
 cfr_run_sh() {
-    # Deliberate split of the fixed shell selection ("busybox ash").
-    # Child diagnostics go to the stage log, never to the marker stream.
-    # shellcheck disable=SC2086
-    $CFR_SH "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
+    # A single absolute executable; children never resolve their shell through PATH.
+    case $CFR_SH in /*) ;; *) cfr_refuse SUPERVISOR helper_shell_path;; esac
+    "$CFR_SH" "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
 }
 
 cfr_extract() {
@@ -133,6 +133,7 @@ cfr_extract() {
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) CFR_STAGE=; cfr_refuse PAYLOAD staging_path_unexpected;; esac
     cfr_info "staging $CFR_STAGE"
     chmod 700 "$CFR_STAGE" || cfr_refuse PAYLOAD staging_mode
+    command -v base64 >/dev/null 2>&1 || cfr_refuse PAYLOAD missing_base64
     cfr_payload_extract || cfr_refuse PAYLOAD extraction_failed
     cfr_count=0
     while read -r cfr_sum cfr_mode cfr_path; do
@@ -144,6 +145,12 @@ cfr_extract() {
     done < "$CFR_STAGE/manifest"
     [ "$cfr_count" = "$CFR_PAYLOAD_COUNT" ] || cfr_refuse PAYLOAD manifest_count
     for cfr_dir in $CFR_PAYLOAD_DIRS; do chmod 700 "$CFR_STAGE/$cfr_dir" || cfr_refuse PAYLOAD directory_mode; done
+    if [ "$CFR_FIXTURE" = 1 ] && [ "${CF_TEST_SHELL:-sh}" = 'busybox ash' ]; then
+        # The entry re-exec recognizes BusyBox by its executable basename.
+        if ! { cp "$CFR_STAGE/router/lib/busybox-static" "$CFR_STAGE/busybox" &&
+            chmod 755 "$CFR_STAGE/busybox" && ln -s busybox "$CFR_STAGE/ash"; }; then cfr_refuse PAYLOAD fixture_shell; fi
+        CFR_SH=$CFR_STAGE/ash
+    fi
     cfr_ok PAYLOAD
 }
 
@@ -232,10 +239,62 @@ cfr_glob_count() {
     printf '%s\n' "$cfr_n"
 }
 
+# Verify before every execution, including each supervisor launch. Never run a bare PATH setsid.
+cfr_helper_verify() {
+    # Use the independently admitted stat primitive before hashing or executing the
+    # helper. The private stage closes replacement by another uid after this check.
+    cfr_helper_owner=0:0
+    CFR_HELPER_ERROR=helper_hash
+    if [ "${CFR_FIXTURE:-0}" = 1 ]; then cfr_helper_owner=$(id -u):$(id -g)
+    else
+        case $CFR_STAGE in /tmp/couvre-feu-first.??????) ;; *) return 1;; esac
+        [ -d /tmp ] && [ ! -L /tmp ] || return 1
+        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ] || return 1
+    fi
+    case $CFR_STAGE in /*) ;; *) return 1;; esac
+    [ -d "$CFR_STAGE" ] && [ ! -L "$CFR_STAGE" ] || return 1
+    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$CFR_STAGE")" = "$cfr_helper_owner:700" ] || return 1
+    for cfr_helper_parent in "$CFR_STAGE/router" "$CFR_STAGE/router/lib"; do
+        [ -d "$cfr_helper_parent" ] && [ ! -L "$cfr_helper_parent" ] || return 1
+        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$cfr_helper_parent")" = "$cfr_helper_owner:700" ] || return 1
+    done
+    [ "$CFR_SETSID_HELPER" = "$CFR_STAGE/router/lib/busybox-static" ] || return 1
+    if [ ! -e "$CFR_SETSID_HELPER" ] && [ ! -L "$CFR_SETSID_HELPER" ]; then
+        CFR_HELPER_ERROR=helper_missing
+        return 1
+    fi
+    [ -f "$CFR_SETSID_HELPER" ] && [ ! -L "$CFR_SETSID_HELPER" ] && [ -x "$CFR_SETSID_HELPER" ] || return 1
+    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$CFR_SETSID_HELPER")" = "$cfr_helper_owner:755" ] || return 1
+    cfr_helper_sum=$(sha256sum < "$CFR_SETSID_HELPER") || return 1
+    [ "${cfr_helper_sum%% *}" = "$CFR_SETSID_HELPER_SHA256" ]
+}
+cfr_helper_probe() {
+    CFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static
+    cfr_helper_verify || cfr_refuse "$1" "$CFR_HELPER_ERROR"
+    "$CFR_SETSID_HELPER" true </dev/null >/dev/null 2>&1 5>&- || cfr_refuse "$1" helper_exec
+    case $CFR_SH in /*) ;; *) cfr_refuse "$1" helper_shell_path;; esac
+    cfr_helper_shell=$(readlink -f "$CFR_SH") || cfr_refuse "$1" helper_shell_path
+    rm -f "$CFR_STAGE/helper-shell"
+    cfr_helper_verify || cfr_refuse "$1" "$CFR_HELPER_ERROR"
+    # The quoted program expands these variables in the supervised child.
+    # shellcheck disable=SC2016
+    ( exec "$CFR_SETSID_HELPER" setsid "$CFR_SH" -c '
+        printf "%s\n" "$$" > "$1"
+        readlink -f "/proc/$$/exe" >> "$1"
+        exit 7' helper-probe "$CFR_STAGE/helper-shell" ) </dev/null >/dev/null 2>&1 5>&- &
+    cfr_helper_pid=$!
+    wait "$cfr_helper_pid"
+    [ "$?" = 7 ] || cfr_refuse "$1" helper_setsid_forks
+    cfr_helper_expected=$(printf '%s\n%s' "$cfr_helper_pid" "$cfr_helper_shell")
+    [ "$(cat "$CFR_STAGE/helper-shell" 2>/dev/null)" = "$cfr_helper_expected" ] || cfr_refuse "$1" helper_shell_executable
+    rm -f "$CFR_STAGE/helper-shell"
+}
+
 cfr_prereq() {
     for cfr_tool in sha256sum awk sed sort cmp mktemp iptables-save ip6tables-save ipset uci ip; do
         command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
     done
+    cfr_helper_probe PREREQ
     cfr_od=$(command -v od) || cfr_refuse PREREQ od_missing
     cfr_stat_path=$(command -v stat) || cfr_refuse PREREQ stat_missing
     cfr_info "tools stat=$cfr_stat_path od=$cfr_od"

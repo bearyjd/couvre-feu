@@ -31,6 +31,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 from harness import RouterFixture  # noqa: E402
+from pinned_helper import helper_binary
 
 
 def load(name, path):
@@ -134,6 +135,7 @@ def good_probe(host):
 
 class PilotBase(unittest.TestCase):
     model_fresh_router = TLR.LiveRehearsalTests.model_fresh_router
+    model_tmp_namespace_owner = TLR.LiveRehearsalTests.model_tmp_namespace_owner
     truncating_cp = TLR.LiveRehearsalTests.truncating_cp
     write_agent = TLR.LiveRehearsalTests.write_agent
     provision_mutex = TLR.LiveRehearsalTests.provision_mutex
@@ -260,7 +262,7 @@ class PilotBase(unittest.TestCase):
     def plan_details(self, config_path):
         code, out, err = self.invoke('plan', config_path)
         self.assertEqual(code, 0, err)
-        return json.loads(out[:out.rindex('}') + 1])
+        return json.JSONDecoder().raw_decode(out)[0]
 
     def refused_before_ssh(self, config_path, reason):
         code, _, err = self.invoke('plan', config_path)
@@ -287,6 +289,32 @@ class PilotBase(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertTrue(runs[0].name.endswith('-penn-pilot'))
         return runs[0]
+
+
+class HelperPinBindingTests(unittest.TestCase):
+    def test_scope_legs_bind_the_payload_bootstrap_blob_without_import_time_reads(self):
+        with mock.patch.object(Path, 'read_text', side_effect=AssertionError('unexpected working-tree read')):
+            v2 = load('isolated_penn_v2', REPO / 'tools/live/penn_pilot_v2.py')
+        v2.bind(SOURCE.tool.FR)
+        config = {'roles': {v2.SCOPE_TARGET_ROLE: PHONE}}
+        argv = ['ssh', '-T', HOST, 'command']
+        for pin in ('1' * 64, '2' * 64):
+            blobs = {'router/lib/platform-bootstrap.sh': ('CF_SETSID_HELPER_SHA256=' + pin + '\n').encode()}
+            legs = v2.scope_legs(config, argv, blobs)
+            self.assertEqual(len(legs), len(v2.SCOPE_LEGS))
+            for leg in legs:
+                self.assertIn(pin, leg['commandTemplate'])
+                self.assertNotIn('@CF_SETSID_HELPER_SHA256@', leg['commandTemplate'])
+                self.assertEqual(leg['sshArgv'][-1], leg['commandTemplate'])
+
+    def test_scope_legs_refuse_malformed_payload_bootstrap_pin(self):
+        v2 = SOURCE.tool.V2
+        config = {'roles': {v2.SCOPE_TARGET_ROLE: PHONE}}
+        for declaration in ('CF_SETSID_HELPER_SHA256=bad\n',
+                            ('CF_SETSID_HELPER_SHA256=' + '1' * 64 + '\n') * 2):
+            with self.subTest(declaration=declaration), self.assertRaises(SOURCE.tool.Refusal):
+                v2.scope_legs(config, ['ssh', '-T', HOST, 'command'],
+                              {'router/lib/platform-bootstrap.sh': declaration.encode()})
 
 
 class PilotPlanTests(PilotBase):
@@ -1316,7 +1344,7 @@ class PilotConfigV2Tests(PilotBase):
             if leg['form'] == 'cfctl':
                 self.assertEqual(argv[6:], ['/usr/sbin/cfctl', leg['op'], '{MAC}', '--base', '{BASE}'])
             else:
-                self.assertEqual(argv[6:], ['env', f'SSH_ORIGINAL_COMMAND=cfctl {leg["op"]} {{MAC}} --base {{BASE}}',
+                self.assertEqual(argv[6:], ['/usr/bin/env', f'SSH_ORIGINAL_COMMAND=cfctl {leg["op"]} {{MAC}} --base {{BASE}}',
                                            '/usr/sbin/cfctl-scope', 'pilot'])
         base = details['sshArgv']
         for leg in legs:  # the leg-1 argv with `-e none -tt` for `-T`: no ssh escape character on the pty
@@ -1623,20 +1651,31 @@ class PilotFixtureTests(PilotBase):
         self.fixture.update_backend(neighbors=[dict(MGMT, state='REACHABLE'), dict(JD, state='STALE'),
                                                dict(PENN, state='DELAY'), ipv6,
                                                dict(ip='2001:db8::99', mac='02:00:00:00:00:99', state='STALE')])
-        shell = shlex.split(self.spec['shell'])
-        program = shell[0]
         q = shlex.quote
-        real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
-        real_shell = ' '.join([real, *map(q, shell[1:])])
         rpc_log, accepted = self.work / 'rpc-count', self.work / 'accepted.json'
         reply = q('{"ok":false,"errors":["incomplete_transition_address_coverage"],"receipt":null}')
-        self.router_double(program, (
-            f'case " $* " in *{q(" " + cfctl + " rpc-sync ")}*)\n'
-            f'  cat >/dev/null; echo rpc-sync >> {q(str(rpc_log))}\n'
-            f'  {real_shell} {q(cfctl)} rpc-status --json > {q(str(accepted))}\n'
-            f'  echo {reply}\n'
-            '  exit 1;; esac\n'
-            f'exec {real} "$@"\n'))
+        # Children run as one absolute "$CFR_SH" under the pinned helper, never a PATH-selected shell, so a PATH
+        # double of the shell is never reached: instrument the disposable source's supervisor as status_double does.
+        source = SourceCopy()
+        self.addCleanup(source.tmp.cleanup)
+        self.tool = source.tool
+        self.model_tmp_namespace_owner()
+        wrapper = ('cfp_run() {\n'
+                   '    if [ "$3" = "$CFR_CFCTL" ] && [ "${4:-}" = rpc-sync ]; then\n'
+                   f'        echo rpc-sync >> {q(str(rpc_log))}\n'
+                   f'        cfp_fixture_run /dev/null "$2" "$CFR_CFCTL" rpc-status --json > {q(str(accepted))}\n'
+                   f'        echo {reply}\n'
+                   '        return 1\n'
+                   '    fi\n'
+                   '    cfp_fixture_run "$@"\n'
+                   '}\n')
+        path = source.root / 'tools/live/penn-pilot.sh'
+        text = path.read_text().replace('cfp_run() {\n', 'cfp_fixture_run() {\n', 1)
+        self.assertEqual(text.count('cfp_main </dev/null'), 1)
+        path.write_text(text.replace('cfp_main </dev/null', wrapper + '\ncfp_main </dev/null'))
+        subprocess.run(['git', '-C', str(source.root), '-c', 'user.name=fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qam', 'instrument fixture rpc-sync'],
+                       check=True, capture_output=True)
         before = self.router_snapshot()
         code, out, err = self.execute()
         stdout = (self.evidence() / 'stdout.log').read_text()
@@ -1861,26 +1900,64 @@ class PilotFixtureTests(PilotBase):
         path.chmod(0o700)
 
     def status_double(self, rewrite, count, skip=0):
-        """Double of the fixture's CFR_SH program from PATH (`sh`, or `busybox` for `busybox ash`): logs every
-        `cfctl rpc-sync` and pipes `count` `cfctl status --json` replies after the first rpc-sync, from the
-        one after the first `skip`, through sed `rewrite`. Every call still runs the real cfctl exactly once."""
-        program = shlex.split(self.spec['shell'])[0]
+        """Instrument the disposable pilot's supervisor, preserving absolute shell execution.
+
+        Each real call runs once in the supervising shell; only the captured status
+        reply changes. No production hook or PATH-selected shell is involved.
+        """
+        source = SourceCopy()
+        self.addCleanup(source.tmp.cleanup)
+        self.tool = source.tool
+        self.model_tmp_namespace_owner()
         q = shlex.quote
-        real, cfctl = q(shutil.which(program)), str(self.root / 'usr/sbin/cfctl')
-        self.rpc_log, count_file = self.work / 'rpc-sync.log', self.work / 'status-rewrites'
-        self.router_double(program, (
-            f'case " $* " in\n'
-            f'  *{q(" " + cfctl + " rpc-sync ")}*) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
-            f'  *{q(" " + cfctl + " status --json ")}*)\n'
-            f'    n=$(cat {q(str(count_file))} 2>/dev/null || echo 0)\n'
-            f'    [ -s {q(str(self.rpc_log))} ] && echo $((n + 1)) > {q(str(count_file))}\n'
-            f'    if [ -s {q(str(self.rpc_log))} ] && [ "$n" -ge {skip} ] && [ "$n" -lt {skip + count} ]; then\n'
-            f'      out=$({real} "$@"); rc=$?\n'
-            f'      printf "%s\\n" "$out" | sed {q(rewrite)}\n'
-            f'      exit $rc\n'
-            f'    fi;;\n'
-            f'esac\n'
-            f'exec {real} "$@"\n'))
+        self.rpc_log = self.work / 'rpc-sync.log'
+        self.status_rewrite_log = self.work / 'rewritten-statuses'
+        count_file, response = self.work / 'status-rewrites', self.work / 'status-response'
+        self.status_wrapper = (
+            'cfp_run() {\n'
+            '    if [ "$3" = "$CFR_CFCTL" ]; then\n'
+            '        case ${4:-} in\n'
+            f'            rpc-sync) echo rpc-sync >> {q(str(self.rpc_log))};;\n'
+            '            status)\n'
+            f'                n=$(cat {q(str(count_file))} 2>/dev/null || echo 0)\n'
+            f'                [ ! -s {q(str(self.rpc_log))} ] || echo $((n + 1)) > {q(str(count_file))}\n'
+            f'                if [ -s {q(str(self.rpc_log))} ] && [ "$n" -ge {skip} ] && [ "$n" -lt {skip + count} ]; then\n'
+            f'                    echo "$n" >> {q(str(self.status_rewrite_log))}\n'
+            f'                    cfp_fixture_run "$@" > {q(str(response))}\n'
+            '                    cfp_fixture_rc=$?\n'
+            f'                    sed {q(rewrite)} {q(str(response))}\n'
+            '                    return "$cfp_fixture_rc"\n'
+            '                fi;;\n'
+            '        esac\n'
+            '    fi\n'
+            '    cfp_fixture_run "$@"\n'
+            '}\n')
+        path = source.root / 'tools/live/penn-pilot.sh'
+        text = path.read_text().replace('cfp_run() {\n', 'cfp_fixture_run() {\n', 1)
+        self.assertEqual(text.count('cfp_main </dev/null'), 1)
+        path.write_text(text.replace('cfp_main </dev/null', self.status_wrapper + '\ncfp_main </dev/null'))
+        subprocess.run(['git', '-C', str(source.root), '-c', 'user.name=fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qam', 'instrument fixture status'],
+                       check=True, capture_output=True)
+
+    def test_status_double_intercepts_once_and_preserves_supervisor_state_and_exit(self):
+        self.status_double(self.DRIFT, 1)
+        calls = self.work / 'real-status-calls'
+        script = ('CFR_CFCTL=/fixture/cfctl\nCFP_FIXTURE_CALLS=0\n'
+                  'cfp_fixture_run() { CFP_FIXTURE_CALLS=$((CFP_FIXTURE_CALLS + 1)); '
+                  + 'printf "%s\\n" ' + shlex.quote('{"ok":true,"drift":false,}') + '; return 7; }\n'
+                  + self.status_wrapper
+                  + 'cfp_run /dev/null 1 "$CFR_CFCTL" rpc-sync >/dev/null\n'
+                  + 'cfp_run /dev/null 1 "$CFR_CFCTL" status --json; echo RC:$?\n'
+                  + 'cfp_run /dev/null 1 "$CFR_CFCTL" status --json; echo RC:$?\n'
+                  + 'printf "%s" "$CFP_FIXTURE_CALLS" > ' + shlex.quote(str(calls)) + '\n')
+        done = subprocess.run(shlex.split(self.spec['shell']) + ['-c', script], capture_output=True, text=True, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), ['{"ok":false,"drift":true,}', 'RC:7',
+                                                  '{"ok":true,"drift":false,}', 'RC:7'])
+        self.assertEqual(calls.read_text(), '3')
+        self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertEqual(self.status_rewrite_log.read_text().splitlines(), ['0'])
 
     DRIFT = 's/"ok":true,/"ok":false,/;s/"drift":false,/"drift":true,/'
 
@@ -1910,6 +1987,7 @@ class PilotFixtureTests(PilotBase):
         self.assertEqual(code, 0, out + err + '\n'.join(stdout[-40:]))
         self.assertEqual(stdout[-1], 'PENN_PILOT_PASS')
         self.assertEqual(self.rpc_log.read_text().splitlines(), ['rpc-sync'])
+        self.assertEqual(self.status_rewrite_log.read_text().splitlines(), ['0'])
         self.assertTrue(any('"drift":true,' in line and line.startswith('INFO status ') for line in stdout))
         self.assertTrue(any(re.fullmatch(r'INFO status_settle ENROLL attempts=2 waited_s=[0-9]+', line) for line in stdout))
         self.assertTrue(any(line.startswith('INFO status_settle_neigh ENROLL attempt=2 ') for line in stdout))
@@ -2006,7 +2084,8 @@ H=%(h)s
 CFR_STAGE=$H/stage
 mkdir -p "$CFR_STAGE/pilot" "$H/root"
 CFP_DIR=$CFR_STAGE/pilot
-CFR_SH=sh
+CFR_SH=/bin/sh
+CFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static
 CFR_FIXTURE=1
 CFR_ROOT=$H/root
 CFR_START=$(date +%%s)
@@ -2097,6 +2176,19 @@ class PilotShellBase(PilotBase):
         home.mkdir()
         for name, text in (files or {}).items():
             (home / name).write_text(text)
+        helper, _ = helper_binary()
+        stage_helper = home / 'stage/router/lib/busybox-static'
+        stage_helper.parent.mkdir(parents=True)
+        shutil.copyfile(helper, stage_helper)
+        stage_helper.chmod(0o755)
+        for directory in (home / 'stage', stage_helper.parent.parent, stage_helper.parent):
+            directory.chmod(0o700)
+        (home / 'ash').symlink_to(helper)
+        # Supervision accepts one absolute executable, including in ash fixtures.
+        # sig_driver quotes `<path>/busybox ash` whole; it is the same pinned BusyBox, so it maps to $H/ash too.
+        driver = re.sub(r"CFR_SH='(?:[^'\n]*/)?busybox ash'", 'CFR_SH=' + shlex.quote(str(home / 'ash')), driver)
+        driver = re.sub(r'CFR_SH=sh(?=[\n;])', 'CFR_SH=/bin/sh', driver)
+        head += '\nCFR_SETSID_HELPER_SHA256=' + hashlib.sha256(helper.read_bytes()).hexdigest()
         (home / 'script.sh').write_text(head + '\n' + PRELUDE % {'h': shlex.quote(str(home)), 'driver': driver,
                                                                   'stop': self.STUB_STOP if stub_stop else ':'})
         env = {'PATH': os.environ['PATH'], 'LC_ALL': 'C', 'HOME': str(home)}
@@ -2677,7 +2769,8 @@ class PilotReviewFixTests(PilotShellBase):
         text = (REPO / 'tools/live/penn-pilot.sh').read_text()
         loose = [line for line in text.splitlines()
                  if not line.lstrip().startswith('#') and ('cfr_run_sh' in line or '$CFR_SH' in line)
-                 and 'exec setsid $CFR_SH' not in line]
+                 and 'exec "$CFR_SETSID_HELPER" setsid "$CFR_SH"' not in line
+                 and line.strip() != 'case $CFR_SH in /*) ;; *)']  # the absolute-path guard starts nothing
         self.assertEqual(loose, [])
 
     UNINSTALL_DRIVER = r'''
@@ -2941,8 +3034,8 @@ class PilotV2FixtureTests(PilotShellBase):
                          + f'{os.environ.get("CF_TEST_SHELL", "sh")} {shlex.quote(str(self.root / "usr/sbin/cfctl"))} "$@"\n')
         target.chmod(0o700)
         self.leg_log = self.work / 'legs.jsonl'
-        self.spec['env'].update(CFP_WRAPPER_DIR=str(REPO / 'router'))
-        self.spec['leg2'] = {'mode': 'fixture', 'wrapper_scope': str(REPO / 'router/cfctl-scope'), 'log': str(self.leg_log)}
+        self.spec['env'].update(CFP_WRAPPER_DIR=str(self.fixture.router))
+        self.spec['leg2'] = {'mode': 'fixture', 'wrapper_scope': str(self.fixture.router / 'cfctl-scope'), 'log': str(self.leg_log)}
         self.spec['leg_helper'] = str(REPO / 'tests/fake-leg-ssh.py')
         self.spec['cfctl'] = str(self.root / 'usr/sbin/cfctl')
 
@@ -3465,11 +3558,49 @@ class PilotHardeningT3cTests(PilotShellBase):
         return self.run_driver(driver, timeout=60)
 
     def test_a_forking_setsid_is_refused_before_any_mutation(self):
-        fake = 'printf "#!/bin/sh\\n( \\"\\$@\\" ) </dev/null >/dev/null 2>&1 &\\nexit 0\\n" > "$H/bin/setsid"; chmod +x "$H/bin/setsid"\n'
+        fake = ('printf \'#!/bin/sh\\nshift\\n( "$@" ) </dev/null >/dev/null 2>&1 &\\nexit 0\\n\' > "$CFR_SETSID_HELPER"\n'
+                'CFR_SETSID_HELPER_SHA256=$(sha256sum < "$CFR_SETSID_HELPER"); CFR_SETSID_HELPER_SHA256=${CFR_SETSID_HELPER_SHA256%% *}\n')
         done = self.baseline_run(fake)
-        self.assertIn('PHASE BASELINE FAIL setsid_forks', done.stdout, done.stdout + done.stderr)
+        self.assertIn('PHASE BASELINE FAIL helper_setsid_forks', done.stdout, done.stdout + done.stderr)
         self.assertIn('REFUSED_BEFORE_MUTATION BASELINE', done.stdout)
         self.assertEqual(done.returncode, 10)
+
+    def test_bad_helper_hash_refuses_before_execution_or_mutation(self):
+        done = self.baseline_run('echo bad >> "$CFR_SETSID_HELPER"\n')
+        self.assertEqual(done.returncode, 10)
+        self.assertIn('PHASE BASELINE FAIL helper_hash', done.stdout)
+        self.assertIn('REFUSED_BEFORE_MUTATION BASELINE', done.stdout)
+
+    def test_bad_helper_hash_leaves_no_live_child_state(self):
+        driver = ('echo bad >> "$CFR_SETSID_HELPER"\n'
+                  'cfp_run /dev/null 1 -c \'echo should_not_run\'; echo "RC:$? LIVE:$CFP_RUN_LIVE"\n')
+        done = self.run_driver(driver)
+        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+        self.assertIn('PHASE SUPERVISOR FAIL helper_hash', done.stdout)
+        self.assertNotIn('LIVE:starting', done.stdout)
+        self.assertNotIn('should_not_run', done.stdout)
+
+    def test_bad_helper_during_optional_call_stops_the_phase(self):
+        driver = ('CFP_MUTATED=1\necho bad >> "$CFR_SETSID_HELPER"\n'
+                  'cfp_run /dev/null 1 -c \'echo CHILD_STARTED\' || echo OPTIONAL_FAILURE_IGNORED\n'
+                  'echo NEXT_MUTATION\n')
+        done = self.run_driver(driver)
+        self.assertEqual(done.returncode, 77, done.stdout + done.stderr)
+        self.assertIn('STOP SUPERVISOR helper_hash', done.stdout)
+        self.assertNotIn('OPTIONAL_FAILURE_IGNORED', done.stdout)
+        self.assertNotIn('NEXT_MUTATION', done.stdout)
+        self.assertNotIn('CHILD_STARTED', done.stdout)
+
+    def test_helper_stage_drift_during_mutation_stops_before_launch(self):
+        done = self.run_driver('CFP_MUTATED=1\nchmod 777 "$CFR_STAGE"\n'
+                               'cfp_run /dev/null 1 -c \'echo CHILD_STARTED\'\n')
+        self.assertEqual(done.returncode, 77)
+        self.assertIn('STOP SUPERVISOR helper_hash', done.stdout)
+        self.assertNotIn('CHILD_STARTED', done.stdout)
+
+    def test_bare_setsid_is_never_used(self):
+        done = self.baseline_run('printf \'#!/bin/sh\\nexit 99\\n\' > "$H/bin/setsid"; chmod +x "$H/bin/setsid"\n')
+        self.assertIn('PHASE BASELINE OK', done.stdout, done.stdout + done.stderr)
 
     def test_an_in_place_setsid_passes_the_baseline_self_test(self):
         shells = [('sh', ''), ('sh', 'system')]
@@ -3480,7 +3611,7 @@ class PilotHardeningT3cTests(PilotShellBase):
                 setup = 'ln -sf "$(command -v busybox)" "$H/bin/setsid"\n' if applet == 'busybox' else ''
                 done = self.baseline_run(setup, shell=shell)
                 self.assertIn('PHASE BASELINE OK', done.stdout, done.stdout + done.stderr)
-                self.assertNotIn('setsid_forks', done.stdout)
+                self.assertNotIn('helper_setsid_forks', done.stdout)
 
     LOCK_NO_PID = '#!/bin/sh\ntrap \'\' TERM\nmkdir "$PLOCK"\nwhile :; do sleep 1; done >/dev/null 2>&1\n'
 

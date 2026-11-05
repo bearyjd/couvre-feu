@@ -15,6 +15,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 
 def scoped_policy(revision=1):
@@ -30,7 +33,7 @@ class RpcCommon:
         script_env = env or self.f.env
         if name == 'uninstall.sh':
             script_env = dict(script_env, CF_TEST_INSTALL_KERNEL='1')
-        return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *args],
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / name), *args],
                               env=script_env, capture_output=True, text=True, timeout=60)
 
     def observe(self, identifier=None):
@@ -605,7 +608,7 @@ class RpcTests(RpcCommon, unittest.TestCase):
         marker = self.f.root / 'rpc-stopped'
         marker.unlink(missing_ok=True)
         env = dict(self.f.env, CF_TEST_RPC_STOP=checkpoint)
-        child = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'rpc-sync'],
+        child = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'rpc-sync'],
                                  env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True, start_new_session=True)
         child.stdin.write(json.dumps(request));child.stdin.close();child.stdin = None
@@ -732,7 +735,7 @@ class RpcTests(RpcCommon, unittest.TestCase):
                 child.kill();child.communicate()
 
     def test_open_stdin_does_not_lock_expiry_and_crosses_uninstall(self):
-        child = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'rpc-sync'], env=self.f.env,
+        child = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'rpc-sync'], env=self.f.env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             child.stdin.write(json.dumps(self.request()));child.stdin.flush()
@@ -753,7 +756,7 @@ class RpcTests(RpcCommon, unittest.TestCase):
 
     def test_input_deadline_and_size_leave_state_unchanged(self):
         before = self.f.durable_snapshot();count = len(self.f.mutation_calls())
-        child = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), 'rpc-sync'], env=self.f.env,
+        child = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'rpc-sync'], env=self.f.env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         start = time.monotonic()
         try:
@@ -1165,7 +1168,7 @@ def stopped_at(fixture, checkpoint, *args, stdin=None):
     """Start cfctl with a fixture checkpoint; return once it is stopped there (60 s cap, not a fixed wait)."""
     marker = fixture.root / 'rpc-stopped'
     marker.unlink(missing_ok=True)
-    child = subprocess.Popen(fixture.shell + [str(REPO / 'router/cfctl'), *args], env=dict(fixture.env, CF_TEST_RPC_STOP=checkpoint),
+    child = subprocess.Popen(fixture.shell + [str(TEST_ROUTER / 'cfctl'), *args], env=dict(fixture.env, CF_TEST_RPC_STOP=checkpoint),
                              stdin=subprocess.PIPE if stdin is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, start_new_session=True)
     if stdin is not None:
@@ -1366,7 +1369,7 @@ class LiveScopeTests(ScopedRpcMixin, RpcCommon, unittest.TestCase):
                     self.assertEqual(len(self.f.mutation_calls()), count)
 
     def core(self, snippet, *args):
-        env = dict(self.f.env, CF_BASE=str(self.f.root), CF_LIB=str(REPO / 'router/lib'))
+        env = dict(self.f.env, CF_BASE=str(self.f.root), CF_LIB=str(TEST_ROUTER / 'lib'))
         return subprocess.run(self.f.shell + ['-c', '. "$CF_LIB/core.sh"; ' + snippet, 'sh', *map(str, args)],
                               env=env, capture_output=True, text=True, timeout=60)
 

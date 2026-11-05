@@ -43,7 +43,9 @@ class NoDevStdinTests(unittest.TestCase):
     def test_static_no_dev_fd_operands(self):
         pattern = re.compile(r'/dev/(stdin|fd)|/proc/self/fd')
         # Live tools run the same router shell remotely, so their scripts are in scope too.
-        files = [p for p in sorted((REPO / 'router').rglob('*')) if p.is_file()] + sorted((REPO / 'tools/live').glob('*.sh'))
+        files = [p for p in sorted((REPO / 'router').rglob('*'))
+                 if p.is_file() and p != REPO / 'router/lib/busybox-static']
+        files += sorted((REPO / 'tools/live').glob('*.sh'))
         self.assertIn(REPO / 'tools/live/penn-pilot.sh', files)
         hits = [f'{p.relative_to(REPO)}:{n}' for p in files
                 for n, line in enumerate(p.read_text(errors='replace').splitlines(), 1) if pattern.search(line)]
@@ -89,7 +91,9 @@ class NoDevStdinTests(unittest.TestCase):
         env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(root), PATH=f'{directory}:{os.environ["PATH"]}')
         env.pop('SSH_CONNECTION', None)
         env.pop('SSH_CLIENT', None)
-        result = subprocess.run(['sh', str(REPO / 'router/install.sh'), '--source-dir', str(REPO / 'router'),
+        from pinned_helper import fixture_source
+        router = fixture_source(REPO) / 'router'
+        result = subprocess.run(['sh', str(router / 'install.sh'), '--source-dir', str(router),
                                  '--protect', '02:00:00:00:00:01', '--rpc-allow', '02:00:00:00:00:02'], env=env, capture_output=True, text=True)
         self.assertNotIn('No such file', result.stderr)
         self.assertEqual(result.returncode, 0, result.stderr)
