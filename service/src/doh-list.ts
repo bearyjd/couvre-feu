@@ -42,9 +42,9 @@ export const DOH_IPV6: readonly string[] = unique(DOH_PROVIDERS.flatMap(p => p.i
 /**
  * Every address this list ever shipped and later removed from the code. Append here (never delete) when an entry is dropped from
  * DOH_PROVIDERS, so the next policy operation with the flag present strips it from the router.
+ * Mullvad DNS retired 2026-11-03 after its announced 2026-11-02 shutdown; source verified 2026-10-28:
+ * https://mullvad.net/en/help/dns-over-https-and-dns-over-tls (see docs/dns-hardening.md).
  */
-// Mullvad DNS retired 2026-11-03 after its announced 2026-11-02 shutdown; source verified 2026-10-28:
-// https://mullvad.net/en/help/dns-over-https-and-dns-over-tls (see docs/dns-hardening.md).
 export const DOH_RETIRED_IPV4: readonly string[] = Object.freeze(['194.242.2.2', '194.242.2.3', '194.242.2.4', '194.242.2.5', '194.242.2.6', '194.242.2.9']);
 export const DOH_RETIRED_IPV6: readonly string[] = Object.freeze(['2a07:e340::2', '2a07:e340::3', '2a07:e340::4', '2a07:e340::5', '2a07:e340::6', '2a07:e340::9']);
 

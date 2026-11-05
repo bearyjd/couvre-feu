@@ -194,7 +194,13 @@ test('flag on: the submitted policy and RPC envelope carry existing doh plus the
 
 test('shipped Mullvad retirement reaches submitted policies and RPC envelopes only when the flag is present', async () => {
     const unrelated = {ipv4: ['192.0.2.53'], ipv6: ['2001:db8::53']};
-    const held = {ipv4: [...DOH_RETIRED_IPV4, ...unrelated.ipv4], ipv6: [...DOH_RETIRED_IPV6, ...unrelated.ipv6]};
+    const retired = {
+        ipv4: ['194.242.2.2', '194.242.2.3', '194.242.2.4', '194.242.2.5', '194.242.2.6', '194.242.2.9'],
+        ipv6: ['2a07:e340::2', '2a07:e340::3', '2a07:e340::4', '2a07:e340::5', '2a07:e340::6', '2a07:e340::9']
+    };
+    for (const ip of retired.ipv4) assert.ok(DOH_RETIRED_IPV4.includes(ip), ip);
+    for (const ip of retired.ipv6) assert.ok(DOH_RETIRED_IPV6.includes(ip), ip);
+    const held = {ipv4: [...retired.ipv4, '1.0.0.1', ...unrelated.ipv4], ipv6: [...retired.ipv6, ...unrelated.ipv6]};
     for (const enabled of [true, false, undefined]) {
         const result = await queued(enabled === undefined ? undefined : {dohList: enabled}, held);
         try {
@@ -206,6 +212,11 @@ test('shipped Mullvad retirement reaches submitted policies and RPC envelopes on
             for (const policy of [result.payload, result.envelope.policy]) {
                 assert.deepEqual(policy, expected, `dohList=${String(enabled)}`);
                 assert.deepEqual(normalizePolicy(policy), policy);
+                if (enabled !== undefined) {
+                    for (const ip of retired.ipv4) assert.ok(!policy.doh.ipv4.includes(ip), ip);
+                    for (const ip of retired.ipv6) assert.ok(!policy.doh.ipv6.includes(ip), ip);
+                }
+                assert.equal(policy.doh.ipv4.includes('1.0.0.1'), enabled !== false);
             }
         } finally { result.f.cleanup(); }
     }
