@@ -123,6 +123,15 @@ def scripted(cfg, command):
     if cfg.get('stderr_line'):
         sys.stderr.write(cfg['stderr_line'] + '\n')  # the local client's own warning (it names the router)
         sys.stderr.flush()
+    if ('pre_prompt_reply' in cfg and
+            (not cfg.get('pre_prompt_reply_match') or re.search(cfg['pre_prompt_reply_match'], command))):
+        for part in cfg['pre_prompt_reply']:
+            sys.stdout.write(part)
+            sys.stdout.flush()
+            time.sleep(cfg.get('reply_part_delay', 0))
+        event('reply')
+        time.sleep(cfg.get('linger', 0))
+        sys.exit(cfg.get('reply_exit', 10))
     for line in cfg.get('before', []):
         print(line.replace('{mac}', mac), flush=True)
     text = cfg.get('prompt_text') or '%s %s --base %s\n%s' % (op, mac, base, PROMPT)

@@ -186,8 +186,34 @@ class RemoteLegSupervisionTests(L2.DriverBase):
         command = command.replace(__import__('hashlib').sha256(helper.read_bytes()).hexdigest(), '0' * 64)
         done = subprocess.run(['sh', '-c', command], capture_output=True, check=False)
         self.assertEqual(done.returncode, 10)
-        self.assertIn(b'HELPER_REFUSED helper_hash', done.stderr)
+        self.assertNotIn(b'HELPER_REFUSED', done.stderr)
+        self.assertEqual(done.stdout, b'{"ok":false,"errors":["helper_hash"]}\n')
         self.assertFalse(executed.exists())
+
+    def test_copy_failure_on_a_merged_remote_tty_preserves_only_the_fixed_refusal(self):
+        command = self.helper_command(self.details['legs'][0]['commandTemplate'])
+        bindir = self.work / 'copy-failure-bin'
+        bindir.mkdir()
+        copier = bindir / 'cp'
+        copier.write_text('#!/bin/sh\necho "private source 192.0.2.34" >&2\nexit 1\n')
+        copier.chmod(0o700)
+        executed = self.work / 'child-executed'
+        command = command.replace('/usr/sbin/cfctl', '/bin/touch ' + shlex.quote(str(executed)))
+        done = subprocess.run(['sh', '-c', command],
+                              env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH']),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout, b'{"ok":false,"errors":["helper_hash"]}\n')
+        self.assertFalse(executed.exists())
+        self.assertEqual(list(self.work.glob('couvrefeu-leg.*.*')), [])
+
+    def test_missing_helper_refuses_with_the_fixed_reply_before_execution(self):
+        command = self.helper_command(self.details['legs'][0]['commandTemplate'])
+        (self.work / 'busybox-static').unlink()
+        done = subprocess.run(['sh', '-c', command], capture_output=True, check=False)
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout, b'{"ok":false,"errors":["helper_missing"]}\n')
+        self.assertNotIn(b'HELPER_REFUSED', done.stderr)
 
     def test_stale_stage_sweep_reclaims_dead_owner_and_preserves_active_or_unsafe_entries(self):
         dead_pid = 2147483647
@@ -221,7 +247,8 @@ class RemoteLegSupervisionTests(L2.DriverBase):
         os.link(self.work / 'busybox-static', self.work / 'helper-alias')
         done = subprocess.run(['sh', '-c', command], capture_output=True, check=False)
         self.assertEqual(done.returncode, 10)
-        self.assertIn(b'HELPER_REFUSED helper_hash', done.stderr)
+        self.assertNotIn(b'HELPER_REFUSED', done.stderr)
+        self.assertEqual(done.stdout, b'{"ok":false,"errors":["helper_hash"]}\n')
 
     def test_unsafe_source_parent_refuses_before_hash_or_execution(self):
         command = self.helper_command(self.details['legs'][0]['commandTemplate'])
@@ -239,7 +266,8 @@ class RemoteLegSupervisionTests(L2.DriverBase):
         finally:
             self.work.chmod(0o700)
         self.assertEqual(done.returncode, 10)
-        self.assertIn(b'HELPER_REFUSED helper_hash', done.stderr)
+        self.assertNotIn(b'HELPER_REFUSED', done.stderr)
+        self.assertEqual(done.stdout, b'{"ok":false,"errors":["helper_hash"]}\n')
         self.assertFalse(hashed.exists(), 'unsafe ancestry reached the helper hash')
 
     def test_wrong_architecture_is_an_explicit_helper_execution_refusal(self):
@@ -249,7 +277,8 @@ class RemoteLegSupervisionTests(L2.DriverBase):
         done = subprocess.run(['sh', '-c', self.helper_command(self.details['legs'][0]['commandTemplate'], helper)],
                               capture_output=True, check=False)
         self.assertEqual(done.returncode, 10)
-        self.assertIn(b'HELPER_REFUSED helper_exec', done.stderr)
+        self.assertNotIn(b'HELPER_REFUSED', done.stderr)
+        self.assertEqual(done.stdout, b'{"ok":false,"errors":["helper_exec"]}\n')
 
     def test_private_helper_survives_source_replacement_and_is_cleaned(self):
         command = self.helper_command(self.details['legs'][0]['commandTemplate'])

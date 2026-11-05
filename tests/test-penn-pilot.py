@@ -3571,6 +3571,19 @@ class PilotHardeningT3cTests(PilotShellBase):
         self.assertIn('PHASE BASELINE FAIL helper_hash', done.stdout)
         self.assertIn('REFUSED_BEFORE_MUTATION BASELINE', done.stdout)
 
+    def test_leg_supervisor_refusals_emit_only_fixed_codes_and_cannot_continue_to_mutation(self):
+        supervisor = self.tool.V2.LEG_SUPERVISOR
+        refusal = next(line for line in supervisor.splitlines() if line.startswith('refuse()'))
+        codes = set(re.findall(r'\brefuse (helper_[a-z_]+)', supervisor))
+        self.assertEqual(codes, {'helper_missing', 'helper_hash', 'helper_exec'})
+        for code in sorted(codes):
+            with self.subTest(code=code):
+                done = subprocess.run(['sh', '-c', refusal + f'\nrefuse {code}\necho NEXT_MUTATION\n'],
+                                      capture_output=True, text=True, check=False)
+                self.assertEqual(done.returncode, 10)
+                self.assertEqual(done.stdout, f'{{"ok":false,"errors":["{code}"]}}\n')
+                self.assertEqual(done.stderr, '')
+
     def test_bad_helper_hash_leaves_no_live_child_state(self):
         driver = ('echo bad >> "$CFR_SETSID_HELPER"\n'
                   'cfp_run /dev/null 1 -c \'echo should_not_run\'; echo "RC:$? LIVE:$CFP_RUN_LIVE"\n')

@@ -281,6 +281,50 @@ class DriverTests(DriverBase):
                 self.assertFalse(leg['confirmationSent'], name)
                 self.assertEqual(self.received(), [], name)
 
+    def test_fixed_helper_refusals_stop_before_confirmation_and_before_the_leg_deadline(self):
+        for code in ('helper_missing', 'helper_hash', 'helper_exec'):
+            with self.subTest(code=code):
+                self.legs_log.unlink(missing_ok=True)
+                self.ssh_log.unlink(missing_ok=True)
+                reply = f'{{"ok":false,"errors":["{code}"]}}\n'
+                self.drive([marker()] + gone(), child=str(self.pidfile),
+                           pre_prompt_reply=[reply[:10], reply[10:-1], reply[-1:]], reply_part_delay=0.1, linger=300)
+                (leg,) = self.legs()
+                self.assertEqual((leg['outcome'], leg['ok'], leg['errors'], leg['confirmationSent']),
+                                 ('helper_refused', False, [code], False))
+                self.assertLess(leg['seconds'], 2)
+                self.assertLess(self.elapsed, LEG_SECONDS)
+                self.assertEqual(self.received(), [])
+                self.child_dead()
+                self.assertIn(f'STOP SCOPE-ADD-1 {code}', (self.work / 'stdout.log').read_text())
+
+    def test_helper_refusal_on_the_wrapper_add_records_the_scope_add_two_stop_and_blocks_later_legs(self):
+        script = [marker(), [0, '@wait exit 1'], marker('2b', BASE2), [0, '@wait exit 2'], marker('2c')]
+        script += [[0, '@wait reply 3'], [0.2, f'CFP_LEG2_READY 2d {BASE2}']] + gone()
+        self.drive(script, child=str(self.pidfile), pre_prompt_reply=['{"ok":false,"errors":["helper_hash"]}\n'],
+                   pre_prompt_reply_match=r"SSH_ORIGINAL_COMMAND='cfctl scope-add")
+        self.assertEqual(len(self.leg_calls()), 3)
+        leg = self.legs()[-1]
+        self.assertEqual((leg['leg'], leg['outcome'], leg['errors'], leg['confirmationSent']),
+                         ('2c', 'helper_refused', ['helper_hash'], False))
+        self.assertIn('STOP SCOPE-ADD-2 helper_hash', (self.work / 'stdout.log').read_text())
+        self.assertLess(leg['seconds'], 2)
+        self.child_dead()
+
+    def test_malformed_or_free_text_pre_prompt_refusals_never_become_reason_codes(self):
+        replies = ['HELPER_REFUSED helper_hash\n', '{"ok":false,"errors":["private address 192.0.2.34"]}\n',
+                   '{"ok":false,"errors":["helper_hash"]', '{"ok":true,"errors":["helper_hash"]}\n',
+                   '{"ok":false,"errors":["helper_hash"],"private":"192.0.2.34"}\n',
+                   '{"ok":false,"errors":["helper_unknown"]}\n']
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.drive([marker()] + gone(), child=str(self.pidfile), pre_prompt_reply=[reply], linger=300)
+                (leg,) = self.legs()
+                self.assertEqual((leg['errors'], leg['confirmationSent'], leg['ok']), ([], False, False))
+                self.assertNotEqual(leg['outcome'], 'helper_refused')
+                self.assertNotIn('192.0.2.34', json.dumps(self.outcome))
+                self.child_dead()
+
     def test_a_prompt_cut_short_is_never_answered_and_ends_at_the_deadline(self):
         mac = PHONE['mac']
         self.drive([marker()] + gone(), child=str(self.pidfile),
