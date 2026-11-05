@@ -410,7 +410,9 @@ def payload_region(blobs):
             raise Refusal(f'{path} contains its delimiter')
         manifest.append(f'{digest} {payload_mode(rel)} {path}')
         if rel == 'lib/busybox-static':
-            bodies.append(f'base64 -d > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
+            if not 1 <= len(data) <= 16 * 1024 * 1024:
+                raise Refusal(f'{path}: helper size outside decoder bounds')
+            bodies.append(f'cfr_decode_helper {len(data)} > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
                           + base64.encodebytes(data).decode('ascii') + delimiter + '\n')
             continue
         bodies.append(f'cat > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'

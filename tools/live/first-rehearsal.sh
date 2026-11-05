@@ -128,12 +128,60 @@ cfr_run_sh() {
     "$CFR_SH" "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
 }
 
+# Admit extraction tools before staging, using only shell builtins on refusal.
+cfr_payload_prereq() {
+    for cfr_tool in awk cat chmod date id mkdir mktemp rm rmdir sed sha256sum; do
+        command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
+    done
+}
+
+# Decode only the generated, canonical 76-column base64 framing. Byte count and
+# line width bound output and work; LC_ALL=C makes %c preserve NUL/high bytes on
+# BusyBox awk. The caller hashes every extracted file before any helper runs.
+cfr_decode_helper() {
+    LC_ALL=C awk -v bytes="$1" '
+        BEGIN {
+            alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            if(bytes !~ /^[0-9]+$/ || bytes<1 || bytes>16777216) {bad=1; exit 1}
+            for(i=1;i<=64;i++) value[substr(alphabet,i,1)]=i-1
+        }
+        {
+            width=length($0)
+            if(done || shortline || width<4 || width>76 || width%4) {bad=1; exit 1}
+            shortline=(width<76)
+            for(i=1;i<=width;i+=4) {
+                a=substr($0,i,1); b=substr($0,i+1,1)
+                c=substr($0,i+2,1); d=substr($0,i+3,1)
+                if(!(a in value) || !(b in value)) {bad=1; exit 1}
+                padding=0
+                if(c=="=") {
+                    if(d!="=" || value[b]%16) {bad=1; exit 1}
+                    padding=2
+                } else {
+                    if(!(c in value)) {bad=1; exit 1}
+                    if(d=="=") {
+                        if(value[c]%4) {bad=1; exit 1}
+                        padding=1
+                    } else if(!(d in value)) {bad=1; exit 1}
+                }
+                if(padding && i+3!=width) {bad=1; exit 1}
+                count+=3-padding
+                if(count>bytes) {bad=1; exit 1}
+                printf "%c", value[a]*4+int(value[b]/16)
+                if(padding<2) printf "%c", (value[b]%16)*16+int(value[c]/4)
+                if(!padding) printf "%c", (value[c]%4)*64+value[d]
+                if(padding) done=1
+            }
+        }
+        END {if(bad || count!=bytes) exit 1}
+    '
+}
+
 cfr_extract() {
     CFR_STAGE=$(mktemp -d /tmp/couvre-feu-first.XXXXXX) || cfr_refuse PAYLOAD staging_mktemp_failed
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) CFR_STAGE=; cfr_refuse PAYLOAD staging_path_unexpected;; esac
     cfr_info "staging $CFR_STAGE"
     chmod 700 "$CFR_STAGE" || cfr_refuse PAYLOAD staging_mode
-    command -v base64 >/dev/null 2>&1 || cfr_refuse PAYLOAD missing_base64
     cfr_payload_extract || cfr_refuse PAYLOAD extraction_failed
     cfr_count=0
     while read -r cfr_sum cfr_mode cfr_path; do
@@ -473,6 +521,7 @@ cfr_connectivity() {
 
 cfr_main() {
     umask 077
+    cfr_payload_prereq
     CFR_START=$(date +%s)
     printf 'BEGIN first-rehearsal commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS"; do

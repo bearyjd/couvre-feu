@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
@@ -189,6 +190,149 @@ class HelperPrerequisiteTests(unittest.TestCase):
             self.assertEqual(done.returncode, 10)
             self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
             self.assertFalse(executed.exists())
+
+
+class PayloadDecoderTests(unittest.TestCase):
+    # Deliberately no host PATH fallback: new extraction commands require an
+    # explicit admission here. In particular there is no base64 or openssl.
+    COMMANDS = ('awk', 'cat', 'chmod', 'date', 'id', 'mkdir', 'mktemp', 'rm',
+                'rmdir', 'sed', 'sha256sum')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-decoder-')
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.bin = self.work / 'bin'
+        self.bin.mkdir()
+        busybox, _ = helper_binary()
+        # Keep this applet symlink path: resolving it loses BusyBox dispatch.
+        self.busybox = busybox
+        version = subprocess.run([str(self.busybox)], capture_output=True, timeout=30).stdout
+        self.assertIn(b'BusyBox v1.33.1', version)
+        for name in self.COMMANDS:
+            (self.bin / name).symlink_to(self.busybox)
+        self.assertEqual(set(path.name for path in self.bin.iterdir()), set(self.COMMANDS))
+        self.env = {'PATH': str(self.bin), 'LC_ALL': 'C'}
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        self.template = template
+        self.functions = template[:template.index('# One br-lan IPv4 row')]
+        self.tool = load_tool(REPO / 'tools/live/first-rehearsal.py')
+
+    def region(self, data):
+        with mock.patch.object(self.tool, 'emitted_tree', return_value={
+                'lib/busybox-static': ('755', data), 'text.sh': ('644', b'# quoted $() `data`\n')}):
+            return self.tool.payload_region({})
+
+    def extract(self, region):
+        script = (self.functions + '\n' + region + '\nCFR_FIXTURE=0\n'
+                  'cfr_payload_prereq\ncfr_extract\nprintf "MUTATION_BEGIN\\n"\n')
+        done = subprocess.run([str(self.busybox), 'ash', '-s'], input=script, env=self.env,
+                              text=True, capture_output=True, timeout=30)
+        stages = re.findall(r'^INFO staging (/tmp/couvre-feu-first\.[^\n]+)$', done.stdout, re.M)
+        for stage in stages:
+            self.addCleanup(shutil.rmtree, stage, True)
+        return done, Path(stages[0]) if stages else None
+
+    def test_router_path_without_base64_preserves_production_and_all_byte_helpers(self):
+        for data in ((REPO / 'router/lib/busybox-static').read_bytes(), bytes(range(256)) * 4096):
+            with self.subTest(bytes=len(data)):
+                done, stage = self.extract(self.region(data))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual((stage / 'router/lib/busybox-static').read_bytes(), data)
+                self.assertEqual((stage / 'router/text.sh').read_bytes(), b'# quoted $() `data`\n')
+                self.assertIn('MUTATION_BEGIN', done.stdout)
+
+    def test_corrupt_helper_is_refused_before_mutation(self):
+        data = bytes(range(256)) * 4096
+        region = self.region(data)
+        encoded = base64.encodebytes(data).decode()
+        for replacement, reason in ((encoded.replace('AAEC', 'AQEC', 1), 'hash_mismatch'),
+                                    (encoded.replace('AAEC', '!AEC', 1), 'extraction_failed')):
+            done, _ = self.extract(region.replace(encoded, replacement))
+            self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+            self.assertIn('PHASE PAYLOAD FAIL ' + reason, done.stdout)
+            self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_missing_extraction_tools_have_fixed_prereq_refusal_before_staging(self):
+        for name in self.COMMANDS:
+            with self.subTest(tool=name):
+                executable = self.bin / name
+                hidden = self.work / ('hidden-' + name)
+                executable.rename(hidden)
+                try:
+                    done, stage = self.extract(self.region(b'abc'))
+                finally:
+                    hidden.rename(executable)
+                self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                self.assertIn('PHASE PREREQ FAIL missing_tool ' + name, done.stdout)
+                self.assertIsNone(stage)
+                self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_decoder_rejects_noncanonical_truncated_and_excess_input(self):
+        for encoded, size in (('AB==\n', 1), ('AAB=\n', 2), ('AA=A\n', 1),
+                              ('AAAA\nAAAA\n', 6), ('AAAA\n', 4), ('AAAA\n', 2),
+                              ('AAAA\n\n', 3), (' AAAA\n', 3), ('AAAA\r\n', 3),
+                              ('A' * 80 + '\n', 60), ('', 1), ('AA==\nAAAA\n', 4),
+                              ('AA==\n', 0), ('AA==\n', 16777217)):
+            with self.subTest(encoded=encoded[:20], size=size):
+                script = self.functions + f"\ncfr_decode_helper {size} <<'ENCODED'\n{encoded}ENCODED\n"
+                done = subprocess.run([str(self.busybox), 'ash', '-s'], input=script.encode(), env=self.env,
+                                      capture_output=True, timeout=30)
+                self.assertNotEqual(done.returncode, 0)
+
+    def test_decoder_preserves_each_padding_case(self):
+        for data in (b'\0', b'\0\xff', b'\0\xff\x80'):
+            done, stage = self.extract(self.region(data))
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual((stage / 'router/lib/busybox-static').read_bytes(), data)
+
+    def test_command_allowlist_rejects_unadmitted_extraction_command(self):
+        region = self.region(b'abc').replace('cfr_payload_extract() {',
+                                           'cfr_payload_extract() {\nopenssl version || return 1')
+        done, _ = self.extract(region)
+        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+        self.assertIn('PHASE PAYLOAD FAIL extraction_failed', done.stdout)
+        self.assertIn('openssl: not found', done.stderr)
+        self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_extraction_command_allowlist_covers_shell_ast(self):
+        # Additional whole-script audit when the parser is installed; the
+        # restricted-PATH command guard above remains mandatory everywhere.
+        shfmt = shutil.which('shfmt')
+        if not shfmt:
+            self.skipTest('shfmt unavailable for shell AST command audit')
+        source = self.tool.replace_region(self.template, 'CF_GENERATED_PAYLOAD', self.region(b'abc'))
+        done = subprocess.run([shfmt, '-tojson'], input=source, text=True,
+                              capture_output=True, check=True, timeout=30)
+        calls = set()
+        functions = set()
+
+        def visit(node):
+            if isinstance(node, dict):
+                if node.get('Type') == 'CallExpr' and node.get('Args'):
+                    word = node['Args'][0]
+                    name = source[word['Pos']['Offset']:word['End']['Offset']]
+                    calls.add(name)
+                    if name == 'exec':
+                        target = node['Args'][1]
+                        self.assertEqual(source[target['Pos']['Offset']:target['End']['Offset']],
+                                         '"$CFR_SETSID_HELPER"')
+                if node.get('Type') == 'FuncDecl':
+                    functions.add(node['Name']['Value'])
+                for value in node.values():
+                    visit(value)
+            elif isinstance(node, list):
+                for value in node:
+                    visit(value)
+
+        visit(json.loads(done.stdout))
+        external = set(self.COMMANDS) | {'cmp', 'cp', 'grep', 'ip', 'ip6tables-save', 'ipset',
+                                        'iptables-save', 'ln', 'od', 'readlink', 'sort', 'stat', 'tr', 'uci'}
+        builtins = {':', '[', 'cd', 'command', 'continue', 'exec', 'exit', 'printf', 'pwd',
+                    'read', 'return', 'set', 'trap', 'umask', 'wait'}
+        allowed = external | builtins | functions | {'"$CFR_SETSID_HELPER"', '"$CFR_SH"'}
+        self.assertTrue(calls)
+        self.assertEqual(calls - allowed, set())
 
 
 class VersionedIdentityTests(unittest.TestCase):
@@ -826,7 +970,10 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual(self.router_snapshot(), before)
 
     def test_evidence_dir_on_volatile_storage_refused(self):
-        volatile = self.work / 'evidence'
+        # CI may point TMPDIR at persistent storage for executable helpers.
+        temporary = tempfile.TemporaryDirectory(prefix='couvre-feu-volatile-', dir='/tmp')
+        self.addCleanup(temporary.cleanup)
+        volatile = Path(temporary.name) / 'evidence'
         volatile.mkdir(mode=0o700)
         config = self.write_config(evidenceDir=str(volatile))
         code, _, err = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))

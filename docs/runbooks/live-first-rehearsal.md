@@ -62,11 +62,13 @@ Before connecting, `execute`:
 3. checks that the public key's fingerprint matches the configuration and that `ssh-add -l` lists it
 4. creates a new evidence directory, refusing if the name already exists or if `evidenceDir` is under `/tmp`, `/run`, `/dev/shm` or `/var/tmp`, or on tmpfs, according to `/proc/mounts`
 
+The GL-XE3000 BusyBox 1.33.2 target has no `base64` decoder. Extraction therefore uses the existing `awk`, with byte-oriented output and strict encoded-length, alphabet and padding checks; malformed input refuses at PAYLOAD before installation. Required extraction commands are checked with fixed PREREQ refusals before staging. The helper remains unexecuted until payload hashes and its pinned hash have passed. Decoder changes alter the payload size/hash and `planSha256`; regenerate and disclose the plan for the reviewed commit.
+
 It then runs one `ssh` with the payload on stdin. From then on, every local failure, including Ctrl-C, is reported as UNKNOWN with exit 2. On the router, the script writes the files to a fresh `mktemp -d /tmp/couvre-feu-first.XXXXXX` and runs the phases in order. Each phase prints one `PHASE <name> OK|FAIL <reason>` line:
 
 | Phase | What it checks or does |
 |---|---|
-| PAYLOAD | Every file's sha256 matches the embedded manifest; the release closure modes are set |
+| PAYLOAD | Quoted heredocs extract text and a bounded strict awk decoder extracts the binary helper without a `base64` applet. Every file's sha256 matches the embedded manifest before any helper execution; the release closure modes are set |
 | IDENTITY | Each role has one `br-lan` IPv4 neighbor with the configured MAC (management REACHABLE, as the installer requires; the others REACHABLE, STALE or DELAY) and one matching DHCP lease. `SSH_CONNECTION` comes from the management IP. No live MAC equals a protected historical MAC |
 | PREREQ | Normal-PATH `stat` and `od` (coreutils `/bin/stat` and `/usr/bin/od` on the target) are callable; their paths are printed. `stat -c %y` on a probe file the script creates in its own staging directory, and on `/etc/config/firewall`, must show nine fractional digits, and `stat -c '%d %m'` on `/etc/config` must print a device number and an absolute mount point (the installer's same-filesystem proof). `install.sh` validates and stages without `--activate` and leaves no lock or stage residue |
 | SNAPSHOT | Records sha256, mode, uid, gid, size and mtime (seconds plus nanoseconds) for every installer-managed path, their `.couvrefeu-tmp` siblings, the journal, recovery, release and lock paths, and records absent paths explicitly. Records mode, owner and existence for the managed directories (not their mtimes). Hashes `iptables-save`/`ip6tables-save` (comments and counters stripped), sorted `ipset list -n` and `ipset save` (members), `uci export firewall` and the root crontab. Every snapshot record is also printed as a `SNAPSHOT` line, so local `stdout.log` holds the baseline |
