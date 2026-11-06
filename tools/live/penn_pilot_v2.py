@@ -233,21 +233,21 @@ def pilot_policies(config, base, candidates=candidate_policies):
 
 LEG_SUPERVISOR = '''seconds=$1; grace=$2; shift 2
 trap '' HUP INT TERM
-refuse() { printf 'HELPER_REFUSED %s\\n' "$1" >&2; exit 10; }
+refuse() { printf '{"ok":false,"errors":["%s"]}\\n' "$1"; exit 10; }
 source=/usr/lib/couvrefeu/busybox-static
 owner=0:0
 # Check every source ancestor with a non-helper primitive before reading bytes.
 for parent in / /usr /usr/lib /usr/lib/couvrefeu; do
     [ -d "$parent" ] && [ ! -L "$parent" ] || refuse helper_hash
-    case $(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$parent") in
+    case $(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$parent" 2>/dev/null) in
         "$owner:700"|"$owner:750"|"$owner:755") ;; *) refuse helper_hash;;
     esac
 done
 if [ ! -e "$source" ] && [ ! -L "$source" ]; then refuse helper_missing; fi
 [ -f "$source" ] && [ ! -L "$source" ] && [ -x "$source" ] || refuse helper_hash
-[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a:%h' "$source")" = "$owner:755:1" ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a:%h' "$source" 2>/dev/null)" = "$owner:755:1" ] || refuse helper_hash
 [ -d /tmp ] && [ ! -L /tmp ] || refuse helper_hash
-[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ] || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' /tmp 2>/dev/null)" = 0:0:1777 ] || refuse helper_hash
 # Reclaim only PID-tagged stages whose owning supervisor has exited. Preserve
 # live owners, legacy names, symlinks, hardlinks and unrecognized entries.
 for stale in /tmp/couvrefeu-leg.*.*; do
@@ -258,23 +258,23 @@ for stale in /tmp/couvrefeu-leg.*.*; do
     case "$suffix" in *[!a-zA-Z0-9]*) continue;; esac
     [ "${#suffix}" = 6 ] || continue
     [ ! -d "/proc/$pid" ] || continue
-    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stale")" = "$owner:700" ] || continue
+    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stale" 2>/dev/null)" = "$owner:700" ] || continue
     if [ -e "$stale/busybox-static" ] || [ -L "$stale/busybox-static" ]; then
         [ -f "$stale/busybox-static" ] && [ ! -L "$stale/busybox-static" ] || continue
-        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%h' "$stale/busybox-static")" = "$owner:1" ] || continue
-        rm -f "$stale/busybox-static" || continue
+        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%h' "$stale/busybox-static" 2>/dev/null)" = "$owner:1" ] || continue
+        rm -f "$stale/busybox-static" 2>/dev/null || continue
     fi
     rmdir "$stale" 2>/dev/null || :
 done
-stage=$(mktemp -d /tmp/couvrefeu-leg.$$.XXXXXX) || refuse helper_hash
+stage=$(mktemp -d /tmp/couvrefeu-leg.$$.XXXXXX 2>/dev/null) || refuse helper_hash
 helper=$stage/busybox-static
-trap 'rm -f "$helper"; rmdir "$stage"' 0
+trap 'rm -f "$helper" 2>/dev/null; rmdir "$stage" 2>/dev/null' 0
 [ -d "$stage" ] && [ ! -L "$stage" ] || refuse helper_hash
-[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stage")" = "$owner:700" ] || refuse helper_hash
-cp "$source" "$helper" && chmod 755 "$helper" || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$stage" 2>/dev/null)" = "$owner:700" ] || refuse helper_hash
+cp "$source" "$helper" 2>/dev/null && chmod 755 "$helper" 2>/dev/null || refuse helper_hash
 [ -f "$helper" ] && [ ! -L "$helper" ] || refuse helper_hash
-[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a:%h' "$helper")" = "$owner:755:1" ] || refuse helper_hash
-sum=$(sha256sum < "$helper") || refuse helper_hash
+[ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a:%h' "$helper" 2>/dev/null)" = "$owner:755:1" ] || refuse helper_hash
+sum=$(sha256sum 2>/dev/null < "$helper") || refuse helper_hash
 [ "${sum%% *}" = "@CF_SETSID_HELPER_SHA256@" ] || refuse helper_hash
 "$helper" true </dev/null >/dev/null 2>&1 || refuse helper_exec
 exec 3<&0
