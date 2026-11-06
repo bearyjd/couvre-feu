@@ -412,7 +412,7 @@ def payload_region(blobs):
         if rel == 'lib/busybox-static':
             if not 1 <= len(data) <= 16 * 1024 * 1024:
                 raise Refusal(f'{path}: helper size outside decoder bounds')
-            bodies.append(f'cfr_decode_helper {len(data)} > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
+            bodies.append(f'cfr_decode_file {len(data)} "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
                           + base64.encodebytes(data).decode('ascii') + delimiter + '\n')
             continue
         bodies.append(f'cat > "$CFR_STAGE/{path}" <<\'{delimiter}\' || return 1\n'
