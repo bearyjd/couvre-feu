@@ -1,15 +1,10 @@
-"""Leg-2 pty driver of the Penn pilot (schema v2): marker watcher plus the four TTY commit legs.
+"""Penn pilot v2 pty driver: strict marker watcher and four digest-bound TTY commit legs.
 
-Imports cleanly on its own. penn-pilot.py calls `bind(first_rehearsal_module)` right after loading it, which sets
-`FR` and makes `Refusal` the same class the pilot catches. Not a script: it has no entry point. Standard library only.
-
-Leg 1 is the single `ssh ... /bin/sh -s` payload session. Its stdout file is tailed here; a strict
-`CFP_LEG2_READY <leg> <64 hex>` line starts the next planned leg once, under a pty, with the argv bound in the plan
-digest. The typed confirmation (last six hex digits of the scope target MAC) is sent only when everything the leg has
-printed equals the one expected text. Each leg gets its planned seconds, no retry, and is killed when leg 1 prints
-STOP or CFP_LEG2_CANCEL, ends, or times out. Nothing the leg prints is kept except counts and the reply's reason codes.
-This module never changes how the router is logged in to: it only reuses the pinned leg-1 ssh options. The known-hosts
-and identity files are re-hashed before every leg and every ack; SIGTERM, SIGHUP and SIGINT end a run like Ctrl-C."""
+penn-pilot.py binds FR, V2 and Refusal. Leg-1 stdout markers start each leg once with pinned ssh options.
+Only the exact expected prompt receives confirmation. Every leg is bounded and killed on
+STOP, cancel, leg-1 exit or timeout. Evidence retains counts and sanitized reason codes.
+Pinned files are re-hashed before legs and acks. TERM/HUP/INT clean up like Ctrl-C. Standard library only.
+"""
 import contextlib
 import hmac
 import json
@@ -81,6 +76,10 @@ LINE_BYTES = 65536
 READ_BYTES = 65536  # most one step takes from a leg's pty or stderr: a flood cannot starve the deadline, STOP or cancel
 POLL_SECONDS = 0.05
 REASON = re.compile(r'[a-z0-9_]{1,64}')
+# Exact pre-prompt replies from the fixed supervisor, including the terminating newline.
+HELPER_REFUSALS = {f'{{"ok":false,"errors":["{code}"]}}\n': code
+                   for code in ('helper_missing', 'helper_hash', 'helper_exec')}
+LEG_PHASE = {'2a': 'SCOPE-ADD-1', '2b': 'SCOPE-ADD-1', '2c': 'SCOPE-ADD-2', '2d': 'SCOPE-REMOVE'}
 
 
 def confirmation_digits(mac):
@@ -178,6 +177,8 @@ class Leg:
 
     def check_prompt(self):
         text = self.buffer.decode('utf-8', 'replace').replace('\r\n', '\n')
+        if len(self.buffer) <= CAPTURE_BYTES and any(line.startswith(text.removesuffix('\r')) for line in HELPER_REFUSALS):
+            return True  # a fragmented refusal is never a confirmation prompt
         if len(self.buffer) > CAPTURE_BYTES or not self.expected.startswith(text.removesuffix('\r')):
             return False
         if text == self.expected:
@@ -189,7 +190,9 @@ class Leg:
         if self.result:
             return
         self.read()
-        if self.exited():
+        if not self.sent and self.buffer.decode('utf-8', 'replace').replace('\r\n', '\n') in HELPER_REFUSALS:
+            self.kill('helper_refused', now)
+        elif self.exited():
             self.read()
             self.finish('exited', self.process.wait(), now)
         elif not self.sent and self.buffer and not self.check_prompt():
@@ -231,6 +234,8 @@ class Leg:
                 os.close(self.master)
             finally:
                 self.master = None
+        if not self.sent and self.buffer.decode('utf-8', 'replace').replace('\r\n', '\n') in HELPER_REFUSALS:
+            outcome = 'helper_refused'
         reply = {}
         for line in reversed((self.buffer + self.after).decode('utf-8', 'replace').replace('\r\n', '\n').split('\n')):
             if line.startswith('{'):
@@ -240,6 +245,8 @@ class Leg:
                     continue
                 break
         reply = reply if isinstance(reply, dict) else {}
+        if not self.sent and outcome != 'helper_refused':
+            reply = {}  # arbitrary pre-prompt output cannot supply evidence reason codes
         errors = reply.get('errors') if isinstance(reply.get('errors'), list) else []
         # Counts and reason codes only: no line the leg printed (MAC, base, echoed digits) is ever kept.
         self.result = {'leg': self.leg, 'form': self.entry['form'], 'op': self.entry['op'], 'outcome': outcome,
@@ -382,6 +389,7 @@ class Driver:
         if not self.files_unchanged():
             raise Refusal('known hosts or identity file differs from the approved plan: nothing was sent')
         self.results, self.ignored, self.active, self.pending, self.ack_process, self.env = [], 0, None, None, None, env
+        self.stdout_fd = stdout_fd
         self.locked = self.cancelled = False
         self.ack, self.pinned_state = 'none', 'ok'
         # The mask is captured, and the signals blocked, BEFORE any handler is installed: a signal that arrives while the
@@ -477,7 +485,13 @@ class Driver:
 
     def reap(self):
         if self.active and self.active.result:
-            self.results.append(self.active.result)
+            result = self.active.result
+            self.results.append(result)
+            if result['outcome'] == 'helper_refused':
+                self.locked, self.pending = True, None
+                # Evidence only: leg 1 retains its scope poll and teardown, including cancellation/ack checks.
+                code = result['errors'][0]
+                os.write(self.stdout_fd, f"STOP {LEG_PHASE[result['leg']]} {code}\n".encode('ascii'))
             self.active = None
 
     def acknowledge(self, path):
