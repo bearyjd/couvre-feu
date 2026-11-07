@@ -5,7 +5,6 @@ import { object } from '../../shared/src/json.ts';
 import { mac as canonicalMac } from '../../shared/src/router-schema.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
-import { routerScopeOf } from './integration-config.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import type { IntegrationPolicy, IntegrationOperation } from './integration-policy.ts';
@@ -130,12 +129,6 @@ export class ChildAdmin {
     private obligations(person: string): boolean {
         return Boolean(this.store.get("SELECT id FROM time_requests WHERE person_id=? AND (state IN ('pending','approving') OR repause_state IN ('waiting','applying')) LIMIT 1", person));
     }
-    /** The install-time floor, or a MAC the router itself reported in scope on a fresh observation. Old routers report none, so only the floor counts. */
-    private inRouterScope(mac: string): boolean {
-        if (routerScopeOf(this.store.config).includes(mac)) return true;
-        // The remembered scope is generation-checked and only ever written from a clean reply; a reply carrying errors cannot vouch for a MAC.
-        return this.policy.fresh() && this.scope.observedScope().includes(mac);
-    }
     private apply(actor: Actor, kind: ChildAction, target: string, params: Record<string, unknown>): {status?: number; body?: unknown; op?: IntegrationOperation; audit: string} {
         const now = this.policy.now(), config = this.store.config;
         if (kind === 'child_create') {
@@ -172,7 +165,7 @@ export class ChildAdmin {
             if (devicesOf(this.store, target).length >= DEVICES_PER_CHILD) throw new AppError(409, 'child_device_limit_reached', `The router holds at most ${DEVICES_PER_CHILD} devices per entry.`);
             if (this.store.get<{n: number}>('SELECT count(*) n FROM devices')!.n >= DEVICE_LIMIT) throw new AppError(409, 'device_limit_reached', `The router holds at most ${DEVICE_LIMIT} devices.`);
             if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
-            if (!this.inRouterScope(mac)) {
+            if (!this.scope.inRouterScope(mac, this.policy)) {
                 // Not thrown: the request row and the audit entry must commit. The canonical MAC is a field for the admin UI only.
                 const request = this.scope.request(actor, target, mac);
                 return {status: 409, body: {error: {code: 'device_pending_router_scope', message: PENDING_SCOPE_TEXT, mac, requestId: request.id}}, audit: `scope_request:${request.id}:${mac}:${actor.id}`};

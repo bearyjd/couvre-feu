@@ -227,3 +227,14 @@ test('failure labels: reply problems keep inventory_unavailable:<code>; ssh 255 
         f.poll([dev(1)]); assert.equal(f.inv.list(actor).status.lastError, null, 'a complete poll clears the error');
     } finally { f.cleanup(); }
 });
+
+test('seed-only manifest inventory distinguishes scope from assignment without any policy observation', () => {
+    const f = world();
+    try {
+        const seed = f.config.person.device.mac;
+        f.poll([dev(1, {mac: seed}), dev(2)]);
+        assert.deepEqual(f.inv.list(actor).devices.map(d => [d.mac, d.inScope, d.flags.unassigned]), [[m(2), false, true], [seed, true, false]]);
+        assert.equal(f.inv.acknowledge(actor, seed).inScope, true);
+        assert.equal(f.inv.acknowledge(actor, m(2)).inScope, false);
+    } finally { f.cleanup(); }
+});

@@ -41,13 +41,15 @@ test('admin lists the inventory: flags, hostnames as device-reported strings, no
     const w = await world();
     try {
         w.seed();
+        w.config.routerScope = [w.config.person.device.mac, m(1)];
         w.store.run("INSERT INTO inventory_devices(generation,mac,ipv4_json,hostname,source,first_seen,last_seen) VALUES(?,?,'[]',NULL,'both',1,1)", w.config.router.generation, w.config.protectedMacs[0]);
         const admin = await w.client('operator'), r = await admin('/admin/inventory');
         assert.equal(r.status, 200); assert.equal(r.body.source, 'real-router-integration');
-        const devices = r.body.inventory.devices as {mac: string; hostname: string | null; reportedByDevice: boolean; flags: Record<string, boolean>}[];
+        const devices = r.body.inventory.devices as {mac: string; hostname: string | null; reportedByDevice: boolean; inScope: boolean; flags: Record<string, boolean>}[];
         assert.deepEqual(devices.map(d => d.mac).sort(), [m(1), m(2)]);
         const one = devices.find(d => d.mac === m(1))!, two = devices.find(d => d.mac === m(2))!;
         assert.equal(one.hostname, 'host-1'); assert.equal(one.reportedByDevice, true); assert.equal(typeof one.hostname, 'string'); assert.equal(two.hostname, null);
+        assert.equal(one.inScope, true); assert.equal(two.inScope, false);
         assert.deepEqual(two.flags, {new: true, private: false, unassigned: true});
         assert.equal(r.body.inventory.status.pollSeconds, 60);
         assert.equal(r.body.now, w.now()); // the SERVER clock, so the page never compares a router timestamp with the phone clock
@@ -86,7 +88,7 @@ test('acknowledge: strict input, 404 for an unknown MAC, clears New', async () =
         for (const body of [{}, {mac: 5}, {mac: m(2), extra: 1}, {mac: m(2).toUpperCase()}, {mac: 'nope'}, []]) assert.equal((await admin('/admin/inventory/acknowledge', body)).status, 400, JSON.stringify(body));
         assert.equal((await admin('/admin/inventory/acknowledge', {mac: m(77)})).status, 404);
         const ok = await admin('/admin/inventory/acknowledge', {mac: m(2)});
-        assert.equal(ok.status, 200); assert.equal(ok.body.device.flags.new, false);
+        assert.equal(ok.status, 200); assert.equal(ok.body.device.flags.new, false); assert.equal(ok.body.device.inScope, false);
         assert.equal((await admin('/admin/inventory')).body.inventory.devices.find((d: {mac: string}) => d.mac === m(2)).flags.new, false);
     } finally { await w.close(); }
 });

@@ -8,6 +8,9 @@ import { join } from 'node:path';
 import { integrationFixture, actor, testConfig } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import type { AuthSession } from '../src/auth.ts';
+import { InventoryStore } from '../src/inventory-store.ts';
+import { scopeDigest } from '../../shared/src/router-rpc.ts';
+import { ParentAlerts } from '../src/parent-alerts.ts';
 import { ChildAdmin } from '../src/admin-children.ts';
 import { AccountAdmin } from '../src/admin-accounts.ts';
 import type { ChildAction } from '../src/admin-children.ts';
@@ -363,3 +366,41 @@ test('the refusal banner is scoped: a restricted admin never sees another scopeâ
         assert.equal(f.admin.list(fresh(op)).lastRejection, null);
     } finally { f.cleanup(); }
 });
+
+// Exercise the real authenticated assignment path, including its step-up and scope-request result.
+for (const scenario of ['manifest-only', 'fresh', 'remembered', 'stale', 'wrong-generation', 'error-only', 'observation-failure'] as const) {
+    test(`inventory inScope agrees with device_add scope refusal: ${scenario}`, async () => {
+        const f = fixture([SEED]);
+        try {
+            const op = await f.signIn('operator');
+            await f.observe();
+            const precondition = f.token();
+            if (!['manifest-only', 'error-only'].includes(scenario)) {
+                const scope = [SEED, TABLET];
+                f.router.transform = o => ({...o, scope, scopeSha: scopeDigest(scope)});
+                f.advance(1); await f.observe();
+            }
+            if (scenario === 'remembered') {
+                f.advance(1); f.router.transform = null; await f.observe();
+            }
+            if (scenario === 'stale') f.advance(31);
+            if (scenario === 'wrong-generation') f.store.run('UPDATE router_scope_observed SET generation=?', 'e'.repeat(64));
+            if (scenario === 'error-only') {
+                const scope = [SEED, TABLET];
+                f.router.transform = o => ({...o, scope, scopeSha: scopeDigest(scope), errors: ['busy']});
+                f.advance(1); await f.observe();
+            }
+            if (scenario === 'observation-failure') f.store.run("UPDATE integration_state SET observation_error='ssh_timeout' WHERE singleton=1");
+            const inventory = new InventoryStore(f.store, new ParentAlerts(f.store, null, f.now), f.now);
+            inventory.ingest({inventory_version: 1, generation: f.config.router.generation, routerTime: f.now(), devices: [SEED, TABLET, LAPTOP].map(mac => ({mac, ipv4: [], hostname: null, source: 'neigh'})), truncated: false, errors: []});
+            const rows = inventory.list(actor).devices;
+            assert.deepEqual(rows.map(d => [d.mac, d.inScope]), [[SEED, true], [TABLET, ['fresh', 'remembered'].includes(scenario)], [LAPTOP, false]]);
+            // Pending rows first; an admitted enrollment may create an active operation.
+            for (const row of [...rows].sort((a, b) => Number(a.inScope) - Number(b.inScope))) {
+                const result = await f.act(op, 'device_add', 'pilot', {label: 'Inventory device', mac: row.mac, precondition}).catch((error: {status: number; code: string}) => ({status: error.status, body: {error: {code: error.code}}}));
+                assert.equal(result.status === 409 && result.body.error?.code === 'device_pending_router_scope', !row.inScope, row.mac);
+                assert.equal(inventory.acknowledge(actor, row.mac).inScope, row.inScope, 'acknowledge uses the same DTO scope calculation');
+            }
+        } finally { f.cleanup(); }
+    });
+}

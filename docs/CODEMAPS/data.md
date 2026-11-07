@@ -26,3 +26,9 @@ Main DB migrations 001..013 (`PRAGMA user_version`; integration mode runs 001, 0
 Also referenced: automatic_read_summary (created in integration-db.ts). `notify_state` (key/value: last pushed alert id, last sent digest slot) is created by push-runtime.ts only when `push.enabled`.
 Highest numbered migration: 013 (service/migrations). Features that write to `parent_audit` are flagged off by default (`auditLog.enabled`).
 Router-side state: see [router.md](router.md).
+
+Admin inventory HTTP DTOs: `shared/src/admin-inventory.ts` (`InventoryDTO`, `InventoryDeviceDTO`).
+The additive `inScope` boolean is computed when listing/acknowledging by the same scope predicate
+as device assignment; it is not persisted and does not change `inventory_devices` or the strict
+`shared/src/router-inventory.ts` router protocol. MAC fields remain admin-only and protected rows
+stay filtered.
