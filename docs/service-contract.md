@@ -283,3 +283,23 @@ Privacy: the page keeps no reward data beyond memory for the current session; si
 5. **Start the service** and check: the parent page loads and sign-in works; with `owner` mode only the owner account sees the ask-for-time card; a non-owner gets the generic 404 `route_not_found` from `GET /time-requests` (the `mayDecide` gate, then the final fall-through, `service/src/http.ts:326,337`); `GET /audit` returns 200 (not 404) when `auditLog` is on; no flag-off route has appeared (`POST /people/:id/reward` is 404 until `rewardTime` is on).
 6. **Watch the first uses.** After a first grant or reward: the request stays "Applying..." until the router confirms it; the audit row shows `applied`; `GET /operations/:id` shows the router outcome; the child is re-blocked at the end time. Any grant shown approved that the router did not confirm, or any audit read outside a parent's children: turn the flag off and stop.
 7. **Turn off.** Stop the service, set the key off (`"mode": "off"`, `"enabled": false`, or remove it), rebind to that manifest, restart. `integration:rebind` REFUSES while an operation is pending or unknown or a time request owes a restore, so the flag cannot be turned off until that settles. Wait for the grant or reward to settle (check `GET /operations/:id`), then rebind. Meanwhile a parent's Pause ends a grant or reward and lets it settle. Effects: time requests off hides the card, returns 404 on the child routes, and keeps stored rows; grants already queued are still followed to confirmation by a drain-only timer; a reward already queued is still dispatched; audit rows are kept until their 90 days pass. Password login on the router and CT107 is never touched by any flag.
+
+## Integration admin inventory
+
+`GET /admin/inventory` returns `{source, inventory, now}`. `inventory.devices` uses the shared
+`InventoryDeviceDTO` in `shared/src/admin-inventory.ts`; `POST /admin/inventory/acknowledge {mac}`
+returns the same device DTO under `device`. Every device includes a required boolean `inScope`:
+the MAC belongs to the manifest router scope (the seed device when no explicit scope is set), or
+policy observation is fresh and the generation-checked remembered clean router scope contains it.
+This is exactly the scope predicate used by `device_add`; `false` means assignment reaches
+`409 device_pending_router_scope` once the other assignment preconditions pass. `true` does not
+promise assignment succeeds: authorization, existing enrollment, limits, revision and router health
+still apply. Inventory freshness and policy membership do not determine scope. A later observation
+without scope leaves the remembered scope intact; an error-bearing reply never replaces it.
+Stale or failed policy observation prevents remembered scope from authorizing a device, while the
+manifest floor still counts. An observation from another generation cannot authorize it.
+
+Both routes require an admin. The existing admin DTO retains MACs for assignment and acknowledgement;
+protected management devices are filtered, child names remain viewer-scoped, and inventory row text does not
+render raw MACs. `inScope` is additive HTTP metadata; the strict `rpc-inventory` router protocol
+and its shared wire types are unchanged. No new assignment UI is introduced.
