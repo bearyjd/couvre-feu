@@ -17,11 +17,16 @@ Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activ
 | GET /admin/inventory, POST /admin/inventory/{acknowledge,refresh} | inventory-http.ts |
 | GET/POST /admin/accounts[/:id/{tokens,role,active}], /admin/passkeys/:id/{approve,revoke}, GET /account/passkeys, POST /account/passkeys/:id/revoke, POST /step-up/options | admin-accounts-http.ts -> admin-accounts.ts `AccountAdmin` |
 | GET /admin/children, POST /admin/children[/:id/{remove,devices}], /admin/devices/:id/{move,remove} | admin-children.ts `ChildAdmin` |
+| POST /step-up/options (action child_batch), POST /admin/children/batch | admin-children-batch.ts `ChildBatchAdmin`; childrenPost claims before singles; ordered canonical binding includes clientKey; one transaction, at most one enroll operation |
 | GET /time-requests; POST /people/:id/request-link[/revoke], /time-requests/:uuid/{approve,decline} | time-requests-http.ts parentGet/parentPost -> TimeRequestService |
 
 Policy path: HTTP -> `PolicyService` (policy.ts, demo) or `IntegrationPolicy` (integration-policy.ts) -> idempotent `operations` row (revision CAS, key per actor) -> worker.
 
 Auth (auth.ts): bootstrap token (CLI `issueBootstrap`, 10 min, one use) -> WebAuthn registration -> session (hash, csrf, permission_version, browser_hash/epoch binding). Login re-checks account permission_version. Step-up: a fresh passkey confirmation bound to one exact account/passkey/child change (`step_ups` table, migration 007; `/step-up/options`; auth.ts stepUpChallenge/stepUpVerify).
+
+Batch setup: admin-children-batch.ts normalizes at most 40 create/rename/add items, resolves backward @index references, checks readiness/scope/accumulating limits in the write transaction, and queues one composed revision +1 policy. Local-only batches queue nothing. Batch-only challenge = sha256(binding + nonce), session/account bound, 120 s; options rate 3/actor/min. Additive retry/setup state in admin-batches.sql; idempotency lookup after commitStepUp and before first-run gate. Transactional audit once per child, counts only; worker conflict settlement uses each device's person_id. InventoryStore replaces inventory_coverage on complete polls (fresh lease/neighbour address proof); incomplete/failure clears it. Client UI is a separate task; docs/design/first-run preserves the throwaway prototype.
+
+Batch verification: `service/tests/admin-children-batch.test.ts` (transaction/security/recovery), `admin-children-batch-http.test.ts` (HTTP guards and ready-device enrollment), and `fixtures/previous-store.ts` (pre-batch Store reader/writer compatibility). Manual `node service/tests/batch-guard-mutations.ts` disables guards in a disposable source copy and maps each mutation to a failing regression; uses pinned Node 26.8.1 and a private TMPDIR, with `BATCH_REPORT_DIR` for result logs.
 
 Dispatch (integration-worker.ts / integration-automatic.ts): op `pending` + rpc phase queued -> claim (token, epoch, lease) -> dispatch_batches/steps (`observe|apply|receipt|activity`, single step, deadline 1-30 s) -> SSHRouter -> receipt -> op `confirmed|unknown|failed|conflict`. Expired claim -> `uncertain`, never auto-retried. `AutomaticDispatch` is one serialized supervisor.
 

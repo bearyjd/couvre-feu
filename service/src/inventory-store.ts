@@ -107,7 +107,7 @@ export class InventoryStore {
     }
     /** The ONLY place a failed poll is recorded. It never touches integration_state.observation_error. */
     recordFailure(label: string, at = this.now()): void {
-        this.atomic(() => { this.state(); this.store.run('UPDATE inventory_state SET last_error=? WHERE singleton=1', label.slice(0, 96)); this.noteIncomplete(at); });
+        this.atomic(() => { this.state(); this.store.run('DELETE FROM inventory_coverage'); this.store.run('UPDATE inventory_state SET last_error=? WHERE singleton=1', label.slice(0, 96)); this.noteIncomplete(at); });
     }
     /** Starts (or continues) the clock of "no complete poll" at the last complete one, and alerts once it has run for 30 minutes. */
     private noteIncomplete(at: number): void {
@@ -143,6 +143,8 @@ export class InventoryStore {
             this.purgeProtected();
             this.pruneAt(at);
             const g = this.generation;
+            // Coverage is a snapshot, unlike retained inventory history; an absent row cannot authorize a batch add.
+            this.store.run('DELETE FROM inventory_coverage');
             // Warning codes alone are not structural, but a refusal body (errors and no devices) lists nothing and is never a baseline.
             const other = reply.errors.find(e => !BENIGN_ROUTER_ERRORS.includes(e));
             if (other !== undefined || reply.truncated || (reply.errors.length > 0 && reply.devices.length === 0)) {
@@ -160,6 +162,9 @@ export class InventoryStore {
             for (const d of reply.devices) {
                 if (known.has(d.mac)) this.refresh(g, d, at);
                 else if (stored.has(d.mac)) this.store.run('INSERT INTO inventory_devices(generation,mac,ipv4_json,hostname,source,first_seen,last_seen) VALUES(?,?,?,?,?,?,?)', g, d.mac, JSON.stringify(d.ipv4), d.hostname, d.source, at, at);
+                if ((known.has(d.mac) || stored.has(d.mac)) && d.ipv4.length > 0 && !this.store.config.protectedMacs.includes(d.mac)) {
+                    this.store.run('INSERT INTO inventory_coverage(generation,mac,observed_at) VALUES(?,?,?)', g, d.mac, at);
+                }
             }
             const dropped = fresh.length - stored.size;
             this.store.run('UPDATE inventory_state SET baseline_at=?,last_ok_at=?,last_error=?,incomplete_since=NULL WHERE singleton=1', rebaseline ? at : state.baseline_at, at,

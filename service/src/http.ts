@@ -219,7 +219,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const session = auth.session(sessionToken, jar.cf_browser);
                 auth.csrf(session, request.headers['x-csrf-token']);
-                const child = await childrenPost(children, session, path, payload);
+                const child = await childrenPost(children, session, path, payload, clientKey(request.headers['idempotency-key']));
                 if (child) {
                     send(response, child.status, {...provenance, ...child.body as object});
                     return;
