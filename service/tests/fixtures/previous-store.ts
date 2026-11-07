@@ -19,6 +19,7 @@ export class Store {
             });
         }
         this.db = new DatabaseSync(path, {
+            // timeout-ok: SQLite busy timeout copied verbatim from the previous binary's store so this fixture matches it; local single-process fixture DB, no contention
             timeout: 1000, enableForeignKeyConstraints: true, allowExtension: false, defensive: true
         });
         if (path !== ':memory:' && existsSync(path)) {
