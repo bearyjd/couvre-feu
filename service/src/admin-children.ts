@@ -5,7 +5,6 @@ import { object } from '../../shared/src/json.ts';
 import { mac as canonicalMac } from '../../shared/src/router-schema.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
-import { routerScopeOf } from './integration-config.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import type { IntegrationPolicy, IntegrationOperation } from './integration-policy.ts';
@@ -14,6 +13,7 @@ import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
 import { audited, auditFor } from './parent-audit.ts';
 import type { AuditAction } from './parent-audit.ts';
+import { ChildBatchAdmin } from './admin-children-batch.ts';
 
 /** Child/device-group and device changes. Admin-only; every one needs a fresh step-up bound to the exact change. */
 export type ChildAction = 'child_create' | 'child_remove' | 'device_add' | 'device_remove' | 'device_move';
@@ -28,14 +28,14 @@ export interface ChildAdminDTO {
 }
 export interface RejectionDTO { operationId: string; code: string; at: number; devices: {child: string; device: string}[]; otherDevices: number }
 
-function label(value: unknown, code: string): string {
+export function label(value: unknown, code: string): string {
     if (typeof value !== 'string') throw new AppError(400, code);
     const trimmed = value.trim();
     if (trimmed.length < 1 || trimmed.length > 64 || /[\x00-\x1f\x7f]/.test(trimmed)) throw new AppError(400, code);
     return trimmed;
 }
 /** Accepts upper case and dash separators; the result is the router's canonical unicast form (multicast/zero refused). */
-function macInput(value: unknown): string {
+export function macInput(value: unknown): string {
     if (typeof value !== 'string' || value.length > 17) throw new AppError(400, 'invalid_mac');
     return canonicalMac(value.trim().toLowerCase().replaceAll('-', ':'));
 }
@@ -72,9 +72,11 @@ export class ChildAdmin {
     readonly auth: Auth;
     readonly policy: IntegrationPolicy;
     readonly scope: ScopeTracker;
+    readonly batch: ChildBatchAdmin;
     constructor(auth: Auth, policy: IntegrationPolicy) {
         this.auth = auth; this.policy = policy;
         this.scope = new ScopeTracker(policy.store, new ParentAlerts(policy.store, null, policy.now), policy.now);
+        this.batch = new ChildBatchAdmin(auth, policy);
     }
     private get store() { return this.policy.store; }
     private allowed(actor: Actor): void { if (actor.role !== 'admin') throw new AppError(403, 'admin_required'); }
@@ -89,6 +91,7 @@ export class ChildAdmin {
         return {children, canCreate: this.scopeAll(actor.id), limits: {children: CHILD_LIMIT, devicesPerChild: DEVICES_PER_CHILD, devices: DEVICE_LIMIT}, lastRejection: this.rejection(actor)};
     }
     async stepUpOptions(session: AuthSession, input: unknown) {
+        if ((input as {action?: unknown} | null)?.action === 'child_batch') return this.batch.stepUpOptions(session, input);
         const body = object(input, ['action', 'target', 'params']);
         if (!ChildAdmin.isAction(body.action)) throw new AppError(400, 'invalid_action');
         this.allowed(session.dto.actor);
@@ -130,12 +133,6 @@ export class ChildAdmin {
     private obligations(person: string): boolean {
         return Boolean(this.store.get("SELECT id FROM time_requests WHERE person_id=? AND (state IN ('pending','approving') OR repause_state IN ('waiting','applying')) LIMIT 1", person));
     }
-    /** The install-time floor, or a MAC the router itself reported in scope on a fresh observation. Old routers report none, so only the floor counts. */
-    private inRouterScope(mac: string): boolean {
-        if (routerScopeOf(this.store.config).includes(mac)) return true;
-        // The remembered scope is generation-checked and only ever written from a clean reply; a reply carrying errors cannot vouch for a MAC.
-        return this.policy.fresh() && this.scope.observedScope().includes(mac);
-    }
     private apply(actor: Actor, kind: ChildAction, target: string, params: Record<string, unknown>): {status?: number; body?: unknown; op?: IntegrationOperation; audit: string} {
         const now = this.policy.now(), config = this.store.config;
         if (kind === 'child_create') {
@@ -172,7 +169,7 @@ export class ChildAdmin {
             if (devicesOf(this.store, target).length >= DEVICES_PER_CHILD) throw new AppError(409, 'child_device_limit_reached', `The router holds at most ${DEVICES_PER_CHILD} devices per entry.`);
             if (this.store.get<{n: number}>('SELECT count(*) n FROM devices')!.n >= DEVICE_LIMIT) throw new AppError(409, 'device_limit_reached', `The router holds at most ${DEVICE_LIMIT} devices.`);
             if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
-            if (!this.inRouterScope(mac)) {
+            if (!this.scope.inRouterScope(mac, this.policy)) {
                 // Not thrown: the request row and the audit entry must commit. The canonical MAC is a field for the admin UI only.
                 const request = this.scope.request(actor, target, mac);
                 return {status: 409, body: {error: {code: 'device_pending_router_scope', message: PENDING_SCOPE_TEXT, mac, requestId: request.id}}, audit: `scope_request:${request.id}:${mac}:${actor.id}`};
@@ -231,7 +228,7 @@ export class ChildAdmin {
         const op = this.store.all<IntegrationOperation>('SELECT * FROM operations ORDER BY created_at DESC,rowid DESC LIMIT 64').find(row => this.policy.affectedPeople(row).some(person => actor.personIds.includes(person)));
         if (!op || op.state !== 'failed' || !op.error || !ADDRESS_COVERAGE_REJECTIONS.has(op.error) || this.policy.now() - op.updated_at > 86400) return null;
         const macs = [...new Set([op.base_json, op.payload_json].flatMap(json => (JSON.parse(json) as {people: {id: string; macs: string[]}[]}).people.flatMap(p => p.macs.map(m => `${p.id}\n${m}`))))].sort();
-        const request = JSON.parse(op.request_json) as {mac?: string; label?: string; target?: string};
+        const request = JSON.parse(op.request_json) as {mac?: string; label?: string; target?: string; devices?: {mac: string; label: string; person: string}[]};
         const names = new Map(this.store.all<ChildRow>('SELECT * FROM people').map(c => [c.id, c.name]));
         const devices: RejectionDTO['devices'] = [];
         let otherDevices = 0;
@@ -239,7 +236,7 @@ export class ChildAdmin {
             const [person, mac] = entry.split('\n');
             if (!actor.personIds.includes(person)) { otherDevices++; continue; }
             const row = this.store.get<DeviceRow>("SELECT * FROM devices WHERE identifier_kind='mac' AND identifier=?", mac);
-            const device = row?.label ?? (request.mac === mac ? request.label : undefined);
+            const device = row?.label ?? (request.mac === mac ? request.label : undefined) ?? request.devices?.find(d => d.person === person && d.mac === mac)?.label;
             if (device) devices.push({child: names.get(person) ?? person, device}); else otherDevices++;
         }
         return {operationId: op.id, code: op.error, at: op.updated_at, devices, otherDevices};
@@ -254,8 +251,10 @@ const DEVICE_MOVE = /^\/admin\/devices\/([a-z][a-z0-9_]{0,31})\/move$/;
 const CHILD = /^\/admin\/children\/([a-z][a-z0-9_]{0,31})\/(remove|devices)$/;
 const DEVICE = /^\/admin\/devices\/([a-z][a-z0-9_]{0,31})\/remove$/;
 /** Session- and CSRF-checked changes. `/step-up/options` is claimed only for this module's actions. */
-export async function childrenPost(admin: ChildAdmin | null, session: AuthSession, path: string, payload: unknown): Promise<Routed | null> {
+export async function childrenPost(admin: ChildAdmin | null, session: AuthSession, path: string, payload: unknown, key?: string): Promise<Routed | null> {
     if (!admin) return null;
+    if (path === '/admin/children/batch') return admin.batch.perform(session, payload, key);
+    if (path === '/step-up/options' && (payload as {action?: unknown} | null)?.action === 'child_batch') return {status: 200, body: await admin.stepUpOptions(session, payload)};
     if (path === '/step-up/options') return ChildAdmin.isAction((payload as {action?: unknown} | null)?.action) ? {status: 200, body: await admin.stepUpOptions(session, payload)} : null;
     if (path === '/admin/children') return admin.perform(session, 'child_create', '', payload);
     const child = CHILD.exec(path);

@@ -84,6 +84,30 @@ export interface OperationalAlertEvidenceDTO {
     conditions: OperationalAlertSignalDTO[];
 }
 export type EntryKind = 'child' | 'device_group';
+/** Ordered first-run review items. References name an earlier child_create index (e.g. @0). */
+export type ChildBatchItem =
+    | {action: 'child_create'; target: ''; params: {name: string; kind: EntryKind}; key: string}
+    | {action: 'child_rename'; target: string; params: {name: string}; key: string}
+    | {action: 'device_add'; target: string; params: {label: string; mac: string}; key: string};
+export interface ChildBatchItemResult {
+    key: string;
+    index: number;
+    status: 'saved' | 'queued';
+    childId?: string;
+    deviceId?: string;
+}
+export interface ChildBatchResult {
+    batchId: string;
+    results: ChildBatchItemResult[];
+    operation?: OperationDTO;
+}
+/** clientKey is part of the commitment as well as the execute request's Idempotency-Key. */
+export interface ChildBatchOptionsRequest {
+    action: 'child_batch';
+    clientKey: string;
+    precondition: string | null;
+    items: ChildBatchItem[];
+}
 export interface PersonDTO {
     /** Integration only: a child, or a named group of shared devices (e.g. a TV) paused/scheduled the same way. */
     kind?: EntryKind;

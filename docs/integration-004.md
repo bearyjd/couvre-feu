@@ -124,6 +124,31 @@ database — `integration.sqlite` together with `integration.sqlite-wal` and
   adults' devices can never be added — changing protection stays a manifest edit plus
   rebind), never already managed by any entry (`device_already_enrolled`, without naming
   the owner).
+- **First-run batch step-up (service).** `child_batch` options commit to the exact ordered
+  canonical list (at most 40 `child_create`, `child_rename`, `device_add` items), the
+  client idempotency key and the shared revision precondition. One 120-second, one-use
+  assertion is bound to session/account; its challenge is SHA-256 of the UTF-8 binding
+  digest plus a random base64url nonce. Before prompting, the future client must check
+  both the canonical echo and the derived challenge. Execute is `POST /admin/children/batch`
+  with the same `Idempotency-Key`. Singles retain their existing step-up flow.
+  Only ready devices enter a batch: assignment `inScope`, fresh healthy router observation,
+  and a lease/neighbour address in the current generation's latest complete inventory
+  poll within 30 seconds. These checks run again inside the transaction; any unready item
+  refuses the entire batch with `device_not_ready`, never creates a scope request.
+  Creates/renames alone need no router precondition and never queue a router operation.
+  With device adds, all rows stage for one composed policy (revision +1), one operation,
+  and all-or-nothing local writes. A later router rejection removes every pending device
+  while keeping the children saved. Limits accumulate per item and are reasserted before
+  commit. Audit reuses existing actions once per child, counts devices in the legacy log,
+  stores ids only, and commits in the same transaction. Additive tables preserve old-binary
+  readability without rebuilding parent_audit or bumping user_version.
+  Options issuance is limited to three batches per actor per minute. A persisted first-run
+  marker gates later setup unless an admin has fresh proof that no nonseed active device
+  is router-confirmed. Transactional retry lookup precedes that gate; fresh-assertion retries
+  return stored results, changed bodies with an old key conflict, and consumed refusals
+  are retained. See [the batch contract](service-contract.md#first-run-batch-step-up-integration-service)
+  for wire fields, canonicalization and retry behavior. The [throwaway design](design/first-run/DESIGN.md)
+  is preserved for the later client task; its original single-change API notes are historical.
 - **Router scope.** The router's `--rpc-allow` set is the install-time floor; the live
   `rpc-allowed` may grow past it, and `rpc-status` reports `scope`/`scopeSha` on scoped installs
   (see `docs/contracts/tier1-rpc.md` section 7; routers before the scope release do not report
