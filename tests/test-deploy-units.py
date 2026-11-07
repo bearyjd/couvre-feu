@@ -68,6 +68,48 @@ def public_files():
     return [p for root in (REPO / 'deploy',) for p in root.rglob('*') if p.is_file()] + [REPO / '.dockerignore', DOC_PATH]
 
 
+def unit_verify_problems(stderr, unit_paths):
+    names = '|'.join(re.escape(Path(path).name) for path in unit_paths)
+    if not names:
+        return []
+    unit_reference = re.compile(r'(?<![\w.@:+\\-])(?:' + names + r')(?![\w.@+\\-])')
+    missing_node = 'couvrefeu.service: Command /usr/local/bin/node is not executable: No such file or directory'
+    return [line for line in stderr.splitlines() if unit_reference.search(line) and line != missing_node]
+
+
+class UnitVerifyDiagnostics(unittest.TestCase):
+    def test_foreign_unit_diagnostics_are_ignored(self):
+        stderr = '\n'.join([
+            '/usr/lib/systemd/system/xfs_scrub_all.service:26: Support for option CPUAccounting= has been removed and it is ignored',
+            '/usr/lib/systemd/system/system-xfs_scrub.slice:12: Support for option CPUAccounting= has been removed and it is ignored',
+            '/usr/lib/systemd/system/walinuxagent.service:14: Support for option CPUAccounting= has been removed and it is ignored',
+        ])
+        self.assertEqual(unit_verify_problems(stderr, [UNITS / 'couvrefeu.service']), [])
+
+    def test_own_unit_diagnostics_survive_interleaved_foreign_output(self):
+        own = [
+            f'{UNITS / "couvrefeu.service"}:12: Unknown key name',
+            'couvrefeu-agent.service: Failed to load configuration',
+        ]
+        stderr = '\n'.join(['xfs_scrub_all.service: warning', own[0],
+                            'walinuxagent.service: error', own[1], 'system-xfs_scrub.slice: error'])
+        self.assertEqual(unit_verify_problems(stderr, [UNITS / 'couvrefeu.service',
+                                                      UNITS / 'couvrefeu-agent.service']), own)
+
+    def test_unit_names_are_bounded_and_supplied_units_are_generic(self):
+        own = '/tmp/extra@sample.service:9: Unknown key name'
+        stderr = '\n'.join(['prefix-extra@sample.service: warning',
+                            'extra@sample.service.backup: warning', own,
+                            'extra@sample.service: Failed to load configuration'])
+        self.assertEqual(unit_verify_problems(stderr, [Path('/tmp/extra@sample.service')]),
+                         [own, 'extra@sample.service: Failed to load configuration'])
+
+    def test_only_exact_missing_node_diagnostic_is_exempt(self):
+        missing = 'couvrefeu.service: Command /usr/local/bin/node is not executable: No such file or directory'
+        other = missing.replace('No such file or directory', 'Permission denied')
+        self.assertEqual(unit_verify_problems('\n'.join([missing, other]), [UNITS / 'couvrefeu.service']), [other])
+
+
 class DeployFiles(unittest.TestCase):
     def test_app_unit_has_exactly_the_reviewed_directives(self):
         text = read('deploy', 'systemd', 'couvrefeu.service')
@@ -188,10 +230,11 @@ class DeployFiles(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze is not installed')
     def test_systemd_analyze_verify(self):
-        result = subprocess.run(['systemd-analyze', 'verify', str(UNITS / 'couvrefeu-agent.service'), str(UNITS / 'couvrefeu.service')],
+        unit_paths = [UNITS / 'couvrefeu-agent.service', UNITS / 'couvrefeu.service']
+        result = subprocess.run(['systemd-analyze', 'verify', *map(str, unit_paths)],
                                 capture_output=True, text=True, timeout=60)
         # Only the interpreter binary may be absent on the machine running this check.
-        problems = [l for l in result.stderr.splitlines() if l and not re.fullmatch(r'couvrefeu\.service: Command /usr/local/bin/node is not executable: No such file or directory', l)]
+        problems = unit_verify_problems(result.stderr, unit_paths)
         self.assertEqual(problems, [], result.stderr)
 
 
