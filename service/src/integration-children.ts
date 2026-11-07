@@ -66,6 +66,17 @@ export function withDevice(base: RouterPolicy, config: Pick<IntegrationManifest,
     if (people.length > CHILD_LIMIT) throw new AppError(409, 'child_limit_reached');
     return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownerSchedules({people}, config)}, config.protectedMacs);
 }
+/** All additions share one revision and one router operation; callers stage every device before validation. */
+export function withDevices(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, additions: readonly {person: string; mac: string}[]): RouterPolicy {
+    const people = base.people.map(p => ({...p, macs: [...p.macs]}));
+    for (const addition of additions) {
+        const person = people.find(p => p.id === addition.person);
+        if (person) person.macs.push(addition.mac);
+        else people.push({id: addition.person, macs: [addition.mac]});
+    }
+    if (people.length > CHILD_LIMIT) throw new AppError(409, 'child_limit_reached');
+    return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownerSchedules({people}, config)}, config.protectedMacs);
+}
 /** Next policy with one MAC removed; a child left without devices leaves the router with its pause, allowance and schedules. */
 export function withoutDevice(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, person: string, mac: string): RouterPolicy {
     const people = base.people.map(p => p.id === person ? {...p, macs: p.macs.filter(m => m !== mac)} : p).filter(p => p.macs.length > 0);

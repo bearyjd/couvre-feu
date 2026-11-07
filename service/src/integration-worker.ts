@@ -326,8 +326,8 @@ export class IntegrationWorker {
         if (state === 'conflict') {
             const o = this.store.observation().value;
             if (!o) return null;
-            for (const row of this.store.all<{id: string; identifier: string}>('SELECT id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
-                held = o.acceptedPolicy.people.some(p => p.id === op.person_id && p.macs.includes(row.identifier));
+            for (const row of this.store.all<{id: string; person_id: string; identifier: string}>('SELECT id,person_id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
+                held = o.acceptedPolicy.people.some(p => p.id === row.person_id && p.macs.includes(row.identifier));
                 this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE id=?" : 'DELETE FROM devices WHERE id=?', row.id);
             }
             return null;

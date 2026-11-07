@@ -416,15 +416,18 @@ export class Auth {
         return this.actor(account);
     }
     /** A fresh assertion challenge limited to the session account's own active passkeys and bound to one exact change. */
-    async stepUpChallenge(session: AuthSession, binding: string) {
+    async stepUpChallenge(session: AuthSession, binding: string, bindChallenge = false) {
         const now = this.now(), recent = (this.stepUpAttempts.get(session.dto.actor.id) ?? []).filter(timestamp => timestamp > now - 60);
         if (recent.length >= STEP_UPS_PER_MINUTE) throw new AppError(429, 'step_up_rate_limited');
         this.stepUpAttempts.set(session.dto.actor.id, [...recent, now]);
         this.store.run('DELETE FROM step_ups WHERE expires_at<? OR consumed=1', now);
         const credentials = this.store.all<{id: string; transports: string}>("SELECT id,transports FROM credentials WHERE account_id=? AND state='active'", session.dto.actor.id);
         if (!credentials.length) throw new AppError(403, 'step_up_unavailable');
+        // Batch review can verify the commitment before prompting. Single-change challenges keep their existing random form.
+        const nonce = bindChallenge ? secret() : undefined;
         const options = await generateAuthenticationOptions({
             rpID: this.rpID, userVerification: 'required', timeout: 120000,
+            ...(nonce === undefined ? {} : {challenge: createHash('sha256').update(binding + nonce).digest()}),
             allowCredentials: credentials.map(c => ({id: c.id, transports: JSON.parse(c.transports) as AuthenticatorTransportFuture[]}))
         });
         const id = secret();
@@ -432,7 +435,7 @@ export class Auth {
             this.liveSession(session);
             this.store.run('INSERT INTO step_ups(id,challenge,session_hash,account_id,binding,credential_ids,expires_at) VALUES(?,?,?,?,?,?,?)', id, options.challenge, session.hash, session.dto.actor.id, binding, JSON.stringify(credentials.map(c => c.id)), this.now() + 120);
         });
-        return {challengeId: id, options};
+        return {challengeId: id, options, ...(nonce === undefined ? {} : {binding, nonce})};
     }
     /** Consumes the step-up challenge once, then checks its binding and the signature. Nothing is written until commitStepUp. */
     async stepUpVerify(session: AuthSession, input: unknown, binding: string): Promise<StepUpProof> {
