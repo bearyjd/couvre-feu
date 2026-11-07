@@ -80,7 +80,7 @@ cfr_cleanup() {
         done < "$CFR_STAGE/manifest"
     fi
     for cfr_name in manifest mtime-probe identity.neigh connectivity.neigh status.json snapshot.before snapshot.after \
-        phase.log child.log diff.txt ash busybox helper-shell \
+        phase.log child.log diff.txt ash busybox helper-shell decode.commands decode.probe \
         text.before.iptables text.before.ip6tables text.before.ipset text.before.ipsetsave text.before.uci text.before.cron \
         text.after.iptables text.after.ip6tables text.after.ipset text.after.ipsetsave text.after.uci text.after.cron; do
         rm -f "$CFR_STAGE/$cfr_name"
@@ -128,12 +128,117 @@ cfr_run_sh() {
     "$CFR_SH" "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
 }
 
+# Admit extraction tools before staging, using only shell builtins on refusal.
+cfr_payload_prereq() {
+    for cfr_tool in awk cat chmod date id mkdir mktemp rm rmdir sed sha256sum wc; do
+        command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
+    done
+}
+
+# Decode canonical 76-column base64 to ASCII shell commands, never raw bytes:
+# some BusyBox awk versions drop NUL from %c. Each line holds at most 57 bytes
+# as three-digit octal escapes. Validate the entire private file before sh sees
+# it; the caller hashes every extracted file before any helper runs.
+cfr_decode_helper() {
+    LC_ALL=C awk -v bytes="$1" -v target="$2" '
+        BEGIN {
+            alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            if(bytes !~ /^[0-9]+$/ || bytes<1 || bytes>16777216) {bad=1; exit 1}
+            for(i=1;i<=64;i++) value[substr(alphabet,i,1)]=i-1
+        }
+        {
+            width=length($0)
+            if(done || shortline || width<4 || width>76 || width%4) {bad=1; exit 1}
+            shortline=(width<76)
+            printf "printf \047"
+            for(i=1;i<=width;i+=4) {
+                a=substr($0,i,1); b=substr($0,i+1,1)
+                c=substr($0,i+2,1); d=substr($0,i+3,1)
+                if(!(a in value) || !(b in value)) {bad=1; exit 1}
+                padding=0
+                if(c=="=") {
+                    if(d!="=" || value[b]%16) {bad=1; exit 1}
+                    padding=2
+                } else {
+                    if(!(c in value)) {bad=1; exit 1}
+                    if(d=="=") {
+                        if(value[c]%4) {bad=1; exit 1}
+                        padding=1
+                    } else if(!(d in value)) {bad=1; exit 1}
+                }
+                if(padding && i+3!=width) {bad=1; exit 1}
+                count+=3-padding
+                if(count>bytes) {bad=1; exit 1}
+                printf "\\%03o", value[a]*4+int(value[b]/16)
+                if(padding<2) printf "\\%03o", (value[b]%16)*16+int(value[c]/4)
+                if(!padding) printf "\\%03o", (value[c]%4)*64+value[d]
+                if(padding) done=1
+            }
+            printf "\047 >> \047%s\047\n", target
+        }
+        END {if(bad || count!=bytes) exit 1}
+    '
+}
+
+cfr_decode_file() {
+    # These are the only destinations, and neither contains shell metacharacters.
+    case "$CFR_STAGE" in /tmp/couvre-feu-first.[a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9]) ;; *) return 1;; esac
+    case "$2" in "$CFR_STAGE/router/lib/busybox-static"|"$CFR_STAGE/decode.probe") ;; *) return 1;; esac
+    cfr_decode_helper "$1" "$2" > "$CFR_STAGE/decode.commands" || return 1
+    cfr_decode_lines=$(wc -l < "$CFR_STAGE/decode.commands") || return 1
+    cfr_decode_size=$(wc -c < "$CFR_STAGE/decode.commands") || return 1
+    LC_ALL=C awk -v bytes="$1" -v target="$2" -v lines="$cfr_decode_lines" -v size="$cfr_decode_size" '
+        BEGIN {prefix="printf \047"; suffix="\047 >> \047" target "\047"}
+        {
+            # BusyBox awk can treat NUL as a record separator. Account for
+            # physical bytes and LF lines independently before trusting records.
+            textsize+=length($0)+1
+            if(shortline || substr($0,1,length(prefix))!=prefix ||
+                substr($0,length($0)-length(suffix)+1)!=suffix) {bad=1; exit 1}
+            octal=substr($0,length(prefix)+1,length($0)-length(prefix)-length(suffix))
+            width=length(octal)
+            if(width<4 || width>228 || width%4) {bad=1; exit 1}
+            for(i=1;i<=width;i+=4)
+                if(substr(octal,i,4) !~ /^\\[0-3][0-7][0-7]$/) {bad=1; exit 1}
+            count+=width/4
+            if(count>bytes) {bad=1; exit 1}
+            shortline=(width<228)
+        }
+        END {if(bad || count!=bytes || NR!=lines || textsize!=size) exit 1}
+    ' "$CFR_STAGE/decode.commands" || return 1
+    : > "$2" || return 1
+    # A fresh absolute shell with an empty search path proves printf is builtin
+    # in the same process that sources the fully validated command file.
+    case "$CFR_SH" in /*) ;; *) return 1;; esac
+    # shellcheck disable=SC2016
+    PATH=/nonexistent LC_ALL=C "$CFR_SH" -ec '
+        [ "$(command -v printf)" = printf ] || exit 1
+        . "$1"
+    ' decode "$CFR_STAGE/decode.commands" </dev/null 5>&- || return 1
+    rm -f "$CFR_STAGE/decode.commands" || return 1
+}
+
+cfr_decoder_selftest() {
+    # shellcheck disable=SC2016
+    PATH=/nonexistent LC_ALL=C "$CFR_SH" -c '[ "$(command -v printf)" = printf ]' </dev/null 5>&- || cfr_refuse PREREQ decoder_printf
+    cfr_decode_file 256 "$CFR_STAGE/decode.probe" <<'CF_FIRST_DECODER_PROBE_EOF' || cfr_refuse PREREQ decoder_selftest
+AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4
+OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3Bx
+cnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmq
+q6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj
+5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==
+CF_FIRST_DECODER_PROBE_EOF
+    cfr_probe_sum=$(sha256sum < "$CFR_STAGE/decode.probe") || cfr_refuse PREREQ decoder_selftest
+    [ "${cfr_probe_sum%% *}" = 40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880 ] || cfr_refuse PREREQ decoder_selftest
+    rm -f "$CFR_STAGE/decode.probe" || cfr_refuse PREREQ decoder_selftest
+}
+
 cfr_extract() {
     CFR_STAGE=$(mktemp -d /tmp/couvre-feu-first.XXXXXX) || cfr_refuse PAYLOAD staging_mktemp_failed
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) CFR_STAGE=; cfr_refuse PAYLOAD staging_path_unexpected;; esac
     cfr_info "staging $CFR_STAGE"
     chmod 700 "$CFR_STAGE" || cfr_refuse PAYLOAD staging_mode
-    command -v base64 >/dev/null 2>&1 || cfr_refuse PAYLOAD missing_base64
+    cfr_decoder_selftest
     cfr_payload_extract || cfr_refuse PAYLOAD extraction_failed
     cfr_count=0
     while read -r cfr_sum cfr_mode cfr_path; do
@@ -473,6 +578,7 @@ cfr_connectivity() {
 
 cfr_main() {
     umask 077
+    cfr_payload_prereq
     CFR_START=$(date +%s)
     printf 'BEGIN first-rehearsal commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS"; do
