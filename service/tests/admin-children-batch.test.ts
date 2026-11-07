@@ -8,6 +8,7 @@ import type { InventorySource } from '../../shared/src/router-inventory.ts';
 import { integrationFixture, actor } from './fixtures/integration.ts';
 import { Auth, digest, issueOperatorBootstrap } from '../src/auth.ts';
 import { ChildBatchAdmin } from '../src/admin-children-batch.ts';
+import { AppError } from '../../shared/src/errors.ts';
 import { ChildAdmin } from '../src/admin-children.ts';
 import { BulkOps } from '../src/integration-bulk.ts';
 import { TestAuthenticator } from './authenticator.ts';
@@ -492,7 +493,10 @@ test('batch: final staged child/device/MAC invariants catch transaction-time int
                 f.store.db.exec("CREATE TRIGGER batch_inject AFTER INSERT ON devices WHEN NEW.state='enrolling' BEGIN UPDATE devices SET person_id='kid2' WHERE id=NEW.id; END");
             }
             if (interference === 'mac_set') f.store.db.exec(`CREATE TRIGGER batch_inject AFTER INSERT ON devices WHEN NEW.state='enrolling' BEGIN UPDATE devices SET identifier='${mac(300)}' WHERE id=NEW.id; END`);
-            await refuses(f.perform(who, [add(1)]), interference === 'child_count' ? 'child_limit_reached' : interference === 'device_count' ? 'device_limit_reached' : interference === 'per_child_count' ? 'child_device_limit_reached' : 'device_already_enrolled');
+            const result = await f.perform(who, [add(1)]);
+            assert.ok((result.body as {error?: object}).error);
+            assert.deepEqual(Object.keys((result.body as {error: object}).error), ['code']);
+            await refuses(Promise.resolve(result), interference === 'child_count' ? 'child_limit_reached' : interference === 'device_count' ? 'device_limit_reached' : interference === 'per_child_count' ? 'child_device_limit_reached' : 'device_already_enrolled');
             assert.equal(f.count('people'), interference === 'per_child_count' ? 2 : 1); assert.equal(f.count('devices'), 1); assert.equal(f.count('operations'), 0);
         } finally { f.cleanup(); }
     });
@@ -689,5 +693,78 @@ test('batch: audit writes are transactional and a parent-audit failure rolls bac
         const retry = await f.perform(who, items);
         assert.equal(retry.status, 200); assert.equal(adminWrites, 2); assert.equal(parentWrites, 2);
         assert.equal(f.count('operations'), 1); assert.equal(f.count('devices'), 3); assert.equal(f.count('people'), 3);
+    } finally { f.cleanup(); }
+});
+
+
+test('batch: retryable execution errors are not persisted and final refusals are audited once', async () => {
+    for (const [status, code] of [[409, 'revision_conflict'], [409, 'operation_in_progress'], [409, 'batch_setup_completed'], [503, 'unavailable']] as const) {
+        const f = world();
+        try {
+            const who = await f.signIn(); await f.observe(); f.ready([mac(1)]);
+            const original = f.policy.queue.bind(f.policy);
+            f.policy.queue = () => { throw new AppError(status, code); };
+            await refuses(f.perform(who, [add(1)]), code);
+            assert.equal(f.count('admin_batches'), 0);
+            assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM audit WHERE outcome LIKE 'refused:%'")!.n, 1);
+            assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM parent_audit WHERE result='refused'")!.n, 1);
+            f.policy.queue = original;
+            assert.equal((await f.perform(who, [add(1)])).status, 200);
+        } finally { f.cleanup(); }
+    }
+    const f = world();
+    try {
+        const who = await f.signIn(); await f.observe();
+        const items = [add(1)];
+        const first = await f.perform(who, items), second = await f.perform(who, items);
+        assert.deepEqual(first, second);
+        const row = f.store.get<{action: string; outcome: string}>("SELECT action,outcome FROM audit WHERE outcome LIKE 'refused:%'")!;
+        assert.deepEqual({...row}, {action: 'admin_device_add', outcome: 'refused:device_not_ready:1'});
+        const parent = f.store.get<{action: string; result: string; person_id: string | null}>("SELECT action,result,person_id FROM parent_audit WHERE result='refused'")!;
+        assert.deepEqual({...parent}, {action: 'device_assign', result: 'refused', person_id: null});
+    } finally { f.cleanup(); }
+});
+
+test('batch: failed options release only their own concurrent rate reservation', async () => {
+    const f = world();
+    try {
+        const who = await f.signIn(), original = f.auth.stepUpChallenge.bind(f.auth);
+        let reject!: (reason: Error) => void;
+        f.auth.stepUpChallenge = () => new Promise((_, fail) => { reject = fail; });
+        const failed = f.options(who, [create()], 'batch_client_reserve_1');
+        f.auth.stepUpChallenge = original;
+        await Promise.all([f.options(who, [create()], 'batch_client_reserve_2'), f.options(who, [create()], 'batch_client_reserve_3')]);
+        reject(new Error('auth failed')); await assert.rejects(failed, /auth failed/);
+        await f.options(who, [create()], 'batch_client_reserve_4');
+        await refuses(f.options(who, [create()], 'batch_client_reserve_5'), 'batch_rate_limited');
+    } finally { f.cleanup(); }
+});
+
+
+test('batch: identity and gate failures have no item attribution', async () => {
+    for (const kind of ['identity', 'gate']) {
+        const f = world();
+        try {
+            const who = await f.signIn();
+            if (kind === 'identity') f.store.assertIdentity = () => { throw new AppError(409, 'identity_changed'); };
+            else f.store.run('INSERT INTO admin_batch_setup(singleton,setup_completed) VALUES(1,1)');
+            const result = await f.perform(who, [create()]);
+            assert.deepEqual(result.body, {error: {code: kind === 'identity' ? 'identity_changed' : 'batch_setup_completed'}});
+        } finally { f.cleanup(); }
+    }
+});
+
+
+test('batch: refusal remains stored if parent audit insertion fails', async () => {
+    const f = world();
+    try {
+        const who = await f.signIn(); await f.observe();
+        f.store.db.exec("CREATE TRIGGER fail_parent_refusal BEFORE INSERT ON parent_audit WHEN NEW.result='refused' BEGIN SELECT RAISE(FAIL, 'audit unavailable'); END");
+        const items = [add(1)], first = await f.perform(who, items);
+        assert.equal(first.status, 409);
+        assert.deepEqual(await f.perform(who, items), first);
+        assert.equal(f.count('admin_batches'), 1);
+        assert.equal(f.count('parent_audit'), 0);
+        assert.equal(f.store.get<{outcome: string}>("SELECT outcome FROM audit WHERE outcome LIKE 'refused:%'")?.outcome, 'refused:device_not_ready:1');
     } finally { f.cleanup(); }
 });

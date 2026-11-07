@@ -67,7 +67,7 @@ export class ChildBatchAdmin {
     readonly auth: Auth;
     readonly policy: IntegrationPolicy;
     readonly scope: ScopeTracker;
-    private readonly attempts = new Map<string, number[]>();
+    private readonly attempts = new Map<string, {at: number}[]>();
     constructor(auth: Auth, policy: IntegrationPolicy) {
         this.auth = auth; this.policy = policy;
         this.scope = new ScopeTracker(policy.store, new ParentAlerts(policy.store, null, policy.now), policy.now);
@@ -107,12 +107,18 @@ export class ChildBatchAdmin {
             this.gate(actor);
             this.validateItems(actor, batch);
         }
-        const now = this.policy.now(), recent = (this.attempts.get(actor.id) ?? []).filter(at => at > now - 60);
+        const now = this.policy.now(), recent = (this.attempts.get(actor.id) ?? []).filter(entry => entry.at > now - 60);
         if (recent.length >= 3) throw new AppError(429, 'batch_rate_limited');
         // Reserve before the asynchronous authenticator-options call so concurrent requests cannot bypass the limit.
-        this.attempts.set(actor.id, [...recent, now]);
-        const challenge = await this.auth.stepUpChallenge(session, batch.binding, true);
-        return {...challenge, bindingVersion: 1 as const, binding: batch.binding, items: batch.items};
+        const reservation = {at: now};
+        this.attempts.set(actor.id, [...recent, reservation]);
+        try {
+            const challenge = await this.auth.stepUpChallenge(session, batch.binding, true);
+            return {...challenge, bindingVersion: 1 as const, binding: batch.binding, items: batch.items};
+        } catch (error) {
+            this.attempts.set(actor.id, (this.attempts.get(actor.id) ?? []).filter(entry => entry !== reservation));
+            throw error;
+        }
     }
     /** Shape checks with no writes. Resolve actual references and repeat all authorization/readiness checks at execution. */
     private validateItems(actor: Actor, batch: CanonicalBatch): void {
@@ -147,7 +153,7 @@ export class ChildBatchAdmin {
                 return JSON.parse(prior.result_json) as Routed;
             }
             const id = newId('batch');
-            let routed: Routed, operation: string | null = null, failedIndex = 0;
+            let routed: Routed, operation: string | null = null, failedIndex: number | null = null;
             this.store.db.exec('SAVEPOINT child_batch_work');
             try {
                 this.store.assertIdentity();
@@ -160,14 +166,17 @@ export class ChildBatchAdmin {
                 this.store.db.exec('ROLLBACK TO child_batch_work');
                 this.store.db.exec('RELEASE child_batch_work');
                 if (!(error instanceof AppError)) throw error;
-                routed = {status: error.status, body: {error: {code: error.code, failedIndex, key: batch.items[failedIndex].key}}};
+                routed = {status: error.status, body: {error: {code: error.code, ...(failedIndex === null ? {} : {failedIndex, key: batch.items[failedIndex].key})}}};
+                this.store.run('INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES(?,NULL,?,?,?)', actor.id, `admin_${batch.items[0].action}`, this.policy.now(), `refused:${error.code}:${batch.items.length}`);
+                if (batch.items.some(item => item.action === 'device_add')) auditFor(this.store).record({actor: actor.id, action: 'device_assign', people: [], result: 'refused', at: this.policy.now()});
+                if (error.status >= 500 || ['revision_conflict', 'operation_in_progress', 'batch_setup_completed'].includes(error.code)) return routed;
             }
             this.store.run('INSERT INTO admin_batches(id,actor_id,client_key,digest,result_json,operation_id,created_at) VALUES(?,?,?,?,?,?,?)',
                 id, actor.id, batch.clientKey, batch.binding, JSON.stringify(routed), operation, this.policy.now());
             return routed;
         });
     }
-    private apply(actor: Actor, batch: CanonicalBatch, at: (index: number) => void): Omit<ChildBatchResult, 'batchId'> {
+    private apply(actor: Actor, batch: CanonicalBatch, at: (index: number | null) => void): Omit<ChildBatchResult, 'batchId'> {
         const now = this.policy.now(), created = new Map<number, string>(), touched = new Map<string, Touched>();
         const keys = new Set<string>(), renamed = new Set<string>();
         const seen = new Set(this.store.all<{identifier: string}>("SELECT identifier FROM devices WHERE identifier_kind='mac'").map(d => d.identifier));
@@ -225,9 +234,11 @@ export class ChildBatchAdmin {
             op = this.policy.queue(scoped, additions[0].person, 'enroll', JSON.stringify({kind: 'child_batch', devices: additions.map(d => ({person: d.person, mac: d.mac, label: d.label})), permissionVersion: actor.permissionVersion}), randomUUID(), batch.precondition,
                 base => withDevices(base, this.store.config, additions), operation => {
                     for (const d of additions) this.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES(?,?,?,'mac',?,'enrolling',?,?)", d.id, d.person, d.label, d.mac, operation, now);
+                    at(null);
                     this.assertTotals(childCount, deviceCount, counts, seen);
                 }, [...touched.keys()]);
         }
+        at(null);
         this.assertTotals(childCount, deviceCount, counts, seen);
         for (const [person, change] of touched) {
             this.store.run('INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES(?,?,?,?,?)', actor.id, op?.id ?? null, `admin_${change.action}`, now, `child:${person}:devices:${change.devices}`);
