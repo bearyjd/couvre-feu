@@ -66,8 +66,20 @@ publication. Cron and firewall callbacks invoke the immutable versioned source
 with an installation generation; a stale callback refuses after retirement or a
 later installation of the same release. Recovery reconciles the audited service
 state; daemon exit alone is not a job-drain proof or whole-system quiescence.
-Production admission requires exact audited cron init, `rc.common`, `procd.sh`
-and firewall init hashes plus the admitted procd image binding. Unknown sources
+Production admission requires exact audited hashes for cron init, `rc.common`,
+`procd.sh`, `functions.sh`, `service.sh`, `uci.sh`, `jshn.sh`, firewall init
+and the admitted procd image binding. Both `gl-xe3000-4.8.3-logd-011-v1` and
+`gl-xe3000-4.8.3-os-trust-v1` permit the three exact metadata shapes observed
+on GL-XE3000 vendor firmware, accepting its existing GID0 writer trust:
+`/usr/share` root:root real directory 0775, `/etc/rc.common` root:root
+regular file 0775 and `/lib/functions/service.sh` root:root regular file 0664. Canonical
+ancestry, non-symlink types and all other parent rules remain enforced; strict
+retains its original modes. The `rc.common` pin remains
+`ebeeedc132a75942ce876465e4636a75f745e468c573fdf9ad058e57e58a0341`;
+the `service.sh` pin remains
+`afb750abd9c4b4eeb1e8dc5eb9f66c7d47774782494f2c168183390803db3b91`.
+Group-writable exceptions trust every GID0 writer, including unobserved holders;
+metadata and pins alone cannot prove writer exclusion. Unknown sources
 refuse before managed writes. Target source bytes, flock, pinned-helper setsid and service
 behavior remain UNVERIFIED; this narrows eligibility, not a hardware admission.
 

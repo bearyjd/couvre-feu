@@ -10,14 +10,14 @@ CF_PLATFORM_LOCKED=0
 CF_PLATFORM_NESTED=0
 CF_PLATFORM_OWNER=0:0
 CF_PLATFORM_LIB=
-CF_RELEASE_ID=7735cba86f2ca6486afd59e262cec71ee4dbfdc03a94336c9561d822155e5dee
+CF_RELEASE_ID=41032ce9dcf79d7b3ccaef0f53024e85fdbd67d463ce62506e896e54448aac09
 CF_VENDOR_PROFILE=gl-xe3000-4.8.3-logd-011-v1
 CF_OS_TRUST_PROFILE=gl-xe3000-4.8.3-os-trust-v1
 CF_PLATFORM_INITIAL_WRITE=0
 # The single platform lock path: acquire, release, recover, the compatibility fence and
 # explicit recovery (install-common.sh) all name it through this variable.
 platform_lock_path=/tmp/couvrefeu-platform.lock
-CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:0fc5151f5bb1ef4382ffb8be8b14cb630d5be584a59f12e96e9bd4358cbf23a5 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:349b71a250b9387f2390f0bf6764f560583b44c4d71f31b5b262f3d87d12afb0 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
+CF_RELEASE_MODULES='core.sh:3e3d6b0a19eb55e7d051ad34457c501aaa8a6f9c204b7c2c116dfbf9c35d1ecb rpc.sh:09da345369405c59ee943c2e8340673d6be224ddd64456176c991718e954ae67 firewall.sh:6d26a4d0bbb658224a568c87f3efa29e7fc1316561efd79017f440339267cbd7 install-common.sh:0fc5151f5bb1ef4382ffb8be8b14cb630d5be584a59f12e96e9bd4358cbf23a5 state.awk:3326364e1827d767c9b7b291e66668fef456a705ea79bd25f2e9fe82b15b7755 rules.awk:523595998750193b4cc2bc8b1d407a45fae95738d8a47a356afd16025a268954 json.awk:ae3a0773339230ebff7349e9bafc6ff02d42aa7cf162b6377ff33638186d03fc vendor-platform.sh:5019d91b2331fff339958fcdef2aff0b88823e42809cf094cbfe85570b4e8084 activity.sh:6bf33a31000f5a8c3078a813856b21834b58b06d98055e45fa71a8cd414e2155'
 
 platform_fail() {
     printf 'couvre-feu: platform %s\n' "$*" >&2
@@ -218,7 +218,7 @@ platform_helper_parents() {
             if [ "$((0$platform_helper_mode & 020))" != 0 ]; then
                 platform_vendor_selected || platform_fail helper_missing
                 case "$platform_helper_parent:$platform_helper_metadata" in
-                    /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775) ;;
+                    /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775|/usr/share:0:0:775) ;;
                     *) platform_fail helper_missing;;
                 esac
             fi
@@ -874,7 +874,7 @@ platform_service_sources() {
         if ! { [ -d "$service_parent" ] && [ ! -L "$service_parent" ]; }; then platform_fail service_source_parent; fi
         service_parent_meta=$(platform_stat -c '%u:%g:%a' "$service_parent")
         case "$service_parent_meta" in 0:0:755) ;;
-            0:0:775) case "$service_parent" in /etc|/etc/init.d|/lib/config|/sbin)
+            0:0:775) case "$service_parent" in /etc|/etc/init.d|/lib/config|/sbin|/usr/share)
                 platform_vendor_selected || platform_fail service_source_parent_metadata;;
                 *) platform_fail service_source_parent_metadata;; esac;;
             *) platform_fail service_source_parent_metadata;; esac
@@ -895,8 +895,9 @@ platform_service_sources() {
             /sbin/procd) service_mode=755; service_pin=cbd00d8102c236d3f2ee2c56c159a9133f574477ef89efc80d2be5f4daf0a3d1;;
         esac
         service_exception=0
-        case "$service_source" in /lib/functions.sh|/lib/config/uci.sh)
-            if platform_vendor_selected && [ "$(platform_stat -c '%u:%g:%a' "$service_source")" = 0:0:664 ]; then service_exception=1; fi;;
+        case "$service_source:$(platform_stat -c '%u:%g:%a' "$service_source")" in
+            /etc/rc.common:0:0:775|/lib/functions/service.sh:0:0:664|/lib/functions.sh:0:0:664|/lib/config/uci.sh:0:0:664)
+                if platform_vendor_selected; then service_exception=1; fi;;
         esac
         if [ "$service_exception" = 1 ]; then platform_regular "$service_source"; platform_canonical "$service_source"
         else platform_private "$service_source" "$service_mode"; fi

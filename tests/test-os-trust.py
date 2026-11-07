@@ -363,8 +363,8 @@ fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
 class HelperParentTrustTests(unittest.TestCase):
     def test_helper_ancestry_uses_the_selected_platform_trust(self):
         # Both predicates see identical metadata for real isolated directory
-        # paths. Only the six absolute exception names are mapped into /tmp.
-        allowed=['/lib/config','/etc','/etc/opkg','/usr/libexec','/sbin','/etc/init.d']
+        # paths. Only the exact absolute exception names are mapped into /tmp.
+        allowed=['/lib/config','/etc','/etc/opkg','/usr/libexec','/sbin','/etc/init.d','/usr/share']
         with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-trust-') as folder:
             root=Path(folder)
             bootstrap=(REPO/'router/lib/platform-bootstrap.sh').read_text()

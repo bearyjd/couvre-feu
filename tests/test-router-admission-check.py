@@ -35,7 +35,10 @@ GOOD_METADATA = {
     "path:/tmp:metadata": "0:0:1777",
 }
 REAL_METADATA = dict(GOOD_METADATA, **{"path:/usr/share:metadata": "0:0:775"})
+SAVED_FACTS = REPO / "tests/fixtures/router-facts-gl-xe3000-20261107.txt"
 PIN_WITNESSES = {
+    "path:/etc/rc.common:sha256": "ebeeedc132a75942ce876465e4636a75f745e468c573fdf9ad058e57e58a0341",
+    "path:/lib/functions/service.sh:sha256": "afb750abd9c4b4eeb1e8dc5eb9f66c7d47774782494f2c168183390803db3b91",
     "path:/lib/libc.so:sha256": "c7ad6aff9300a5810e33ed8099057ef4515c0e711e9570309161d4014a5768ce",
     "path:/lib/libgcc_s.so.1:sha256": "6baf0c0086b0bd2915019e942a2fa7b2b4dfb4e0935db43a71fc54add13d1a69",
     "path:/usr/libexec/stat-coreutils:sha256": "774eaa80136871de03ea7c94ef713aac209cea00eddb8e7d07c7036e511499a0",
@@ -60,10 +63,10 @@ class AdmissionCheckerTests(unittest.TestCase):
         rows = self.subset_rows(GOOD_METADATA)
         self.assertEqual([row[0] for row in rows], ["PASS"] * 10)
 
-    def test_user_real_metadata_fails_exactly_usr_share(self):
+    def test_vendor_service_parent_metadata_matches(self):
         rows = checker.assess(checker.parse_facts(capture(REAL_METADATA), self.rules), self.rules)
-        self.assertEqual([row[1] for row in rows if row[0] == "FAIL"], ["path:/usr/share:metadata"])
-        self.assertEqual(sum(row[0] == "PASS" for row in rows), 9)
+        self.assertFalse(any(row[0] == "FAIL" for row in rows))
+        self.assertEqual(sum(row[0] == "PASS" for row in rows), 10)
         self.assertTrue(any(row[0] == "MISSING" for row in rows))
         self.assertTrue(any(row[0] == "SKIP" and row[1] == "runtime:supervisor" for row in rows))
 
@@ -75,7 +78,7 @@ class AdmissionCheckerTests(unittest.TestCase):
             self.assertIn(digest, source)
 
     def test_service_parent_exception_does_not_spread(self):
-        for path in ("/lib", "/lib/functions", "/usr", "/usr/share", "/usr/share/libubox"):
+        for path in ("/lib", "/lib/functions", "/usr", "/usr/share/libubox"):
             with self.subTest(path=path):
                 rows = self.subset_rows({f"path:{path}:metadata": "0:0:775"})
                 self.assertEqual(rows[0][0], "FAIL")
@@ -166,15 +169,57 @@ class AdmissionCheckerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 checker.parse_facts(data, self.rules)
 
-    def test_cli_real_fixture_reports_rule_and_incomplete(self):
-        result = subprocess.run([sys.executable, "-B", str(TOOL)], input=capture(REAL_METADATA),
+    def test_cli_saved_complete_fixture_preserves_unknowns(self):
+        data = SAVED_FACTS.read_bytes()
+        facts = checker.parse_facts(data, self.rules)
+        rows = checker.assess(facts, self.rules)
+        self.assertEqual({status: sum(row[0] == status for row in rows)
+                          for status in ("PASS", "FAIL", "MISSING", "SKIP")},
+                         {"PASS": 218, "FAIL": 0, "MISSING": 0, "SKIP": 76})
+        result = subprocess.run([sys.executable, "-B", str(TOOL), str(SAVED_FACTS)],
+                                capture_output=True, timeout=COMMAND_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"RESULT INCOMPLETE pass=218 fail=0 missing=0 skip=76", result.stdout)
+        self.assertIn(b"SKIP runtime:supervisor observed=UNOBSERVABLE", result.stdout)
+        self.assertIn(b"no installer execution", result.stdout)
+
+    def test_cli_rejects_tampered_complete_fixture(self):
+        facts = checker.parse_facts(SAVED_FACTS.read_bytes(), self.rules)
+        facts["path:/usr/share:metadata"] = "0:1:775"
+        result = subprocess.run([sys.executable, "-B", str(TOOL)], input=capture(facts),
                                 capture_output=True, timeout=COMMAND_TIMEOUT)
         self.assertEqual(result.returncode, 1, result.stderr)
         failures = [line for line in result.stdout.decode().splitlines() if line.startswith("FAIL ")]
         self.assertEqual(len(failures), 1)
-        self.assertIn('FAIL path:/usr/share:metadata observed=0:0:775 rule=["0:0:755"]', failures[0])
-        self.assertIn(b"RESULT INCOMPLETE", result.stdout)
-        self.assertIn(b"MISSING ", result.stdout)
+        self.assertIn('FAIL path:/usr/share:metadata observed=0:1:775 rule=["0:0:755","0:0:775"]', failures[0])
+        self.assertIn(b"RESULT INCOMPLETE pass=217 fail=1 missing=0 skip=76", result.stdout)
+
+    def test_named_vendor_exceptions_keep_exact_owner_mode_type_and_ancestry(self):
+        for path, kind, mode in (("/usr/share", "dir", "775"),
+                                 ("/etc/rc.common", "file", "775"),
+                                 ("/lib/functions/service.sh", "file", "664")):
+            good = {f"path:{path}:metadata": f"0:0:{mode}",
+                    f"path:{path}:type": kind, f"path:{path}:canonical": "yes"}
+            with self.subTest(path=path):
+                self.assertTrue(all(row[0] == "PASS" for row in self.subset_rows(good)))
+            for field, value in (("metadata", f"1:0:{mode}"),
+                                 ("metadata", f"0:1:{mode}"),
+                                 ("metadata", "0:0:777"),
+                                 ("metadata", "0:0:6775"),
+                                 ("metadata", "0:0:" + ("664" if mode == "775" else "775")),
+                                 ("type", "link"), ("canonical", "no")):
+                with self.subTest(path=path, field=field, value=value):
+                    rows = self.subset_rows({f"path:{path}:{field}": value})
+                    self.assertEqual(rows[0][0], "FAIL")
+
+    def test_saved_fixture_tampered_service_pins_still_fail(self):
+        original = checker.parse_facts(SAVED_FACTS.read_bytes(), self.rules)
+        for path in ("/etc/rc.common", "/lib/functions/service.sh"):
+            key = f"path:{path}:sha256"
+            facts = dict(original, **{key: "0" * 64})
+            with self.subTest(path=path):
+                failures = [row[1] for row in checker.assess(facts, self.rules) if row[0] == "FAIL"]
+                self.assertEqual(failures, [key])
 
     def test_good_observable_fixture_keeps_intrinsic_unknown_explicit(self):
         facts = dict(GOOD_METADATA, **{"runtime:supervisor": "UNOBSERVABLE"})
