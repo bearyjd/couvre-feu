@@ -1,4 +1,5 @@
 import type { Auth } from './auth.ts';
+import { pruneBatches } from './admin-children-batch.ts';
 import { ActivityStore, retentionDays } from './activity-store.ts';
 import { appServer } from './http.ts';
 import type { DemoConfig } from './config.ts';
@@ -24,6 +25,7 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
         try { worker.inventory.prune(); } catch { process.stderr.write('inventory_prune_failed\n'); }
         // Audit rows age out after 90 days whether or not the log is still on; this runs at startup and hourly (a bounded delete).
         try { auditFor(store).prune(); } catch { process.stderr.write('parent_audit_prune_failed\n'); }
+        try { pruneBatches(store); } catch { process.stderr.write('admin_batches_prune_failed\n'); }
     };
     const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => appServer(auth, new IntegrationPolicy(store), serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory);
     return {worker, activity, prune, app};

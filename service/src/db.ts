@@ -65,6 +65,8 @@ export class Store {
                 try {
                     for (const [table, columns] of Object.entries(required)) this.db.prepare(`SELECT ${columns} FROM ${table} LIMIT 0`).all();
                 } catch { throw new Error('unsupported_database_schema'); }
+                // Intentionally outside the numbered migrations: the previous service must remain able to open this DB.
+                this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/admin-batches.sql', import.meta.url), 'utf8')));
             }
         }
         catch (error) {

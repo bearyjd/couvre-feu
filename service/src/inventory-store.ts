@@ -1,6 +1,10 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { isPrivateAddress } from '../../shared/src/router-inventory.ts';
 import type { InventorySource, RouterInventory } from '../../shared/src/router-inventory.ts';
+import type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
+export type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
+import { IntegrationPolicy } from './integration-policy.ts';
+import { ScopeTracker } from './integration-scope.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
@@ -38,14 +42,6 @@ export function inventoryFailureLabel(code: string): string {
     if (code === 'ssh_exit_255') return 'inventory_transport_error:ssh_exit_255';
     return `inventory_unavailable:${code.replace(/[^a-z0-9_]/g, '_').slice(0, 64)}`;
 }
-export interface InventoryDeviceDTO {
-    mac: string; ipv4: string[]; hostname: string | null; reportedByDevice: true; source: InventorySource;
-    firstSeen: number; lastSeen: number; acknowledgedAt: number | null; personId: string | null; personName: string | null; flags: {new: boolean; private: boolean; unassigned: boolean};
-}
-export interface InventoryDTO {
-    status: {baselineAt: number | null; lastOkAt: number | null; lastAttemptAt: number | null; lastError: string | null; refreshRequestedAt: number | null; pollSeconds: number; retentionDays: number};
-    devices: InventoryDeviceDTO[];
-}
 interface StateRow {
     generation: string | null; baseline_at: number | null; last_ok_at: number | null; last_attempt_at: number | null; last_error: string | null;
     refresh_requested_at: number | null; refresh_pending: number; alert_day_start: number | null; alert_day_count: number; last_alert_at: number | null;
@@ -66,9 +62,13 @@ export class InventoryStore {
     readonly alerts: Pick<ParentAlerts, 'raise'>;
     readonly now: () => number;
     readonly retentionDays: number;
+    readonly policy: IntegrationPolicy;
+    readonly scope: ScopeTracker;
     constructor(store: IntegrationStore, alerts: Pick<ParentAlerts, 'raise'>, now = () => Math.floor(Date.now() / 1000), retentionDays = DEFAULT_INVENTORY_RETENTION_DAYS) {
         if (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > MAX_INVENTORY_RETENTION_DAYS) throw new Error('invalid_inventory_retention_days');
         this.store = store; this.alerts = alerts; this.now = now; this.retentionDays = retentionDays;
+        this.policy = new IntegrationPolicy(store, now);
+        this.scope = new ScopeTracker(store, alerts, now);
         this.atomic(() => this.purgeProtected());
     }
     /** A protected management MAC is never listed, so a stored row for one (an older manifest, a hand edit) is removed. */
@@ -107,7 +107,7 @@ export class InventoryStore {
     }
     /** The ONLY place a failed poll is recorded. It never touches integration_state.observation_error. */
     recordFailure(label: string, at = this.now()): void {
-        this.atomic(() => { this.state(); this.store.run('UPDATE inventory_state SET last_error=? WHERE singleton=1', label.slice(0, 96)); this.noteIncomplete(at); });
+        this.atomic(() => { this.state(); this.store.run('DELETE FROM inventory_coverage'); this.store.run('UPDATE inventory_state SET last_error=? WHERE singleton=1', label.slice(0, 96)); this.noteIncomplete(at); });
     }
     /** Starts (or continues) the clock of "no complete poll" at the last complete one, and alerts once it has run for 30 minutes. */
     private noteIncomplete(at: number): void {
@@ -143,6 +143,8 @@ export class InventoryStore {
             this.purgeProtected();
             this.pruneAt(at);
             const g = this.generation;
+            // Coverage is a snapshot, unlike retained inventory history; an absent row cannot authorize a batch add.
+            this.store.run('DELETE FROM inventory_coverage');
             // Warning codes alone are not structural, but a refusal body (errors and no devices) lists nothing and is never a baseline.
             const other = reply.errors.find(e => !BENIGN_ROUTER_ERRORS.includes(e));
             if (other !== undefined || reply.truncated || (reply.errors.length > 0 && reply.devices.length === 0)) {
@@ -160,6 +162,9 @@ export class InventoryStore {
             for (const d of reply.devices) {
                 if (known.has(d.mac)) this.refresh(g, d, at);
                 else if (stored.has(d.mac)) this.store.run('INSERT INTO inventory_devices(generation,mac,ipv4_json,hostname,source,first_seen,last_seen) VALUES(?,?,?,?,?,?,?)', g, d.mac, JSON.stringify(d.ipv4), d.hostname, d.source, at, at);
+                if ((known.has(d.mac) || stored.has(d.mac)) && d.ipv4.length > 0 && !this.store.config.protectedMacs.includes(d.mac)) {
+                    this.store.run('INSERT INTO inventory_coverage(generation,mac,observed_at) VALUES(?,?,?)', g, d.mac, at);
+                }
             }
             const dropped = fresh.length - stored.size;
             this.store.run('UPDATE inventory_state SET baseline_at=?,last_ok_at=?,last_error=?,incomplete_since=NULL WHERE singleton=1', rebaseline ? at : state.baseline_at, at,
@@ -244,7 +249,7 @@ export class InventoryStore {
     /** The owner is named only to a viewer who manages that child; for anyone else it is null (the device still counts as assigned). */
     private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor): InventoryDeviceDTO {
         const owner = lookup.owners.get(r.mac), visible = owner !== undefined && viewer.personIds.includes(owner) && lookup.names.has(owner);
-        return {mac: r.mac, ipv4: JSON.parse(r.ipv4_json) as string[], hostname: r.hostname, reportedByDevice: true, source: r.source, firstSeen: r.first_seen, lastSeen: r.last_seen, acknowledgedAt: r.acknowledged_at,
+        return {mac: r.mac, inScope: this.scope.inRouterScope(r.mac, this.policy), ipv4: JSON.parse(r.ipv4_json) as string[], hostname: r.hostname, reportedByDevice: true, source: r.source, firstSeen: r.first_seen, lastSeen: r.last_seen, acknowledgedAt: r.acknowledged_at,
             personId: visible ? owner : null, personName: visible ? lookup.names.get(owner)! : null,
             flags: {new: baseline !== null && r.acknowledged_at === null && r.first_seen > baseline, private: isPrivateAddress(r.mac), unassigned: owner === undefined}};
     }

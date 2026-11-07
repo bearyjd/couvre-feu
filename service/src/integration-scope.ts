@@ -35,6 +35,10 @@ export class ScopeTracker {
         const row = this.current();
         return row ? JSON.parse(row.scope_json) as string[] : [];
     }
+    /** The install-time floor, or remembered clean, generation-checked scope while policy observation is fresh. */
+    inRouterScope(mac: string, policy: {fresh(): boolean}): boolean {
+        return routerScopeOf(this.store.config).includes(mac) || (policy.fresh() && this.observedScope().includes(mac));
+    }
     private current(): ObservedRow | undefined {
         const row = this.store.get<ObservedRow>('SELECT generation,scope_sha,scope_json FROM router_scope_observed WHERE singleton=1');
         return row && row.generation === this.store.config.router.generation ? row : undefined;

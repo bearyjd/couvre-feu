@@ -24,6 +24,7 @@ Trust boundaries
 - Service never gets a shell: cfctl-ssh accepts only `cfctl rpc-*|status|pause|resume|sync|expire|apply-fw` tokens.
 - In `owner` mode the owner account is guarded against other admins and against self-lockout (admin-accounts.ts, PR #100).
 - Router is source of truth for enforcement; service holds desired policy (revision CAS) and an observation.
+- First-run batch review binds an ordered list plus client key to one passkey assertion. Fresh scope/address coverage and accumulated limits are checked transactionally; all device adds become one policy revision +1. Local metadata batches never queue; additive SQLite tables keep the previous binary readable.
 - Time-limited pause/allowance expires via the immutable generation-bound cron callback even if service is down.
 - A permanent kernel mutex fences install/runtime/recovery workers; immutable PREPARED and a final retirement receipt bind exact restoration. Admin-only external-source recovery precedes the single uninstaller. Production legacy automatic restore refuses; target eligibility remains UNVERIFIED. [Recovery contract](../runbooks/vendor-platform-admission.md).
 
