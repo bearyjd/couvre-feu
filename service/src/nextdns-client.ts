@@ -241,8 +241,12 @@ export function createFetchTransport(options: FetchTransportOptions = {}): Trans
     const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS, maxBytes = options.maxBytes ?? MAX_RESPONSE_BYTES;
     return async req => {
         const url = new URL(req.path, base);
+        // `new URL` silently normalises (%2e%2e, ./, tabs, //): the path fetched must be exactly the path requested.
+        // It keeps %2f, %5c and %25 as they are, so those (and encoded dots) are refused outright; the query is not checked.
+        const requested = req.path.split('?', 1)[0]!;
         if (url.origin !== base.origin || !req.path.startsWith('/') || req.path.includes('\\')
-            || /[\u0000-\u001f\u007f]|\.\./.test(req.path)) return fail('transport');
+            || /[\u0000-\u001f\u007f]/.test(req.path) || /%(?:2e|2f|5c|25)/i.test(requested)
+            || url.pathname !== requested) return fail('transport');
         const timer = AbortSignal.timeout(timeoutMs), signal = req.signal ? AbortSignal.any([timer, req.signal])
             : timer;
         try {
