@@ -41,7 +41,7 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
    **The service's private SSH key is not stored in either directory.** Both are readable by the service uid (and `/etc/couvrefeu` is mounted into the container), so a compromised service could copy an encrypted key and brute-force its passphrase. Keep the key in a root-only directory (`install -d -o root -g root -m 0700 /root/couvrefeu-key`, key file `0600 root:root`) and only ever hand it to the agent (below). Only the public key (`/etc/couvrefeu/service_key.pub`) and `known_hosts` live in `/etc/couvrefeu`.
 4. `openssh-client` (the router transport runs `ssh` with `PATH=/usr/bin:/bin`).
 5. A private manifest built from [integration-004](../integration-004.md) and [http-behind-proxy](http-behind-proxy.md): `listen.host` is `<APP_IP>`, `trustedProxies` lists exactly the address the service sees for the proxy, `publicOrigin` is `https://cf.example.invalid`, `router.agentSocket` is `/run/couvrefeu/agent.sock`.
-6. Backups: before any upgrade stop the service and copy `integration.sqlite`, `integration.sqlite-wal` and `integration.sqlite-shm` from the data directory together. Database migrations are not reversible.
+6. Backups: before any upgrade stop the service and copy `integration.sqlite`, `integration.sqlite-wal` and `integration.sqlite-shm` from the data directory together. Database migrations are not reversible; in particular migration 014 (content filtering) rebuilds `parent_audit` and raises the schema version, so rolling back the code requires restoring the pre-upgrade snapshot.
 
 ## Option 1: systemd (LXC, VM or bare metal)
 

@@ -151,6 +151,41 @@ test('a store that throws never rejects the reconcile, and the next reconcile of
     } finally { s.close(); }
 });
 
+test('a burst of reconciles is coalesced: one running, one waiting, later callers share the waiting run', async () => {
+    let gate!: () => void, patches = 0;
+    const open = new Promise<void>(resolve => { gate = resolve; });
+    const s = setup(next => async req => { if (req.method === 'PATCH') { patches++; if (patches === 1) await open; } return next(req); });
+    try {
+        s.put();
+        const first = s.reconciler.reconcile('pilot');
+        await new Promise(r => setImmediate(r));
+        s.filters.put('pilot', parseDesired(input({categories: ['porn']})), 'operator');
+        const burst = Array.from({length: 5}, () => s.reconciler.reconcile('pilot'));
+        assert.ok(burst.every(p => p === burst[0]), 'one shared waiting run');
+        gate();
+        const [, ...rest] = await Promise.all([first, ...burst]);
+        assert.equal(patches, 2, 'two round trips for six callers');
+        assert.ok(rest.every(r => r!.revision === 2 && r!.state === 'applied'), 'the waiting run reads the newest revision');
+        assert.deepEqual(active(s.profile.parentalControl.categories), ['porn']);
+        assert.equal((await s.reconciler.reconcile('pilot'))!.state, 'applied', 'the slot is free again');
+    } finally { s.close(); }
+});
+
+test('reconcileWithin gives up waiting at the budget and answers the stored pending state; the run carries on', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const w = fakeWorld(next => async req => { await hold; return next(req); });
+    const db = new Store(':memory:'), filters = new ContentFilterStore(db, () => 1);
+    const reconciler = new ContentFilterReconciler({client: w.client, profiles: {pilot: PROFILE_ID}, store: filters, waitMs: 40});
+    try {
+        filters.put('pilot', DESIRED, 'operator');
+        const started = Date.now(), answer = await reconciler.reconcileWithin('pilot');
+        assert.ok(Date.now() - started < 1500); assert.equal(answer!.state, 'pending');
+        release();
+        assert.equal((await reconciler.reconcile('pilot'))!.state, 'applied', 'the abandoned run finished and the next one is not stuck');
+    } finally { release(); db.close(); }
+});
+
 test('a newer revision wins: the outcome of a reconcile that raced a newer PUT is dropped', async () => {
     let raced = false;
     const s = setup(next => async req => {

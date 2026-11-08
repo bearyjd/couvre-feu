@@ -353,7 +353,7 @@ test('batch: first-run completion refuses later setup with confirmed nonseed dev
     } finally { f.cleanup(); }
 });
 
-test('batch: additive schema leaves version, parent-audit schema and existing data readable by old readers', () => {
+test('batch: tables stay additive, but migration 014 raises the version so the pre-014 binary refuses the database', () => {
     const f = world();
     try {
         assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12);

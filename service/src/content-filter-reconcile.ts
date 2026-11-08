@@ -32,7 +32,8 @@ async function write(client: NextDnsClient, profile: string, desired: ContentFil
 /** What NextDNS holds now, in the desired shape. Only active entries count: an inactive entry filters nothing. */
 async function readBack(client: NextDnsClient, profile: string, call: Call): Promise<ContentFilterDesired> {
     const parental = await client.getParentalControl(profile, call);
-    const [denylist, allowlist] = [await client.getList(profile, 'denylist', call), await client.getList(profile, 'allowlist', call)];
+    const denylist = await client.getList(profile, 'denylist', call);
+    const allowlist = await client.getList(profile, 'allowlist', call);
     return canonicalize({
         categories: activeIds(parental.categories), services: activeIds(parental.services), safeSearch: parental.safeSearch,
         youtubeRestrictedMode: parental.youtubeRestrictedMode, blockBypass: parental.blockBypass === true, denylist: activeIds(denylist), allowlist: activeIds(allowlist),
@@ -40,7 +41,7 @@ async function readBack(client: NextDnsClient, profile: string, call: Call): Pro
 }
 
 export interface ReconcilerOptions {
-    readonly client: NextDnsClient; readonly profiles: Readonly<Record<string, string>>; readonly store: ContentFilterStore; readonly budgetMs?: number;
+    readonly client: NextDnsClient; readonly profiles: Readonly<Record<string, string>>; readonly store: ContentFilterStore; readonly budgetMs?: number; readonly waitMs?: number;
 }
 /**
  * Write the desired filter to NextDNS, read it back, diff. The stop rule of PRP-006: 'applied' only when the read-back equals the
@@ -49,15 +50,34 @@ export interface ReconcilerOptions {
  */
 export class ContentFilterReconciler {
     private readonly options: ReconcilerOptions;
-    private readonly tails = new Map<string, Promise<unknown>>();
+    private readonly slots = new Map<string, Promise<FilterRecord | undefined>>();
+    private readonly queued = new Map<string, Promise<FilterRecord | undefined>>();
     constructor(options: ReconcilerOptions) { this.options = options; }
     /** Whether this child has a NextDNS profile in the manifest. */
     configured(person: string): boolean { return Object.hasOwn(this.options.profiles, person); }
-    /** Runs one at a time per child; each run reads the newest revision when it starts. */
+    /**
+     * Runs one at a time per child, with at most one run waiting behind the current one: later callers share the waiting run, which reads
+     * the newest revision when it starts, so a burst of PUTs costs at most two NextDNS round trips.
+     */
     reconcile(person: string): Promise<FilterRecord | undefined> {
-        const run = (this.tails.get(person) ?? Promise.resolve()).then(() => this.run(person));
-        this.tails.set(person, run);
-        const clear = () => { if (this.tails.get(person) === run) this.tails.delete(person); };
+        const current = this.slots.get(person);
+        if (current === undefined) return this.start(person);
+        const waiting = this.queued.get(person);
+        if (waiting !== undefined) return waiting;
+        const next = current.then(() => { this.queued.delete(person); return this.start(person); });
+        this.queued.set(person, next);
+        return next;
+    }
+    /** reconcile, but a caller waits no longer than the reconcile budget: on expiry it gets the stored state (still pending); the run carries on. */
+    async reconcileWithin(person: string): Promise<FilterRecord | undefined> {
+        let timer: NodeJS.Timeout | undefined;
+        const expired = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), this.options.waitMs ?? this.options.budgetMs ?? RECONCILE_BUDGET_MS); });
+        try { return await Promise.race([this.reconcile(person), expired]) ?? this.options.store.get(person); } finally { clearTimeout(timer); }
+    }
+    private start(person: string): Promise<FilterRecord | undefined> {
+        const run = this.run(person);
+        this.slots.set(person, run);
+        const clear = () => { if (this.slots.get(person) === run) this.slots.delete(person); };
         run.then(clear, clear);
         return run;
     }

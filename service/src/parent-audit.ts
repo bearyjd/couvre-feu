@@ -51,6 +51,17 @@ export class ParentAudit {
         } catch { process.stderr.write('parent_audit_write_failed\n'); }
     }
 
+    /**
+     * Like record, for a change that must not exist without its audit row: a failed insert throws (so the caller's transaction rolls back).
+     * Does nothing when the log is off. No refusal flood limit: it is for accepted changes only.
+     */
+    recordOrThrow(entry: AuditEntry): void {
+        if (!this.enabled) return;
+        const at = entry.at ?? this.now(), people = entry.people.length ? [...new Set(entry.people)] : [null];
+        const write = () => { for (const person of people) this.store.run('INSERT INTO parent_audit(at,actor_id,action,person_id,operation_id,result) VALUES(?,?,?,?,?,?)', at, entry.actor, entry.action, person, entry.operationId ?? null, entry.result); };
+        if (this.store.db.isTransaction) write(); else this.store.transaction(write);
+    }
+
     /** Refused rows carry no operation id, so nothing else dedupes them: an actor's flood of refusals stops being stored after REFUSED_MAX in REFUSED_WINDOW_SECONDS. */
     private refusedRecently(actor: string, at: number): boolean {
         const n = this.store.get<{n: number}>("SELECT count(*) n FROM (SELECT 1 FROM parent_audit WHERE at>? AND actor_id=? AND result='refused' LIMIT ?)", at - REFUSED_WINDOW_SECONDS, actor, REFUSED_MAX)?.n ?? 0;

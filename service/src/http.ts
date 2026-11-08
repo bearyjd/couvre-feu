@@ -292,14 +292,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 throw new AppError(404, 'route_not_found');
             }
-            if (request.method === 'PUT' && FILTER_PATH.test(path)) {
-                // Off (or no filter service) is a route that does not exist.
+            if (request.method === 'PUT' && contentFilter && FILTER_PATH.test(path)) {
+                // No filter service, mode off or an excluded actor: like any other PUT path (405).
                 if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
                 const payload = await body(request);
                 const session = auth.session(sessionToken, jar.cf_browser);
                 auth.csrf(session, request.headers['x-csrf-token']);
-                const written = await contentFilter?.put(session, path, payload);
-                if (!written) throw new AppError(404, 'route_not_found');
+                const written = await contentFilter.put(session, path, payload);
+                if (!written) throw new AppError(405, 'method_not_allowed');
                 send(response, written.status, {...provenance, ...written.body as object});
                 return;
             }

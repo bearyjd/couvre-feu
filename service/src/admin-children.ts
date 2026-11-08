@@ -155,6 +155,8 @@ export class ChildAdmin {
             if (this.store.get("SELECT 1 FROM devices WHERE move_to=? AND state='moving'", target)) throw new AppError(409, 'device_change_in_progress', 'A device is being moved to this entry.');
             if (this.obligations(target)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
             this.store.run('UPDATE people SET active=0 WHERE id=?', target);
+            // The desired content filter belongs to this child only; a later entry must never inherit it.
+            this.store.run('DELETE FROM content_filter_desired WHERE person_id=?', target);
             this.store.run('UPDATE request_links SET revoked_at=?,revoked_by=? WHERE person_id=? AND revoked_at IS NULL', now, actor.id, target);
             return {body: {removed: target}, audit: target};
         }

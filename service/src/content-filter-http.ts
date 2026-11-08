@@ -10,8 +10,9 @@ import type { ContentFilterDesired, ContentFilterStore, FilterRecord, FilterStat
 import { auditFor } from './parent-audit.ts';
 import type { Routed } from './time-requests-http.ts';
 
-export const FILTER_PATH = /^\/people\/([a-z][a-z0-9_]{0,31})\/filter$/;
-const PERSON = /^[a-z][a-z0-9_]{0,31}$/;
+const PERSON_ID = '[a-z][a-z0-9_]{0,31}';
+export const FILTER_PATH = new RegExp(`^/people/(${PERSON_ID})/filter$`);
+const PERSON = new RegExp(`^${PERSON_ID}$`);
 /** Stated on every answer: nothing here is enforced or measured on the router. */
 export const FILTER_NOTE = 'unverified on this router';
 export const PUTS_PER_MINUTE = 20;
@@ -69,25 +70,30 @@ export class ContentFilterRoutes {
     }
     async put(session: AuthSession, path: string, payload: unknown): Promise<Routed | null> {
         const person = FILTER_PATH.exec(path)?.[1], actor = session.dto.actor;
-        if (person === undefined) return null;
+        // Off, or an actor the mode excludes: the same answer as any other PUT path that does not exist (405).
+        if (person === undefined || !this.visible(actor)) return null;
         this.scope(actor, person);
         this.limit(actor.id);
         const body = object(payload, ['desired'], ['stepUp']), desired = parseDesired(body.desired), sha = desiredSha256(desired);
         const proof = isLoosening(this.options.filters.get(person)?.desired ?? null, desired)
             ? await this.options.auth.stepUpVerify(session, body.stepUp, filterBinding(person, sha)) : undefined;
-        const loosened = this.commit(session, person, desired, proof);
-        auditFor(this.options.auth.store).record({actor: actor.id, action: loosened ? 'content_filter_loosened' : 'content_filter_set', people: [person], result: 'applied', at: this.options.auth.now()});
-        await this.options.reconciler.reconcile(person);
+        this.commit(session, person, desired, proof);
+        await this.options.reconciler.reconcileWithin(person);
         return {status: 200, body: toDTO(this.options.filters.get(person)!)};
     }
-    /** One transaction: loosening is judged again against the stored state, so a change that raced the proof check cannot slip through unproven. */
-    private commit(session: AuthSession, person: string, desired: ContentFilterDesired, proof: Parameters<Auth['commitStepUp']>[1] | undefined): boolean {
-        return this.options.auth.store.transaction(() => {
-            const loosened = isLoosening(this.options.filters.get(person)?.desired ?? null, desired);
+    /**
+     * One transaction: the child is authorised again (it may have been deactivated or re-scoped during the step-up), loosening is judged
+     * again against the stored state, and the audit row is part of the change: if it cannot be written, nothing is stored.
+     */
+    private commit(session: AuthSession, person: string, desired: ContentFilterDesired, proof: Parameters<Auth['commitStepUp']>[1] | undefined): void {
+        const {auth, filters} = this.options;
+        auth.store.transaction(() => {
+            const actor = proof === undefined ? auth.liveSession(session) : auth.commitStepUp(session, proof);
+            this.scope(actor, person);
+            const loosened = isLoosening(filters.get(person)?.desired ?? null, desired);
             if (loosened && proof === undefined) throw new AppError(403, 'step_up_required');
-            if (proof !== undefined) this.options.auth.commitStepUp(session, proof);
-            this.options.filters.put(person, desired, session.dto.actor.id);
-            return loosened;
+            filters.put(person, desired, actor.id);
+            auditFor(auth.store).recordOrThrow({actor: actor.id, action: loosened ? 'content_filter_loosened' : 'content_filter_set', people: [person], result: 'applied', at: auth.now()});
         });
     }
 }

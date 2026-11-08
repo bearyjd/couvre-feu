@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
+import { AppError } from '../../shared/src/errors.ts';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
@@ -13,20 +15,25 @@ import type { ContentFilterMode } from '../src/content-filter-config.ts';
 import type { Transport } from '../src/nextdns-client.ts';
 import { API_KEY, DESIRED, PROFILE_ID, SECRET_ALLOWED, SECRET_DOMAIN, fakeWorld, input, json } from './fixtures/content-filter.ts';
 
-let nextPort = 41000 + process.pid % 10000;
+async function freePort(): Promise<number> {
+    const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
+    const port = (probe.address() as {port: number}).port;
+    await new Promise<void>(resolve => probe.close(() => resolve()));
+    return port;
+}
 class RacyStore extends ContentFilterStore {
     script: (FilterRecord | undefined)[] = [];
     override get(person: string) { return this.script.length ? this.script.shift() : super.get(person); }
 }
-interface Options { mode?: ContentFilterMode; profiles?: Record<string, string>; wrap?: (next: Transport) => Transport; audit?: boolean; service?: boolean }
+interface Options { mode?: ContentFilterMode; profiles?: Record<string, string>; wrap?: (next: Transport) => Transport; audit?: boolean; service?: boolean; authorize?: (actor: unknown, person: string) => void }
 async function world(options: Options = {}) {
     const f = integrationFixture(), fake = fakeWorld(options.wrap);
     f.config.ownerAccountId = 'operator';
     if (options.audit !== false) f.config.auditLog = {enabled: true};
     f.store.run("INSERT INTO people(id,name,created_at) VALUES('other','Other child',0)");
-    const port = nextPort++, origin = `http://localhost:${port}`, auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
+    const port = await freePort(), origin = `http://localhost:${port}`, auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
     const filters = new RacyStore(f.store, f.now), reconciler = new ContentFilterReconciler({client: fake.client, profiles: options.profiles ?? {pilot: PROFILE_ID, other: PROFILE_ID, ghost: PROFILE_ID}, store: filters});
-    const routes = new ContentFilterRoutes({auth, filters, reconciler, mode: options.mode ?? 'owner', ownerAccountId: 'operator', authorize: (actor, person) => { f.policy.authorized(actor, person); }});
+    const routes = new ContentFilterRoutes({auth, filters, reconciler, mode: options.mode ?? 'owner', ownerAccountId: 'operator', authorize: (actor, person) => { options.authorize?.(actor, person); f.policy.authorized(actor, person); }});
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`}, undefined, undefined, undefined, undefined, options.service === false ? undefined : routes);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     function client() {
@@ -57,7 +64,7 @@ async function world(options: Options = {}) {
         return api;
     }
     const audit = () => f.store.all<Record<string, unknown>>('SELECT * FROM parent_audit ORDER BY id').map(r => ({...r}));
-    return {...f, fake, filters, routes, client, audit, origin, cleanup: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); f.cleanup(); }};
+    return {...f, auth, fake, filters, routes, client, audit, origin, cleanup: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); f.cleanup(); }};
 }
 type W = Awaited<ReturnType<typeof world>>;
 const err = (r: {status: number; body: {error?: {code: string}}}, status: number, code: string) => { assert.equal(r.status, status, JSON.stringify(r.body)); assert.equal(r.body.error?.code, code); };
@@ -105,7 +112,8 @@ test('mode off, an absent service and an excluded actor all answer as if the rou
         const w = await world(options);
         try {
             const c = w.client(), key = await c.signIn('operator');
-            for (const r of [await c.get('pilot'), await c.put('pilot', DESIRED)]) err(r, 404, 'route_not_found');
+            err(await c.get('pilot'), 404, 'route_not_found');
+            err(await c.put('pilot', DESIRED), 405, 'method_not_allowed');
             const o = await c.call('POST', '/step-up/options', {action: 'content_filter_set', person: 'pilot', desired: DESIRED});
             assert.notEqual(o.status, 200); void key;
             assert.equal(w.filters.get('pilot'), undefined); assert.equal(w.fake.fake.requests.length, 0);
@@ -118,7 +126,7 @@ test('owner mode: only the owner account; parents mode: any parent in scope', as
     try {
         await seeded(owner);
         const p = owner.client(); await p.signIn('parent');
-        err(await p.get('pilot'), 404, 'route_not_found'); err(await p.put('pilot', DESIRED), 404, 'route_not_found');
+        err(await p.get('pilot'), 404, 'route_not_found'); err(await p.put('pilot', DESIRED), 405, 'method_not_allowed');
         assert.equal((await p.call('POST', '/step-up/options', {action: 'content_filter_set', person: 'pilot', desired: DESIRED})).status, 400);
         assert.equal(owner.filters.get('pilot')!.revision, 1);
     } finally { await owner.cleanup(); }
@@ -296,6 +304,39 @@ test('audit rows carry an action type and the child only: set for tightening, lo
         for (const secret of [SECRET_DOMAIN, SECRET_ALLOWED, 'second-example', 'porn', 'gambling', 'tiktok', PROFILE_ID, API_KEY, w.config.person.device.mac]) assert.ok(!dump.includes(secret), secret);
         const page = await c.call('GET', '/audit'); assert.equal(page.status, 200);
         assert.deepEqual(page.body.entries.map((e: {action: string}) => e.action), ['content_filter_loosened', 'content_filter_set', 'content_filter_loosened']);
+    } finally { await w.cleanup(); }
+});
+
+test('the audit row is part of the change: if it cannot be written the PUT fails and nothing is stored', async () => {
+    const w = await world({mode: 'parents'});
+    try {
+        const {c, key} = await seeded(w, 'operator'), before = JSON.stringify(w.filters.get('pilot')), auditBefore = w.audit().length;
+        w.store.db.exec("CREATE TRIGGER audit_refuses BEFORE INSERT ON parent_audit BEGIN SELECT RAISE(ABORT, 'audit down'); END");
+        const loose = input({categories: ['porn']}), proof = await c.proof(key, 'pilot', loose);
+        const r = await c.put('pilot', loose, proof);
+        assert.ok(r.status >= 500, r.text); assert.ok(!r.text.includes('audit down'));
+        const tight = await c.put('pilot', input({categories: ['gambling', 'porn', 'social']}));
+        assert.ok(tight.status >= 500);
+        assert.equal(JSON.stringify(w.filters.get('pilot')), before, 'neither change was stored');
+        assert.equal(w.audit().length, auditBefore);
+        w.store.db.exec('DROP TRIGGER audit_refuses');
+        assert.equal((await c.put('pilot', loose, await c.proof(key, 'pilot', loose))).status, 200);
+        assert.equal(w.audit().at(-1)!.action, 'content_filter_loosened');
+    } finally { await w.cleanup(); }
+});
+
+test('the child is authorised again at commit: deactivated or re-scoped during the step-up window means refused, nothing stored', async () => {
+    let calls = 0, revoke = false;
+    const w = await world({mode: 'parents', authorize: () => { calls++; if (revoke) throw new AppError(404, 'person_not_found'); }});
+    try {
+        const {c, key} = await seeded(w, 'operator'), loose = input({categories: ['porn']}), proof = await c.proof(key, 'pilot', loose);
+        const callsBefore = calls;
+        // The pre-check passes; the child disappears after it (during the await of the passkey check) and before the commit.
+        const original = w.auth.stepUpVerify.bind(w.auth);
+        w.auth.stepUpVerify = async (...args: Parameters<typeof original>) => { const result = await original(...args); revoke = true; return result; };
+        err(await c.put('pilot', loose, proof), 404, 'person_not_found');
+        assert.ok(calls > callsBefore + 1, 'authorize ran again inside the commit');
+        assert.equal(w.filters.get('pilot')!.revision, 1);
     } finally { await w.cleanup(); }
 });
 
