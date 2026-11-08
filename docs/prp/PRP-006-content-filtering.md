@@ -17,7 +17,7 @@ This PRP adds three layers, each inside the existing rules:
 
 | Layer | Owner | What it does | Framework it must fit |
 |---|---|---|---|
-| A. Filtering | NextDNS (profiles) driven by the Couvre-feu service | Per-child categories, apps, SafeSearch, denylist | Flags off by default; strict manifest keys ([service contract](../service-contract.md)); audit log; step-up on loosening; privacy gate |
+| A. Filtering | NextDNS (profiles) driven by the Couvre-feu service | Per-child categories, apps, SafeSearch | Flags off by default; strict manifest keys ([service contract](../service-contract.md)); audit log; step-up on loosening; privacy gate |
 | B. Delivery | NextDNS CLI on the router, child MAC → profile | Routes each enrolled device to its profile; strict default for everything else | **Conflicts with `AGENTS.md` (no dnsmasq change)**; needs a scoped owner exception, read-only inspection and rehearsed uninstall exactly as PRP-004 requires |
 | C. Device coverage and detection | Couvre-feu inventory + alerts; OS controls (Family Link, Screen Time) | Knows which device is covered by which layer; alerts on the bypass signatures the router can see | Counts only, no domains; `parent_alerts` rules; roadmap item 3 (unknown devices) and item 8 (activity estimates) |
 
@@ -25,7 +25,7 @@ The design principle from the enforcement contract carries over: **the router co
 
 ## 2. Non-goals
 
-- No domain, URL, search-term, page-title or per-query data stored anywhere in Couvre-feu. The one exception is parent-entered denylist/allowlist entries, which stay in NextDNS only: the service holds them in memory for the drift check and never persists, logs or audits them. NextDNS keeps its own query log for one week (owner decision D4, 2026-11-08) and only parents read it, by hand, in the NextDNS Logs tab. The service reads **counts** from NextDNS analytics (D5, approved) and never reads log entries. DNS cannot see search terms at all: they travel inside HTTPS.
+- No domain, URL, search-term, page-title or per-query data stored anywhere in Couvre-feu. Parent-entered denylist/allowlist entries are **not managed by Couvre-feu in Phase A**. They stay in NextDNS, edited there by a parent; the service neither stores nor reads them. NextDNS keeps its own query log for one week (owner decision D4, 2026-11-08) and only parents read it, by hand, in the NextDNS Logs tab. The service reads **counts** from NextDNS analytics (D5, approved) and never reads log entries. DNS cannot see search terms at all: they travel inside HTTPS.
 - No NextDNS Recreation Time, Parental Control schedules or "block during" windows. Time lives in Couvre-feu only, so there is one truth for "why is this blocked right now". (Time-zone complaints about Recreation Time in the NextDNS community are an additional reason; UNVERIFIED.)
 - No TLS interception, no custom CA, no block page. HTTPS to a blocked domain fails without explanation; the UI must say so.
 - No VPN/Tor IP lists ([Do not build](../ROADMAP.md#do-not-build), owner decision 2026-10-28). Detection of VPN-like behaviour is in scope; blocking by provider list is not.
@@ -46,7 +46,7 @@ Written from the child's side, ordered by effort. "Stops" means the layer preven
 | 6 | Medium | Installs a VPN app or Tor | Partly: Block Bypass Methods blocks known VPN, proxy and Tor domains (coverage UNVERIFIED) | — (decided not to list) | Sees: one long-lived encrypted flow to one destination (§5.2); traffic with no DNS | **Stops** via install approval; Family Link cannot block a VPN already allowed |
 | 7 | Medium | Turns on MAC randomization, or forgets to turn it off for the home SSID; or factory-resets the device | — | Falls to the default profile **only if the device is still on the CLI path** (kids' DNAT is by MAC, so a rotated MAC is not redirected at all until roadmap item 3 makes unknown devices kids-path by default) — D1 helps only where redirected | Sees: `new_device` (exists) and child MAC absent while household is active (§5.4); also escapes Couvre-feu pause rules (known limit) | Family Link survives a reset only if the account is re-added |
 | 8 | Medium | Uses the guest SSID, a sibling's or an adult's device, or a console/TV | — | Partly: strict default covers unmapped devices that are redirected; an adult device is outside scope by design | Sees: nothing for adult devices | Per-device controls on the borrowed device, if any |
-| 9 | Low–medium | Cellular data, a friend's hotspot, a second SIM | — | — | Sees: child device *known to be present* (phone on Wi-Fi) with near-zero bytes while screen is in use is **not** observable by the router. Weak signal: device absent from Wi-Fi during normal home hours (§5.4) | **The only layer**: Family Link / Screen Time apply on any network |
+| 9 | Low–medium | Cellular data, a friend's hotspot, a second SIM | — | — | Not observable: traffic on cellular. Weak signal only: the device absent from Wi-Fi during hours an owner-set home window expects it (§5.4) | **The only layer**: Family Link / Screen Time apply on any network |
 | 10 | High | Rooted / unmanaged device, sideloaded builds, a second device the parents don't know about | — | Strict default, only if redirected (see row 7) | Sees: `new_device` | — |
 
 Takeaways that drive the design:
@@ -59,21 +59,23 @@ Takeaways that drive the design:
 ## 4. Architecture
 
 ```
-child device --UDP/TCP 53--> router (kids DNAT to LAN addr; unchanged) --> NextDNS CLI listener
+child device --UDP/TCP 53--> router (resolver on LAN:53; DNAT only catches queries to other addresses) --> NextDNS CLI listener (mechanism unresolved, §4.2)
                                                                             |-- profile <child MAC>=<id>   (one line per enrolled MAC, first match wins)
                                                                             |-- profile <strict default id>  (everything else)
                                                                             `--DoH from the router--> dns.nextdns.io
 adult / protected MACs -----------------------------------------------------> unchanged resolution path (out of scope)
 
-service --HTTPS X-Api-Key--> api.nextdns.io/profiles/<id>/parentalControl|denylist|allowlist|settings   (write desired, read back, never logs)
+service --HTTPS X-Api-Key--> api.nextdns.io/profiles/<id>/parentalControl|settings   (write desired, read back, never logs)
 service --existing RPC--> router rpc-activity / rpc-inventory (+ proposed rpc-dns-counters)             (counts only)
 ```
 
-**4.1 Filtering (A).** `service/src/nextdns-client.ts`: a thin client over the NextDNS API (base `https://api.nextdns.io`, header `X-Api-Key`), injectable transport, retries on 429 with backoff, and a strict response schema. Per child it manages `parentalControl.categories`, `parentalControl.services`, `parentalControl.safeSearch` / `youtubeRestrictedMode`, `denylist`, `allowlist`, and `settings.logs` (set to the owner's D4 choice). Desired state lives in the Couvre-feu database (new table, migration), is written to NextDNS, read back, and compared; the diff is the "applied / not confirmed / drift" state shown to parents. Only NextDNS analytics counts are fetched (D5); log entries never are.
+**4.1 Filtering (A).** `service/src/nextdns-client.ts`: a thin client over the NextDNS API (base `https://api.nextdns.io`, header `X-Api-Key`), injectable transport, retries on 429 with backoff, and a strict response schema. Per child it manages `parentalControl.categories`, `parentalControl.services`, `parentalControl.safeSearch` / `youtubeRestrictedMode`, and `settings.logs` (denylist/allowlist are out of scope; the client may implement them for later but Phase A never calls them) (set to the owner's D4 choice). Desired state lives in the Couvre-feu database (new table, migration), is written to NextDNS, read back, and compared; the diff is the "applied / not confirmed / drift" state shown to parents. Only NextDNS analytics counts are fetched (D5); log entries never are.
 
 Why not the CLI's own filtering or GL's AdGuard Home: the ROADMAP already records that per-child AdGuard profiles likely break GL's filtering and model schedules inversely. NextDNS profiles are the per-child model the UI needs, with an API.
 
 **4.2 Delivery (B).** The NextDNS CLI's conditional profile selection: `profile <MAC>=<id>` repeated, first match wins, bare `profile <id>` as fallback. The service generates the profile lines from the same enrollment truth it already holds (enrolled child MACs by person) and exposes them as a *proposed router config artifact*; applying it is a separately approved live step, as every router write is. The CLI's upstream DoH connections originate on the router, so the kids' forwarded-traffic DoH rejects should not catch them, and NextDNS stays on the `doh-list.ts` block list (a child cannot pick a different profile from the device). **Both halves of that sentence are UNVERIFIED on this router and are gate G3.**
+
+**Unresolved delivery mechanism (blocker found in review):** `firewall.sh:72` DNATs only queries a kid sends to an address other than the router's LAN address. Queries sent to the router itself (the normal DHCP-handed DNS case) reach whatever listens on LAN:53 (dnsmasq or AdGuard Home) and never see a CLI on a high port. So per-child profiles for kids on the default path need a change on the resolver side (the CLI on LAN:53, or dnsmasq/AdGuard forwarding to it) or a DHCP DNS change, all of which `AGENTS.md:39` forbids today. No shape is chosen; picking one is part of E1 and of the spike-006 inspection.
 
 The rule conflict: the CLI either listens on port 53 itself or sits behind dnsmasq as its upstream, and GL's firmware also puts AdGuard Home on that path. Either arrangement is a DNS-plumbing change. `AGENTS.md` forbids changing dnsmasq configuration; the 2026-10-27 lift covered the kids' firewall DNS rules only. **No B step starts before the owner records exception E1 (§6).** Installation itself is also blocked today (spike-005: package install not verified; BusyBox `stat`/`od` missing), so B begins with a read-only inspection, not an install.
 
@@ -83,25 +85,25 @@ The rule conflict: the CLI either listens on port 53 itself or sits behind dnsma
 
 Each signal is a `parent_alerts` candidate with the existing `details` rule (≤1024 bytes; counts, windows, operation ids; never MACs, addresses, hostnames or domains). All are hints with stated false-positive causes; none pause or block anything.
 
-**5.1 `traffic_without_dns`.** Per child, over an evaluation window: bytes from `rpc-activity` (exists) are high while **DNS queries counted for that child's MACs** are near zero. Needs a new read-only counter: a per-child-MAC `udp/tcp dport 53` packet count in mangle PREROUTING for forwarded traffic and INPUT for queries addressed to the router (DNAT'd queries are INPUT, not FORWARD; no verdict, same pattern as `cf_acct`). The ratio threshold comes from a measurement spike, not a guess. Benign causes to state in the UI: long-lived app sessions, aggressive OS caching, IPv6 paths the counters miss, flow offload undercounting bytes (`offload: on` makes this signal unreliable; suppress it then).
+**5.1 `traffic_without_dns`.** Per child, over an evaluation window: bytes from `rpc-activity` (exists) are high while **DNS queries counted for that child's MACs** are near zero. Needs a new read-only counter: a per-child-MAC `udp/tcp dport 53` packet count in mangle PREROUTING (it sees queries before NAT, whether later forwarded or delivered to the router; no verdict, the `cf_acct` idea but a different hook, since `cf_acct` is FORWARD). Note TCP/53 to the router has no INPUT accept today (only UDP/53 does). The ratio threshold comes from a measurement spike, not a guess. Benign causes to state in the UI: long-lived app sessions, aggressive OS caching, IPv6 paths the counters miss, flow offload undercounting bytes (`offload: on` makes this signal unreliable; suppress it then).
 
 **5.2 `long_lived_single_flow`.** Per child: one conntrack entry carrying most of the window's bytes to a single destination, lasting longer than N minutes. Read-only conntrack listing already exists for address binding; this adds a scoped read. It looks like a VPN; it also looks like a video call or a game. Severity `info`, never `critical`.
 
-**5.3 `dns_bypass_attempts`.** Per child: hits on the kids' DoH/DoT/DoQ reject rules and the IPv6 port-53 reject. Today these hits are explicitly **unattributed**: `router/lib/activity.sh` counts only MAC, pause and destination rule kinds, so the set-based DoH/DoT/IPv6-53 rejects count nothing at all and there is no household-wide DNS-reject signal yet ([activity counters](../activity-counters.md)). Attribution needs per-MAC counting rules, i.e. a router change and a new release id — it belongs in the Phase 4 release of the roadmap, not before. Until then no DNS-bypass count exists; do not display one.
+**5.3 `dns_bypass_attempts`.** Per child: hits on the kids' DoH/DoT/DoQ reject rules and the IPv6 port-53 reject. Today these hits are explicitly **unattributed**: `router/lib/activity.sh` counts only MAC, pause and destination rule kinds, so the set-based DoH/DoT/IPv6-53 rejects count nothing at all and there is no household-wide DNS-reject signal yet ([activity counters](../activity-counters.md); that doc's `blocked_unattributed` wording is stale for these rules, to be corrected in item A6). Attribution needs per-MAC counting rules, i.e. a router change and a new release id — it belongs in the Phase 4 release of the roadmap, not before. Until then no DNS-bypass count exists; do not display one.
 
-**5.4 `child_device_absent`.** Per child: a device enrolled for that child has not been seen by `rpc-inventory` during hours when the household schedule expects it home, while other household devices are present. Weak by design (cellular, battery off). Default off; owner-only.
+**5.4 `child_device_absent`.** Per child: a device enrolled for that child has not been seen by `rpc-inventory` during an owner-configured home window (new setting; no such concept exists yet), while other household devices are present. Weak by design (cellular, battery off). Default off; owner-only.
 
 **5.5 Coverage model.** For each child device: platform, OS-control (Family Link / Screen Time / Family Safety / console / none), install-approval on, DNS or VPN setting locked, NextDNS profile mapped, last hand-checked date. The parent UI shows a per-child coverage matrix and the gaps. This is the one place where the plan admits what the router cannot see (rows 2, 6, 9) and points at the control that can.
 
-**5.6a `blocked_category_attempts`.** Per child per day: the count of blocked lookups by reason class (for example porn, gambling, bypass methods), read from NextDNS analytics counts (D5). Alert at a threshold chosen from a week of measurement, naming the class and the count only, never a domain. It exists so a parent can have a conversation early; it is not evidence of intent, because prefetch, ads and accidental clicks also produce blocked lookups. The parent decides whether to open the NextDNS Logs tab (blocked-only filter) and look at actual domains, at most weekly.
-
 **5.6 Weekly digest additions (counts).** Blocked queries per child by reason class (D5), bypass-attempt count, traffic-without-DNS windows, new/rotated devices, coverage gaps open.
+
+**5.6a `blocked_category_attempts`.** Per child per day: the count of blocked lookups by reason class (for example porn, gambling, bypass methods), read from NextDNS analytics counts (D5). Alert at a threshold chosen from a week of measurement, naming the class and the count only, never a domain. It exists so a parent can have a conversation early; it is not evidence of intent, because prefetch, ads and accidental clicks also produce blocked lookups. The parent decides whether to open the NextDNS Logs tab (blocked-only filter) and look at actual domains, at most weekly.
 
 ## 6. Owner decisions and exceptions
 
 | Id | Decision | Options | Recommendation and why |
 |---|---|---|---|
-| D1 | Default (unmapped) profile | Strict kids-level; permissive household | **Strict.** Filters any device that reaches the CLI listener without a mapping; rotated or unknown MACs are covered only once roadmap item 3 redirects them. Adults then need explicit mappings (their MACs are already protected identities). |
+| D1 | Default (unmapped) profile | Strict kids-level; permissive household | **Strict.** Filters any device that reaches the CLI listener without a mapping; rotated or unknown MACs are covered only once roadmap item 3 redirects them. Adults and management MACs are never put on the CLI path (§4.2); only kids-path devices see the default. |
 | D2 | Profile granularity | One per child; per age band; one "kids" | **One per child.** The UI, audit and step-up are per child already. Plan limits on profile count: UNVERIFIED. |
 | D3 | Who edits filters | Owner only → all parents (`contentFilter.mode`, like `timeRequests.mode`) | Owner only first; loosening needs step-up. |
 | D4 | NextDNS logging | Disabled; 1 week; longer | **Decided 2026-11-08: enabled, 1-week retention**, so a parent can see blocked attempts and talk early. Couvre-feu itself stores no domains. Tell the children what is logged and who reads it. |
@@ -116,10 +118,10 @@ Follows the roadmap's shared rules: one PR per step, tests first, strict manifes
 
 ### Phase A — service and web, no router (item 11)
 
-1. **Client + schema.** `nextdns-client.ts` with a fake NextDNS server in tests (200, 400 shapes, 429 retry, pagination cursors, unknown profile, hex-encoded service ids). Shared schema for a child filter. Manifest `contentFilter: {mode, apiKeyFile, profiles: {<personId>: <profileId>}, defaultProfile}`; the key is read from a root-only file, never stored in the manifest or database.
+1. **Client + schema.** `nextdns-client.ts` with a fake NextDNS server in tests (200, 400 shapes, 429 retry, pagination cursors, unknown profile, hex-encoded service ids). Shared schema for a child filter. Manifest `contentFilter: {mode, apiKeyFile, profiles: {<personId>: <profileId>}, defaultProfile}`; the key is read from a `0600` file owned by the service uid, never stored in the manifest or database.
 2. **Desired state + reconcile.** Migration; write–read-back–diff; states `applied | pending | not_confirmed | drift`. Audit rows as action types only. Tests: diff correctness, no free text, key never logged (snapshot test on stderr).
-3. **Routes + gate.** `GET/PUT /people/:id/filter`, owner → parents per `contentFilter.mode`; loosening (removing a category/service, adding an allowlist entry) requires the existing step-up. 404 scoping tests.
-4. **Web.** Per-child filter card: categories, apps, SafeSearch, denylist/allowlist; honest state pill; copy stating "unverified on this router" and that HTTPS blocks show no page. Playwright on the demo with a fake NextDNS.
+3. **Routes + gate.** `GET/PUT /people/:id/filter`, owner → parents per `contentFilter.mode`; loosening (removing a category/service, turning SafeSearch off) requires the existing step-up. 404 scoping tests.
+4. **Web.** Per-child filter card: categories, apps, SafeSearch; honest state pill; copy stating "unverified on this router" and that HTTPS blocks show no page. Playwright on the demo with a fake NextDNS.
 5. **Digest + alerts (D5).** Blocked-count per child by reason class in the weekly digest; `blocked_category_attempts` and `filter_drift` alerts.
 6. **Docs.** Service contract section, operating notes, dns-hardening cross-reference (NextDNS stays blocked for kids).
 
@@ -138,8 +140,8 @@ Entry: Phase 0 (first live rehearsal) passed; A merged; E1 recorded. Exit: live 
 ### Phase C — coverage and detection (item 13)
 
 1. **Coverage model** (service + web, no router): per-device coverage record, matrix per child, gaps list. Tests: scoping; no MAC in alert details.
-2. **Measurement spike** for §5.1/5.2 on a test device (offload off, then on): what the bytes-to-queries ratio and single-flow share look like during normal use vs a DoH/VPN bypass; publish the numbers and false-positive rate.
-3. **`traffic_without_dns`** behind `detection.enabled`: new read-only per-MAC port-53 counter in the `cf_acct` pattern (mangle, no verdict). This is a **router change** and rides the Phase 4 release with item 3; the service side can merge earlier against fixtures.
+2. **Measurement spike** for §5.2 now, and for §5.1 once C3's counter exists (C3 rides the Phase 4 release): what the bytes-to-queries ratio and single-flow share look like during normal use vs a DoH/VPN bypass; publish the numbers and false-positive rate.
+3. **`traffic_without_dns`** behind `detection.trafficWithoutDns`: new read-only per-MAC port-53 counter in the `cf_acct` pattern (mangle, no verdict). This is a **router change** and rides the Phase 4 release with item 3; the service side can merge earlier against fixtures.
 4. **`long_lived_single_flow`** (read-only conntrack, service-side heuristic). `info` only.
 5. **`dns_bypass_attempts`** attribution: per-MAC counting rules for the kids' DNS/DoH rejects; same release.
 6. **`child_device_absent`**, owner-only, default off.
@@ -149,7 +151,7 @@ Entry: A merged; 3 and 5 wait for the Phase 4 release. Exit: measured thresholds
 
 ### Rollout order across phases
 
-A1–A6 → C1 (both offline) → Phase 0 → B1–B5 → C2 → Phase 4 release carrying C3/C5 → C4/C6/C7.
+A1–A6 → C1 (both offline) → Phase 0 → B1–B5 → C2 (single-flow part only) → Phase 4 release carrying C3/C5 → C2 (bytes-to-queries part) and G6 → C4/C6/C7.
 
 ## 8. Gates (what must be shown, not assumed)
 
@@ -160,7 +162,7 @@ A1–A6 → C1 (both offline) → Phase 0 → B1–B5 → C2 → Phase 4 release
 | G3 | Kids still cannot reach NextDNS anycast directly (DoH/DoT rejects hold) **and** the router-originated CLI upstream is not caught by those rejects | B4 |
 | G4 | Uninstall restores every touched DNS file byte-exact; adult and management resolution unchanged throughout | B4 |
 | G5 | Pause, schedule and allowance behaviour unchanged with the CLI in the path | B4 |
-| G6 | `traffic_without_dns` separates a scripted DoH/VPN bypass from normal use at a stated false-positive rate | C2 |
+| G6 | `traffic_without_dns` separates a scripted DoH/VPN bypass from normal use at a stated false-positive rate (needs the C3 counter) | C2, after C3 |
 | G7 | No alert, digest or log line ever contains a domain, MAC, address or hostname (snapshot tests, CI) | A, C |
 
 ## 9. Risks
