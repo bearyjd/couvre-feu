@@ -25,7 +25,7 @@ The design principle from the enforcement contract carries over: **the router co
 
 ## 2. Non-goals
 
-- No domain, URL, search-term, page-title or per-query logging anywhere in Couvre-feu. The service never reads NextDNS logs. It may read **counts** from NextDNS analytics only if the owner approves that in §6 (decision D5); otherwise not at all.
+- No domain, URL, search-term, page-title or per-query data stored anywhere in Couvre-feu. NextDNS keeps its own query log for one week (owner decision D4, 2026-11-08) and only parents read it, by hand, in the NextDNS Logs tab. The service reads **counts** from NextDNS analytics (D5, approved) and never reads log entries. DNS cannot see search terms at all: they travel inside HTTPS.
 - No NextDNS Recreation Time, Parental Control schedules or "block during" windows. Time lives in Couvre-feu only, so there is one truth for "why is this blocked right now". (Time-zone complaints about Recreation Time in the NextDNS community are an additional reason; UNVERIFIED.)
 - No TLS interception, no custom CA, no block page. HTTPS to a blocked domain fails without explanation; the UI must say so.
 - No VPN/Tor IP lists ([Do not build](../ROADMAP.md#do-not-build), owner decision 2026-10-28). Detection of VPN-like behaviour is in scope; blocking by provider list is not.
@@ -38,12 +38,12 @@ Written from the child's side, ordered by effort. "Stops" means the layer preven
 
 | # | Effort | What the child does | A. NextDNS filter | B. Router delivery | C. Detection | OS controls (Family Link / Screen Time) |
 |---|---|---|---|---|---|---|
-| 1 | Trivial | Opens a blocked site in the normal browser | Stops (domain) | — | Sees: blocked-query count rises (if D5 allows reading counts) | — |
+| 1 | Trivial | Opens a blocked site in the normal browser | Stops (domain) | — | Sees: blocked-query count rises (D5, counts only) | — |
 | 2 | Trivial | Uses a different browser or an app with the content inside it (YouTube in-app, Discord embeds) | Partly: app/service blocks are domain-level; content inside an allowed app is invisible | — | — | **Stops** if app installs need approval |
 | 3 | Low | Changes the device's Private DNS / DNS-over-HTTPS setting to a public resolver | — | **Stops**: kids' DoH/DoT/DoQ rejects for listed resolvers ([DNS enforcement today](../enforcement-contract.md#dns-enforcement-today)); plain port 53 is redirected to the router | Sees: hits on the kids' DNS/DoH reject rules (today unattributed per child, see §5.3) | Stops only if the setting is locked (UNVERIFIED for Family Link) |
-| 4 | Low | Enables Chrome/Firefox secure DNS to an unlisted endpoint, or an app with hard-coded DoH | — | Partly: only listed addresses are rejected ([known gaps](../dns-hardening.md#known-gaps-list-on-does-not-mean-doh-is-blocked)) | Sees: **traffic with no DNS** (§5.1) | Stops if browser settings are managed |
+| 4 | Low | Enables Chrome/Firefox secure DNS to an unlisted endpoint, or an app with hard-coded DoH | Partly: Block Bypass Methods covers known encrypted-DNS provider domains (coverage UNVERIFIED) | Partly: only listed addresses are rejected ([known gaps](../dns-hardening.md#known-gaps-list-on-does-not-mean-doh-is-blocked)) | Sees: **traffic with no DNS** (§5.1) | Stops if browser settings are managed |
 | 5 | Low | Types an IP address, uses a proxy/translate/cache site | Partly: proxy sites are a NextDNS category | — | Sees: traffic with no DNS (IP literal) | — |
-| 6 | Medium | Installs a VPN app or Tor | — | — (decided not to list) | Sees: one long-lived encrypted flow to one destination (§5.2); traffic with no DNS | **Stops** via install approval; Family Link cannot block a VPN already allowed |
+| 6 | Medium | Installs a VPN app or Tor | Partly: Block Bypass Methods blocks known VPN, proxy and Tor domains (coverage UNVERIFIED) | — (decided not to list) | Sees: one long-lived encrypted flow to one destination (§5.2); traffic with no DNS | **Stops** via install approval; Family Link cannot block a VPN already allowed |
 | 7 | Medium | Turns on MAC randomization, or forgets to turn it off for the home SSID; or factory-resets the device | — | **Falls to the default profile** — strict default (D1) keeps filtering | Sees: `new_device` (exists) and child MAC absent while household is active (§5.4); also escapes Couvre-feu pause rules (known limit) | Family Link survives a reset only if the account is re-added |
 | 8 | Medium | Uses the guest SSID, a sibling's or an adult's device, or a console/TV | — | Partly: strict default profile covers unmapped devices on the kids' path; an adult device is outside scope by design | Sees: nothing for adult devices | Per-device controls on the borrowed device, if any |
 | 9 | Low–medium | Cellular data, a friend's hotspot, a second SIM | — | — | Sees: child device *known to be present* (phone on Wi-Fi) with near-zero bytes while screen is in use is **not** observable by the router. Weak signal: device absent from Wi-Fi during normal home hours (§5.4) | **The only layer**: Family Link / Screen Time apply on any network |
@@ -69,7 +69,7 @@ service --HTTPS X-Api-Key--> api.nextdns.io/profiles/<id>/parentalControl|denyli
 service --existing RPC--> router rpc-activity / rpc-inventory (+ proposed rpc-dns-counters)             (counts only)
 ```
 
-**4.1 Filtering (A).** `service/src/nextdns-client.ts`: a thin client over the NextDNS API (base `https://api.nextdns.io`, header `X-Api-Key`), injectable transport, retries on 429 with backoff, and a strict response schema. Per child it manages `parentalControl.categories`, `parentalControl.services`, `parentalControl.safeSearch` / `youtubeRestrictedMode`, `denylist`, `allowlist`, and `settings.logs` (set to the owner's D4 choice). Desired state lives in the Couvre-feu database (new table, migration), is written to NextDNS, read back, and compared; the diff is the "applied / not confirmed / drift" state shown to parents. Nothing from NextDNS analytics or logs is fetched unless D5 is approved, and then counts only.
+**4.1 Filtering (A).** `service/src/nextdns-client.ts`: a thin client over the NextDNS API (base `https://api.nextdns.io`, header `X-Api-Key`), injectable transport, retries on 429 with backoff, and a strict response schema. Per child it manages `parentalControl.categories`, `parentalControl.services`, `parentalControl.safeSearch` / `youtubeRestrictedMode`, `denylist`, `allowlist`, and `settings.logs` (set to the owner's D4 choice). Desired state lives in the Couvre-feu database (new table, migration), is written to NextDNS, read back, and compared; the diff is the "applied / not confirmed / drift" state shown to parents. Only NextDNS analytics counts are fetched (D5); log entries never are.
 
 Why not the CLI's own filtering or GL's AdGuard Home: the ROADMAP already records that per-child AdGuard profiles likely break GL's filtering and model schedules inversely. NextDNS profiles are the per-child model the UI needs, with an API.
 
@@ -93,7 +93,9 @@ Each signal is a `parent_alerts` candidate with the existing `details` rule (≤
 
 **5.5 Coverage model.** For each child device: platform, OS-control (Family Link / Screen Time / Family Safety / console / none), install-approval on, DNS or VPN setting locked, NextDNS profile mapped, last hand-checked date. The parent UI shows a per-child coverage matrix and the gaps. This is the one place where the plan admits what the router cannot see (rows 2, 6, 9) and points at the control that can.
 
-**5.6 Weekly digest additions (counts).** Blocked queries per child (only with D5), bypass-attempt count, traffic-without-DNS windows, new/rotated devices, coverage gaps open.
+**5.6a `blocked_category_attempts`.** Per child per day: the count of blocked lookups by reason class (for example porn, gambling, bypass methods), read from NextDNS analytics counts (D5). Alert at a threshold chosen from a week of measurement, naming the class and the count only, never a domain. It exists so a parent can have a conversation early; it is not evidence of intent, because prefetch, ads and accidental clicks also produce blocked lookups. The parent decides whether to open the NextDNS Logs tab (blocked-only filter) and look at actual domains, at most weekly.
+
+**5.6 Weekly digest additions (counts).** Blocked queries per child by reason class (D5), bypass-attempt count, traffic-without-DNS windows, new/rotated devices, coverage gaps open.
 
 ## 6. Owner decisions and exceptions
 
@@ -102,8 +104,8 @@ Each signal is a `parent_alerts` candidate with the existing `details` rule (≤
 | D1 | Default (unmapped) profile | Strict kids-level; permissive household | **Strict.** Converts MAC rotation and unknown devices into "filtered, not escaped". Adults then need explicit mappings (their MACs are already protected identities). |
 | D2 | Profile granularity | One per child; per age band; one "kids" | **One per child.** The UI, audit and step-up are per child already. Plan limits on profile count: UNVERIFIED. |
 | D3 | Who edits filters | Owner only → all parents (`contentFilter.mode`, like `timeRequests.mode`) | Owner only first; loosening needs step-up. |
-| D4 | NextDNS logging | Disabled; 1 h; longer | **Disabled**, so "no domains stored" is true end to end. |
-| D5 | Read NextDNS analytics counts | Never; counts only (blocked total per profile per day) | Counts only, owner-visible first. No domains, no device names. |
+| D4 | NextDNS logging | Disabled; 1 week; longer | **Decided 2026-11-08: enabled, 1-week retention**, so a parent can see blocked attempts and talk early. Couvre-feu itself stores no domains. Tell the children what is logged and who reads it. |
+| D5 | Read NextDNS analytics counts | Never; counts only (blocked total per profile per day) | **Decided 2026-11-08: counts only**, owner-visible first. No domains, no device names. UNVERIFIED: that analytics keep reason-class counts at the one-week retention; test before building the alert. |
 | D6 | Drift handling | Alert only; auto-correct | Alert only; auto-correct later if drift is frequent. |
 | D7 | Cellular / off-network | Family Link + Screen Time by hand; companion app later | By hand, recorded in the coverage model. |
 | E1 | **Exception to `AGENTS.md:39`** | Which exact DNS service files/UCI sections may change, for the kids' resolution path only; adult/management DNS, DHCP and WAN stay untouched | Required before any B step; scoped like the 2026-10-27 lift; recorded here and in the enforcement contract. |
@@ -118,7 +120,7 @@ Follows the roadmap's shared rules: one PR per step, tests first, strict manifes
 2. **Desired state + reconcile.** Migration; write–read-back–diff; states `applied | pending | not_confirmed | drift`. Audit rows as action types only. Tests: diff correctness, no free text, key never logged (snapshot test on stderr).
 3. **Routes + gate.** `GET/PUT /people/:id/filter`, owner → parents per `contentFilter.mode`; loosening (removing a category/service, adding an allowlist entry) requires the existing step-up. 404 scoping tests.
 4. **Web.** Per-child filter card: categories, apps, SafeSearch, denylist/allowlist; honest state pill; copy stating "unverified on this router" and that HTTPS blocks show no page. Playwright on the demo with a fake NextDNS.
-5. **Digest + alerts (D5 permitting).** Blocked-count per child in the weekly digest; `filter_drift` alert.
+5. **Digest + alerts (D5).** Blocked-count per child by reason class in the weekly digest; `blocked_category_attempts` and `filter_drift` alerts.
 6. **Docs.** Service contract section, operating notes, dns-hardening cross-reference (NextDNS stays blocked for kids).
 
 Entry: none beyond CI. Exit: merged, flags off. Rollout: owner only one week, then parents. Stop: any filter shown "applied" that NextDNS did not confirm → flag off.

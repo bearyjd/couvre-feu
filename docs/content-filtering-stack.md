@@ -15,14 +15,14 @@ Companion to [PRP-006](prp/PRP-006-content-filtering.md). PRP-006 says *what* an
 | **Family Link** (Android/ChromeOS) and **Screen Time** (iOS/macOS) | Child devices | The off-network layer: app-install approval, app/time limits, locked settings; Chrome filtering (Family Link) | Network-level anything; alerting Couvre-feu |
 | **Tailscale / adult NextDNS** | Adult devices | Household adults' own DNS and VPN. Out of scope; listed so no one points a child device at it | — |
 
-Data flow: child device → (port 53, redirected by the router core) → NextDNS CLI → profile by MAC → NextDNS cloud. Service → NextDNS API for profile *configuration*. Service → router RPC for *counts*. Nothing flows from NextDNS logs to the service.
+Data flow: child device → (port 53, redirected by the router core) → NextDNS CLI → profile by MAC → NextDNS cloud. Service → NextDNS API for profile *configuration*. Service → router RPC for *counts*. From NextDNS the service reads analytics counts only (D5), never log entries.
 
 ## 2. Configuration
 
 ### 2.1 NextDNS account and profiles
 
 1. Create one profile per child plus one **strict default** profile (decision D1). Name them by role, not by the child's real name, since profile names appear in NextDNS UI and in URLs.
-2. On every kids profile and the default: Parental Control categories and services per the owner; SafeSearch on; YouTube Restricted Mode on; **Logs: disabled** (D4). Block Page off (it needs a CA; out of scope).
+2. On every kids profile and the default: Parental Control categories and services per the owner; SafeSearch on; YouTube Restricted Mode on; **Block Bypass Methods on**; **Logs enabled with 1-week retention** (D4, decided 2026-11-08). Block Page off (it needs a CA; out of scope). Status 2026-11-08: the three child profiles exist with SafeSearch, YouTube Restricted Mode and one-week logs applied; categories, Block Bypass Methods and the Security/Privacy toggles are pending the owner's calls.
 3. API key: account page → bottom. Store it on the service host as a root-only file, e.g. `/etc/couvrefeu/private/nextdns.key` (`0600`). Never in the manifest, repo, logs or a policy sent to the router.
 4. Record the profile ids in the private manifest (below). Changing categories later is done in the Couvre-feu UI once Phase A ships; until then, in NextDNS directly.
 
@@ -75,6 +75,14 @@ Consoles, TVs, laptops: per-device parental controls where they exist; otherwise
 
 From a child device at home: open `https://test.nextdns.io` → it should report the child's profile id. Try a blocked category → fails. Try `https://1.1.1.1` → fails (reject rule). From an adult device: `test.nextdns.io` must **not** report a kids profile.
 
+### 2.6 Weekly review (parents, about ten minutes)
+
+1. Open each child's profile in NextDNS → **Logs** → filter to blocked only.
+2. Look for patterns, not single hits: repeated bypass-tool or adult-category domains, the same blocked site on several days.
+3. Ignore ads, trackers and one-off hits; they come from prefetch and apps.
+4. If something stands out, talk to the child first. Adjust a profile only after that.
+5. Logs are kept one week, so a missed week is simply gone. Nothing is copied into Couvre-feu.
+
 ## 3. Risk register
 
 Each row: what breaks or is bypassed, which component, how a parent would notice, and the mitigation. "Residual" is what remains after mitigation; be honest about it in the UI.
@@ -95,10 +103,11 @@ Each row: what breaks or is bypassed, which component, how a parent would notice
 | R12 | API key leak | Service host | Unexpected profile changes in NextDNS | Root-only key file; never in manifest/DB/logs (CI snapshot test on stderr); rotate on any suspicion (NextDNS currently has one key per account; rotation means regenerating) | One key covers the whole account, including adult profiles |
 | R13 | NextDNS outage or account lapse | Cloud | Kids' DNS fails (CLI has no fallback by design) | CLI cache; decide in E1 whether a failure falls back to GL's resolver (unfiltered) or fails closed (no internet for kids); recommended **fail closed** for kids, with an alert | Fail closed means homework stops during an outage |
 | R14 | Detection false positives erode trust; false negatives give false comfort | Service alerts | Parents ignore alerts, or trust silence | Thresholds from measurement (C2); alerts owner-only for two weeks; every alert lists benign causes; never `critical` for heuristics except `traffic_without_dns` after measurement | Heuristics stay heuristics |
-| R15 | Privacy regression: a domain, MAC or hostname lands in an alert, digest or log | Service | CI | Privacy gate snapshot tests (G7); NextDNS logs disabled; analytics limited to counts (D5) | NextDNS cloud still sees the queries; that is the vendor trade-off the owner accepted |
+| R15 | Privacy regression: a domain, MAC or hostname lands in an alert, digest or log | Service | CI | Privacy gate snapshot tests (G7); Couvre-feu stores no domains; NextDNS keeps one week of logs that only parents read; the service reads counts only (D5) | NextDNS cloud still sees the queries; that is the vendor trade-off the owner accepted |
 | R16 | Flow offload makes byte counters undercount, so `traffic_without_dns` is wrong | Router | `offload: on` in activity output | Suppress the signal when offload is on; measure both states in C2 | Offload on means weaker detection |
 | R17 | Two truths for time (Couvre-feu schedules vs NextDNS Recreation Time) | Design | "Why is this blocked?" has two answers | Recreation Time stays off; filter editor hides time features | A parent enabling it in NextDNS directly causes confusion; drift check reports it |
 | R18 | Parent-side mistakes: accidental loosening, wrong child | Service/UI | Audit log | Step-up on loosening; audit rows; owner-only rollout first | — |
+| R19 | Log review turns into surveillance or unfair accusation (prefetch, ads and accidental clicks create blocked lookups) | Parents | Child conflict, hiding behaviour | Weekly blocked-only review at most, never live; a hit starts a conversation, not a punishment; tell the children what is logged; alert on repeated reason-class counts, not single hits | Trust still depends on how it is used |
 
 ## 4. What to tell parents (limits, plainly)
 
