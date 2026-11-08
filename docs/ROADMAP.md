@@ -18,6 +18,9 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 | 10 | Guest / visitor profile (internet only, no LAN) | 4 | Not started |
 | 8 | Per-child daily online time, labelled an estimate | 5 | Not started |
 | 9 | DNS hardening (wider DoH list; port 853 is already blocked for kids). The VPN/Tor list (9c) is NOT BUILT, see [Do not build](#do-not-build) | 5 (or 4) | Rule lifted for the kids' firewall DNS rules only (2026-10-27); VPN/Tor list decided not to build (2026-10-28) |
+| 11 | Content filtering: per-child NextDNS profiles managed by the service ([PRP-006](prp/PRP-006-content-filtering.md), [stack and risks](content-filtering-stack.md)) | A (no router) | Proposal only (2026-11-08); owner decided NextDNS + CLI on router, Family Link off-network |
+| 12 | Filter delivery: NextDNS CLI on the router, child MAC → profile, strict default | B (router; needs exception E1 to `AGENTS.md:39`) | Proposal only; blocked on E1 and a read-only inspection |
+| 13 | Device coverage matrix and bypass detection (traffic without DNS, single long flow, per-child DNS-reject attribution), counts only | C (service first; attribution rides the Phase 4 release) | Proposal only |
 
 Phase 0 (prove what already exists) comes before all of them.
 
