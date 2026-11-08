@@ -96,6 +96,8 @@ pi_rollback_lines() {
 pi_halt() {
     # No re-entry: a second signal must not interleave a second FAIL/STOPPED report.
     trap '' INT TERM
+    # A scope check leaves globbing off; the snapshot's glob counts need it on.
+    set +f
     if cfr_snapshot after; then
         if cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then cfr_info 'post-failure snapshot equals SNAPSHOT'
         else cfr_diff; fi
@@ -105,12 +107,14 @@ pi_halt() {
     exit 20
 }
 cfr_stop() {
+    trap '' INT TERM
     cfr_fail "$1" "$2"
     pi_halt "$1"
 }
 # Invoked by the trap after MUTATION_BEGIN.
 # shellcheck disable=SC2317,SC2329
 pi_signal() {
+    trap '' INT TERM
     cfr_fail INSTALL signal_received
     pi_halt SIGNAL
 }

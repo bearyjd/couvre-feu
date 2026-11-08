@@ -72,7 +72,11 @@ class PermanentBase(unittest.TestCase):
     invoke = TLR.LiveRehearsalTests.invoke
     plan_details = TLR.LiveRehearsalTests.plan_details
     plan_sha = TLR.LiveRehearsalTests.plan_sha
-    evidence = TLR.LiveRehearsalTests.evidence
+
+    def evidence(self):
+        runs = sorted(p for p in (self.evidence_root / 'evidence').iterdir() if p.name.endswith('-permanent-install'))
+        self.assertEqual(len(runs), 1)
+        return runs[0]
 
     def setUp(self):
         self.tool = SOURCE
@@ -266,9 +270,26 @@ class PlanTests(PermanentBase):
         later = self.now + datetime.timedelta(seconds=1)
         code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha, now=later)
         self.assertEqual(code, 1, out + err)
-        self.assertIn('already executed', err)
-        self.assertEqual(len(list((self.evidence_root / 'evidence').iterdir())), 1)
+        self.assertIn('already claimed', err)
+        claim = self.evidence_root / 'evidence' / f'.claim-{sha}'
+        self.assertEqual(claim.stat().st_mode & 0o777, 0o600)
         self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
+        # The evidence scan is independent of the claim file.
+        claim.unlink()
+        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha, now=later + datetime.timedelta(seconds=1))
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('already executed', err)
+        self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
+
+    def test_claim_without_any_evidence_still_refuses(self):
+        config = self.write_config(activate=False)
+        sha = self.plan_sha(config)
+        (self.evidence_root / 'evidence' / f'.claim-{sha}').write_text('')
+        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('already claimed', err)
+        self.assertFalse(self.ssh_log.exists())
+        self.assertEqual([p for p in (self.evidence_root / 'evidence').iterdir() if p.name.endswith('-permanent-install')], [])
 
     def test_plan_sha_mismatch_refused_without_connection(self):
         code, _, err = self.invoke('execute', self.write_config(), '--expect-plan-sha256', 'a' * 64)
@@ -576,7 +597,14 @@ class RemoteRunTests(PermanentBase):
         self.assertIn('ROLLBACK_UNAVAILABLE', stdout)
 
     def test_installed_rpc_scope_must_equal_the_plan(self):
-        self.assert_verify_stop('rpc_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/rpc-allowed'), 'echo 02:00:00:00:00:99; exit 0'))
+        stdout = self.assert_verify_stop('rpc_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/rpc-allowed'), 'echo 02:00:00:00:00:99; exit 0'))
+
+    def test_halt_after_a_scope_stop_counts_stage_leftovers_with_globbing_on(self):
+        # A leftover stage entry appearing during VERIFY is a real difference; set -f from the scope check must not hide it.
+        late = shlex.quote(str(self.root / '.couvrefeu-stage.late'))
+        stdout = self.assert_verify_stop('rpc_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/rpc-allowed'),
+                                                                f': > {late}; echo 02:00:00:00:00:99; exit 0'))
+        self.assertRegex(stdout, r'(?m)^DIFF \+ G \S+\.couvrefeu-stage\.\* 1$')
 
     def test_installed_protected_list_must_equal_the_plan(self):
         self.assert_verify_stop('protect_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/protected'), 'echo 02:00:00:00:00:99; exit 0'))
@@ -589,12 +617,28 @@ class RemoteRunTests(PermanentBase):
         self.assertIn('ROLLBACK_UNTRUSTED ', stdout)
         self.assertNotIn('ROLLBACK_COMMAND', stdout)
 
-    def test_signal_after_mutation_stops_once_with_rollback(self):
+    def test_second_signal_during_the_post_failure_snapshot_cannot_reenter(self):
+        self.patch_ssh_for_term()
+        flag = self.work / 'second-term'
+        action = ('if grep -qs signal_received /tmp/couvre-feu-first.*/phase.log && [ ! -e ' + shlex.quote(str(flag)) + ' ]; then\n'
+                  ': > ' + shlex.quote(str(flag)) + '; trap "" TERM; kill -TERM 0\nfi')
+        self.hook('iptables-save', ('',), action)
+        code, out, err = self.execute()
+        stdout = self.stdout()
+        self.assertTrue(flag.exists(), 'second TERM never fired')
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual(stdout.count('STOPPED_AFTER_MUTATION'), 1, stdout)
+        self.assertEqual(stdout.count('PHASE INSTALL FAIL'), 1, stdout)
+
+    def patch_ssh_for_term(self):
         patched = TLR.FAKE_SSH.replace("    if spec.get('hangup_after')", "    if spec.get('term_after') and line.decode().rstrip('\\n') == spec['term_after']:\n"
                                        "        os.kill(child.pid, signal.SIGTERM)\n    if spec.get('hangup_after')", 1)
         self.assertNotEqual(patched, TLR.FAKE_SSH)
         (self.bin / 'ssh').write_text(f'#!{sys.executable}\n' + patched)
         self.spec['term_after'] = 'MUTATION_BEGIN'
+
+    def test_signal_after_mutation_stops_once_with_rollback(self):
+        self.patch_ssh_for_term()
         code, out, err = self.execute()
         stdout = self.stdout()
         self.assertEqual(code, 2, out + err)
@@ -676,7 +720,9 @@ class RemoteRunTests(PermanentBase):
         self.assertEqual((summary['outcome'], summary['remoteExit']), ('UNKNOWN', 255))
         self.assertIn('UNKNOWN:', out)
         rid = self.tool.FR.release_id(self.tool.FR.head_source()[1])
-        rollback = f'ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-{rid}/uninstall.sh (separate approval; verify the file first)'
+        digest = __import__('hashlib').sha256(self.tool.FR.emitted_tree(self.tool.FR.head_source()[1])['uninstall.sh'][1]).hexdigest()
+        rollback = (f'ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-{rid}/uninstall.sh (only meaningful if the router shows '
+                    f'MUTATION_BEGIN effects; separate approval; verify the file first: expected sha256 {digest})')
         self.assertIn(rollback, summary['rollback'])
         self.assertIn(rollback, out)
         self.assertIn('SIGKILL', out)

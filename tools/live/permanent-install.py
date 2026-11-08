@@ -254,6 +254,7 @@ def plan(config, env):
                'protectedHistoricalMacs': config['protectedHistoricalMacs'], 'protect': config['protect'],
                'rpcAllow': config['rpcAllow'], 'rpcAllowFixedAtInstall': True, 'activate': config['activate'], 'installArgv': install_argv(config),
                'phases': planned_phases(config), 'uninstallInHappyPath': False,
+               'uninstallSha256': hashlib.sha256(FR.emitted_tree(blobs)['uninstall.sh'][1]).hexdigest(),
                'knownHostsSha256': FR.regular_file_sha256(config['knownHostsPath'], 'knownHostsPath'),
                'adminPublicKeySha256': FR.regular_file_sha256(config['adminPublicKeyPath'], 'adminPublicKeyPath')}
     details['planSha256'] = plan_digest(details)
@@ -305,7 +306,19 @@ def rollback_lines(stdout_text):
 
 def unknown_rollback(details):
     return (f'ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-{details["releaseId"]}/uninstall.sh '
-            '(separate approval; verify the file first)')
+            '(only meaningful if the router shows MUTATION_BEGIN effects; separate approval; verify the file first: '
+            f'expected sha256 {details["uninstallSha256"]})')
+
+
+def claim_plan(config, plan_sha):
+    """Atomic single-use claim, never removed: a second execute of the same digest cannot race the evidence scan."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        os.close(os.open(os.path.join(config['evidenceDir'], f'.claim-{plan_sha}'), flags, 0o600))
+    except FileExistsError:
+        raise Refusal('this plan sha256 was already claimed; a new plan and approval are required') from None
+    except OSError as error:
+        raise Refusal(f'cannot create the plan claim in evidenceDir: {error.strerror}') from None
 
 
 def already_executed(config, plan_sha):
@@ -346,6 +359,7 @@ def execute(config, expected_plan_sha, env, now_fn):
     details, payload = plan(config, env)
     if not hmac.compare_digest(details['planSha256'], expected_plan_sha):
         raise Refusal(f'plan sha256 {details["planSha256"]} differs from the disclosed value')
+    claim_plan(config, details['planSha256'])
     if already_executed(config, details['planSha256']):
         raise Refusal('this plan sha256 was already executed (evidence exists); a new plan and approval are required')
     FR.check_deadline(config, now_fn())
