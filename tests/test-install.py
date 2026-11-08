@@ -1385,6 +1385,252 @@ exec ''' + shlex.quote(real_hash) + ''' "$@"
             process.communicate()
 
 
+class ServiceSourceAdmissionTests(unittest.TestCase):
+    """Production gates with private paths, native modes and inert pinned bytes.
+
+    Only absolute paths, expected content pins and native UID/GID are adapted.
+    CF_TEST_MODE stays zero, so the production service gate cannot skip checks.
+    """
+    PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
+    EXCEPTIONS = {'/usr/share': 0o775, '/etc/rc.common': 0o775,
+                  '/lib/functions/service.sh': 0o664}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='couvre-feu-service-sources-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        vendor = (REPO / 'router/lib/vendor-platform.sh').read_text()
+        gate = bootstrap[bootstrap.index('platform_service_sources() {'):bootstrap.index('platform_admit() {')]
+        pins = re.findall(r'(/[^ )]+)\) service_mode=([0-7]+); service_pin=([0-9a-f]{64});;', gate)
+        self.assertEqual(len(pins), 9)
+        for path in ['/etc', '/etc/init.d', '/lib', '/lib/functions', '/lib/config',
+                     '/usr', '/usr/share', '/usr/share/libubox', '/sbin']:
+            self.path(path).mkdir(parents=True, exist_ok=True)
+            self.path(path).chmod(0o755)
+        self.contents = {}
+        for path, mode, pin in pins:
+            content = ('inert source fixture for ' + path + '\n').encode()
+            if path == '/etc/init.d/cron':
+                content += b'USE_PROCD=1\n'
+            self.contents[path] = content
+            self.path(path).write_bytes(content)
+            self.path(path).chmod(int(mode, 8))
+            replacement = hashlib.sha256(content).hexdigest()
+            bootstrap = bootstrap.replace(pin, replacement)
+            vendor = vendor.replace(pin, replacement)
+        # One pass prevents remapping the private prefix introduced by a match.
+        def mapped(source):
+            return re.sub(r'/(etc|lib|usr|sbin)(?=/|[^A-Za-z0-9_-]|$)',
+                          lambda match: str(self.root / match.group(1)), source)
+        self.bootstrap = self.root / 'bootstrap.sh'
+        self.bootstrap.write_text(mapped(bootstrap))
+        self.vendor = self.root / 'vendor.sh'
+        self.vendor.write_text(mapped(vendor))
+        self.lib = self.root / 'admission-lib'
+        self.lib.mkdir(mode=0o700)
+        (self.lib / 'platform-bootstrap.sh').write_text('inert verified module fixture\n')
+        (self.lib / 'platform-bootstrap.sh').chmod(0o644)
+
+    def path(self, path):
+        return self.root / path.lstrip('/')
+
+    def run_gate(self, profile, path=None, metadata=None, entry=None, vendor=False):
+        target = str(self.path(path)) if path else ''
+        script = f'''set -eu
+CF_TEST_MODE=0
+. {shlex.quote(str(self.bootstrap))}
+. {shlex.quote(str(self.vendor))}
+CF_PLATFORM_PROFILE={profile}; vp_profile={profile}
+CF_PLATFORM_ENTRY_TICK=100
+platform_clock_tick() {{ printf 100; }}
+platform_stat() {{
+    if [ "$3" = {shlex.quote(target)} ] && [ -n {shlex.quote(metadata or '')} ]; then
+        printf '%s\\n' {shlex.quote(metadata or '')}
+    else
+        fixture_meta=$(command stat "$@") || return
+        printf '0:0:%s\\n' "${{fixture_meta##*:}}"
+    fi
+}}
+stat_private() {{ platform_stat "$@"; }}
+regular() {{ platform_regular "$@"; }}
+fail() {{ platform_fail "$@"; }}
+'''
+        if entry == 'cron-preflight':
+            common = (REPO / 'router/lib/install-common.sh').read_text()
+            start = common.index('cron_preflight() {')
+            stop = common.index('\n}', start) + 2
+            script += common[start:stop] + '\n'
+            script += re.search(r'^service_source_gate\(\).*$', common, re.M).group() + '\n'
+            script += f'''cron_script() {{ printf '%s\\n' {shlex.quote(str(self.path('/etc/init.d/cron')))}; }}
+cron_service() {{ printf cron-dispatch; }}
+cron_preflight
+'''
+        elif entry:
+            # Keep platform_admit's real entry dispatch and service checks;
+            # unrelated hardware, release and transaction work is inert.
+            script += f'''
+platform_choose() {{ CF_PLATFORM_PROFILE=$1; }}
+platform_bootstrap_vendor() {{ :; }}
+platform_verify_modules() {{ :; }}
+platform_external_closure() {{ :; }}
+platform_attest_vendor() {{ :; }}
+platform_profile_validate() {{ :; }}
+platform_lock_acquire() {{ :; }}
+platform_transaction_begin() {{ printf 'transaction:%s' "$1"; exit 91; }}
+ACTIVATE=1
+platform_admit {profile} '' {shlex.quote(str(self.lib))}
+'''
+        elif vendor:
+            script += f'vp_metadata {shlex.quote(target)}\n'
+        else:
+            script += 'platform_service_sources\n'
+        env = dict(os.environ, CF_TEST_MODE='0')
+        command = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        return subprocess.run(command + ['-c', script, str(self.root / (entry or 'gate'))],
+                              env=env, capture_output=True, text=True, timeout=15)
+
+    def assert_admission(self, profile, path=None, metadata=None, accepted=False):
+        # Run both independently: a production refusal cannot mask vp_metadata.
+        result = self.run_gate(profile, path, metadata)
+        self.assertEqual(result.returncode == 0, accepted, result.stderr)
+        if path:
+            result = self.run_gate(profile, path, metadata, vendor=True)
+            self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_observed_tuples_require_vendor_profiles(self):
+        for profile in self.PROFILES:
+            self.assert_admission(profile, accepted=True)
+        for path, mode in self.EXCEPTIONS.items():
+            with self.subTest(path=path):
+                target = self.path(path)
+                original = target.stat().st_mode & 0o7777
+                target.chmod(mode)
+                for profile in self.PROFILES:
+                    self.assert_admission(profile, path, accepted=profile != 'strict')
+                target.chmod(original)
+        for path, mode in self.EXCEPTIONS.items():
+            self.path(path).chmod(mode)
+        for profile in self.PROFILES:
+            self.assert_admission(profile, accepted=profile != 'strict')
+
+    def test_nearby_modes_and_owners_refuse_in_both_gates(self):
+        for path, admitted_mode in self.EXCEPTIONS.items():
+            target = self.path(path)
+            original = target.stat().st_mode & 0o7777
+            for mode in [0o777, 0o776, 0o2775, 0o1775, 0o4775, 0o665]:
+                target.chmod(mode)
+                for profile in self.PROFILES[1:]:
+                    with self.subTest(path=path, mode=oct(mode), profile=profile):
+                        self.assert_admission(profile, path)
+            target.chmod(admitted_mode)
+            for owner in ['1000:0', '0:1000']:
+                for mode in {admitted_mode, 0o775}:
+                    metadata = owner + ':' + format(mode, 'o')
+                    for profile in self.PROFILES[1:]:
+                        with self.subTest(path=path, metadata=metadata, profile=profile):
+                            self.assert_admission(profile, path, metadata)
+            target.chmod(original)
+
+    def test_links_and_canonical_parents_refuse(self):
+        for path, mode in self.EXCEPTIONS.items():
+            target = self.path(path)
+            saved = target.with_name(target.name + '.saved')
+            target.rename(saved)
+            target.symlink_to(saved, target_is_directory=saved.is_dir())
+            for profile in self.PROFILES[1:]:
+                with self.subTest(path=path, profile=profile):
+                    self.assert_admission(profile, path)
+            target.unlink()
+            saved.rename(target)
+        # A canonicality check must reject a symlink above an ordinary file.
+        parent = self.path('/lib/functions')
+        saved = parent.with_name('functions.saved')
+        parent.rename(saved)
+        parent.symlink_to(saved, target_is_directory=True)
+        for profile in self.PROFILES[1:]:
+            self.assert_admission(profile, '/lib/functions/service.sh')
+
+    def test_wrong_exception_types_refuse(self):
+        for path, mode in self.EXCEPTIONS.items():
+            target = self.path(path)
+            saved = target.with_name(target.name + '.saved')
+            target.rename(saved)
+            if saved.is_dir():
+                target.write_text('a file cannot replace a trusted parent\n')
+            else:
+                target.mkdir()
+            target.chmod(mode)
+            for profile in self.PROFILES[1:]:
+                with self.subTest(path=path, profile=profile):
+                    self.assert_admission(profile, path)
+            if target.is_dir():
+                target.rmdir()
+            else:
+                target.unlink()
+            saved.rename(target)
+
+    def test_exceptions_do_not_spread_to_other_paths(self):
+        for path, mode in [('/usr/share/libubox', 0o775), ('/lib/functions', 0o775),
+                           ('/etc/init.d/cron', 0o775), ('/lib/functions/procd.sh', 0o664)]:
+            target = self.path(path)
+            original = target.stat().st_mode & 0o7777
+            target.chmod(mode)
+            for profile in self.PROFILES[1:]:
+                with self.subTest(path=path, profile=profile):
+                    self.assert_admission(profile, path)
+            target.chmod(original)
+
+    def test_changed_content_refuses_even_with_observed_metadata(self):
+        for path in ['/etc/rc.common', '/lib/functions/service.sh']:
+            target = self.path(path)
+            original = target.stat().st_mode & 0o7777
+            for observed in [False, True]:
+                if observed:
+                    target.chmod(self.EXCEPTIONS[path])
+                target.write_bytes(self.contents[path] + b'changed\n')
+                for profile in self.PROFILES:
+                    with self.subTest(path=path, profile=profile, observed=observed):
+                        result = self.run_gate(profile)
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        if observed:
+                            result = self.run_gate(profile, path, vendor=True)
+                            self.assertNotEqual(result.returncode, 0, result.stderr)
+                target.write_bytes(self.contents[path])
+            target.chmod(original)
+
+    def test_install_uninstall_and_cron_share_production_gate(self):
+        for path, mode in self.EXCEPTIONS.items():
+            self.path(path).chmod(mode)
+        for entry in ['install.sh', 'uninstall.sh']:
+            for profile in self.PROFILES:
+                with self.subTest(entry=entry, profile=profile):
+                    result = self.run_gate(profile, entry=entry)
+                    self.assertEqual(result.returncode, 2 if profile == 'strict' else 91, result.stderr)
+                    self.assertEqual('transaction:' in result.stdout, profile != 'strict')
+        for profile in self.PROFILES:
+            with self.subTest(entry='cron-preflight', profile=profile):
+                result = self.run_gate(profile, entry='cron-preflight')
+                self.assertEqual(result.returncode, 2 if profile == 'strict' else 0, result.stderr)
+                self.assertEqual('cron-dispatch' in result.stdout, profile != 'strict')
+        for entry in ['install.sh', 'uninstall.sh']:
+            self.assertIn('platform_admit ', (REPO / 'router' / entry).read_text())
+
+    def test_cron_recovery_gate_precedes_observation_and_restoration(self):
+        common = (REPO / 'router/lib/install-common.sh').read_text()
+        headers = list(re.finditer(r'^[a-zA-Z_]+\(\) [({]', common, re.M))
+        functions = {header.group().split('(')[0]: common[header.start():
+                     headers[index + 1].start() if index + 1 < len(headers) else len(common)]
+                     for index, header in enumerate(headers)}
+        pending = functions['cron_quiescence_preflight']
+        self.assertLess(pending.index('service_source_gate'), pending.index('cron_quiescence_capture'))
+        restore = functions['cron_restore_barrier']
+        for operation in ['cron_quiescence_capture', 'journal_record', 'restore_original', 'cron_service reload']:
+            self.assertLess(restore.index('service_source_gate'), restore.index(operation))
+        uninstall = (REPO / 'router/uninstall.sh').read_text()
+        self.assertIn('then cron_restore_barrier; fi', uninstall)
+
+
 class SourceClosureBeforeAdmissionTests(unittest.TestCase):
     def test_complete_entry_closure_precedes_persistent_admission(self):
         for entry in ('install.sh', 'uninstall.sh'):

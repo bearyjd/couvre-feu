@@ -29,8 +29,12 @@ vp_metadata() {
     # This private primitive is used inside a fresh transaction. Callers must
     # use vp_transaction_check, never retain its success as later permission.
     case "$1:$tuple" in
-        /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775)
+        /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775|/usr/share:0:0:775)
             [ -d "$1" ] || fail exception_type;;
+        /etc/rc.common:0:0:775)
+            [ "$(vp_hash_value "$1")" = ebeeedc132a75942ce876465e4636a75f745e468c573fdf9ad058e57e58a0341 ] || fail helper_pin;;
+        /lib/functions/service.sh:0:0:664)
+            [ "$(vp_hash_value "$1")" = afb750abd9c4b4eeb1e8dc5eb9f66c7d47774782494f2c168183390803db3b91 ] || fail helper_pin;;
         /lib/functions.sh:0:0:664)
             [ "$(vp_hash_value "$1")" = b2b07ca83222f8677f8117e4ed8bff162ef9e6ad0aadaa42d6248c5865831406 ] || fail helper_pin;;
         /lib/config/uci.sh:0:0:664)

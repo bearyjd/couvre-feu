@@ -18,10 +18,12 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 from harness import run_owned_process
 
-SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py', 'test-penn-pilot.py', 'test-penn-pilot-leg2.py', 'test-penn-pilot-leg2-guards.py', 'test-scope-admin.py', 'test-inventory.py')
+SUITES = ('test-transition.py', 'test-rpc.py', 'test-core.py', 'test-fixture-process.py', 'test-penn-pilot.py', 'test-penn-pilot-leg2.py', 'test-penn-pilot-leg2-guards.py', 'test-scope-admin.py', 'test-inventory.py', 'test-router-admission-check.py')
 # Fixed public source paths bind the plan to fixtures and the entire release.
 SOURCE_FILES = ('.github/workflows/ci.yml', 'tests/run.sh', 'tests/run-fixtures.py', 'tests/fixtures/harness.py', 'tests/fixtures/backend.py',
                 'tests/test-live-rehearsal.py', 'tests/fixtures/pinned_helper.py',
+                'tools/live/router-admission-probe.sh', 'tools/live/router-admission-check.py',
+                'docs/runbooks/router-admission-facts.md',
                 'router/release.sha256', 'router/install.sh', 'router/uninstall.sh',
                 'router/cfctl', 'router/cfctl-ssh', 'router/cfctl-scope', 'router/lib/platform-bootstrap.sh',
                 'router/lib/vendor-platform.sh', 'router/lib/install-common.sh',
