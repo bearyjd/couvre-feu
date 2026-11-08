@@ -1532,8 +1532,23 @@ cfp_scope_add_2_phase() {
 # normalised (every apply may flip a/b).
 cfp_fw_shape() {
     cfp_fw_state "$CFP_DIR/fw.raw" || return 1
-    sed -e '/^slot /d' -e 's/cf2_[ab]_/cf2_X_/g' "$CFP_DIR/fw.raw" > "$1"
-    rm -f "$CFP_DIR/fw.raw"
+    # ipset member order depends on insertion history (every apply rebuilds the sets in the other slot), so the
+    # ipset lines are compared sorted (same members, any order); the iptables rule lines keep their order.
+    sed -e '/^slot /d' -e 's/cf2_[ab]_/cf2_X_/g' "$CFP_DIR/fw.raw" > "$CFP_DIR/fw.norm" || { rm -f "$CFP_DIR/fw.raw" "$CFP_DIR/fw.norm"; return 1; }
+    cfp_fw_rc=0
+    grep -E '^(create|add) ' "$CFP_DIR/fw.norm" > "$CFP_DIR/fw.sets"
+    [ $? -le 1 ] || cfp_fw_rc=1
+    LC_ALL=C sort "$CFP_DIR/fw.sets" > "$CFP_DIR/fw.sets.sorted" || cfp_fw_rc=1
+    grep -Ev '^(create|add) ' "$CFP_DIR/fw.norm" > "$CFP_DIR/fw.rules.norm"
+    [ $? -le 1 ] || cfp_fw_rc=1
+    cat "$CFP_DIR/fw.sets.sorted" "$CFP_DIR/fw.rules.norm" > "$1" || cfp_fw_rc=1
+    rm -f "$CFP_DIR/fw.raw" "$CFP_DIR/fw.norm" "$CFP_DIR/fw.sets" "$CFP_DIR/fw.sets.sorted" "$CFP_DIR/fw.rules.norm"
+    [ "$cfp_fw_rc" = 0 ]
+}
+# On a mismatch print the first differing lines (rules and set members only) so the evidence explains the stop.
+cfp_fw_mismatch_info() {
+    command -v diff >/dev/null 2>&1 || { cfr_info 'firewall_diff unavailable (no diff)'; return 0; }
+    diff "$1" "$2" 2>/dev/null | head -n 20 | sed 's/[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/<ipv4>/g' | while IFS= read -r cfp_fd_line; do cfr_info "firewall_diff $cfp_fd_line"; done
 }
 cfp_move_phase() {
     cfp_fw_shape "$CFP_DIR/fw.move0" || cfp_stop MOVE firewall_read_failed
@@ -1558,7 +1573,7 @@ cfp_move_phase() {
     if grep -Fq "$CFP_PILOT_B" "$CFP_DIR/rpc-sync.json"; then cfp_stop MOVE pilot_b_left_populated; fi
     cfp_status_settle MOVE move_back_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
     cfp_fw_shape "$CFP_DIR/fw.move1" || cfp_stop MOVE firewall_read_failed
-    cmp -s "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1" || cfp_stop MOVE firewall_not_restored_after_move_back
+    cmp -s "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1" || { cfp_fw_mismatch_info "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1"; cfp_stop MOVE firewall_not_restored_after_move_back; }
     cfr_out 'MEASURE move_block_follows_device measured chromebook_paused=1 phone_paused=0 adult_probe_ok moved_back=1 pilot_b_absent=1 filter_ipset_shape_unchanged'
     cfr_ok MOVE
 }

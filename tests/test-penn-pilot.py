@@ -2719,6 +2719,32 @@ class PilotShellMoveFlowTests(PilotShellBase):
                 self.assertEqual(self.stop_of(done), [f'STOP MOVE {reason}'], done.stdout)
                 self.assertNotIn('PHASE MOVE OK', done.stdout)
 
+    def test_move_back_mismatch_prints_the_differing_firewall_lines(self):
+        done = self.move(shape_after='shape-different')
+        self.assertEqual(self.stop_of(done), ['STOP MOVE firewall_not_restored_after_move_back'], done.stdout)
+        self.assertIn('INFO firewall_diff < shape', done.stdout)
+        self.assertIn('INFO firewall_diff > shape-different', done.stdout)
+        self.assertLessEqual(done.stdout.count('INFO firewall_diff'), 20)
+
+    def shape(self, state):
+        """The real cfp_fw_shape over a canned cfp_fw_state; returns the normalised shape text."""
+        driver = ('cfp_fw_state() { cat "$H/state" > "$1"; }\n'
+                  'cfp_fw_shape "$CFP_DIR/out" || { echo SHAPE_FAIL; exit 1; }\ncat "$CFP_DIR/out"\n')
+        done = self.run_driver(driver, files={'state': state})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done.stdout
+
+    def test_firewall_shape_ignores_set_member_order_and_slot_but_not_membership_or_rules(self):
+        head = 'slot a\ncreate cf2_a_k hash:mac\n'
+        tail = 'iptables\n-A FORWARD -m set --match-set cf2_a_k src -j DROP\nip6tables\n'
+        one = self.shape(head + 'add cf2_a_k aa:aa\nadd cf2_a_k bb:bb\n' + tail)
+        swapped = self.shape(head.replace('cf2_a_', 'cf2_b_') + 'add cf2_b_k bb:bb\nadd cf2_b_k aa:aa\n'
+                             + tail.replace('cf2_a_', 'cf2_b_'))
+        self.assertEqual(one, swapped)
+        self.assertNotEqual(one, self.shape(head + 'add cf2_a_k aa:aa\n' + tail))
+        self.assertNotEqual(one, self.shape(head + 'add cf2_a_k aa:aa\nadd cf2_a_k bb:bb\n'
+                                            + tail.replace('DROP', 'ACCEPT')))
+
 
 class PilotReviewFixTests(PilotShellBase):
     """Review fixes: bounded children, leg-2 cancel, no raw LAN IPv4, the uptime clock, a real BULK receipt check,
