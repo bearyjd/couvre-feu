@@ -102,7 +102,7 @@ Also avoid OpenAppFilter code (GPL-2.0, not combinable with this AGPL-3.0 projec
   - `service/src/http.ts`: one route PR per phase; rebase, do not stack.
   - `shared/src/router-schema.ts`: only Phase 4 (new desired-JSON fields) and Phase 3 if S5 is taken.
   - `web/public/app.js`: one UI PR in flight at a time; the planned split of tab logic out of `app.js` (Follow-ups) goes before Phase 3 if it can.
-  - `router/` release bytes: at most two new release ids for items 1-10; items 11-13 (PRP-006) add the E1 delivery release and C3/C5 counters, which ride the Phase 4 release only if E1 is recorded (Phase 4, and Phase 5 only if DNS is not ready in time).
+  - `router/` release bytes: at most two new release ids for items 1-10; items 11-13 (PRP-006) add the E1 delivery release and C3/C5 counters, where the read-only C3/C5 counters ride the Phase 4 release and the E1 delivery release needs E1 first (Phase 4, and Phase 5 only if DNS is not ready in time).
 
 ### Privacy design gate
 

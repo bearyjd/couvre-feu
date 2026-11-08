@@ -15,7 +15,7 @@ Companion to [PRP-006](prp/PRP-006-content-filtering.md). PRP-006 says *what* an
 | **Family Link** (Android/ChromeOS) and **Screen Time** (iOS/macOS) | Child devices | The off-network layer: app-install approval, app/time limits, locked settings; Chrome filtering (Family Link) | Network-level anything; alerting Couvre-feu |
 | **Tailscale / adult NextDNS** | Adult devices | Household adults' own DNS and VPN. Out of scope; listed so no one points a child device at it | — |
 
-Data flow: child device → (port 53, redirected by the router core) → NextDNS CLI → profile by MAC → NextDNS cloud. Service → NextDNS API for profile *configuration*. Service → router RPC for *counts*. From NextDNS the service reads analytics counts only (D5), never log entries.
+Data flow (delivery mechanism unresolved, §2.3): child device → port 53 → (router resolver or core redirect) → NextDNS CLI → profile by MAC → NextDNS cloud. Service → NextDNS API for profile *configuration*. Service → router RPC for *counts*. From NextDNS the service reads analytics counts only (D5), never log entries.
 
 ## 2. Configuration
 
@@ -52,7 +52,7 @@ profile aa:bb:cc:dd:ee:01=<child A profile>
 profile aa:bb:cc:dd:ee:02=<child A profile>
 profile aa:bb:cc:dd:ee:11=<child B profile>
 profile <strict default id>
-listen <router LAN addr>:<port chosen in E1>
+listen <address:port chosen by the spike-006 inspection and recorded in E1>
 report-client-info false
 cache-size 10MB
 log-queries false
