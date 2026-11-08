@@ -7,6 +7,8 @@ import { id, integer, mac, normalizePolicy } from '../../shared/src/router-schem
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import { hexDigest, sha256 } from '../../shared/src/router-rpc.ts';
 import type { Role, Provenance } from '../../shared/src/contracts.ts';
+import { parseContentFilter } from './content-filter-config.ts';
+import type { ContentFilterManifest } from './content-filter-config.ts';
 import { scheduleClockReader } from './schedule-clock.ts';
 import { loadTLS, privateIPv4, privateListenHost } from './tls.ts';
 import type { TLSFiles } from './tls.ts';
@@ -27,6 +29,8 @@ export interface IntegrationManifest {
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
     /** Child time requests are off unless enabled here: 'owner' lets only ownerAccountId decide them, 'parents' every parent account. Legacy {enabled} is read as parents/off. */
     timeRequests?: {mode: TimeRequestMode};
+    /** NextDNS content filtering (docs/prp/PRP-006); absent is off. The API key is read from apiKeyFile, never stored here. */
+    contentFilter?: ContentFilterManifest;
     /** Audit log of parent actions; absent is off. */
     auditLog?: {enabled: boolean};
     /** Content-free admin push through ntfy (topic and token come from the environment, see push-sender.ts); absent is off. */
@@ -107,7 +111,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'rewardTime', 'focus', 'dnsHardening', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'rewardTime', 'focus', 'dnsHardening', 'contentFilter', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -190,8 +194,9 @@ export function integrationConfig(path: string): IntegrationConfig {
     const ownerAccountId = m.ownerAccountId === undefined ? undefined : id(m.ownerAccountId);
     if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
     if (timeRequests?.mode === 'owner' && ownerAccountId === undefined) bad('owner_account_required');
+    const contentFilter = m.contentFilter === undefined ? undefined : parseContentFilter(m.contentFilter, ownerAccountId);
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));
