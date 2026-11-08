@@ -1,6 +1,9 @@
 /**
  * Manifest key for NextDNS content filtering (PRP-006). Absent means off. Pure validation: no file or network access here, so the
- * private manifest can be checked without touching the API key, which is read separately (readApiKeyFile in nextdns-client.ts).
+ * private manifest can be checked without touching the API key. The key file's existence, owner and mode are NOT checked here: the later
+ * wiring PR (PRP-006 A2) must enforce a private 0600 file with requirePrivatePath before reading it.
+ * Person ids are deliberately not checked against the manifest's single seeded person: children live in the database, so a profile map
+ * may name children the manifest does not seed. An unmapped child falls back to defaultProfile.
  * Errors are codes only; no value from the manifest is echoed.
  */
 import { isAbsolute, resolve } from 'node:path';
@@ -11,7 +14,7 @@ export type ContentFilterMode = 'off' | 'owner' | 'parents';
 export interface ContentFilterManifest {
     /** Who may change a child's filter: nobody, only ownerAccountId, or every parent account. Loosening always needs step-up. */
     mode: ContentFilterMode;
-    /** Absolute path of a private (0600) file holding the NextDNS API key. The key itself is never in the manifest. */
+    /** Absolute path of the file holding the NextDNS API key (must be private 0600; enforced by the reader, see header). The key itself is never in the manifest. */
     apiKeyFile: string;
     /** The strict profile for devices that are not mapped to a child. */
     defaultProfile: string;
@@ -37,7 +40,8 @@ export function parseContentFilter(value: unknown, ownerAccountId: string | unde
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('invalid_content_filter_profiles');
     const entries = Object.entries(raw as Record<string, unknown>);
     if (entries.length > MAX_FILTER_PROFILES) bad('invalid_content_filter_profiles');
-    const profiles: Record<string, string> = {};
+    // Null prototype: a person id like 'constructor' must not resolve to an inherited member on lookup.
+    const profiles: Record<string, string> = Object.create(null);
     const seen = new Set<string>([defaultProfile as string]);
     for (const [person, profile] of entries) {
         let personId: string;

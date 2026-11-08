@@ -29,7 +29,7 @@ export interface IntegrationManifest {
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
     /** Child time requests are off unless enabled here: 'owner' lets only ownerAccountId decide them, 'parents' every parent account. Legacy {enabled} is read as parents/off. */
     timeRequests?: {mode: TimeRequestMode};
-    /** NextDNS content filtering (docs/prp/PRP-006); absent is off. The API key is read from apiKeyFile, never stored here. */
+    /** NextDNS content filtering (docs/prp/PRP-006); absent is off. apiKeyFile names the key file (read by a later PR); the key is never stored here. */
     contentFilter?: ContentFilterManifest;
     /** Audit log of parent actions; absent is off. */
     auditLog?: {enabled: boolean};

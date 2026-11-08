@@ -23,8 +23,14 @@ test('content filter manifest: strict keys and values, codes only', () => {
     assert.equal(code({...good, profiles: many}), 'invalid_content_filter_profiles');
 });
 
+test('content filter manifest: prototype-ish person ids are plain own keys, bad ones rejected', () => {
+    const out = parseContentFilter({...good, profiles: {constructor: 'def456', tostring: 'ghi789'}}, 'parent');
+    assert.equal(Object.getPrototypeOf(out.profiles), null); assert.equal(Object.hasOwn(out.profiles, 'constructor'), true); assert.equal(out.profiles['hasownproperty'], undefined);
+    for (const person of ['__proto__', 'Constructor', '1jack', 'a-b', '']) assert.equal(code({...good, profiles: {[person]: 'def456'}}), 'invalid_content_filter_profiles');
+});
+
 test('content filter manifest: errors never echo values', () => {
     for (const bad of [{...good, apiKeyFile: '/etc/secret key'}, {...good, defaultProfile: 'SECRETID'}]) {
-        try { parseContentFilter(bad, 'parent'); assert.fail('should throw'); } catch (e) { assert.doesNotMatch((e as Error).message, /secret|SECRETID/i); }
+        try { parseContentFilter(bad, 'parent'); assert.fail('should throw'); } catch (e) { assert.match((e as Error).message, /^invalid_content_filter(_key_file|_profile)?$/); }
     }
 });

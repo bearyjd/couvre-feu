@@ -261,6 +261,7 @@ Everything below ships **OFF** and is **unverified on this router** until the Ph
 | Feature | Manifest key (all absent = off) | What it gates |
 |---|---|---|
 | Time requests (F1, F3) | `"timeRequests": {"mode": "off" \| "owner" \| "parents"}`; legacy `{"enabled": true}` reads as `parents`. Top-level `"ownerAccountId"` | Child request link and page, parent ask-for-time card, grants |
+| Content filter (PRP-006) | `"contentFilter": {"mode": "off" \| "owner" \| "parents", "apiKeyFile", "defaultProfile", "profiles": {<personId>: <profileId>}}`; `owner` needs `ownerAccountId`. Config only so far (no route or caller yet) | Reserved for the NextDNS filter routes in PRP-006 Phase A; changing it changes the manifest digest and needs `integration-rebind` |
 | Audit log (F2) | `"auditLog": {"enabled": true}` | Writes to `parent_audit` and `GET /audit` |
 | Reward Time (F4) | `"rewardTime": {"enabled": true}` | `POST /people/:id/reward` |
 | Focus window (F5) | `"focus": {"enabled": true}` | `POST /people/:id/focus` (also needs `timeRequests` on) |
