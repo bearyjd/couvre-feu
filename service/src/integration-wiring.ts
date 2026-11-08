@@ -10,6 +10,7 @@ import { IntegrationWorker } from './integration-worker.ts';
 import { inventoryRetentionDays } from './inventory-store.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import { auditFor } from './parent-audit.ts';
+import { wireContentFilter } from './content-filter-wiring.ts';
 import type { AsyncRouter } from './router-transport.ts';
 
 /**
@@ -27,7 +28,12 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
         try { auditFor(store).prune(); } catch { process.stderr.write('parent_audit_prune_failed\n'); }
         try { pruneBatches(store); } catch { process.stderr.write('admin_batches_prune_failed\n'); }
     };
-    const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => appServer(auth, new IntegrationPolicy(store), serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory);
+    // Throws at startup (before anything listens) when filtering is on and the environment would expose the NextDNS API key.
+    const filter = wireContentFilter(config, store, env);
+    const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => {
+        const policy = new IntegrationPolicy(store);
+        return appServer(auth, policy, serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory, filter?.routes(auth, policy));
+    };
     return {worker, activity, prune, app};
 }
 

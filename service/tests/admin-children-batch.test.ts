@@ -356,22 +356,15 @@ test('batch: first-run completion refuses later setup with confirmed nonseed dev
 test('batch: additive schema leaves version, parent-audit schema and existing data readable by old readers', () => {
     const f = world();
     try {
-        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 11);
+        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12);
         assert.equal(f.count('people'), 1); assert.equal(f.count('devices'), 1);
         const sql = f.store.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE name='admin_batches'")!.sql;
         assert.match(sql, /UNIQUE\s*\(actor_id,\s*client_key\)/i);
         assert.equal(f.store.all('PRAGMA foreign_key_check').length, 0);
         const old = readFileSync(new URL('../migrations/013.sql', import.meta.url), 'utf8');
         assert.ok(old.includes("'device_assign'")); assert.equal(f.count('parent_audit'), 0);
-        const previous = new PreviousStore(join(f.dir, 'integration.sqlite'), undefined, 'integration');
-        try {
-            assert.equal(previous.get<{id: string}>('SELECT id FROM people')!.id, 'pilot');
-            assert.equal(previous.get<{identifier: string}>('SELECT identifier FROM devices')!.identifier, SEED);
-            previous.run("UPDATE people SET name='Previous service can still write' WHERE id='pilot'");
-            previous.run("INSERT INTO parent_audit(at,actor_id,action,person_id,result) VALUES(1,'operator','device_assign','pilot','applied')");
-            assert.equal(previous.get<{user_version: number}>('PRAGMA user_version')!.user_version, 11);
-        } finally { previous.close(); }
-        assert.equal(f.store.get<{name: string}>("SELECT name FROM people WHERE id='pilot'")!.name, 'Previous service can still write');
+        // 014 (content filtering) rebuilds parent_audit, like 010-013 before it: the binary from before it cannot open a database that has run it.
+        assert.throws(() => new PreviousStore(join(f.dir, 'integration.sqlite'), undefined, 'integration'), /unsupported_database_version/);
     } finally { f.cleanup(); }
 });
 

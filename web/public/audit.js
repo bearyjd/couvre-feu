@@ -8,6 +8,7 @@ const WHAT = {
   device_assign: 'Assigned a device', device_move: 'Moved a device', device_remove: 'Removed a device',
   grant_approve: 'Approved extra time', grant_decline: 'Declined a request', grant_end: 'Ended extra time',
   reward_add: 'Added reward time', focus_start: 'Started a focus window',
+  content_filter_set: 'Changed the content filter', content_filter_loosened: 'Relaxed the content filter',
 };
 const GENERIC_WHAT = 'Changed a setting';
 const EVERYONE = new Set(['pause_all', 'resume_all']);
