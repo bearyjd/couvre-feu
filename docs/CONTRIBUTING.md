@@ -47,6 +47,8 @@ Host `sh -n` alone is not ash proof: `tests/run.sh` reports `PENDING` when BusyB
 
 **Router fixtures.** The ten sharded suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`, `test-penn-pilot.py`, `test-penn-pilot-leg2.py`, `test-penn-pilot-leg2-guards.py`, `test-scope-admin.py`, `test-inventory.py`, `test-router-admission-check.py`) include slow enforcement fixtures and the offline admission checker. CI splits each into 4 partitions, except `test-core.py` and `test-penn-pilot.py` with 5 (42 shards), and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
 
+**Permanent-install preflight suite.** `tests/test-permanent-install.py` (fake-ssh fixtures for `tools/live/permanent-install.py`) is listed in `tests/run.sh --list-preflight-suites` and runs as its own `preflight_suites` matrix entry in `ci.yml` because it takes several minutes; keep both lists consistent.
+
 ```sh
 export CF_TEST_SHELL="busybox ash" CF_TEST_AWK="busybox awk" CF_TEST_TIMEOUT="busybox timeout" CF_TEST_WORKERS=1
 python3 tools/freeze-router-release.py --check

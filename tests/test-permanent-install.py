@@ -13,11 +13,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
@@ -155,6 +157,13 @@ class ConfigTests(PermanentBase):
             with self.subTest(change=str(change)[:80]):
                 self.refused(**change)
 
+    def test_paths_with_ssh_option_metacharacters_are_refused(self):
+        for key in ('knownHostsPath', 'adminPublicKeyPath', 'evidenceDir', 'authorizationPath'):
+            for value in ('/tmp/a b/known_hosts', '/tmp/%d/known_hosts', '/tmp/a,b', '/tmp/a\tb', '/tmp/a"b', "/tmp/a'b", '/tmp/a=b'):
+                with self.subTest(key=key, value=value):
+                    err = self.refused(**{key: value})
+                    self.assertIn(key, err)
+
     def test_rpc_allow_bound_is_exactly_256(self):
         macs = ['02:00:00:01:%02x:%02x' % divmod(i, 256) for i in range(1, 257)]
         document = dict(self.config, rpcAllow=macs, platformProfile='strict')
@@ -235,6 +244,31 @@ class PlanTests(PermanentBase):
         other, fingerprint = TLR.public_key()
         (self.work / 'admin.pub').write_text(other)
         self.assertNotEqual(self.plan_sha(self.write_config(adminKeyFingerprint=fingerprint)), base)
+
+    def test_plan_warns_that_scope_is_fixed_at_install(self):
+        config = self.write_config(rpcAllow=[PHONE_MAC, PENN['mac']])
+        code, out, err = self.invoke('plan', config)
+        self.assertEqual(code, 0, err)
+        tail = out[out.rindex('}') + 1:]
+        for key, macs in (('rpcAllow', sorted([PHONE_MAC, PENN['mac']])), ('protect', sorted(PROTECT))):
+            block = f'WARNING {key} is FIXED AT INSTALL and cannot be changed by reinstalling: {len(macs)} MACs:\n' + '\n'.join(macs) + '\n'
+            self.assertIn(block, tail)
+        self.assertIs(json.loads(out[:out.rindex('}') + 1])['rpcAllowFixedAtInstall'], True)
+        self.assertIn('rpcAllowFixedAtInstall', self.tool.PLAN_DIGEST_FIELDS)
+
+    def test_plan_sha_is_single_use(self):
+        self.model_tmp_namespace_owner()
+        config = self.write_config(activate=False)
+        sha = self.plan_sha(config)
+        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
+        self.assertEqual(code, 0, out + err)
+        self.cleanup_staging()
+        later = self.now + datetime.timedelta(seconds=1)
+        code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha, now=later)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('already executed', err)
+        self.assertEqual(len(list((self.evidence_root / 'evidence').iterdir())), 1)
+        self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
 
     def test_plan_sha_mismatch_refused_without_connection(self):
         code, _, err = self.invoke('execute', self.write_config(), '--expect-plan-sha256', 'a' * 64)
@@ -405,22 +439,170 @@ class RemoteRunTests(PermanentBase):
         self.assertIn('PHASE IDENTITY FAIL ssh_source_not_management', self.stdout())
         self.assertFalse(self.installer_ran())
 
-    def test_remote_gate_refuses_incomplete_protect_and_protected_scope(self):
-        config = self.tool.validate_config(json.loads(Path(self.write_config()).read_text()))
+    def run_payload(self, payload):
+        """Run a (possibly doctored) payload through the ssh double; return the completed process."""
+        self.tool_env()
+        result = subprocess.run([str(self.bin / 'ssh'), 'fixture'], input=payload, capture_output=True,
+                                env={'FAKE_SSH_SPEC': str(self.spec_path), 'PATH': os.environ['PATH']})
+        self.cleanup_staging_from(result.stdout)
+        return result
+
+    def base_config(self):
+        return self.tool.validate_config(json.loads(Path(self.write_config()).read_text()))
+
+    def doctored_payload(self, **change):
         commit, blobs = self.tool.FR.head_source()
-        for label, change, reason in (('ct107 not protected', {'protect': [m for m in PROTECT if m != CT107['mac']]},
-                                       'protect_list_incomplete'),
-                                      ('scope MAC protected', {'rpcAllow': [PENN['mac'], CT107['mac']]},
-                                       'rpc_allow_mac_protected')):
+        return self.tool.build_payload(dict(self.base_config(), **change), commit, blobs)[0]
+
+    def assert_remote_refusal(self, payload, phase, reason, installer_may_have_staged=False):
+        result = self.run_payload(payload)
+        self.assertEqual(result.returncode, 10, result.stderr.decode() + result.stdout.decode())
+        self.assertIn(f'PHASE {phase} FAIL {reason}'.encode(), result.stdout)
+        self.assertNotIn(b'MUTATION_BEGIN', result.stdout)
+        self.assertNotIn(b'--activate', result.stdout)
+        if not installer_may_have_staged:
+            self.assertFalse(self.installer_ran())
+
+    def test_remote_identity_guards_refuse_independently_of_local_validation(self):
+        roles = {'management': MGMT, 'jd_adult': JD, 'ct107': CT107}
+        no = lambda mac: [m for m in PROTECT if m != mac]  # noqa: E731
+        cases = [
+            ('historical equals jd', {'protectedHistoricalMacs': [JD['mac']]}, 'live_role_matches_protected_historical_mac'),
+            ('historical equals mgmt', {'protectedHistoricalMacs': [MGMT['mac']]}, 'live_role_matches_protected_historical_mac'),
+            ('historical equals ct107', {'protectedHistoricalMacs': [CT107['mac']]}, 'live_role_matches_protected_historical_mac'),
+            ('duplicate mac', {'roles': dict(roles, jd_adult={'ip': '192.0.2.99', 'mac': MGMT['mac']})}, 'duplicate_live_mac'),
+            ('duplicate ip', {'roles': dict(roles, jd_adult={'ip': MGMT['ip'], 'mac': JD['mac']})}, 'duplicate_live_ip'),
+            ('mgmt not protected', {'protect': no(MGMT['mac'])}, 'protect_list_incomplete'),
+            ('jd not protected', {'protect': no(JD['mac'])}, 'protect_list_incomplete'),
+            ('ct107 not protected', {'protect': no(CT107['mac'])}, 'protect_list_incomplete'),
+            ('historical not protected', {'protect': no(HISTORICAL[0])}, 'protect_list_incomplete'),
+            ('scope MAC protected', {'rpcAllow': [PENN['mac'], CT107['mac']]}, 'rpc_allow_mac_protected')]
+        for label, change, reason in cases:
             with self.subTest(label):
-                payload = self.tool.build_payload(dict(config, **change), commit, blobs)[0]
-                self.tool_env()
-                result = subprocess.run([str(self.bin / 'ssh'), 'fixture'], input=payload, capture_output=True,
-                                        env={'FAKE_SSH_SPEC': str(self.spec_path), 'PATH': os.environ['PATH']})
-                self.assertEqual(result.returncode, 10, result.stderr.decode())
-                self.assertIn(f'PHASE IDENTITY FAIL {reason}'.encode(), result.stdout)
+                self.assert_remote_refusal(self.doctored_payload(**change), 'IDENTITY', reason)
+
+    def test_missing_parameter_and_exhausted_budget_refuse_before_mutation(self):
+        payload = self.doctored_payload().decode()
+        missing = payload.replace(f"CFPI_CT107_MAC='{CT107['mac']}'", "CFPI_CT107_MAC=''")
+        self.assertNotEqual(missing, payload)
+        self.assert_remote_refusal(missing.encode(), 'PAYLOAD', 'parameters_missing')
+        slow = payload.replace('CFR_PREMUTATION_BUDGET=300', 'CFR_PREMUTATION_BUDGET=-1')
+        self.assertNotEqual(slow, payload)
+        self.assert_remote_refusal(slow.encode(), 'SNAPSHOT', 'premutation_budget_exceeded', installer_may_have_staged=True)
+
+    def test_ssh_connection_missing_or_invalid_is_refused(self):
+        for value, reason in (('', 'ssh_connection_missing'), ('one two', 'ssh_connection_invalid')):
+            with self.subTest(value=value):
+                self.spec['ssh_connection'] = value
+                code, out, err = self.execute()
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(f'PHASE IDENTITY FAIL {reason}', self.stdout())
                 self.assertFalse(self.installer_ran())
-                self.cleanup_staging_from(result.stdout)
+                shutil.rmtree(self.evidence_root / 'evidence')
+                (self.evidence_root / 'evidence').mkdir(mode=0o700)
+
+    def test_existing_installation_is_refused_before_the_installer_runs(self):
+        rid = self.tool.FR.release_id(self.tool.FR.head_source()[1])
+        for label, path, kind in (('state dir', 'etc/couvrefeu', 'dir'), ('release dir', f'etc/.couvrefeu-release-{rid}', 'dir'),
+                                  ('cfctl', 'usr/sbin/cfctl', 'file')):
+            with self.subTest(label):
+                target = self.root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.mkdir() if kind == 'dir' else target.write_text('x\n')
+                self.assert_remote_refusal(self.doctored_payload(), 'PREREQ', 'existing_installation_present')
+                shutil.rmtree(target) if kind == 'dir' else target.unlink()
+
+    # --- VERIFY guards: a router-side tool double changes one observation, deterministically.
+    def hook(self, tool, fragments, action):
+        wrapper = self.fixture.bin / tool
+        if wrapper.exists():
+            real = self.fixture.bin / (tool + '.real')
+            wrapper.rename(real)
+        else:
+            real = Path(shutil.which(tool))
+        pattern = '*' + '*'.join(shlex.quote(f) for f in fragments) + '*'
+        wrapper.write_text(f'#!/bin/sh\ncase "$*" in {pattern})\n{action}\n;; esac\nexec {shlex.quote(str(real))} "$@"\n')
+        wrapper.chmod(0o700)
+
+    LAST = 'for last; do :; done\n'
+
+    def edit_last(self, expression):
+        return self.LAST + f'sed {shlex.quote(expression)} "$last" > "$last.t"; mv "$last.t" "$last"'
+
+    def assert_verify_stop(self, reason, hook_args=None):
+        if hook_args:
+            self.hook(*hook_args)
+        code, out, err = self.execute()
+        stdout = self.stdout()
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f'PHASE VERIFY FAIL {reason}', stdout)
+        self.assertIn('STOPPED_AFTER_MUTATION VERIFY', stdout)
+        self.assertNotIn('PERMANENT_INSTALL_PASS', stdout)
+        self.assertNotIn('PERMANENT_GENERATION', stdout)
+        return stdout
+
+    JOURNAL_READ = ('{print $2; n++}',)
+
+    def test_generation_unreadable_stops(self):
+        self.assert_verify_stop('generation_unreadable', ('awk', self.JOURNAL_READ, 'exit 1'))
+
+    def test_generation_malformed_stops(self):
+        self.assert_verify_stop('generation_malformed', ('awk', self.JOURNAL_READ, 'echo not-a-generation; exit 0'))
+
+    def test_rpc_generation_must_equal_the_journal_generation(self):
+        self.assert_verify_stop('generation_mismatch', ('awk', ('rpc_version',),
+                                self.edit_last('s/"generation":"[0-9a-f]*"/"generation":"' + 'b' * 64 + '"/')))
+
+    def test_rpc_policy_must_be_fresh_revision_zero_in_the_same_object(self):
+        self.assert_verify_stop('activation_not_fresh', ('awk', ('rpc_version',), self.edit_last('s/"revision":0/"revision":3/')))
+
+    def test_rpc_reply_must_be_exactly_one_line(self):
+        self.assert_verify_stop('rpc_status_shape', ('awk', ('rpc_version',), self.LAST + 'echo garbage >> "$last"'))
+
+    def test_rpc_status_failure_stops(self):
+        action = f'chmod 000 {shlex.quote(str(self.root / "usr/sbin/cfctl"))}'
+        self.assert_verify_stop('rpc_status_failed', ('awk', self.JOURNAL_READ, action))
+
+    def test_status_must_be_one_line(self):
+        self.assert_verify_stop('status_output_shape', ('awk', ('NR==1{print}END{exit NR!=1}',), self.LAST + 'echo extra >> "$last"'))
+
+    def test_unhealthy_status_stops_after_mutation(self):
+        self.assert_verify_stop('status_not_healthy_empty', ('awk', ('"ok":true,"desiredRevision":0',),
+                                                             self.edit_last('s/"ok":true/"ok":false/')))
+
+    def test_release_uninstall_missing_stops(self):
+        action = f'rm -f {shlex.quote(str(self.release_dir() / "uninstall.sh"))}'
+        stdout = self.assert_verify_stop('release_uninstall_missing', ('grep', ('CF_RELEASE_ID=',), action))
+        self.assertIn('ROLLBACK_UNAVAILABLE', stdout)
+
+    def test_installed_rpc_scope_must_equal_the_plan(self):
+        self.assert_verify_stop('rpc_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/rpc-allowed'), 'echo 02:00:00:00:00:99; exit 0'))
+
+    def test_installed_protected_list_must_equal_the_plan(self):
+        self.assert_verify_stop('protect_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/protected'), 'echo 02:00:00:00:00:99; exit 0'))
+
+    def test_rollback_script_that_differs_from_its_digest_is_untrusted_even_if_verify_passed_it(self):
+        # The tree check passes, then the retained uninstall.sh is altered; a later VERIFY stop must not advertise it.
+        target = shlex.quote(str(self.release_dir() / 'uninstall.sh'))
+        self.hook('grep', ('CF_RELEASE_ID=',), f'printf "# altered\\n" >> {target}')
+        stdout = self.assert_verify_stop('rpc_scope_mismatch', ('sort', ('-u', 'etc/couvrefeu/rpc-allowed'), 'echo 02:00:00:00:00:99; exit 0'))
+        self.assertIn('ROLLBACK_UNTRUSTED ', stdout)
+        self.assertNotIn('ROLLBACK_COMMAND', stdout)
+
+    def test_signal_after_mutation_stops_once_with_rollback(self):
+        patched = TLR.FAKE_SSH.replace("    if spec.get('hangup_after')", "    if spec.get('term_after') and line.decode().rstrip('\\n') == spec['term_after']:\n"
+                                       "        os.kill(child.pid, signal.SIGTERM)\n    if spec.get('hangup_after')", 1)
+        self.assertNotEqual(patched, TLR.FAKE_SSH)
+        (self.bin / 'ssh').write_text(f'#!{sys.executable}\n' + patched)
+        self.spec['term_after'] = 'MUTATION_BEGIN'
+        code, out, err = self.execute()
+        stdout = self.stdout()
+        self.assertEqual(code, 2, out + err)
+        self.assertIn('PHASE INSTALL FAIL signal_received', stdout)
+        self.assertEqual(stdout.count('STOPPED_AFTER_MUTATION'), 1)
+        self.assertIn('STOPPED_AFTER_MUTATION SIGNAL', stdout)
+        self.assertEqual(stdout.count('PHASE INSTALL FAIL'), 1)
+        self.assertTrue(any(line.startswith('ROLLBACK_') for line in stdout.splitlines()))
 
     def cleanup_staging_from(self, stdout):
         for line in stdout.decode().splitlines():
@@ -453,35 +635,19 @@ class RemoteRunTests(PermanentBase):
         rollback = [line for line in stdout.splitlines() if line.startswith('ROLLBACK_COMMAND ')]
         self.assertTrue(rollback or 'ROLLBACK_UNAVAILABLE' in stdout)
 
-    def test_tampered_installed_tree_stops_with_the_retained_uninstall_as_rollback(self):
+    def test_tampered_installed_tree_stops_and_the_rollback_is_untrusted(self):
         rid = self.tool.FR.release_id(self.tool.FR.head_source()[1])
         self.tamper_installed_file('usr/lib/couvrefeu/rpc.sh')
         code, out, err = self.execute()
         self.assertTrue((self.work / 'tampered').exists(), 'tamper hook never fired')
         stdout = self.assert_stopped(code, out, err, 'VERIFY')
         self.assertIn('installed_tree_mismatch usr/lib/couvrefeu/rpc.sh', stdout)
-        self.assertIn(f'ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-{rid}/uninstall.sh', stdout)
+        # VERIFY found a mismatch in the uninstall inputs: the rollback is not advertised.
+        self.assertIn('ROLLBACK_UNTRUSTED ', stdout)
+        self.assertNotIn('ROLLBACK_COMMAND', stdout)
         self.assertNotIn('PERMANENT_GENERATION', stdout)
+        del rid
         self.assertTrue((self.release_dir() / 'uninstall.sh').is_file())
-
-    def test_unhealthy_status_stops_after_mutation(self):
-        # The healthy status is replaced by an enrolled one just before VERIFY reads it.
-        hook = self.fixture.bin / 'sha256sum'
-        done = self.work / 'status-sabotaged'
-        hook.write_text('#!/bin/sh\n'
-                        'if [ "$#" = 0 ] && [ -f "$CF_ROOT/etc/couvrefeu/state" ] && [ ! -e ' + str(done) + ' ]; then\n'
-                        '  target=$(readlink /proc/$$/fd/0 2>/dev/null)\n'
-                        '  case "$target" in *"/usr/sbin/cfctl-ssh") : > ' + str(done) + '; printf "P\\tpenn\\t-\\n" >> "$CF_ROOT/etc/couvrefeu/state";; esac\n'
-                        'fi\n'
-                        f'exec {shutil.which("sha256sum")} "$@"\n')
-        hook.chmod(0o700)
-        code, out, err = self.execute()
-        if not done.exists():
-            self.skipTest('state sabotage hook did not fire in this shell')
-        self.assertEqual(code, 2, out + err)
-        stdout = self.stdout()
-        self.assertIn('STOPPED_AFTER_MUTATION VERIFY', stdout)
-        self.assertNotIn('PERMANENT_INSTALL_PASS', stdout)
 
     def test_connectivity_loss_after_install_stops_after_mutation(self):
         ip = self.fixture.bin / 'ip'
@@ -509,6 +675,23 @@ class RemoteRunTests(PermanentBase):
         summary = json.loads((self.evidence() / 'summary.json').read_text())
         self.assertEqual((summary['outcome'], summary['remoteExit']), ('UNKNOWN', 255))
         self.assertIn('UNKNOWN:', out)
+        rid = self.tool.FR.release_id(self.tool.FR.head_source()[1])
+        rollback = f'ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-{rid}/uninstall.sh (separate approval; verify the file first)'
+        self.assertIn(rollback, summary['rollback'])
+        self.assertIn(rollback, out)
+        self.assertIn('SIGKILL', out)
+        self.assertIn('/tmp/couvrefeu-install.lock', out)
+
+    def test_exception_after_connect_is_unknown_with_rollback(self):
+        config = self.write_config(activate=False)
+        sha = self.plan_sha(config)
+        with mock.patch.object(self.tool.FR, 'run_ssh', side_effect=RuntimeError('boom')):
+            code, out, err = self.invoke('execute', config, '--expect-plan-sha256', sha)
+        self.assertEqual(code, 2)
+        summary = json.loads((self.evidence() / 'summary.json').read_text())
+        self.assertEqual(summary['outcome'], 'UNKNOWN')
+        self.assertTrue(summary['rollback'][0].startswith('ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-'))
+        self.assertIn('ROLLBACK_COMMAND', err)
 
 
 class ClassifyTests(unittest.TestCase):
@@ -548,8 +731,10 @@ class ClassifyTests(unittest.TestCase):
 
     def test_validated_only_without_mutation(self):
         text = ''.join(f'PHASE {p} OK\n' for p in SOURCE.VALIDATE_PHASES) + 'PERMANENT_INSTALL_VALIDATED_NO_MUTATION\n'
-        self.assertEqual(SOURCE.classify(text, 0, False, SOURCE.VALIDATE_PHASES)[:2], ('VALIDATED', 0))
-        self.assertEqual(SOURCE.classify('MUTATION_BEGIN\n' + text, 0, False, SOURCE.VALIDATE_PHASES)[0], 'UNKNOWN')
+        self.assertEqual(SOURCE.classify(text, 0, False, SOURCE.VALIDATE_PHASES, activate=False)[:2], ('VALIDATED', 0))
+        self.assertEqual(SOURCE.classify(text, 0, False, SOURCE.VALIDATE_PHASES)[0], 'UNKNOWN')
+        self.assertEqual(SOURCE.classify(self.lines(), 0, False, SOURCE.PHASES, activate=False)[0], 'UNKNOWN')
+        self.assertEqual(SOURCE.classify('MUTATION_BEGIN\n' + text, 0, False, SOURCE.VALIDATE_PHASES, activate=False)[0], 'UNKNOWN')
 
 
 if __name__ == '__main__':

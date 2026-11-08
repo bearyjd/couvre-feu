@@ -57,6 +57,7 @@ MAX_PROTECT, MAX_RPC_ALLOW = 64, 256
 PASS_LINE = 'PERMANENT_INSTALL_PASS'
 VALIDATED_LINE = 'PERMANENT_INSTALL_VALIDATED_NO_MUTATION'
 STOPPED_PREFIX = 'STOPPED_AFTER_MUTATION '
+SAFE_PATH = re.compile(r'[A-Za-z0-9._/-]+')
 PARAM_VALUE = re.compile(r'[0-9a-z.: -]+')
 PRINTED = ('PHASE ', 'DIFF ', 'REFUSED_', 'STOPPED_', 'ROLLBACK_', 'PERMANENT_', 'MUTATION_BEGIN')
 MESSAGES = {
@@ -64,10 +65,20 @@ MESSAGES = {
     'VALIDATED': 'VALIDATED: activate=false; installer staged and validated only, nothing was installed.',
     'REFUSED': 'REFUSED: the remote script refused before any router mutation.',
     'STOPPED_AFTER_MUTATION': 'STOPPED_AFTER_MUTATION: the install is in place or half done. Preserve evidence; do not rerun '
-                              'install. Rollback is the retained release uninstall.sh (ROLLBACK_COMMAND above), run '
+                              'install. Rollback is the retained release uninstall.sh (ROLLBACK_COMMAND above, unless ROLLBACK_UNTRUSTED/ROLLBACK_UNAVAILABLE), run '
                               'separately after separate approval. Password login is untouched and is the recovery path.',
     'UNKNOWN': 'UNKNOWN: session ended without a complete result. Treat the router as possibly mutated; preserve '
-               'evidence; do not retry blindly. See the runbook before any inspection.'}
+               'evidence; do not retry blindly. A SIGKILL during the unbounded install.sh skips its traps and the installer '
+               'may still be running: check /tmp/couvrefeu-install.lock and /tmp/couvrefeu-platform.lock before anything. '
+               'See the runbook before any inspection.'}
+
+
+def safe_path(value, field):
+    """ssh -o UserKnownHostsFile= parses whitespace and %-tokens, so only plain path characters are allowed."""
+    FR.absolute_path(value, field)
+    if not SAFE_PATH.fullmatch(value):
+        raise Refusal(f'{field}: only [A-Za-z0-9._/-] characters are allowed')
+    return value
 
 
 def unique_macs(value, field, low, high):
@@ -102,7 +113,7 @@ def validate_roles(document, host):
 def validate_common(document):
     config = {'host': FR.canonical_ipv4(document['host'], 'host')}
     for key in ('adminPublicKeyPath', 'knownHostsPath', 'evidenceDir', 'authorizationPath'):
-        config[key] = FR.absolute_path(document[key], key)
+        config[key] = safe_path(document[key], key)
     fingerprint = document['adminKeyFingerprint']
     if not isinstance(fingerprint, str) or not FR.FINGERPRINT.fullmatch(fingerprint):
         raise Refusal('adminKeyFingerprint: SHA256:<43 base64 characters> required')
@@ -220,7 +231,7 @@ def build_payload(config, commit, blobs):
 
 PLAN_DIGEST_FIELDS = FR.PLAN_DIGEST_FIELDS + (
     'tool', 'configSchemaVersion', 'sourceCommit', 'releaseId', 'platformProfile', 'roles', 'protectedHistoricalMacs',
-    'protect', 'rpcAllow', 'activate', 'installArgv', 'phases', 'permanentScriptSha256')
+    'protect', 'rpcAllow', 'rpcAllowFixedAtInstall', 'activate', 'installArgv', 'phases', 'permanentScriptSha256')
 
 
 def plan_digest(details):
@@ -241,7 +252,7 @@ def plan(config, env):
                'deadlineUtc': config['deadlineUtc'], 'authorizationPath': config['authorizationPath'],
                'evidenceDir': config['evidenceDir'], 'roles': config['roles'],
                'protectedHistoricalMacs': config['protectedHistoricalMacs'], 'protect': config['protect'],
-               'rpcAllow': config['rpcAllow'], 'activate': config['activate'], 'installArgv': install_argv(config),
+               'rpcAllow': config['rpcAllow'], 'rpcAllowFixedAtInstall': True, 'activate': config['activate'], 'installArgv': install_argv(config),
                'phases': planned_phases(config), 'uninstallInHappyPath': False,
                'knownHostsSha256': FR.regular_file_sha256(config['knownHostsPath'], 'knownHostsPath'),
                'adminPublicKeySha256': FR.regular_file_sha256(config['adminPublicKeyPath'], 'adminPublicKeyPath')}
@@ -258,10 +269,10 @@ def phase_results(lines, phases):
     return results
 
 
-def completed(lines, remote_exit, timed_out, phases, results):
+def completed(lines, remote_exit, timed_out, phases, results, activate):
     """Every planned phase OK once, the single final line, and for an install a healthy status and one generation."""
-    end_line = PASS_LINE if len(phases) == len(PHASES) else VALIDATED_LINE
-    ok = (not timed_out and remote_exit == FR.REMOTE_PASS and lines.count(end_line) == 1 and lines[-1:] == [end_line]
+    end_line = PASS_LINE if activate else VALIDATED_LINE
+    ok = (tuple(phases) == (PHASES if activate else VALIDATE_PHASES) and not timed_out and remote_exit == FR.REMOTE_PASS and lines.count(end_line) == 1 and lines[-1:] == [end_line]
           and all(results.get(name) == ['OK'] for name in phases) and len(results) == len(phases))
     if not ok:
         return False
@@ -272,11 +283,11 @@ def completed(lines, remote_exit, timed_out, phases, results):
             and re.fullmatch(r'[0-9a-f]{64}', generations[0]) is not None and FR.status_healthy(lines))
 
 
-def classify(stdout_text, remote_exit, timed_out, phases=PHASES):
+def classify(stdout_text, remote_exit, timed_out, phases=PHASES, activate=True):
     lines = stdout_text.splitlines()
     results = phase_results(lines, phases)
-    if completed(lines, remote_exit, timed_out, phases, results):
-        return ('PASS' if len(phases) == len(PHASES) else 'VALIDATED'), EXIT_PASS, results
+    if completed(lines, remote_exit, timed_out, phases, results, activate):
+        return ('PASS' if activate else 'VALIDATED'), EXIT_PASS, results
     refused = (not timed_out and remote_exit == FR.REMOTE_REFUSED and 'MUTATION_BEGIN' not in lines
                and any(line.startswith('REFUSED_BEFORE_MUTATION ') for line in lines))
     if refused:
@@ -292,6 +303,38 @@ def rollback_lines(stdout_text):
     return [line for line in stdout_text.splitlines() if line.startswith('ROLLBACK_')]
 
 
+def unknown_rollback(details):
+    return (f'ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-{details["releaseId"]}/uninstall.sh '
+            '(separate approval; verify the file first)')
+
+
+def already_executed(config, plan_sha):
+    """One approved planSha256 is single-use: any earlier run directory that recorded it blocks a rerun."""
+    try:
+        names = sorted(os.listdir(config['evidenceDir']))
+    except OSError:
+        return False
+    for name in names:
+        if not name.endswith('-permanent-install'):
+            continue
+        try:
+            recorded = json.loads(Path(config['evidenceDir'], name, 'plan.json').read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(recorded, dict) and recorded.get('planSha256') == plan_sha:
+            return True
+    return False
+
+
+def write_unknown(directory, details, error):
+    try:
+        FR.write_evidence(directory, 'summary.json', json.dumps(
+            {'outcome': 'UNKNOWN', 'exitCode': EXIT_FAIL, 'error': type(error).__name__,
+             'rollback': [unknown_rollback(details)]}, sort_keys=True) + '\n')
+    except BaseException:
+        pass
+
+
 def generation_of(stdout_text):
     found = [line.split(' ', 1)[1] for line in stdout_text.splitlines() if line.startswith('PERMANENT_GENERATION ')]
     return found[0] if len(found) == 1 else None
@@ -303,6 +346,8 @@ def execute(config, expected_plan_sha, env, now_fn):
     details, payload = plan(config, env)
     if not hmac.compare_digest(details['planSha256'], expected_plan_sha):
         raise Refusal(f'plan sha256 {details["planSha256"]} differs from the disclosed value')
+    if already_executed(config, details['planSha256']):
+        raise Refusal('this plan sha256 was already executed (evidence exists); a new plan and approval are required')
     FR.check_deadline(config, now_fn())
     details['authorizationSha256'] = FR.regular_file_sha256(config['authorizationPath'], 'authorizationPath')
     FR.check_agent(config, env)
@@ -330,8 +375,9 @@ def execute(config, expected_plan_sha, env, now_fn):
             os.close(stderr_fd)
         return conclude(directory, details, started, remote_exit, timed_out, now_fn)
     except BaseException as error:
-        FR.write_unknown(directory, error)
+        write_unknown(directory, details, error)
         try:
+            print(unknown_rollback(details), file=sys.stderr)
             print(MESSAGES['UNKNOWN'], file=sys.stderr)
         except BaseException:
             pass
@@ -340,19 +386,31 @@ def execute(config, expected_plan_sha, env, now_fn):
 
 def conclude(directory, details, started, remote_exit, timed_out, now_fn):
     stdout_text = Path(directory, 'stdout.log').read_text(errors='replace')
-    outcome, code, phases = classify(stdout_text, remote_exit, timed_out, tuple(details['phases']))
+    outcome, code, phases = classify(stdout_text, remote_exit, timed_out, tuple(details['phases']), details['activate'])
     FR.write_evidence(directory, 'exit-code.txt', f'{remote_exit}\n')
     summary = {'outcome': outcome, 'exitCode': code, 'remoteExit': remote_exit, 'timedOut': timed_out, 'phases': phases,
                'generation': generation_of(stdout_text) if outcome == 'PASS' else None,
-               'rollback': rollback_lines(stdout_text), 'payloadSha256': details['payloadSha256'],
+               'rollback': rollback_lines(stdout_text) or ([unknown_rollback(details)] if outcome == 'UNKNOWN' else []),
+               'payloadSha256': details['payloadSha256'],
                'planSha256': details['planSha256'], 'sourceCommit': details['sourceCommit'],
                'startedUtc': started.strftime('%Y-%m-%dT%H:%M:%SZ'),
                'finishedUtc': now_fn().strftime('%Y-%m-%dT%H:%M:%SZ')}
     FR.write_evidence(directory, 'summary.json', json.dumps(summary, indent=2, sort_keys=True) + '\n')
     for line in FR.console_lines(directory, stdout_text, PRINTED):
         print(line)
+    if outcome == 'UNKNOWN':
+        print(unknown_rollback(details))
     print(MESSAGES[outcome])
     return code
+
+
+def scope_warnings(details):
+    lines = []
+    for key in ('rpcAllow', 'protect'):
+        macs = sorted(details[key])
+        lines.append(f'WARNING {key} is FIXED AT INSTALL and cannot be changed by reinstalling: {len(macs)} MACs:')
+        lines += macs
+    return lines
 
 
 def run(argv, *, env=None, now_fn=None):
@@ -363,6 +421,7 @@ def run(argv, *, env=None, now_fn=None):
         if len(argv) == 2 and argv[0] == 'plan':
             details, _ = plan(load_config(argv[1]), env)
             print(json.dumps(details, indent=2, sort_keys=True))
+            print('\n'.join(scope_warnings(details)))
             print('PLAN ONLY: nothing was sent. Disclose this output, then run:')
             print('python3 -I tools/live/permanent-install.py execute ' + shlex.quote(argv[1])
                   + ' --expect-plan-sha256 ' + details['planSha256'])

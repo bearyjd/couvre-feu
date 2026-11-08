@@ -16,6 +16,14 @@ CFPI_PROTECT=
 CFPI_RPC_ALLOW=
 CFPI_CT107_MAC=
 # @CF_PERMANENT_PARAMETERS_END@
+PI_UNTRUSTED=
+
+# A permanent install is single-use: any existing Couvre-feu state refuses before the installer runs.
+pi_existing() {
+    for pi_path in "$CFR_ROOT/etc/couvrefeu" "$CFR_RELEASE_DIR" "$CFR_ROOT/usr/sbin/cfctl"; do
+        if [ -e "$pi_path" ] || [ -L "$pi_path" ]; then cfr_refuse PREREQ existing_installation_present; fi
+    done
+}
 
 # Exactly the planned installer flags (one per line); --activate is added by the INSTALL phase only.
 cfr_install_args() {
@@ -27,7 +35,7 @@ cfr_install_args() {
 
 # Same gate as the rehearsal, for the management and adult devices only.
 pi_identity() {
-    for pi_live in "$CFR_MGMT_MAC" "$CFR_JD_MAC"; do
+    for pi_live in "$CFR_MGMT_MAC" "$CFR_JD_MAC" "$CFPI_CT107_MAC"; do
         for pi_old in $CFR_HISTORICAL_MACS; do
             [ "$pi_live" != "$pi_old" ] || cfr_refuse IDENTITY live_role_matches_protected_historical_mac
         done
@@ -63,16 +71,31 @@ pi_identity() {
     cfr_ok IDENTITY
 }
 
+# The retained uninstall.sh is advertised only when it is a regular file equal to the shipped digest and
+# VERIFY found no mismatch in the other uninstall inputs.
+pi_uninstall_trusted() {
+    [ -z "$PI_UNTRUSTED" ] || return 1
+    pi_target=$CFR_RELEASE_DIR/uninstall.sh
+    [ -f "$pi_target" ] && [ ! -L "$pi_target" ] || return 1
+    pi_want=$(awk '$3=="router/uninstall.sh"{print $1}' "$CFR_STAGE/manifest") || return 1
+    [ -n "$pi_want" ] || return 1
+    pi_have=$(sha256sum < "$pi_target") || return 1
+    [ "${pi_have%% *}" = "$pi_want" ]
+}
 # The install stays: report the retained release's uninstall.sh, never run it.
 pi_rollback_lines() {
-    if [ -f "$CFR_RELEASE_DIR/uninstall.sh" ] && [ ! -L "$CFR_RELEASE_DIR/uninstall.sh" ]; then
+    if pi_uninstall_trusted; then
         cfr_out "ROLLBACK_COMMAND /bin/sh ${CFR_RELEASE_DIR#"$CFR_ROOT"}/uninstall.sh"
         cfr_out 'ROLLBACK_NOTE run it once, separately, after separate approval; do not rerun install.sh; password login is the recovery path'
+    elif [ -e "$CFR_RELEASE_DIR/uninstall.sh" ] || [ -L "$CFR_RELEASE_DIR/uninstall.sh" ]; then
+        cfr_out "ROLLBACK_UNTRUSTED retained uninstall.sh not verified (${PI_UNTRUSTED:-digest_differs_from_release_manifest}); do not run it; password login is the recovery path"
     else
         cfr_out 'ROLLBACK_UNAVAILABLE retained release uninstall.sh absent; journal /etc/couvrefeu/backup retained; password login is the recovery path'
     fi
 }
 pi_halt() {
+    # No re-entry: a second signal must not interleave a second FAIL/STOPPED report.
+    trap '' INT TERM
     if cfr_snapshot after; then
         if cmp -s "$CFR_STAGE/snapshot.before" "$CFR_STAGE/snapshot.after"; then cfr_info 'post-failure snapshot equals SNAPSHOT'
         else cfr_diff; fi
@@ -97,7 +120,10 @@ pi_signal() {
 # being checked), then required to equal what the router's RPC status reports.
 pi_verify() {
     cfr_verify_installed && pi_rc=0 || pi_rc=$?
-    [ "$pi_rc" = 0 ] || cfr_stop VERIFY "installed_tree_mismatch$cfr_bad; journal retained"
+    if [ "$pi_rc" != 0 ]; then
+        PI_UNTRUSTED="installed_tree_mismatch$cfr_bad"
+        cfr_stop VERIFY "installed_tree_mismatch$cfr_bad; journal retained"
+    fi
     if [ ! -f "$CFR_RELEASE_DIR/uninstall.sh" ] || [ -L "$CFR_RELEASE_DIR/uninstall.sh" ]; then cfr_stop VERIFY release_uninstall_missing; fi
     # status exits nonzero when unhealthy; the JSON body is the gate.
     cfr_run_sh "$CFR_CFCTL" status --json > "$CFR_STAGE/status.json" || :
@@ -109,8 +135,29 @@ pi_verify() {
     case "$pi_generation" in *[!0-9a-f]*|'') cfr_stop VERIFY generation_malformed;; esac
     [ "${#pi_generation}" = 64 ] || cfr_stop VERIFY generation_malformed
     cfr_run_sh "$CFR_CFCTL" rpc-status --json > "$CFR_STAGE/status.json" || cfr_stop VERIFY rpc_status_failed
-    grep -q "^{\"rpc_version\":1,\"generation\":\"$pi_generation\"," "$CFR_STAGE/status.json" || cfr_stop VERIFY generation_mismatch
-    grep -q '"acceptedPolicy":{"version":1,"revision":0,"people":\[\],' "$CFR_STAGE/status.json" || cfr_stop VERIFY activation_not_fresh
+    # ONE reply line; generation and the empty revision-0 policy are checked inside that same object.
+    pi_rc=0
+    awk -v gen="{\"rpc_version\":1,\"generation\":\"$pi_generation\"," \
+        -v pol='"acceptedPolicy":{"version":1,"revision":0,"people":[],' \
+        'NR==1{line=$0}END{if(NR!=1)exit 2;if(index(line,gen)!=1)exit 3;if(index(line,gen pol)!=1)exit 4}' \
+        "$CFR_STAGE/status.json" || pi_rc=$?
+    case "$pi_rc" in
+        0) ;;
+        3) cfr_stop VERIFY generation_mismatch;;
+        4) cfr_stop VERIFY activation_not_fresh;;
+        *) cfr_stop VERIFY rpc_status_shape;;
+    esac
+    # The installed lists must equal the planned sets (installer stores them sorted).
+    set -f
+    # shellcheck disable=SC2086
+    pi_planned=$(printf '%s\n' $CFPI_PROTECT | LC_ALL=C sort -u)
+    pi_installed=$(LC_ALL=C sort -u "$CFR_ROOT/etc/couvrefeu/protected") || cfr_stop VERIFY protect_scope_mismatch
+    [ "$pi_planned" = "$pi_installed" ] || cfr_stop VERIFY protect_scope_mismatch
+    # shellcheck disable=SC2086
+    pi_planned=$(printf '%s\n' $CFPI_RPC_ALLOW | LC_ALL=C sort -u)
+    pi_installed=$(LC_ALL=C sort -u "$CFR_ROOT/etc/couvrefeu/rpc-allowed") || cfr_stop VERIFY rpc_scope_mismatch
+    [ "$pi_planned" = "$pi_installed" ] || cfr_stop VERIFY rpc_scope_mismatch
+    set +f
     cfr_out "PERMANENT_GENERATION $pi_generation"
     cfr_ok VERIFY
 }
@@ -132,6 +179,7 @@ pi_main() {
     trap 'exit 10' HUP INT TERM PIPE
     cfr_extract
     pi_identity
+    pi_existing
     cfr_prereq
     cfr_snapshot before || cfr_refuse SNAPSHOT snapshot_failed
     while IFS= read -r cfr_line; do cfr_out "SNAPSHOT $cfr_line"; done < "$CFR_STAGE/snapshot.before"
