@@ -26,6 +26,7 @@ pi_existing() {
 }
 
 # Exactly the planned installer flags (one per line); --activate is added by the INSTALL phase only.
+# shellcheck disable=SC2329 # called from the appended main flow, which ShellCheck cannot see in this file alone
 cfr_install_args() {
     set -f
     # Generated tokens contain no glob characters; splitting is deliberate.
@@ -56,6 +57,7 @@ pi_identity() {
     set +f
     [ "$#" = 4 ] || cfr_refuse IDENTITY ssh_connection_invalid
     [ "$1" = "$CFR_MGMT_IP" ] || cfr_refuse IDENTITY ssh_source_not_management
+    # shellcheck disable=SC2153 # CFR_STAGE is assigned by the filled first-rehearsal.sh this script is appended to
     ip -4 neigh show dev br-lan > "$CFR_STAGE/identity.neigh" 2>/dev/null </dev/null || cfr_refuse IDENTITY neighbor_read_failed
     if [ ! -f "$CFR_LEASES" ] || [ -L "$CFR_LEASES" ]; then cfr_refuse IDENTITY leases_unavailable; fi
     cfr_neighbor "$CFR_MGMT_IP" "$CFR_MGMT_MAC" REACHABLE "$CFR_STAGE/identity.neigh" || cfr_refuse IDENTITY management_neighbor_mismatch
@@ -125,6 +127,7 @@ pi_signal() {
 pi_verify() {
     cfr_verify_installed && pi_rc=0 || pi_rc=$?
     if [ "$pi_rc" != 0 ]; then
+        # shellcheck disable=SC2154 # cfr_bad is set by cfr_verify_installed in the filled first-rehearsal.sh this script is appended to
         PI_UNTRUSTED="installed_tree_mismatch$cfr_bad"
         cfr_stop VERIFY "installed_tree_mismatch$cfr_bad; journal retained"
     fi
