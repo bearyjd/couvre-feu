@@ -4,7 +4,7 @@ Status as of 2026-10-29; planned additions added 2026-10-27. This is the current
 
 ## Planned additions at a glance
 
-Ten additions picked from the comparable-products research (PR #90), phased in. Details, owner decisions and rules: [Planned additions](#planned-additions) and [Plan](#plan).
+Thirteen additions picked from the comparable-products research (PR #90), phased in. Details, owner decisions and rules: [Planned additions](#planned-additions) and [Plan](#plan).
 
 | # | Addition | Phase | State |
 |---|---|---|---|
@@ -106,7 +106,7 @@ Also avoid OpenAppFilter code (GPL-2.0, not combinable with this AGPL-3.0 projec
 
 ### Privacy design gate
 
-Every PR in Phases 1-5 states in its description how it meets these; reviewers block on a miss.
+Every PR in Phases 1-5 and PRP-006 phases A-C states in its description how it meets these; reviewers block on a miss.
 
 - No domains, URLs, page titles, search terms or content anywhere: database, logs, alerts, pushes, digests.
 - Counts and action types only. Alert `details` keep the existing rule: at most 1024 bytes; counts, windows, operation ids; never MACs, addresses, domains or router diagnostics.
