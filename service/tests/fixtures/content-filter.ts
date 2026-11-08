@@ -19,7 +19,7 @@ export function fakeWorld(wrap?: (next: Transport) => Transport): FakeWorld {
     const profiles = [profile(PROFILE_ID)], fake = createFakeNextDns({apiKey: API_KEY, profiles}), key = {value: API_KEY};
     let reads = 0;
     const transport: Transport = wrap ? wrap(fake.transport) : fake.transport;
-    const client = createNextDnsClient({apiKey: () => key.value, transport: req => { if (req.method === 'GET') reads++; return transport(req); }, sleep: async () => undefined, random: () => 0, baseDelayMs: 0, maxDelayMs: 0});
+    const client = createNextDnsClient({allowDomainLists: true, apiKey: () => key.value, transport: req => { if (req.method === 'GET') reads++; return transport(req); }, sleep: async () => undefined, random: () => 0, baseDelayMs: 0, maxDelayMs: 0});
     return {fake, client, key, profile: profiles[0]!, reads: () => reads};
 }
 export { json };

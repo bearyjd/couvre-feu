@@ -228,7 +228,7 @@ test('the key is read at use time, on every request, and never at load', async (
     assert.equal(reads, 0, 'building the getter reads nothing');
     const s = setup();
     const { createNextDnsClient } = await import('../src/nextdns-client.ts');
-    const client = createNextDnsClient({apiKey: getter, transport: s.fake.transport, sleep: async () => undefined, random: () => 0, baseDelayMs: 0});
+    const client = createNextDnsClient({allowDomainLists: true, apiKey: getter, transport: s.fake.transport, sleep: async () => undefined, random: () => 0, baseDelayMs: 0});
     const reconciler = new ContentFilterReconciler({client, profiles: {pilot: PROFILE_ID}, store: s.filters});
     try {
         assert.equal(reads, 0, 'building the client and reconciler reads nothing');
