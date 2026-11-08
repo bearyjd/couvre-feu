@@ -36,7 +36,7 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         // contentFilter (PRP-006) is optional and strict; 'owner' mode needs an owner account; the API key is a file path, never inline.
         assert.equal(c.contentFilter, undefined);
         const filter = {mode: 'owner', apiKeyFile: '/etc/couvrefeu/private/nextdns.key', defaultProfile: 'abc123', profiles: {pilot: 'def456'}};
-        save({...manifest, contentFilter: filter, ownerAccountId: 'parent'}); assert.deepEqual(integrationConfig(path).contentFilter, filter);
+        save({...manifest, contentFilter: filter, ownerAccountId: 'parent'}); const cf = integrationConfig(path).contentFilter!; assert.deepEqual({...cf, profiles: {...cf.profiles}}, filter);
         save({...manifest, contentFilter: filter}); assert.throws(() => integrationConfig(path), /owner_account_required/);
         save({...manifest, contentFilter: {...filter, apiKey: 'x'.repeat(24)}, ownerAccountId: 'parent'}); assert.throws(() => integrationConfig(path), /invalid_content_filter/);
         // No 16-account product cap: manifest accounts only seed a fresh database, bounded by the defensive ACCOUNT_LIMIT.

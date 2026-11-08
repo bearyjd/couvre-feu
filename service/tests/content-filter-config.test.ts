@@ -6,7 +6,7 @@ const good = {mode: 'owner', apiKeyFile: '/etc/couvrefeu/private/nextdns.key', d
 const code = (value: unknown, ...rest: [string?]) => { try { parseContentFilter(value, rest.length ? rest[0] : 'parent'); } catch (e) { return (e as Error).message; } return 'ok'; };
 
 test('content filter manifest: valid shapes and mode requirements', () => {
-    assert.deepEqual(parseContentFilter(good, 'parent'), good);
+    const parsed = parseContentFilter(good, 'parent'); assert.deepEqual({...parsed, profiles: {...parsed.profiles}}, good);
     assert.equal(parseContentFilter({...good, mode: 'parents'}, undefined).mode, 'parents');
     assert.equal(parseContentFilter({...good, mode: 'off', profiles: {}}, undefined).mode, 'off');
     assert.equal(code(good, undefined), 'owner_account_required');
