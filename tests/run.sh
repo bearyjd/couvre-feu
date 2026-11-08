@@ -21,6 +21,7 @@ preflight_suites() {
         test-os-trust.py \
         test-client-probe.py \
         test-live-rehearsal.py \
+        test-permanent-install.py \
         test-deploy-units.py \
         test-service-key-entry.py
 }

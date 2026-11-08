@@ -37,6 +37,32 @@ Before anything is built the tool recomputes `CF_RELEASE_ID` using the freezer's
 
 If a listed file in the release directory or under `usr/lib/couvrefeu` (the inputs of the installed `uninstall.sh`) fails that check, the script does **not** run the installed `uninstall.sh` as root. It stops at VERIFY with `PHASE VERIFY FAIL installed_uninstall_inputs_mismatch <paths>; uninstall not attempted; journal retained` and `FAIL_AFTER_MUTATION VERIFY`, leaving Couvre-feu installed with its journal (`/etc/couvrefeu/backup`). Recovery is then a manual password login, which this tool never disables; resolve the cause by hand, and do not delete the journal. A mismatch only under `usr/sbin` is reported as `PHASE VERIFY FAIL installed_tree_mismatch` and the run continues to the normal uninstall, which fails the final result.
 
+## Permanent install (`permanent-install.py`)
+
+`permanent-install.py` + `permanent-install.sh` perform the PERMANENT install in one SSH session, with the same `python3 -I`, stdlib-only, `plan` then `execute CONFIG --expect-plan-sha256 HEX` split as the rehearsal. The remote script is the filled `first-rehearsal.sh` (its helpers, payload and identity checks) followed by `permanent-install.sh`. Phases: `PAYLOAD`, `IDENTITY`, `PREREQ` (a staged `install.sh` validation with the exact planned flags and no `--activate`), `SNAPSHOT`, `INSTALL` (`router/install.sh <flags> --activate`, ONE invocation, never retried), `VERIFY`, `CONNECTIVITY`. There is **no uninstall** in any outcome: the install stays. Each run creates `<UTC>-permanent-install/` in `evidenceDir` (`plan.json`, `stdout.log`, `stderr.log`, `exit-code.txt`, `summary.json`).
+
+```sh
+python3 -I tools/live/permanent-install.py plan CONFIG      # disclose, then:
+python3 -I tools/live/permanent-install.py execute CONFIG --expect-plan-sha256 HEX
+```
+
+### Config schema 3 and `config.permanent.example.json`
+
+[`config.permanent.example.json`](config.permanent.example.json) uses fictional values only. The tool accepts only `schemaVersion` 3, and the other tools reject it (tests assert both ways). It rejects unknown, missing and duplicate keys and non-canonical values exactly like the rehearsal. It reuses the rehearsal keys `host`, `adminPublicKeyPath`, `adminKeyFingerprint`, `knownHostsPath`, `evidenceDir`, `authorizationPath`, `deadlineUtc`, `platformProfile`, `remoteTimeoutSeconds` (600-3600, default 1800), `protectedHistoricalMacs` (1-32) with the same rules, plus:
+
+| Key | Rule |
+|---|---|
+| `roles.management`, `roles.jd_adult`, `roles.ct107` | `{ip, mac}` each. Same distinctness rule as the rehearsal (only an exact management/jd_adult pair may coincide). `ct107` is the infrastructure container: protected, not probed. No `penn_child` |
+| `protect` | 1-64 unique canonical MACs, passed as `--protect` in the given order. Must include the management, jd_adult and ct107 MACs and every `protectedHistoricalMacs` entry; extra entries are allowed. A live role MAC may not equal a historical MAC |
+| `rpcAllow` | 1-256 unique canonical unicast MACs, passed as `--rpc-allow` in the given order (the installer stores the sorted set). None may equal any `protect` MAC |
+| `activate` | Boolean, required. `true` runs the INSTALL phase. `false` ends after SNAPSHOT with `PERMANENT_INSTALL_VALIDATED_NO_MUTATION` (exit 0, outcome `VALIDATED`, router unchanged) |
+
+`plan` discloses `installArgv` (the exact flags), the phases and the `planSha256`, which binds the payload (and so the embedded committed `router/` tree, release id and every parameter), the SSH argv, the known-hosts and public-key hashes, the deadline, the roles, `protect`, `rpcAllow`, `activate`, `installArgv`, the timeouts and the authorization and evidence paths. Any change to a flag, MAC, order or the deadline changes it. The authorization file's contents are checked at `execute` and are not part of the digest.
+
+VERIFY requires, after the installer returns: every manifest file hash-matched in the release directory and its installed place (as in the rehearsal), the retained `/etc/.couvrefeu-release-<id>/uninstall.sh`, `cfctl status --json` equal to the fixed healthy empty shape (ok, revision 0/0, no pauses, allowances, kids or paused set, no drift, no errors), and the RPC generation. The generation is read from the installer's own journal (`/etc/couvrefeu/backup/etc_couvrefeu_state.staged`) and `cfctl rpc-status --json` must then report that same generation with an empty revision-0 policy; it is printed once as `PERMANENT_GENERATION <hex>` and recorded in `summary.json`. It is never taken from the reply being checked. CONNECTIVITY then requires the management and adult neighbors to be present.
+
+Outcomes: `PASS` (exit 0; last line `PERMANENT_INSTALL_PASS`), `VALIDATED` (exit 0), `REFUSED` (exit 1, before `MUTATION_BEGIN`), `STOPPED_AFTER_MUTATION` (exit 2) and `UNKNOWN` (exit 2: timeout, dropped session, incomplete output). Any failure after `MUTATION_BEGIN` (installer exit, verify, connectivity, INT/TERM) takes a read-only re-snapshot, prints its `DIFF` lines, then `ROLLBACK_COMMAND /bin/sh /etc/.couvrefeu-release-<id>/uninstall.sh` (or `ROLLBACK_UNAVAILABLE` when that file is absent) and `STOPPED_AFTER_MUTATION <phase>`. The tool never runs the rollback: it is the retained release's `uninstall.sh`, run once, separately, after separate approval, and `install.sh` is not rerun. The journal (`/etc/couvrefeu/backup`) is never deleted. Password login, `authorized_keys`, Dropbear and the console are never touched (a static test enforces it); manual password login stays the recovery path. M4b still gates the live use of this tool, as stated for the rehearsal below.
+
 ## Penn pilot, one or two devices (`penn-pilot.py`)
 
 For the schema v2 operator sequence and live-use blockers, read the [v2 pilot runbook](../../docs/runbooks/live-penn-pilot-v2.md).
