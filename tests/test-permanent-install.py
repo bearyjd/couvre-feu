@@ -281,6 +281,32 @@ class PlanTests(PermanentBase):
         self.assertIn('already executed', err)
         self.assertEqual(len(self.ssh_log.read_text().splitlines()), 1)
 
+    def test_claim_is_created_only_in_a_validated_evidence_dir(self):
+        real = self.evidence_root / 'real'
+        real.mkdir(mode=0o700)
+        link = self.evidence_root / 'link'
+        link.symlink_to(real)
+        loose = self.evidence_root / 'loose'
+        loose.mkdir()
+        loose.chmod(0o770)
+        volatile = Path(tempfile.mkdtemp(prefix='couvre-feu-perm-volatile-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, volatile, True)
+        volatile.chmod(0o700)
+        for label, directory, holder in (('symlink', link, real), ('group writable', loose, loose), ('volatile', volatile, volatile)):
+            with self.subTest(label):
+                config = self.write_config(activate=False, evidenceDir=str(directory))
+                code, out, err = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))
+                self.assertEqual(code, 1, out + err)
+                self.assertIn('evidenceDir', err)
+                self.assertEqual(list(holder.glob('.claim-*')), [])
+                self.assertFalse(self.ssh_log.exists())
+
+    def test_uninstall_digest_is_bound_in_the_plan_digest(self):
+        details = self.plan_details(self.write_config())
+        self.assertIn('uninstallSha256', self.tool.PLAN_DIGEST_FIELDS)
+        self.assertEqual(self.tool.plan_digest(details), details['planSha256'])
+        self.assertNotEqual(self.tool.plan_digest(dict(details, uninstallSha256='0' * 64)), details['planSha256'])
+
     def test_claim_without_any_evidence_still_refuses(self):
         config = self.write_config(activate=False)
         sha = self.plan_sha(config)

@@ -231,7 +231,8 @@ def build_payload(config, commit, blobs):
 
 PLAN_DIGEST_FIELDS = FR.PLAN_DIGEST_FIELDS + (
     'tool', 'configSchemaVersion', 'sourceCommit', 'releaseId', 'platformProfile', 'roles', 'protectedHistoricalMacs',
-    'protect', 'rpcAllow', 'rpcAllowFixedAtInstall', 'activate', 'installArgv', 'phases', 'permanentScriptSha256')
+    'protect', 'rpcAllow', 'rpcAllowFixedAtInstall', 'activate', 'installArgv', 'phases', 'permanentScriptSha256',
+    'uninstallSha256')
 
 
 def plan_digest(details):
@@ -312,6 +313,8 @@ def unknown_rollback(details):
 
 def claim_plan(config, plan_sha):
     """Atomic single-use claim, never removed: a second execute of the same digest cannot race the evidence scan."""
+    # The claim lives only in a validated evidenceDir (owned, non-symlink, no group/other write, persistent).
+    FR.validate_evidence_parent(config['evidenceDir'])
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
     try:
         os.close(os.open(os.path.join(config['evidenceDir'], f'.claim-{plan_sha}'), flags, 0o600))
