@@ -12,7 +12,7 @@ const OK_PATH = /^\/profiles(\/[A-Za-z0-9]{4,32}(\/(settings|denylist|allowlist|
 function setup(fake: Partial<FakeOptions> = {}, client: Partial<NextDnsClientOptions> = {}) {
     const sleeps: number[] = [];
     const api = createFakeNextDns({ apiKey: KEY, ...fake });
-    const c = createNextDnsClient({ apiKey: () => KEY, transport: api.transport, sleep: async ms => { sleeps.push(ms); }, random: () => 0.5, now: () => 1_000_000, ...client });
+    const c = createNextDnsClient({ apiKey: () => KEY, transport: api.transport, sleep: async ms => { sleeps.push(ms); }, random: () => 0.5, now: () => 1_000_000, allowDomainLists: true, ...client });
     return { api, c, sleeps };
 }
 const code = (e: unknown) => e instanceof NextDnsError ? e.code : `not-a-NextDnsError:${String(e)}`;
@@ -403,7 +403,7 @@ test('a GET retries after one timeout and then succeeds', async () => {
 test('content-type is sent on PUT and PATCH, not on GET', async () => {
     const api = createFakeNextDns({ apiKey: KEY }), seen: Record<string, Record<string, string>> = {};
     const transport: Transport = async req => { seen[req.method] = { ...req.headers }; return api.transport(req); };
-    const c = createNextDnsClient({ apiKey: () => KEY, transport });
+    const c = createNextDnsClient({ apiKey: () => KEY, transport, allowDomainLists: true });
     await c.getSettings('abc123'); await c.setParentalControl('abc123', { safeSearch: true }); await c.setList('abc123', 'denylist', []);
     assert.equal(seen.GET!['content-type'], undefined);
     assert.equal(seen.PATCH!['content-type'], 'application/json');
@@ -441,7 +441,7 @@ test('deadline covers pagination: slow pages stop with timeout', async () => {
     let t = 0;
     const api = createFakeNextDns({ apiKey: KEY, pageSize: 1, profiles: [profile('abc123', { denylist: many(10) })] });
     const transport: Transport = async req => { t += 400; return api.transport(req); };
-    const c = createNextDnsClient({ apiKey: () => KEY, transport, now: () => t, deadlineMs: 1000 });
+    const c = createNextDnsClient({ apiKey: () => KEY, transport, now: () => t, deadlineMs: 1000, allowDomainLists: true });
     assert.equal(await codeOf(() => c.getList('abc123', 'denylist')), 'timeout');
     assert.equal(api.requests.length, 3);
 });
@@ -558,4 +558,32 @@ test('environment guard also refuses ALL_PROXY and --use-env-proxy in NODE_OPTIO
     assert.equal(reason({ NODE_OPTIONS: '--max-old-space-size=100 --use-env-proxy' }), 'env_proxy_enabled');
     assert.equal(reason({ NODE_OPTIONS: '--max-old-space-size=100' }), 'ok');
     try { assertSafeNextDnsEnvironment({ ALL_PROXY: 'socks5://secret-host:1' }); } catch (e) { assert.ok(!String((e as Error).stack).includes('secret-host')); }
+});
+
+test('review hardening: domain lists refused by default, key-source throws and bad options stay bounded, writes validated', async () => {
+    const api = createFakeNextDns({ apiKey: KEY, profiles: [profile('abc123')] });
+    const base = { apiKey: () => KEY, transport: api.transport, sleep: async () => undefined };
+    const strict = createNextDnsClient(base);
+    for (const list of ['denylist', 'allowlist'] as const) {
+        assert.equal(await codeOf(() => strict.getList('abc123', list)), 'invalid_request');
+        assert.equal(await codeOf(() => strict.setList('abc123', list, [])), 'invalid_request');
+    }
+    assert.equal(api.requests.length, 0);
+    const throwing = createNextDnsClient({ ...base, apiKey: () => { throw new Error('ENOENT /secret/path/key'); } });
+    try { await throwing.getSettings('abc123'); assert.fail('should reject'); } catch (e) { assert.equal(code(e), 'unauthorized'); assert.ok(!String((e as Error).message).includes('secret')); }
+    const bad = createNextDnsClient({ ...base, maxAttempts: NaN, deadlineMs: Infinity, baseDelayMs: -5, maxDelayMs: NaN, maxPages: NaN });
+    await bad.getSettings('abc123');
+    assert.equal(await codeOf(() => strict.setParentalControl('abc123', {})), 'invalid_request');
+    const sparse = [{ id: 'adult', active: true }]; sparse.length = 2;
+    assert.equal(await codeOf(() => strict.setList('abc123', 'categories', sparse)), 'invalid_request');
+    assert.equal(await codeOf(() => strict.setList('abc123', 'categories', [{ id: 'porn', active: true }, { id: 'porn', active: false }])), 'invalid_request');
+});
+
+test('review hardening: fetch transport refuses cleartext non-loopback hosts and control or dot-dot paths', async () => {
+    assert.throws(() => createFetchTransport({ baseUrl: 'http://evil.example' }), (e: unknown) => code(e) === 'transport');
+    createFetchTransport({ baseUrl: 'http://127.0.0.1:9' });
+    const t = createFetchTransport({ fetch: (async () => { throw new Error('must not fetch'); }) as unknown as typeof fetch });
+    for (const path of ['/pro\tfiles/x', '/profiles/../x', '/a\u0000b']) {
+        await assert.rejects(() => t({ method: 'GET', path, headers: {} }), (e: unknown) => code(e) === 'transport');
+    }
 });

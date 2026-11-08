@@ -81,6 +81,11 @@ export interface NextDnsClientOptions {
     readonly baseDelayMs?: number; readonly maxDelayMs?: number; readonly maxRetryAfterMs?: number;
     /** Overall per-call deadline covering retries and pagination (default 60 s). Expiry is `timeout`. */
     readonly deadlineMs?: number;
+    /**
+     * PRP-006 sections 2 and 4.1: Couvre-feu does not manage parent-entered domains in Phase A. denylist/allowlist calls are refused
+     * (`invalid_request`) unless this is true, so the privacy rule does not rest on caller discipline alone. Tests only for now.
+     */
+    readonly allowDomainLists?: boolean;
     /** Aborts every call of this client. Caller aborts surface as `transport`, deadline expiry as `timeout`. */
     readonly signal?: AbortSignal;
 }
@@ -132,7 +137,7 @@ function obj(v: unknown, required: readonly string[], optional: readonly string[
 const bool = (v: unknown): boolean => typeof v === 'boolean' ? v : fail();
 const str = (v: unknown, re: RegExp): string => typeof v === 'string' && re.test(v) ? v : fail();
 function arr<T>(v: unknown, max: number, item: (x: unknown) => T): readonly T[] {
-    if (!Array.isArray(v) || v.length > max) return fail();
+    if (!Array.isArray(v) || v.length > max || Object.keys(v).length !== v.length) return fail(); // sparse arrays are refused
     return Object.freeze(v.map(item));
 }
 const entryOf = (re: RegExp) => (v: unknown): ListEntry => { const o = obj(v, ['id', 'active']);
@@ -231,11 +236,13 @@ async function readCapped(res: Response, max: number, signal: AbortSignal): Prom
  */
 export function createFetchTransport(options: FetchTransportOptions = {}): Transport {
     const base = new URL(options.baseUrl ?? NEXTDNS_BASE_URL), f = options.fetch ?? fetch;
+    // The key travels in a header: https only, except loopback (tests).
+    if (base.protocol !== 'https:' && !(base.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname))) throw new NextDnsError('transport');
     const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS, maxBytes = options.maxBytes ?? MAX_RESPONSE_BYTES;
     return async req => {
         const url = new URL(req.path, base);
-        if (url.origin !== base.origin || !req.path.startsWith('/')
-            || req.path.includes('\\')) return fail('transport');
+        if (url.origin !== base.origin || !req.path.startsWith('/') || req.path.includes('\\')
+            || /[\u0000-\u001f\u007f]|\.\./.test(req.path)) return fail('transport');
         const timer = AbortSignal.timeout(timeoutMs), signal = req.signal ? AbortSignal.any([timer, req.signal])
             : timer;
         try {
@@ -269,7 +276,7 @@ interface Config {
         readonly random: () => number;
     readonly maxAttempts: number; readonly maxPages: number; readonly baseDelay: number; readonly maxDelay: number;
         readonly maxRetryAfter: number;
-    readonly deadlineMs: number; readonly signal: AbortSignal | undefined;
+    readonly deadlineMs: number; readonly signal: AbortSignal | undefined; readonly domainLists: boolean;
 }
 /**
  * `signal` is deadline + client + call signals; `deadlineSignal` alone says whether the abort was our own deadline
@@ -280,13 +287,16 @@ interface Ctx { readonly cfg: Config; readonly deadline: number; readonly signal
 type Attempt = { readonly ok: true; readonly res: HttpResponse } | { readonly ok: false; readonly err: NextDnsError;
     readonly res?: HttpResponse };
 
+const num = (v: number | undefined, fallback: number): number => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback;
 function resolveConfig(o: NextDnsClientOptions): Config {
     return {
         apiKey: o.apiKey, transport: o.transport ?? createFetchTransport(), sleep: o.sleep ?? abortableSleep,
             now: o.now ?? Date.now, random: o.random ?? Math.random,
-        maxAttempts: Math.max(1, o.maxAttempts ?? 4), maxPages: Math.max(1, o.maxPages ?? 20),
-            baseDelay: o.baseDelayMs ?? 500, maxDelay: o.maxDelayMs ?? 10_000,
-        maxRetryAfter: o.maxRetryAfterMs ?? 30_000, deadlineMs: o.deadlineMs ?? DEFAULT_DEADLINE_MS, signal: o.signal,
+        // Non-finite or negative numbers fall back to the default: NaN/Infinity must not disable a bound.
+        maxAttempts: Math.max(1, Math.floor(num(o.maxAttempts, 4))), maxPages: Math.max(1, Math.floor(num(o.maxPages, 20))),
+            baseDelay: num(o.baseDelayMs, 500), maxDelay: num(o.maxDelayMs, 10_000),
+        maxRetryAfter: num(o.maxRetryAfterMs, 30_000), deadlineMs: num(o.deadlineMs, DEFAULT_DEADLINE_MS), signal: o.signal,
+        domainLists: o.allowDomainLists === true,
     };
 }
 function newCtx(cfg: Config, call: CallOptions): Ctx {
@@ -391,7 +401,8 @@ async function exchange(ctx: Ctx, req: HttpRequest): Promise<HttpResponse> {
 }
 async function request(ctx: Ctx, method: HttpRequest['method'], path: string,
     payload?: unknown): Promise<HttpResponse> {
-    const key = ctx.cfg.apiKey();
+    let key: unknown;
+    try { key = ctx.cfg.apiKey(); } catch { return fail('unauthorized'); } // a throwing key source must not leak its message or path
     if (typeof key !== 'string' || !API_KEY.test(key)) return fail('unauthorized');
     const headers = { 'x-api-key': key, accept: 'application/json', ...(payload === undefined ? {}
         : { 'content-type': 'application/json' }) };
@@ -414,8 +425,8 @@ async function readAll<T>(ctx: Ctx, path: string, item: (x: unknown) => T): Prom
 }
 const profilePath = (profile: string, sub = ''): string => `/profiles/${str(profile, PROFILE_ID)}${sub}`;
 /** `list` comes from callers (possibly untyped): only own keys of LISTS may become a path segment. */
-const listPath = (profile: string, list: ListName): string => {
-    if (!Object.hasOwn(LISTS, list)) return fail();
+const listPath = (profile: string, list: ListName, domainLists: boolean): string => {
+    if (!Object.hasOwn(LISTS, list) || (!domainLists && (list === 'denylist' || list === 'allowlist'))) return fail();
     return profilePath(profile, `/${LISTS[list]}`);
 };
 /**
@@ -429,7 +440,9 @@ const FLAG_KEYS = ['safeSearch', 'youtubeRestrictedMode', 'blockBypass'] as cons
 /** Each value is read exactly once (getters included) and the body is built from those validated reads only. */
 function flagsBody(flags: ParentalFlags): Record<string, boolean> {
     obj(flags, [], FLAG_KEYS);
-    return Object.fromEntries(Object.entries(flags).map(([k, v]) => [k, bool(v)]));
+    const entries = Object.entries(flags);
+    if (entries.length === 0) return fail(); // an empty PATCH is a caller bug, not a no-op write
+    return Object.fromEntries(entries.map(([k, v]) => [k, bool(v)]));
 }
 
 export function createNextDnsClient(options: NextDnsClientOptions): NextDnsClient {
@@ -447,9 +460,10 @@ export function createNextDnsClient(options: NextDnsClientOptions): NextDnsClien
             return read(call, checked(() => profilePath(profile, '/settings')), parseSettings);
         },
         async getList(profile: string, list: ListName, call: CallOptions = {}) {
-            const path = checked(() => listPath(profile, list));
+            const path = checked(() => listPath(profile, list, cfg.domainLists));
             return readAll(newCtx(cfg, call), path, entryOf(ENTRY_ID[list]));
         },
+        /** A rejected write is not proof the write did not happen (a timeout may still have applied): callers must read back before trusting state. */
         async setParentalControl(profile: string, flags: ParentalFlags, call: CallOptions = {}): Promise<void> {
             const path = checked(() => profilePath(profile, '/parentalControl')),
                 body = checked(() => flagsBody(flags));
@@ -457,9 +471,12 @@ export function createNextDnsClient(options: NextDnsClientOptions): NextDnsClien
         },
         async setList(profile: string, list: ListName, entries: readonly ListEntry[],
             call: CallOptions = {}): Promise<void> {
-            const path = checked(() => listPath(profile, list));
-            const body = checked(() => arr(entries, MAX_ITEMS, entryOf(ENTRY_ID[list])).map(e => ({ id: e.id,
-                active: e.active })));
+            const path = checked(() => listPath(profile, list, cfg.domainLists));
+            const body = checked(() => {
+                const items = arr(entries, MAX_ITEMS, entryOf(ENTRY_ID[list])).map(e => ({ id: e.id, active: e.active }));
+                if (new Set(items.map(e => e.id)).size !== items.length) return fail(); // contradictory duplicates
+                return items;
+            });
             checkWrite(await request(newCtx(cfg, call), 'PUT', path, body));
         },
     });
