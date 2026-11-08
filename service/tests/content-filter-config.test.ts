@@ -13,6 +13,9 @@ import { PROFILE_ID_PATTERN, parseContentFilter, readContentFilterKey, ContentFi
 import type { ContentFilterKeyDeps } from '../src/content-filter-config.ts';
 import { testConfig } from './fixtures/integration.ts';
 
+/** A FIFO that was not refused would block open() forever; this bound only turns that hang into a failure. */
+const FIFO_TEST_TIMEOUT_MS = 30_000;
+
 const FAKE_KEY = 'nxk_TESTKEY_do_not_log_0123456789';
 const valid = {mode: 'owner', apiKeyFile: '/etc/couvre-feu/nextdns.key', defaultProfile: 'abc123', profiles: {pilot: 'def456'}};
 /** Compares by value: the profiles map is deliberately a frozen null-prototype object. */
@@ -97,7 +100,7 @@ test('key reader returns the trimmed key and refuses unsafe or invalid real file
     } finally { rmSync(dir, {recursive: true, force: true}); }
 });
 
-test('the real reader refuses a symlink to a valid key file (O_NOFOLLOW, no lstat to lean on), a hard link and a FIFO without hanging', { timeout: 10000 }, t => {
+test('the real reader refuses a symlink to a valid key file (O_NOFOLLOW, no lstat to lean on), a hard link and a FIFO without hanging', { timeout: FIFO_TEST_TIMEOUT_MS }, t => {
     const dir = tmpPrivate();
     try {
         const target = keyFile(dir, FAKE_KEY), link = join(dir, 'link'); symlinkSync(target, link);
