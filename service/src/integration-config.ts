@@ -194,8 +194,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const contentFilter = parseContentFilter(m.contentFilter);
     const ownerAccountId = m.ownerAccountId === undefined ? undefined : id(m.ownerAccountId);
     if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
-    if (timeRequests?.mode === 'owner' && ownerAccountId === undefined) bad('owner_account_required');
-    if (contentFilter?.mode === 'owner' && ownerAccountId === undefined) bad('owner_account_required');
+    if ((timeRequests?.mode === 'owner' || contentFilter?.mode === 'owner') && ownerAccountId === undefined) bad('owner_account_required');
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
     const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
