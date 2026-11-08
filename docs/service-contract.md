@@ -254,6 +254,15 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
 - **Audit.** When `auditLog.enabled`, one `focus_start` entry (migration `012.sql`): actor = the parent, child id, operation id, result `applied` or `refused`. A replay adds no second row. Minutes and the label are not stored in the audit log.
 - **Privacy.** Ids and enums only; no reason or subject text exists.
 
+## Content filter manifest key (PRP-006 A2, off, nothing enforces yet)
+
+`"contentFilter": {"mode": "off" | "owner" | "parents", "apiKeyFile": "/abs/path", "defaultProfile": "<id>", "profiles": {"<personId>": "<profileId>"}}` in the private manifest (`service/src/content-filter-config.ts`). Every filter claim here is **unverified on this router**, and this step only parses and validates configuration: there is no NextDNS client, route, migration or router change yet (later PRs).
+
+- **Strict, absent is off.** Unknown keys are refused, so a manifest that tries `apiKey`, `key` or `secret` is rejected; the manifest never holds the key. Duplicate keys are refused by the shared JSON parser. Errors are the single code `invalid_content_filter` and never echo the offending value or path.
+- **Required once on.** `owner` and `parents` need `apiKeyFile`, `defaultProfile` and a non-empty `profiles` map; `off` makes them optional but still validates any that are present. `owner` mode also needs the top-level `ownerAccountId`, like `timeRequests.mode`; `parents` lets every parent. The default profile is the strict one that unmapped devices get.
+- **Shapes.** `apiKeyFile` is absolute and normalized (no `..`, `.`, `//` or trailing slash), characters `A-Za-z0-9._/-`, at most 255. Profile ids (`defaultProfile` and map values) match `PROFILE_ID_PATTERN` (`^[A-Za-z0-9]{4,32}$`; a later PR asserts it equals the NextDNS client's pattern). `profiles` has at most 64 entries. Person ids are checked for shape only (the manifest seeds one person and the rest live in the database, so they cannot be matched at parse time).
+- **The key is read at use time** by `readContentFilterKey(path)`, never at manifest load and never stored on the manifest or in the database. The file must be a regular file (not a symlink) owned by the service user, with no group or other permission bits (root-only `0600` or `0400` is the supported setup), at most 256 bytes, one trailing newline allowed, printable ASCII without spaces. Failures throw `ContentFilterKeyError` with the code `key_file_missing`, `key_file_unsafe` or `key_file_invalid` and nothing else in the message.
+
 ## Operating notes for the flagged features
 
 Everything below ships **OFF** and is **unverified on this router** until the Phase 0 live proof in the [roadmap](ROADMAP.md#live-proof). These notes were checked against the code on `main` (PR #92 to #95); the sections above give the detail.
@@ -264,6 +273,7 @@ Everything below ships **OFF** and is **unverified on this router** until the Ph
 | Audit log (F2) | `"auditLog": {"enabled": true}` | Writes to `parent_audit` and `GET /audit` |
 | Reward Time (F4) | `"rewardTime": {"enabled": true}` | `POST /people/:id/reward` |
 | Focus window (F5) | `"focus": {"enabled": true}` | `POST /people/:id/focus` (also needs `timeRequests` on) |
+| Content filter (PRP-006 A2) | `"contentFilter": {"mode": "off" \| "owner" \| "parents", ...}`; see above | Nothing yet: parse and validate only |
 | Push and digest (B7) | `"push": {"enabled": true}`, `"digest": {"enabled": true}` (needs push); ntfy settings in `COUVRE_NTFY_*` env | Content-free ntfy push and weekly counts-only digest; no route. See [Push and weekly digest](#push-and-weekly-digest-b7-service-only-off) |
 
 **Owner mode (F1).** `timeRequests.mode` `owner` needs a top-level `ownerAccountId` naming an entry in `accounts` (`owner_account_required` and `invalid_owner_account` refuse the manifest otherwise: `service/src/integration-config.ts:157-159`). Only that account sees or decides requests and the `time_request_pending` alert (`service/src/http.ts:103-104`). Reward Time follows the same gate. **It is not a security boundary against other admins**: it hides the feature, it does not stop another admin from using other routes (for example Pause, Resume or editing devices). Tracked follow-ups, not built: protect the owner account from other admins, and a startup check that the owner account exists and is active (today the check only confirms the id is listed in `accounts`).
