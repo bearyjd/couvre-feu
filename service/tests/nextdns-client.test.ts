@@ -99,9 +99,9 @@ test('429 then success retries with backoff, honours Retry-After seconds and dat
     api.enqueue(json(429, {}, { 'Retry-After': new Date(1_000_000 + 3000).toUTCString() }));
     await c.getSettings('abc123');
     assert.ok(sleeps[1]! >= 2000 && sleeps[1]! <= 3000, String(sleeps[1]));
-    api.enqueue(json(429, {}, { 'retry-after': '999999' }));
+    api.enqueue(json(429, {}, { 'retry-after': '5' }));
     await c.getSettings('abc123');
-    assert.equal(sleeps[2], 5000);
+    assert.equal(sleeps[2], 5000, 'exactly at the cap is honoured in full');
     api.enqueue(json(429, {}));
     await c.getSettings('abc123');
     assert.equal(sleeps[3], 75, 'no header: exponential backoff with jitter (base 100, random 0.5)');
@@ -364,15 +364,27 @@ test('defaults: four attempts, exponential backoff from 500 ms capped at 10 s, R
     assert.deepEqual(custom.sleeps, [75, 150, 300, 600, 750, 750, 750]);
     const capped = setup();
     capped.api.enqueue(json(429, {}, { 'retry-after': '999999' }));
-    await capped.c.getSettings('abc123');
-    assert.deepEqual(capped.sleeps, [30000]);
+    assert.equal(await codeOf(() => capped.c.getSettings('abc123')), 'rate_limited', 'asked for more than the cap: stop, never retry early');
+    assert.deepEqual(capped.sleeps, []);
+    assert.equal(capped.api.requests.length, 1);
+    const atCap = setup();
+    atCap.api.enqueue(json(429, {}, { 'retry-after': '31' }));
+    assert.equal(await codeOf(() => atCap.c.getSettings('abc123')), 'rate_limited');
+    const edge = setup();
+    edge.api.enqueue(json(429, {}, { 'retry-after': '30' }));
+    await edge.c.getSettings('abc123');
+    assert.deepEqual(edge.sleeps, [30000]);
 });
 
-test('Retry-After edge cases: a past date sleeps 0, an absurd number falls back to jitter', async () => {
+test('Retry-After edge cases: 0 or a past date waits at least the base delay, an absurd number falls back to jitter', async () => {
     const past = setup();
     past.api.enqueue(json(429, {}, { 'retry-after': new Date(1_000_000 - 5000).toUTCString() }));
     await past.c.getSettings('abc123');
-    assert.deepEqual(past.sleeps, [0]);
+    assert.deepEqual(past.sleeps, [500]);
+    const zero = setup();
+    zero.api.enqueue(json(429, {}, { 'retry-after': '0' }));
+    await zero.c.getSettings('abc123');
+    assert.deepEqual(zero.sleeps, [500]);
     const absurd = setup();
     absurd.api.enqueue(json(429, {}, { 'retry-after': '9999999999999' }));
     await absurd.c.getSettings('abc123');
@@ -502,4 +514,48 @@ test('fetch transport: the default timeout is 10 s, and a stalled body or reques
     const never = fetchWith((_u, init) => new Promise((_, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason))), { timeoutMs: 30 });
     const c = createNextDnsClient({ apiKey: () => KEY, transport: never, maxAttempts: 1 });
     assert.equal(await keepAlive(() => statusOf(c, x => x.getSettings('abc123'))), 'timeout');
+});
+
+test('every public method rejects an invalid profile id asynchronously, never by throwing synchronously', async () => {
+    const { api, c } = setup();
+    const calls: [string, () => Promise<unknown>][] = [
+        ['getParentalControl', () => c.getParentalControl('../x')], ['getSettings', () => c.getSettings('../x')],
+        ['getList', () => c.getList('../x', 'denylist')], ['setParentalControl', () => c.setParentalControl('../x', { safeSearch: true })],
+        ['setList', () => c.setList('../x', 'denylist', [])], ['getList bad list', () => c.getList('abc123', 'nope' as never)],
+    ];
+    for (const [name, call] of calls) {
+        let pending: Promise<unknown> | undefined;
+        assert.doesNotThrow(() => { pending = call(); }, name);
+        await assert.rejects(pending!, (e: unknown) => e instanceof NextDnsError && e.code === 'invalid_request', name);
+    }
+    assert.equal(api.requests.length, 0);
+});
+
+test('a caller signal that aborts with a TimeoutError reason is still the caller: transport, not timeout', async () => {
+    const api = createFakeNextDns({ apiKey: KEY });
+    const signal = AbortSignal.abort(new DOMException('caller timer', 'TimeoutError'));
+    const c = createNextDnsClient({ apiKey: () => KEY, transport: api.transport });
+    assert.equal(await codeOf(() => c.getSettings('abc123', { signal })), 'transport');
+    assert.equal(await codeOf(() => abortableSleep(10_000, signal)), 'transport');
+});
+
+test('the deadline is enforced even by a transport that ignores the signal and never answers', async () => {
+    const hang: Transport = () => new Promise(() => undefined);
+    const c = createNextDnsClient({ apiKey: () => KEY, transport: hang, deadlineMs: 30, maxAttempts: 1 });
+    assert.equal(await keepAlive(() => codeOf(() => c.getSettings('abc123'))), 'timeout');
+    const w = createNextDnsClient({ apiKey: () => KEY, transport: hang, deadlineMs: 30 });
+    assert.equal(await keepAlive(() => codeOf(() => w.setParentalControl('abc123', { safeSearch: true }))), 'timeout');
+    const controller = new AbortController(); setTimeout(() => controller.abort(), 10);
+    const k = createNextDnsClient({ apiKey: () => KEY, transport: hang, signal: controller.signal });
+    assert.equal(await keepAlive(() => codeOf(() => k.getSettings('abc123'))), 'transport');
+});
+
+test('environment guard also refuses ALL_PROXY and --use-env-proxy in NODE_OPTIONS', () => {
+    const reason = (env: Record<string, string>) => { try { assertSafeNextDnsEnvironment(env); return 'ok'; } catch (e) { return e instanceof NextDnsEnvironmentError ? e.reason : 'wrong-error'; } };
+    assert.equal(reason({ ALL_PROXY: 'socks5://secret-host:1' }), 'all_proxy_set');
+    assert.equal(reason({ all_proxy: 'socks5://secret-host:1' }), 'all_proxy_set');
+    assert.equal(reason({ ALL_PROXY: '' }), 'ok');
+    assert.equal(reason({ NODE_OPTIONS: '--max-old-space-size=100 --use-env-proxy' }), 'env_proxy_enabled');
+    assert.equal(reason({ NODE_OPTIONS: '--max-old-space-size=100' }), 'ok');
+    try { assertSafeNextDnsEnvironment({ ALL_PROXY: 'socks5://secret-host:1' }); } catch (e) { assert.ok(!String((e as Error).stack).includes('secret-host')); }
 });

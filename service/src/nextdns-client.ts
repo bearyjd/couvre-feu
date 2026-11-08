@@ -1,15 +1,22 @@
 /**
  * Thin, strict client for the NextDNS configuration API (PRP-006 4.1). It touches no router.
- * Read https://nextdns.github.io/api on 2026-11-08. CONFIRMED there: base https://api.nextdns.io, header X-Api-Key, {"data":...,"meta":...}
- * envelopes, {"errors":[{code,detail,source:{parameter|pointer}}]} on 400 (also on 200 for user errors), meta.pagination.cursor (null at the end)
- * passed back as ?cursor=, parentalControl {services, categories, safeSearch, youtubeRestrictedMode, blockBypass}, denylist/allowlist as
+ * Read https://nextdns.github.io/api on 2026-11-08. CONFIRMED there: base https://api.nextdns.io, header X-Api-Key,
+ * {"data":...,"meta":...}
+ * envelopes, {"errors":[{code,detail,source:{parameter|pointer}}]} on 400 (also on 200 for user errors),
+ * meta.pagination.cursor (null at the end)
+ * passed back as ?cursor=, parentalControl {services, categories, safeSearch, youtubeRestrictedMode, blockBypass},
+ * denylist/allowlist as
  * [{id, active}], settings {logs, blockPage, performance, web3}, array endpoints take PUT, object endpoints take PATCH.
- * UNVERIFIED (the docs are silent; each is labelled again where used): a list-profiles endpoint (GET /profiles) and its item shape, 429 and
- * Retry-After behaviour, idempotency of any write, the status and body of write answers, bare-JSON write bodies, id alphabets and lengths
+ * UNVERIFIED (the docs are silent; each is labelled again where used): a list-profiles endpoint (GET /profiles) and its
+ * item shape, 429 and
+ * Retry-After behaviour, idempotency of any write, the status and body of write answers, bare-JSON write bodies, id
+ * alphabets and lengths
  * (including hex-encoded service ids), page size limits, and the units and values of settings.logs.retention/location.
- * Errors carry a closed code and never any server text, response body, URL or key. The key arrives through a getter on every request.
+ * Errors carry a closed code and never any server text, response body, URL or key. The key arrives through a getter on
+ * every request.
  */
-export const NEXTDNS_ERROR_CODES = Object.freeze(['transport', 'timeout', 'rate_limited', 'unauthorized', 'not_found', 'invalid_request', 'bad_response', 'server'] as const);
+export const NEXTDNS_ERROR_CODES = Object.freeze(['transport', 'timeout', 'rate_limited', 'unauthorized', 'not_found',
+    'invalid_request', 'bad_response', 'server'] as const);
 export type NextDnsErrorCode = typeof NEXTDNS_ERROR_CODES[number];
 export class NextDnsError extends Error {
     readonly code: NextDnsErrorCode;
@@ -17,8 +24,10 @@ export class NextDnsError extends Error {
 }
 const fail = (code: NextDnsErrorCode = 'bad_response'): never => { throw new NextDnsError(code); };
 
-export interface HttpRequest { readonly method: 'GET' | 'PUT' | 'PATCH'; readonly path: string; readonly headers: Readonly<Record<string, string>>; readonly body?: string; readonly signal?: AbortSignal }
-export interface HttpResponse { readonly status: number; readonly headers: Readonly<Record<string, string>>; readonly body: string }
+export interface HttpRequest { readonly method: 'GET' | 'PUT' | 'PATCH'; readonly path: string;
+    readonly headers: Readonly<Record<string, string>>; readonly body?: string; readonly signal?: AbortSignal }
+export interface HttpResponse { readonly status: number; readonly headers: Readonly<Record<string, string>>;
+    readonly body: string }
 export type Transport = (request: HttpRequest) => Promise<HttpResponse>;
 
 export const NEXTDNS_BASE_URL = 'https://api.nextdns.io';
@@ -28,7 +37,9 @@ export const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 /** Overall budget of one client call, retries and pagination included. */
 export const DEFAULT_DEADLINE_MS = 60_000;
 const MAX_PAGE_ITEMS = 1000;
-// UNVERIFIED alphabets: the docs show only "abc123". Wide enough for hex or base36, narrow enough that no separator, dot or escape can pass.
+// UNVERIFIED alphabets: the docs show only "abc123". Wide enough for hex or base36, narrow enough that no separator,
+// dot
+// or escape can pass.
 const PROFILE_ID = /^[A-Za-z0-9]{4,32}$/;
 const SERVICE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const DOMAIN = /^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]{0,251}[a-z0-9_])?$/;
@@ -42,16 +53,20 @@ export interface ParentalControl {
     readonly services: readonly ListEntry[]; readonly categories: readonly ListEntry[];
     readonly safeSearch: boolean; readonly youtubeRestrictedMode: boolean; readonly blockBypass?: boolean;
 }
-export type ParentalFlags = { readonly safeSearch?: boolean; readonly youtubeRestrictedMode?: boolean; readonly blockBypass?: boolean };
+export type ParentalFlags = { readonly safeSearch?: boolean; readonly youtubeRestrictedMode?: boolean;
+    readonly blockBypass?: boolean };
 export interface ProfileSettings {
-    readonly logs: { readonly enabled: boolean; readonly drop: { readonly ip: boolean; readonly domain: boolean }; readonly retention: number; readonly location: string };
+    readonly logs: { readonly enabled: boolean; readonly drop: { readonly ip: boolean; readonly domain: boolean };
+        readonly retention: number; readonly location: string };
     readonly blockPage: { readonly enabled: boolean };
     readonly performance: { readonly ecs: boolean; readonly cacheBoost: boolean; readonly cnameFlattening: boolean };
     readonly web3: boolean;
 }
-const LISTS = { services: 'parentalControl/services', categories: 'parentalControl/categories', denylist: 'denylist', allowlist: 'allowlist' } as const;
+const LISTS = { services: 'parentalControl/services', categories: 'parentalControl/categories', denylist: 'denylist',
+    allowlist: 'allowlist' } as const;
 export type ListName = keyof typeof LISTS;
-const ENTRY_ID: Record<ListName, RegExp> = { services: SERVICE_ID, categories: SERVICE_ID, denylist: DOMAIN, allowlist: DOMAIN };
+const ENTRY_ID: Record<ListName, RegExp> = { services: SERVICE_ID, categories: SERVICE_ID, denylist: DOMAIN,
+    allowlist: DOMAIN };
 
 export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
 export interface NextDnsClientOptions {
@@ -81,21 +96,28 @@ export interface NextDnsClient {
 
 /** Thrown by assertSafeNextDnsEnvironment. The message is a fixed reason code; no environment value is ever echoed. */
 export class NextDnsEnvironmentError extends Error {
-    readonly reason: 'tls_verification_disabled' | 'env_proxy_enabled' | 'https_proxy_set';
-    constructor(reason: NextDnsEnvironmentError['reason']) { super(reason); this.name = 'NextDnsEnvironmentError'; this.reason = reason; }
+    readonly reason: 'tls_verification_disabled' | 'env_proxy_enabled' | 'https_proxy_set' | 'all_proxy_set';
+    constructor(reason: NextDnsEnvironmentError['reason']) { super(reason); this.name = 'NextDnsEnvironmentError';
+        this.reason = reason; }
 }
 const OFF_VALUES = new Set(['', '0', 'false']);
 /**
- * Startup guard, to be called once by the service before it builds a client (wired in a later PR). The API key travels in a request
- * header, so refuse an environment that would expose it: TLS verification disabled, or Node's env-proxy support switched on (an
- * HTTPS_PROXY / https_proxy would then see or terminate the connection). Pure: it only reads `env`.
+ * Startup guard, to be called once by the service before it builds a client (wired in a later PR). The API key travels
+ * in a request
+ * header, so refuse an environment that would expose it: TLS verification disabled, or Node's env-proxy support
+ * switched on (an
+ * HTTPS_PROXY / https_proxy would then see or terminate the connection, also via NODE_OPTIONS=--use-env-proxy), or
+ * ALL_PROXY set. Pure: it only reads `env`.
  */
 export function assertSafeNextDnsEnvironment(env: Readonly<Record<string, string | undefined>> = process.env): void {
+    const set = (v: string | undefined): boolean => v !== undefined && v !== '';
     if (env.NODE_TLS_REJECT_UNAUTHORIZED === '0') throw new NextDnsEnvironmentError('tls_verification_disabled');
-    const proxyOn = env.NODE_USE_ENV_PROXY !== undefined && !OFF_VALUES.has(env.NODE_USE_ENV_PROXY.trim().toLowerCase());
+    if (set(env.ALL_PROXY) || set(env.all_proxy)) throw new NextDnsEnvironmentError('all_proxy_set');
+    const flag = env.NODE_USE_ENV_PROXY !== undefined && !OFF_VALUES.has(env.NODE_USE_ENV_PROXY.trim().toLowerCase());
+    const proxyOn = flag || (env.NODE_OPTIONS ?? '').split(/\s+/).includes('--use-env-proxy');
     if (!proxyOn) return;
-    const proxySet = [env.HTTPS_PROXY, env.https_proxy].some(v => v !== undefined && v !== '');
-    throw new NextDnsEnvironmentError(proxySet ? 'https_proxy_set' : 'env_proxy_enabled');
+    throw new NextDnsEnvironmentError(set(env.HTTPS_PROXY) || set(env.https_proxy) ? 'https_proxy_set'
+        : 'env_proxy_enabled');
 }
 
 // ---- strict validators (unknown keys, wrong types, oversize values all throw bad_response) ----
@@ -103,7 +125,8 @@ type Obj = Record<string, unknown>;
 function obj(v: unknown, required: readonly string[], optional: readonly string[] = []): Obj {
     if (typeof v !== 'object' || v === null || Array.isArray(v)) return fail();
     const keys = Object.keys(v);
-    if (keys.some(k => !required.includes(k) && !optional.includes(k)) || required.some(k => !keys.includes(k))) return fail();
+    if (keys.some(k => !required.includes(k) && !optional.includes(k))
+        || required.some(k => !keys.includes(k))) return fail();
     return v as Obj;
 }
 const bool = (v: unknown): boolean => typeof v === 'boolean' ? v : fail();
@@ -112,7 +135,8 @@ function arr<T>(v: unknown, max: number, item: (x: unknown) => T): readonly T[] 
     if (!Array.isArray(v) || v.length > max) return fail();
     return Object.freeze(v.map(item));
 }
-const entryOf = (re: RegExp) => (v: unknown): ListEntry => { const o = obj(v, ['id', 'active']); return Object.freeze({ id: str(o.id, re), active: bool(o.active) }); };
+const entryOf = (re: RegExp) => (v: unknown): ListEntry => { const o = obj(v, ['id', 'active']);
+    return Object.freeze({ id: str(o.id, re), active: bool(o.active) }); };
 function parseSettings(v: unknown): ProfileSettings {
     const o = obj(v, ['logs', 'blockPage', 'performance', 'web3']);
     const logs = obj(o.logs, ['enabled', 'drop', 'retention', 'location']), drop = obj(logs.drop, ['ip', 'domain']);
@@ -126,14 +150,16 @@ function parseSettings(v: unknown): ProfileSettings {
             retention, location: str(logs.location, /^[a-z]{2,8}$/),
         }),
         blockPage: Object.freeze({ enabled: bool(obj(o.blockPage, ['enabled']).enabled) }),
-        performance: Object.freeze({ ecs: bool(perf.ecs), cacheBoost: bool(perf.cacheBoost), cnameFlattening: bool(perf.cnameFlattening) }),
+        performance: Object.freeze({ ecs: bool(perf.ecs), cacheBoost: bool(perf.cacheBoost),
+            cnameFlattening: bool(perf.cnameFlattening) }),
         web3: bool(o.web3),
     });
 }
 function parseParental(v: unknown): ParentalControl {
     const o = obj(v, ['services', 'categories', 'safeSearch', 'youtubeRestrictedMode'], ['blockBypass']);
     const base = {
-        services: arr(o.services, MAX_PAGE_ITEMS, entryOf(SERVICE_ID)), categories: arr(o.categories, MAX_PAGE_ITEMS, entryOf(SERVICE_ID)),
+        services: arr(o.services, MAX_PAGE_ITEMS, entryOf(SERVICE_ID)), categories: arr(o.categories, MAX_PAGE_ITEMS,
+            entryOf(SERVICE_ID)),
         safeSearch: bool(o.safeSearch), youtubeRestrictedMode: bool(o.youtubeRestrictedMode),
     };
     return Object.freeze(o.blockBypass === undefined ? base : { ...base, blockBypass: bool(o.blockBypass) });
@@ -152,7 +178,8 @@ function checkErrors(v: unknown): void {
         const o = obj(e, ['code'], ['detail', 'source']);
         str(o.code, /^[A-Za-z0-9_]{1,64}$/);
         if (o.detail !== undefined && (typeof o.detail !== 'string' || o.detail.length > 2000)) fail();
-        if (o.source !== undefined) { const s = obj(o.source, [], ['parameter', 'pointer']); for (const k of Object.keys(s)) str(s[k], /^.{0,256}$/s); }
+        if (o.source !== undefined) { const s = obj(o.source, [], ['parameter', 'pointer']);
+            for (const k of Object.keys(s)) str(s[k], /^.{0,256}$/s); }
     });
 }
 interface Parsed { readonly data: unknown; readonly cursor: string | null }
@@ -164,7 +191,10 @@ function parseEnvelope(text: string): Parsed {
     const pagination = obj(obj(o.meta, [], ['pagination']).pagination ?? { cursor: null }, ['cursor']);
     return { data: o.data, cursor: pagination.cursor === null ? null : str(pagination.cursor, CURSOR) };
 }
-/** UNVERIFIED: the docs give no status or body for PUT/PATCH. Accepted: 200/204 with an empty body, {} or {"data":null}. */
+/**
+ * UNVERIFIED: the docs give no status or body for PUT/PATCH. Accepted: 200/204 with an empty body, {} or
+ * {"data":null}.
+ */
 function checkWrite(res: HttpResponse): void {
     if (res.body === '') return;
     const v = parseJson(res.body);
@@ -174,16 +204,15 @@ function checkWrite(res: HttpResponse): void {
 }
 
 // ---- default transport ----
-export interface FetchTransportOptions { readonly baseUrl?: string; readonly fetch?: typeof fetch; readonly timeoutMs?: number; readonly maxBytes?: number }
-/** TimeoutError reasons (fetch timeout, call deadline) are `timeout`; any other abort is the caller's and surfaces as `transport`. */
-const abortCode = (signal: AbortSignal | undefined): NextDnsErrorCode =>
-    (signal?.reason as { name?: string } | undefined)?.name === 'TimeoutError' ? 'timeout' : 'transport';
+export interface FetchTransportOptions { readonly baseUrl?: string; readonly fetch?: typeof fetch;
+    readonly timeoutMs?: number; readonly maxBytes?: number }
 
 async function readCapped(res: Response, max: number, signal: AbortSignal): Promise<string> {
     // A missing header reads as null; Number(null) is 0, which passes. The streaming cap below still applies.
     const declared = Number(res.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > max) { await res.body?.cancel().catch(() => undefined); return fail(); }
-    const aborted = new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    const aborted = new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason),
+        { once: true }));
     aborted.catch(() => undefined); // handled here so an abort after a clean read is not an unhandled rejection
     const chunks: Uint8Array[] = []; let total = 0;
     const reader = res.body?.getReader();
@@ -196,31 +225,39 @@ async function readCapped(res: Response, max: number, signal: AbortSignal): Prom
     }
     try { return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); } catch { return fail(); }
 }
-/** Default transport: global fetch, one host, redirects never followed, hard timeout (also over the body), capped body. Codes only. */
+/**
+ * Default transport: global fetch, one host, redirects never followed, hard timeout (also over the body), capped
+ * body. Codes only.
+ */
 export function createFetchTransport(options: FetchTransportOptions = {}): Transport {
     const base = new URL(options.baseUrl ?? NEXTDNS_BASE_URL), f = options.fetch ?? fetch;
     const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS, maxBytes = options.maxBytes ?? MAX_RESPONSE_BYTES;
     return async req => {
         const url = new URL(req.path, base);
-        if (url.origin !== base.origin || !req.path.startsWith('/') || req.path.includes('\\')) return fail('transport');
-        const timer = AbortSignal.timeout(timeoutMs), signal = req.signal ? AbortSignal.any([timer, req.signal]) : timer;
+        if (url.origin !== base.origin || !req.path.startsWith('/')
+            || req.path.includes('\\')) return fail('transport');
+        const timer = AbortSignal.timeout(timeoutMs), signal = req.signal ? AbortSignal.any([timer, req.signal])
+            : timer;
         try {
-            const res = await f(url, { method: req.method, headers: { ...req.headers }, body: req.body, redirect: 'manual', signal });
+            const res = await f(url, { method: req.method, headers: { ...req.headers }, body: req.body,
+                redirect: 'manual', signal });
             const headers: Record<string, string> = {};
             res.headers.forEach((value, name) => { headers[name.toLowerCase()] = value; });
-            if (res.status >= 300 && res.status < 400) { await res.body?.cancel().catch(() => undefined); return { status: res.status, headers: {}, body: '' }; }
+            if (res.status >= 300 && res.status < 400) { await res.body?.cancel().catch(() => undefined);
+                return { status: res.status, headers: {}, body: '' }; }
             return { status: res.status, headers, body: await readCapped(res, maxBytes, signal) };
         } catch (error) {
             if (error instanceof NextDnsError) throw error;
-            return fail(signal.aborted ? abortCode(signal) : 'transport');
+            // only our own timer is `timeout`; a caller abort is `transport`
+            return fail(timer.aborted ? 'timeout' : 'transport');
         }
     };
 }
 
 /** Default sleep: abortable, and unref'd so a pending retry never keeps the process alive. */
 export const abortableSleep: Sleep = (ms, signal) => new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) return reject(new NextDnsError(abortCode(signal)));
-    const onAbort = () => { clearTimeout(timer); reject(new NextDnsError(abortCode(signal))); };
+    if (signal?.aborted) return reject(new NextDnsError('transport'));
+    const onAbort = () => { clearTimeout(timer); reject(new NextDnsError('transport')); };
     const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
     timer.unref();
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -228,30 +265,43 @@ export const abortableSleep: Sleep = (ms, signal) => new Promise<void>((resolve,
 
 // ---- request pipeline ----
 interface Config {
-    readonly apiKey: () => string; readonly transport: Transport; readonly sleep: Sleep; readonly now: () => number; readonly random: () => number;
-    readonly maxAttempts: number; readonly maxPages: number; readonly baseDelay: number; readonly maxDelay: number; readonly maxRetryAfter: number;
+    readonly apiKey: () => string; readonly transport: Transport; readonly sleep: Sleep; readonly now: () => number;
+        readonly random: () => number;
+    readonly maxAttempts: number; readonly maxPages: number; readonly baseDelay: number; readonly maxDelay: number;
+        readonly maxRetryAfter: number;
     readonly deadlineMs: number; readonly signal: AbortSignal | undefined;
 }
-interface Ctx { readonly cfg: Config; readonly deadline: number; readonly signal: AbortSignal }
-type Attempt = { readonly ok: true; readonly res: HttpResponse } | { readonly ok: false; readonly err: NextDnsError; readonly res?: HttpResponse };
+/**
+ * `signal` is deadline + client + call signals; `deadlineSignal` alone says whether the abort was our own deadline
+ * (`timeout`).
+ */
+interface Ctx { readonly cfg: Config; readonly deadline: number; readonly signal: AbortSignal;
+    readonly deadlineSignal: AbortSignal }
+type Attempt = { readonly ok: true; readonly res: HttpResponse } | { readonly ok: false; readonly err: NextDnsError;
+    readonly res?: HttpResponse };
 
 function resolveConfig(o: NextDnsClientOptions): Config {
     return {
-        apiKey: o.apiKey, transport: o.transport ?? createFetchTransport(), sleep: o.sleep ?? abortableSleep, now: o.now ?? Date.now, random: o.random ?? Math.random,
-        maxAttempts: Math.max(1, o.maxAttempts ?? 4), maxPages: Math.max(1, o.maxPages ?? 20), baseDelay: o.baseDelayMs ?? 500, maxDelay: o.maxDelayMs ?? 10_000,
+        apiKey: o.apiKey, transport: o.transport ?? createFetchTransport(), sleep: o.sleep ?? abortableSleep,
+            now: o.now ?? Date.now, random: o.random ?? Math.random,
+        maxAttempts: Math.max(1, o.maxAttempts ?? 4), maxPages: Math.max(1, o.maxPages ?? 20),
+            baseDelay: o.baseDelayMs ?? 500, maxDelay: o.maxDelayMs ?? 10_000,
         maxRetryAfter: o.maxRetryAfterMs ?? 30_000, deadlineMs: o.deadlineMs ?? DEFAULT_DEADLINE_MS, signal: o.signal,
     };
 }
 function newCtx(cfg: Config, call: CallOptions): Ctx {
-    const signals = [AbortSignal.timeout(cfg.deadlineMs), ...[cfg.signal, call.signal].filter((s): s is AbortSignal => s !== undefined)];
-    return { cfg, deadline: cfg.now() + cfg.deadlineMs, signal: AbortSignal.any(signals) };
+    const deadlineSignal = AbortSignal.timeout(cfg.deadlineMs);
+    const callers = [cfg.signal, call.signal].filter((s): s is AbortSignal => s !== undefined);
+    return { cfg, deadline: cfg.now() + cfg.deadlineMs, signal: AbortSignal.any([deadlineSignal, ...callers]),
+        deadlineSignal };
 }
 /** Throws `timeout` once the call's budget is spent, or `transport` if the caller aborted. */
 function checkLive(ctx: Ctx): void {
     if (ctx.cfg.now() > ctx.deadline) fail('timeout');
-    if (ctx.signal.aborted) fail(abortCode(ctx.signal));
+    if (ctx.signal.aborted) fail(ctx.deadlineSignal.aborted ? 'timeout' : 'transport');
 }
-const header = (res: HttpResponse, name: string): string | undefined => Object.entries(res.headers).find(([k]) => k.toLowerCase() === name)?.[1];
+const header = (res: HttpResponse, name: string): string
+    | undefined => Object.entries(res.headers).find(([k]) => k.toLowerCase() === name)?.[1];
 function retryAfterMs(res: HttpResponse, now: number): number | null {
     const v = header(res, 'retry-after')?.trim();
     if (v === undefined) return null;
@@ -259,15 +309,26 @@ function retryAfterMs(res: HttpResponse, now: number): number | null {
     const at = Date.parse(v);
     return Number.isNaN(at) ? null : Math.max(0, at - now);
 }
-/** Retry-After (seconds or HTTP date) is honoured up to maxRetryAfter; otherwise exponential backoff with jitter in [cap/2, cap]. */
-function delayMs(cfg: Config, attempt: number, res?: HttpResponse): number {
+/**
+ * Retry-After (seconds or HTTP date) is honoured in full but never below the base delay (0 or a past date must not mean
+ * an immediate
+ * retry). A request to wait longer than maxRetryAfter returns null: stop, because retrying early would hammer a server
+ * that said wait.
+ * Without the header: exponential backoff with jitter in [cap/2, cap].
+ */
+function delayMs(cfg: Config, attempt: number, res?: HttpResponse): number | null {
     const after = res ? retryAfterMs(res, cfg.now()) : null;
-    if (after !== null) return Math.min(after, cfg.maxRetryAfter);
+    if (after !== null) return after > cfg.maxRetryAfter ? null : Math.max(after, cfg.baseDelay);
     const cap = Math.min(cfg.maxDelay, cfg.baseDelay * 2 ** (attempt - 1));
     return cap / 2 + cfg.random() * cap / 2;
 }
 function badRequestError(body: string): NextDnsError {
-    try { checkErrors(parseJson(body)); return new NextDnsError('invalid_request'); } catch (e) { return e instanceof NextDnsError ? e : new NextDnsError('bad_response'); }
+    try {
+        checkErrors(parseJson(body));
+        return new NextDnsError('invalid_request');
+    } catch (e) {
+        return e instanceof NextDnsError ? e : new NextDnsError('bad_response');
+    }
 }
 function statusError(status: number, body: string): NextDnsError | null {
     if (status === 200 || status === 204) return null;
@@ -277,22 +338,45 @@ function statusError(status: number, body: string): NextDnsError | null {
     if (status === 429) return new NextDnsError('rate_limited');
     return new NextDnsError(status >= 500 && status < 600 ? 'server' : 'bad_response');
 }
+/**
+ * Rejects as soon as `signal` aborts, whether or not the work honours it (a custom transport may ignore the signal).
+ */
+function raceAbort<T>(signal: AbortSignal, work: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        if (signal.aborted) { work.catch(() => undefined); return onAbort(); }
+        signal.addEventListener('abort', onAbort, { once: true });
+        work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    });
+}
 async function attemptOnce(ctx: Ctx, req: HttpRequest): Promise<Attempt> {
     try {
-        const res = await ctx.cfg.transport({ ...req, signal: ctx.signal });
+        const res = await raceAbort(ctx.signal, ctx.cfg.transport({ ...req, signal: ctx.signal }));
         // Bytes, not UTF-16 units: a transport without its own cap must not smuggle in twice the limit.
-        if (typeof res.body !== 'string' || Buffer.byteLength(res.body) > MAX_RESPONSE_BYTES) return { ok: false, err: new NextDnsError('bad_response') };
+        if (typeof res.body !== 'string' || Buffer.byteLength(res.body) > MAX_RESPONSE_BYTES) {
+            return { ok: false, err: new NextDnsError('bad_response') };
+        }
         const err = statusError(res.status, res.body);
         return err === null ? { ok: true, res } : { ok: false, err, res };
-    } catch (e) { return { ok: false, err: e instanceof NextDnsError ? e : new NextDnsError('transport') }; }
+    } catch (e) {
+        const err = ctx.deadlineSignal.aborted ? new NextDnsError('timeout') : e instanceof NextDnsError ? e
+            : new NextDnsError('transport');
+        return { ok: false, err };
+    }
 }
 async function pause(ctx: Ctx, ms: number): Promise<void> {
     if (ctx.cfg.now() + ms > ctx.deadline) fail('timeout');
-    try { await ctx.cfg.sleep(ms, ctx.signal); } catch (e) { throw e instanceof NextDnsError ? e : new NextDnsError(abortCode(ctx.signal)); }
+    try {
+        await ctx.cfg.sleep(ms, ctx.signal);
+    } catch { // the only way a sleep rejects is an abort
+        throw new NextDnsError(ctx.deadlineSignal.aborted ? 'timeout' : 'transport');
+    }
 }
-// 429 means "not processed", so every method may retry it. Anything else is retried for GET only (writes are not documented as idempotent).
+// 429 means "not processed", so every method may retry it. Anything else is retried for GET only (writes are not
+// documented as idempotent).
 const retryable = (method: HttpRequest['method'], err: NextDnsError): boolean =>
-    err.code === 'rate_limited' || (method === 'GET' && (err.code === 'transport' || err.code === 'timeout' || err.code === 'server'));
+    err.code === 'rate_limited' || (method === 'GET' && (err.code === 'transport' || err.code === 'timeout'
+        || err.code === 'server'));
 
 async function exchange(ctx: Ctx, req: HttpRequest): Promise<HttpResponse> {
     for (let n = 1; ; n++) {
@@ -300,14 +384,19 @@ async function exchange(ctx: Ctx, req: HttpRequest): Promise<HttpResponse> {
         const attempt = await attemptOnce(ctx, req);
         if (attempt.ok) return attempt.res;
         if (!retryable(req.method, attempt.err) || n >= ctx.cfg.maxAttempts) throw attempt.err;
-        await pause(ctx, delayMs(ctx.cfg, n, attempt.res));
+        const wait = delayMs(ctx.cfg, n, attempt.res);
+        if (wait === null) throw attempt.err; // the server asked for longer than we will wait
+        await pause(ctx, wait);
     }
 }
-async function request(ctx: Ctx, method: HttpRequest['method'], path: string, payload?: unknown): Promise<HttpResponse> {
+async function request(ctx: Ctx, method: HttpRequest['method'], path: string,
+    payload?: unknown): Promise<HttpResponse> {
     const key = ctx.cfg.apiKey();
     if (typeof key !== 'string' || !API_KEY.test(key)) return fail('unauthorized');
-    const headers = { 'x-api-key': key, accept: 'application/json', ...(payload === undefined ? {} : { 'content-type': 'application/json' }) };
-    return exchange(ctx, { method, path, headers, ...(payload === undefined ? {} : { body: JSON.stringify(payload) }) });
+    const headers = { 'x-api-key': key, accept: 'application/json', ...(payload === undefined ? {}
+        : { 'content-type': 'application/json' }) };
+    return exchange(ctx, { method, path, headers, ...(payload === undefined ? {}
+        : { body: JSON.stringify(payload) }) });
 }
 async function readAll<T>(ctx: Ctx, path: string, item: (x: unknown) => T): Promise<readonly T[]> {
     const out: T[] = [], seen = new Set<string>();
@@ -324,9 +413,16 @@ async function readAll<T>(ctx: Ctx, path: string, item: (x: unknown) => T): Prom
     return fail(); // page cap
 }
 const profilePath = (profile: string, sub = ''): string => `/profiles/${str(profile, PROFILE_ID)}${sub}`;
+/** `list` comes from callers (possibly untyped): only own keys of LISTS may become a path segment. */
+const listPath = (profile: string, list: ListName): string => {
+    if (!Object.hasOwn(LISTS, list)) return fail();
+    return profilePath(profile, `/${LISTS[list]}`);
+};
 /**
- * Caller input is validated before any request. Every failure here, whatever the validator threw, is the caller's bad input, so it
- * is reported as invalid_request (the validators' own bad_response means "the server sent junk"). Nothing is swallowed: the code is the report.
+ * Caller input is validated before any request. Every failure here, whatever the validator threw, is the caller's bad
+ * input, so it
+ * is reported as invalid_request (the validators' own bad_response means "the server sent junk"). Nothing is swallowed:
+ * the code is the report.
  */
 const checked = <T>(run: () => T): T => { try { return run(); } catch { throw new NextDnsError('invalid_request'); } };
 const FLAG_KEYS = ['safeSearch', 'youtubeRestrictedMode', 'blockBypass'] as const;
@@ -340,19 +436,30 @@ export function createNextDnsClient(options: NextDnsClientOptions): NextDnsClien
     const cfg = resolveConfig(options);
     const read = async <T>(call: CallOptions, path: string, parse: (data: unknown) => T): Promise<T> =>
         parse(parseEnvelope((await request(newCtx(cfg, call), 'GET', path)).body).data);
+    // Every method is async so that bad input is always a rejected promise, never a synchronous throw.
     return Object.freeze({
-        listProfiles: (call: CallOptions = {}) => readAll(newCtx(cfg, call), '/profiles', parseProfile), // UNVERIFIED endpoint
-        getParentalControl: (profile: string, call: CallOptions = {}) => read(call, checked(() => profilePath(profile, '/parentalControl')), parseParental),
-        getSettings: (profile: string, call: CallOptions = {}) => read(call, checked(() => profilePath(profile, '/settings')), parseSettings),
-        getList: (profile: string, list: ListName, call: CallOptions = {}) =>
-            readAll(newCtx(cfg, call), checked(() => profilePath(profile, `/${LISTS[list]}`)), entryOf(ENTRY_ID[list])),
+        // UNVERIFIED endpoint
+        async listProfiles(call: CallOptions = {}) { return readAll(newCtx(cfg, call), '/profiles', parseProfile); },
+        async getParentalControl(profile: string, call: CallOptions = {}) {
+            return read(call, checked(() => profilePath(profile, '/parentalControl')), parseParental);
+        },
+        async getSettings(profile: string, call: CallOptions = {}) {
+            return read(call, checked(() => profilePath(profile, '/settings')), parseSettings);
+        },
+        async getList(profile: string, list: ListName, call: CallOptions = {}) {
+            const path = checked(() => listPath(profile, list));
+            return readAll(newCtx(cfg, call), path, entryOf(ENTRY_ID[list]));
+        },
         async setParentalControl(profile: string, flags: ParentalFlags, call: CallOptions = {}): Promise<void> {
-            const path = checked(() => profilePath(profile, '/parentalControl')), body = checked(() => flagsBody(flags));
+            const path = checked(() => profilePath(profile, '/parentalControl')),
+                body = checked(() => flagsBody(flags));
             checkWrite(await request(newCtx(cfg, call), 'PATCH', path, body));
         },
-        async setList(profile: string, list: ListName, entries: readonly ListEntry[], call: CallOptions = {}): Promise<void> {
-            const path = checked(() => profilePath(profile, `/${LISTS[list]}`));
-            const body = checked(() => arr(entries, MAX_ITEMS, entryOf(ENTRY_ID[list])).map(e => ({ id: e.id, active: e.active })));
+        async setList(profile: string, list: ListName, entries: readonly ListEntry[],
+            call: CallOptions = {}): Promise<void> {
+            const path = checked(() => listPath(profile, list));
+            const body = checked(() => arr(entries, MAX_ITEMS, entryOf(ENTRY_ID[list])).map(e => ({ id: e.id,
+                active: e.active })));
             checkWrite(await request(newCtx(cfg, call), 'PUT', path, body));
         },
     });
