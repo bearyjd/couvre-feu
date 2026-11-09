@@ -579,11 +579,35 @@ test('review hardening: domain lists refused by default, key-source throws and b
     assert.equal(await codeOf(() => strict.setList('abc123', 'categories', [{ id: 'porn', active: true }, { id: 'porn', active: false }])), 'invalid_request');
 });
 
-test('review hardening: fetch transport refuses cleartext non-loopback hosts and control or dot-dot paths', async () => {
-    assert.throws(() => createFetchTransport({ baseUrl: 'http://evil.example' }), (e: unknown) => code(e) === 'transport');
-    createFetchTransport({ baseUrl: 'http://127.0.0.1:9' });
-    const t = createFetchTransport({ fetch: (async () => { throw new Error('must not fetch'); }) as unknown as typeof fetch });
-    for (const path of ['/pro\tfiles/x', '/profiles/../x', '/a\u0000b']) {
-        await assert.rejects(() => t({ method: 'GET', path, headers: {} }), (e: unknown) => code(e) === 'transport');
+test('fetch transport: cleartext is refused except for loopback hosts', () => {
+    const refused = (baseUrl: string) => { try { createFetchTransport({ baseUrl }); return false; } catch (e) { return code(e) === 'transport'; } };
+    for (const url of ['http://evil.example', 'http://example.com', 'http://[::2]:9', 'http://10.0.0.1:9', 'ftp://127.0.0.1'])
+        assert.equal(refused(url), true, url);
+    for (const url of ['http://127.0.0.1:9', 'http://localhost:9', 'http://[::1]:9', 'https://api.nextdns.io'])
+        assert.equal(refused(url), false, url);
+});
+
+test('fetch transport: paths that are not exactly what was asked for never reach fetch', async () => {
+    let called = false;
+    const t = createFetchTransport({ fetch: (async () => { called = true; return new Response('{}'); }) as unknown as typeof fetch });
+    const bad = ['/pro\tfiles/x', '/a\u0000b', '/a\u007fb', '/profiles/../x', '/profiles/abc/%2e%2e/x', '/profiles/abc/%2E%2E/x', '/profiles/abc/%2e/x',
+        '/profiles/abc/%2E/x', '/profiles/abc/.%2e/x', '/profiles/abc%2ex', '/profiles/abc%2Fx', '/profiles/abc%2fx', '/profiles/abc%5cx', '/profiles/abc%5Cx',
+        '/profiles/abc/%252e%252e/x', '/profiles/abc%25x', '/profiles/abc/./x', '/profiles/abc#frag', 'profiles/abc', '//evil.example/x', '/profiles\\abc'];
+    for (const path of bad) {
+        called = false;
+        await assert.rejects(() => t({ method: 'GET', path, headers: {} }), (e: unknown) => code(e) === 'transport', JSON.stringify(path));
+        assert.equal(called, false, `fetch must not run for ${JSON.stringify(path)}`);
     }
+    for (const path of ['/profiles/abc123/denylist', '/profiles/abc123/denylist?cursor=a%3Db.c', '/profiles']) {
+        called = false;
+        assert.equal((await t({ method: 'GET', path, headers: {} })).status, 200, path);
+        assert.equal(called, true, path);
+    }
+});
+
+test('fractional option values are floored: maxAttempts 2.7 is two attempts', async () => {
+    const { api, c } = setup({}, { maxAttempts: 2.7 });
+    for (let i = 0; i < 5; i++) api.enqueue(json(429, {}));
+    assert.equal(await codeOf(() => c.getSettings('abc123')), 'rate_limited');
+    assert.equal(api.requests.length, 2);
 });
