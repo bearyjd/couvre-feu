@@ -303,13 +303,15 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 send(response, written.status, {...provenance, ...written.body as object});
                 return;
             }
-            if (request.method === 'DELETE' && inventory?.triage && INVENTORY_LINK_PATH.test(path)) {
-                // Without inventoryUi.triage this is any other DELETE (405). No body is read: the row id in the path is the whole request.
+            if (request.method === 'DELETE' && inventory && INVENTORY_LINK_PATH.test(path)) {
+                // Session and CSRF first, so an anonymous caller learns nothing about the flag; then without inventoryUi.triage this is any other DELETE (405).
+                // No body is read: the row id in the path is the whole request.
                 if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
                 request.resume();
                 const session = auth.session(sessionToken, jar.cf_browser);
                 auth.csrf(session, request.headers['x-csrf-token']);
-                const removed = inventoryDelete(inventory, session, path)!;
+                const removed = inventoryDelete(inventory, session, path);
+                if (!removed) throw new AppError(405, 'method_not_allowed');
                 send(response, removed.status, {...provenance, ...removed.body as object});
                 return;
             }

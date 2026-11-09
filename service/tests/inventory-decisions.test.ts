@@ -286,8 +286,13 @@ test('privacy: a label, hostname, vendor or MAC never reaches audit, alerts, log
         t.inv.link(actor, c, b); t.inv.confirmStable(actor, c, true); t.inv.undo(actor, b); t.inv.unlink(actor, c);
         t.f.advance(7200); t.poll([dev(m(1)), dev(priv(2)), dev(priv(3)), dev(m(8), {hostname: 'secrethost2'})]);
         process.stdout.write = real.out; process.stderr.write = real.err;
-        const dump = JSON.stringify([t.rows('SELECT * FROM audit'), t.rows('SELECT * FROM parent_audit'), t.rows('SELECT * FROM parent_alerts'), t.rows('SELECT * FROM inventory_state'), writes]);
+        // EVERY table except the ones that hold devices by design (the decision row itself, the inventory and its coverage snapshot).
+        const tables = t.rows("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").map(r => r.name as string);
+        assert.ok(tables.length > 20 && tables.includes('parent_alerts') && tables.includes('audit'));
+        const dump = JSON.stringify([tables.filter(n => !['inventory_decisions', 'inventory_devices', 'inventory_coverage'].includes(n)).map(n => t.rows(`SELECT * FROM "${n}"`)), writes]);
         for (const secret of ['SecretLabel', 'secrethost', m(1), priv(2), priv(3), '192.0.2.9']) assert.ok(!dump.includes(secret), secret);
+        // the label is also nowhere in the inventory itself: only in its decision row (which the undo above has already cleared)
+        assert.ok(!JSON.stringify(t.rows('SELECT * FROM inventory_devices')).includes('SecretLabel'));
     } finally { process.stdout.write = real.out; process.stderr.write = real.err; t.f.cleanup(); }
 });
 
@@ -310,5 +315,43 @@ test('decisions are rate limited per actor', () => {
         assert.equal(t.code(() => t.inv.classify(actor, b, 'guest')), '429:inventory_decision_rate_limited');
         t.f.advance(61);
         assert.equal(t.inv.classify(actor, b, 'guest').role, 'guest');
+    } finally { t.f.cleanup(); }
+});
+
+test('decisions are bound to (generation, mac): a rebuild that renumbers rowids never moves a decision to another device', () => {
+    const t = setup();
+    try {
+        t.seed([m(1), m(2), m(3)]); const [a, b, c] = [t.id(m(1)), t.id(m(2)), t.id(m(3))];
+        t.inv.classify(actor, b, 'ignored'); t.inv.classify(actor, c, 'home', 'Fridge'); t.inv.link(actor, c, a);
+        // what a table rebuild or .recover may do: the same devices under different implicit row ids
+        const db = t.f.store.db;
+        db.exec('PRAGMA foreign_keys=OFF');
+        try { db.exec(`UPDATE inventory_devices SET rowid=rowid+1000; UPDATE inventory_devices SET rowid=${b} WHERE mac='${m(1)}'; UPDATE inventory_devices SET rowid=${c} WHERE mac='${m(2)}'; UPDATE inventory_devices SET rowid=${a} WHERE mac='${m(3)}'`); } finally { db.exec('PRAGMA foreign_keys=ON'); }
+        const byMac = new Map(t.inv.list(actor).devices.map(d => [d.mac, d]));
+        assert.equal(byMac.get(m(1))!.role, 'new'); assert.equal(byMac.get(m(2))!.role, 'ignored'); assert.equal(byMac.get(m(3))!.role, 'home'); assert.equal(byMac.get(m(3))!.label, 'Fridge');
+        assert.equal(byMac.get(m(3))!.linkedFrom, byMac.get(m(1))!.id, 'the link follows the device, not the old number');
+        assert.equal(t.inv.list(actor).newCount, 0, 'a: baseline, b and c decided');
+        // a row removed with foreign keys off (no cascade) leaves nothing behind for a later device to inherit
+        db.exec('PRAGMA foreign_keys=OFF');
+        try { db.exec(`DELETE FROM inventory_devices WHERE mac='${m(2)}'`); } finally { db.exec('PRAGMA foreign_keys=ON'); }
+        t.inv.prune();
+        assert.deepEqual(t.rows('SELECT mac FROM inventory_decisions ORDER BY mac').map(r => r.mac), [m(3)]);
+    } finally { t.f.cleanup(); }
+});
+
+test('a planned kid (not owned) can be reclassified and undone; an enrolled kid gets 409', () => {
+    const t = setup();
+    try {
+        t.seed(); const b = t.id(m(2));
+        const planned = t.inv.classify(actor, b, 'kid', 'Alex tablet');
+        assert.equal(planned.role, 'kid'); assert.equal(planned.flags.unassigned, true);
+        assert.equal(t.inv.classify(actor, b, 'adult').role, 'adult');
+        assert.equal(t.inv.undo(actor, b).role, 'kid');
+        t.f.advance(60); t.poll([dev(m(1)), dev(m(2)), dev(m(3)), dev(t.f.config.person.device.mac)]);
+        const kid = t.id(t.f.config.person.device.mac);
+        const enrolled = t.inv.list(actor).devices.find(d => d.id === kid)!;
+        assert.equal(enrolled.role, 'kid'); assert.equal(enrolled.flags.unassigned, false);
+        assert.equal(t.code(() => t.inv.classify(actor, kid, 'kid')), '409:inventory_device_enrolled');
+        assert.equal(t.code(() => t.inv.undo(actor, kid)), '409:inventory_device_enrolled');
     } finally { t.f.cleanup(); }
 });

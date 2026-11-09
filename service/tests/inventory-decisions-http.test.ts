@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { createServer } from 'node:net';
+import type { AddressInfo } from 'node:net';
 import { integrationFixture, actor } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
@@ -12,12 +14,16 @@ import type { InventoryDevice } from '../../shared/src/router-inventory.ts';
 const m = (n: number) => `00:00:5e:00:00:${n.toString(16).padStart(2, '0')}`;
 const dev = (n: number, over: Partial<InventoryDevice> = {}): InventoryDevice => ({mac: m(n), ipv4: [`192.0.2.${n}`], hostname: `host-${n}`, source: 'both', ...over});
 
-let worlds = 0;
+async function freePort(): Promise<number> {
+    const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
+    const {port} = probe.address() as AddressInfo; probe.close(); await once(probe, 'close');
+    return port;
+}
 async function world(opts: {automatic?: boolean; triage?: boolean} = {}) {
     const f = integrationFixture();
     if (opts.triage !== false) f.config.inventoryUi = {triage: true, wizard: false, installReadiness: false};
     f.config.auditLog = {enabled: true};
-    const port = 27000 + (process.pid + 7 * worlds++) % 9000, origin = `http://localhost:${port}`;
+    const port = await freePort(), origin = `http://localhost:${port}`;
     if (opts.automatic) f.config.dispatch = {enabled: true, pollSeconds: 2, maxBackoffSeconds: 8};
     const automatic = opts.automatic ? new AutomaticDispatch(f.worker) : null;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
@@ -130,6 +136,9 @@ test('triage off: the old routes behave as before and the new routes do not exis
         }
         const del = await admin(`/admin/inventory/${b}/link`, undefined, {}, 'DELETE'); assert.equal(del.status, 405); assert.equal(del.body.error.code, 'method_not_allowed');
         const hidden = await admin('/admin/inventory/hidden'); assert.equal(hidden.status, 404);
+        // an authenticated parent, flag off: same as today's unknown POST
+        const parent = await w.client('parent');
+        const refused = await parent(`/admin/inventory/${b}/classify`, {role: 'home'}); assert.equal(refused.status, 404); assert.equal(refused.body.error.code, 'route_not_found');
         assert.equal(w.store.get<{n: number}>('SELECT count(*) n FROM inventory_decisions')!.n, 0);
     } finally { await w.close(); }
 });
@@ -150,4 +159,17 @@ test('privacy over HTTP: a label never reaches stdout, stderr, audit or alerts, 
         const dump = JSON.stringify([writes, w.store.all('SELECT * FROM audit'), w.store.all('SELECT * FROM parent_audit'), w.store.all('SELECT * FROM parent_alerts')]);
         assert.ok(!dump.includes('SecretLabel') && !dump.includes('secrethost') && !dump.includes(m(2)));
     } finally { process.stdout.write = real.out; process.stderr.write = real.err; await w.close(); }
+});
+
+test('DELETE: unauthenticated is 401 whatever the flag says; flag off with a valid session and CSRF is a 405, not a crash', async () => {
+    for (const triage of [true, false]) {
+        const w = await world({triage});
+        try {
+            w.seed();
+            const b = rowId(w, m(2)), anonymous = await fetch(`${w.origin}/admin/inventory/${b}/link`, {method: 'DELETE', headers: {Origin: w.origin}});
+            assert.equal(anonymous.status, 401, `triage ${triage}`);
+            const admin = await w.client('operator'), r = await admin(`/admin/inventory/${b}/link`, undefined, {}, 'DELETE');
+            assert.equal(r.status, triage ? 200 : 405); if (!triage) assert.equal(r.body.error.code, 'method_not_allowed');
+        } finally { await w.close(); }
+    }
 });

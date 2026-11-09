@@ -40,6 +40,8 @@ CREATE INDEX parent_alerts_person ON parent_alerts(person_id, id);
 
 -- 3. Inventory snapshot, scoped by generation. last_seen advances only for source neigh or both; alerted_at is when a "New" device was
 -- last counted in an alert (NULL = not yet alerted, so a device whose alert was coalesced away still alerts on a later complete poll).
+-- NOTE (migration 015): inventory_decisions is bound to (generation, mac) with a foreign key, but the row id used by routes and audit is this table's implicit rowid
+-- (no INTEGER PRIMARY KEY). Any rebuild of this table must preserve (generation, mac), should preserve rowids, and must run with the service's decision sweep.
 CREATE TABLE IF NOT EXISTS inventory_devices (
  generation TEXT NOT NULL CHECK(length(generation)=64),
  mac TEXT NOT NULL CHECK(length(mac)=17 AND mac GLOB '[0-9a-f][0-9a-f]:*'),

@@ -21,19 +21,26 @@ CREATE INDEX parent_audit_person ON parent_audit(person_id,id);
 CREATE INDEX parent_audit_at ON parent_audit(at);
 CREATE UNIQUE INDEX parent_audit_once ON parent_audit(operation_id,action,person_id,result) WHERE operation_id IS NOT NULL AND person_id IS NOT NULL;
 
--- Parent decisions about inventory rows, keyed by the inventory row id (rowid of inventory_devices, never a MAC). There is deliberately no foreign key:
--- this numbered migration also runs on demo databases and before integration-006 creates inventory_devices, so InventoryStore removes a decision with its row.
--- The label is free text a parent typed (at most 40 characters): it is read only by the admin inventory DTO and never copied to audit rows, alerts or logs.
+-- Parent decisions about inventory rows. They are bound to the row's NATURAL key (generation, mac), never to its implicit rowid: inventory_devices has no
+-- INTEGER PRIMARY KEY, so a table rebuild, .recover or a delete can renumber rowids, and a rowid-keyed decision would then attach to a different device.
+-- The foreign key makes the binding structural (a decision goes with its row). It is declared against a table that integration-006 creates later (SQLite
+-- resolves it lazily): this numbered migration also runs on demo databases, where inventory_decisions simply stays empty.
+-- The row id (rowid) stays the route/audit identifier and is only ever resolved through this key (InventoryStore joins on it). A link names the older row
+-- by its mac in the same generation. The label is free text a parent typed (at most 40 characters): read only by the admin inventory DTO, never copied
+-- to audit rows, alerts or logs.
 CREATE TABLE inventory_decisions (
- row_id INTEGER PRIMARY KEY,
+ generation TEXT NOT NULL CHECK(length(generation)=64),
+ mac TEXT NOT NULL CHECK(length(mac)=17),
  role TEXT NOT NULL CHECK(role IN ('new','kid','adult','infrastructure','home','guest','ignored')),
  label TEXT CHECK(label IS NULL OR length(label) BETWEEN 1 AND 40),
  previous_role TEXT CHECK(previous_role IS NULL OR previous_role IN ('new','kid','adult','infrastructure','home','guest','ignored')),
- linked_from_row INTEGER CHECK(linked_from_row IS NULL OR linked_from_row <> row_id),
+ linked_from_mac TEXT CHECK(linked_from_mac IS NULL OR (length(linked_from_mac)=17 AND linked_from_mac <> mac)),
  stable_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(stable_confirmed IN (0,1)),
  stable_at INTEGER,
  decided_by TEXT NOT NULL CHECK(length(decided_by) BETWEEN 1 AND 64),
  decided_at INTEGER NOT NULL,
+ PRIMARY KEY(generation, mac),
+ FOREIGN KEY(generation, mac) REFERENCES inventory_devices(generation, mac) ON DELETE CASCADE,
  CHECK(stable_confirmed = 0 OR stable_at IS NOT NULL)
 ) STRICT;
-CREATE INDEX inventory_decisions_linked ON inventory_decisions(linked_from_row) WHERE linked_from_row IS NOT NULL;
+CREATE INDEX inventory_decisions_linked ON inventory_decisions(generation, linked_from_mac) WHERE linked_from_mac IS NOT NULL;

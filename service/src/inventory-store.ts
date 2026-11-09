@@ -57,11 +57,16 @@ interface StateRow {
     refresh_requested_at: number | null; refresh_pending: number; alert_day_start: number | null; alert_day_count: number; last_alert_at: number | null;
     incomplete_since: number | null; last_stall_alert_at: number | null;
 }
+/** A stored decision. It is bound to (generation, mac); `row_id` and `linked_from_row` are the inventory row ids those resolve to right now (never stored). */
 interface DecisionRow {
-    row_id: number; role: InventoryRole; label: string | null; previous_role: InventoryRole | null; linked_from_row: number | null; stable_confirmed: number; stable_at: number | null; decided_by: string; decided_at: number;
+    generation: string; mac: string; role: InventoryRole; label: string | null; previous_role: InventoryRole | null; linked_from_mac: string | null; stable_confirmed: number; stable_at: number | null; decided_by: string; decided_at: number;
+    row_id: number; linked_from_row: number | null;
 }
-type DecisionFields = Pick<DecisionRow, 'role' | 'label' | 'previous_role' | 'linked_from_row' | 'stable_confirmed' | 'stable_at'>;
-const NEW_DECISION: DecisionFields = {role: 'new', label: null, previous_role: null, linked_from_row: null, stable_confirmed: 0, stable_at: null};
+type DecisionFields = Pick<DecisionRow, 'role' | 'label' | 'previous_role' | 'linked_from_mac' | 'stable_confirmed' | 'stable_at'>;
+const NEW_DECISION: DecisionFields = {role: 'new', label: null, previous_role: null, linked_from_mac: null, stable_confirmed: 0, stable_at: null};
+/** Decisions with the row ids their natural keys resolve to. A decision whose row is gone is not returned, so a renumbered rowid can never attach one to another device. */
+const DECISIONS = `SELECT d.*, r.rowid row_id, o.rowid linked_from_row FROM inventory_decisions d JOIN inventory_devices r ON r.generation=d.generation AND r.mac=d.mac
+    LEFT JOIN inventory_devices o ON o.generation=d.generation AND o.mac=d.linked_from_mac`;
 const ASSIGNABLE_ROLES: readonly string[] = INVENTORY_ROLES.filter(r => r !== 'new');
 const DEVICE_COLUMNS = 'rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at';
 /** Plain text only: no control, format, separator or private-use characters and no angle brackets; trimmed, 1 to DECISION_LABEL_MAX characters. null clears. */
@@ -101,11 +106,11 @@ export class InventoryStore {
         const macs = this.store.config.protectedMacs;
         if (macs.length > 0) { this.store.run(`DELETE FROM inventory_devices WHERE mac IN (${macs.map(() => '?').join(',')})`, ...macs); this.sweepDecisions(); }
     }
-    /** Decisions are keyed by the inventory row id and have no foreign key (see migration 015): one goes with its row, and a link to a vanished row is dropped. */
     private sweepDecisions(): void {
-        this.store.run('DELETE FROM inventory_decisions WHERE row_id NOT IN (SELECT rowid FROM inventory_devices)');
-        this.store.run('UPDATE inventory_decisions SET linked_from_row=NULL WHERE linked_from_row IS NOT NULL AND linked_from_row NOT IN (SELECT rowid FROM inventory_devices)');
-        this.store.run("DELETE FROM inventory_decisions WHERE role='new' AND label IS NULL AND linked_from_row IS NULL AND stable_confirmed=0");
+        // The foreign key cascades a deleted row's decision; this also covers a connection or rebuild that ran with foreign keys off.
+        this.store.run('DELETE FROM inventory_decisions WHERE NOT EXISTS (SELECT 1 FROM inventory_devices r WHERE r.generation=inventory_decisions.generation AND r.mac=inventory_decisions.mac)');
+        this.store.run('UPDATE inventory_decisions SET linked_from_mac=NULL WHERE linked_from_mac IS NOT NULL AND NOT EXISTS (SELECT 1 FROM inventory_devices r WHERE r.generation=inventory_decisions.generation AND r.mac=inventory_decisions.linked_from_mac)');
+        this.store.run("DELETE FROM inventory_decisions WHERE role='new' AND label IS NULL AND linked_from_mac IS NULL AND stable_confirmed=0");
     }
     private get generation(): string { return this.store.config.router.generation; }
     /** All-or-nothing, whether or not the caller already holds a transaction (the worker settles its step in the same one). */
@@ -220,10 +225,10 @@ export class InventoryStore {
     private makeRoom(g: string, known: number, wanted: number, listed: Set<string>, baseline: number): number {
         let excess = known + wanted - INVENTORY_ROW_CAP, held = known;
         if (excess > 0) {
-            const decided = new Set(this.store.all<{row_id: number}>('SELECT row_id FROM inventory_decisions').map(d => d.row_id));
+            const decided = new Set(this.store.all<{mac: string}>('SELECT mac FROM inventory_decisions WHERE generation=?', g).map(d => d.mac));
             for (const row of this.store.all<{id: number; mac: string; acknowledged_at: number | null; alerted_at: number | null; first_seen: number}>('SELECT rowid id,mac,acknowledged_at,alerted_at,first_seen FROM inventory_devices WHERE generation=? ORDER BY last_seen ASC, first_seen ASC, mac ASC', g)) {
                 if (excess <= 0) break;
-                if (listed.has(row.mac) || row.acknowledged_at !== null || decided.has(row.id) || (row.alerted_at === null && row.first_seen > baseline)) continue;
+                if (listed.has(row.mac) || row.acknowledged_at !== null || decided.has(row.mac) || (row.alerted_at === null && row.first_seen > baseline)) continue;
                 this.store.run('DELETE FROM inventory_devices WHERE generation=? AND mac=?', g, row.mac); excess--; held--;
             }
             if (held < known) this.sweepDecisions(); // a link to an evicted row must not outlive it (a new row could reuse the id)
@@ -236,7 +241,7 @@ export class InventoryStore {
      */
     private alertNew(g: string, at: number): number {
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')!;
-        const fresh = this.store.all<{mac: string}>('SELECT mac FROM inventory_devices WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ? AND rowid NOT IN (SELECT row_id FROM inventory_decisions WHERE role<>\'new\')', g, s.baseline_at!);
+        const fresh = this.store.all<{mac: string}>('SELECT mac FROM inventory_devices WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ? AND (generation,mac) NOT IN (SELECT generation,mac FROM inventory_decisions WHERE role<>\'new\')', g, s.baseline_at!);
         if (fresh.length === 0) return 0;
         const newDay = s.alert_day_start === null || at - s.alert_day_start >= DAY || at < s.alert_day_start;
         const used = newDay ? 0 : s.alert_day_count;
@@ -250,14 +255,14 @@ export class InventoryStore {
             this.alerts.raise({kind: 'new_device', personId: null, severity: 'warning', details: {count: fresh.length}});
             this.store.run('UPDATE inventory_state SET alert_day_start=?,alert_day_count=? WHERE singleton=1', newDay ? at : s.alert_day_start, used + 1);
         }
-        this.store.run('UPDATE inventory_devices SET alerted_at=? WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ? AND rowid NOT IN (SELECT row_id FROM inventory_decisions WHERE role<>\'new\')', at, g, s.baseline_at!);
+        this.store.run('UPDATE inventory_devices SET alerted_at=? WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ? AND (generation,mac) NOT IN (SELECT generation,mac FROM inventory_decisions WHERE role<>\'new\')', at, g, s.baseline_at!);
         this.store.run('UPDATE inventory_state SET last_alert_at=? WHERE singleton=1', at);
         return fresh.length;
     }
     prune(): void { this.atomic(() => this.pruneAt(this.now())); }
     /** A row a parent decided on outlives the retention window (up to the maximum), so a quiet NAS does not come back as New. */
     private pruneAt(at: number): void {
-        this.store.run("DELETE FROM inventory_devices WHERE last_seen < ? AND (last_seen < ? OR rowid NOT IN (SELECT row_id FROM inventory_decisions WHERE role<>'new'))", at - this.retentionDays * DAY, at - MAX_INVENTORY_RETENTION_DAYS * DAY);
+        this.store.run("DELETE FROM inventory_devices WHERE last_seen < ? AND (last_seen < ? OR (generation,mac) NOT IN (SELECT generation,mac FROM inventory_decisions WHERE role<>'new'))", at - this.retentionDays * DAY, at - MAX_INVENTORY_RETENTION_DAYS * DAY);
         this.sweepDecisions();
     }
 
@@ -281,7 +286,7 @@ export class InventoryStore {
         const status = {baselineAt: baseline, lastOkAt: current?.last_ok_at ?? null, lastAttemptAt: current?.last_attempt_at ?? null, lastError: current?.last_error ?? null,
             refreshRequestedAt: current?.refresh_requested_at ?? null, pollSeconds: INVENTORY_POLL_SECONDS, retentionDays: this.retentionDays};
         if (!this.triage) return {status, devices: shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id)))};
-        const decisions = new Map(this.store.all<DecisionRow>('SELECT * FROM inventory_decisions').map(d => [d.row_id, d])), replaced = new Set([...decisions.values()].flatMap(d => d.linked_from_row === null ? [] : [d.linked_from_row]));
+        const decisions = new Map(this.store.all<DecisionRow>(`${DECISIONS} WHERE d.generation=?`, this.generation).map(d => [d.row_id, d])), replaced = new Set([...decisions.values()].flatMap(d => d.linked_from_row === null ? [] : [d.linked_from_row]));
         const devices = shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id), {decision: decisions.get(r.id), replaced: replaced.has(r.id)}));
         const quiet = (d: InventoryDeviceDTO) => d.role === 'guest' && now - d.lastSeen >= GUEST_HIDE_SECONDS;
         return {status, devices: opts.includeHidden ? devices : devices.filter(d => !quiet(d)), newCount: devices.filter(d => d.flags.new).length, hiddenCount: devices.filter(quiet).length};
@@ -311,7 +316,7 @@ export class InventoryStore {
         const lookup = this.lookup(), now = this.now(), hidden = new Set(this.store.config.protectedMacs);
         const group = this.store.all<DeviceRow>(`SELECT ${DEVICE_COLUMNS} FROM inventory_devices WHERE generation=? AND (mac=? OR (hostname IS NOT NULL AND lower(hostname)=lower(?)))`, this.generation, row.mac, row.hostname);
         const fresh = group.find(r => r.mac === row.mac)!, baseline = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')?.baseline_at ?? null;
-        const triage = this.triage ? {decision: this.decision(fresh.id), replaced: this.store.get('SELECT 1 FROM inventory_decisions WHERE linked_from_row=?', fresh.id) !== undefined} : undefined;
+        const triage = this.triage ? {decision: this.decision(fresh.id), replaced: this.store.get('SELECT 1 FROM inventory_decisions WHERE generation=? AND linked_from_mac=?', this.generation, fresh.mac) !== undefined} : undefined;
         return this.dto(fresh, baseline, lookup, actor, now, this.replacements(group, hidden, lookup.owners, now).get(fresh.id), triage);
     }
     /** Acknowledging records who looked; it never changes identity, assignment or policy. Repeating it keeps the first acknowledgement. */
@@ -332,7 +337,7 @@ export class InventoryStore {
 
     // Parent decisions (UI plan D). Admin only, behind inventoryUi.triage, atomic with their audit rows, and every row that is unknown, from another
     // generation or protected answers the same 404 so the ids reveal nothing.
-    private decision(rowId: number): DecisionRow | undefined { return this.store.get<DecisionRow>('SELECT * FROM inventory_decisions WHERE row_id=?', rowId); }
+    private decision(rowId: number): DecisionRow | undefined { return this.store.get<DecisionRow>(`${DECISIONS} WHERE r.rowid=? AND r.generation=?`, rowId, this.generation); }
     private requireDecider(actor: Actor): void {
         this.requireAdmin(actor);
         if (!this.triage) throw new AppError(404, 'route_not_found');
@@ -355,10 +360,10 @@ export class InventoryStore {
         return this.atomic(() => {
             const row = this.target(rowId), next = change(row, this.decision(row.id));
             if (next !== null) {
-                const empty = next.role === 'new' && next.label === null && next.linked_from_row === null && next.stable_confirmed === 0;
-                if (empty) this.store.run('DELETE FROM inventory_decisions WHERE row_id=?', row.id);
-                else this.store.run('INSERT OR REPLACE INTO inventory_decisions(row_id,role,label,previous_role,linked_from_row,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                    row.id, next.role, next.label, next.previous_role, next.linked_from_row, next.stable_confirmed, next.stable_at, actor.id, this.now());
+                const empty = next.role === 'new' && next.label === null && next.linked_from_mac === null && next.stable_confirmed === 0;
+                if (empty) this.store.run('DELETE FROM inventory_decisions WHERE generation=? AND mac=?', this.generation, row.mac);
+                else this.store.run('INSERT OR REPLACE INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    this.generation, row.mac, next.role, next.label, next.previous_role, next.linked_from_mac, next.stable_confirmed, next.stable_at, actor.id, this.now());
                 this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, action, this.now(), `inventory_row:${row.id}`);
                 auditFor(this.store).recordOrThrow({actor: actor.id, action, people: [], operationId: `inventory_row:${row.id}`, result: 'applied'});
             }
@@ -397,12 +402,12 @@ export class InventoryStore {
             for (let at: number | null | undefined = old.id, hops = 0; at != null; at = this.decision(at)?.linked_from_row, hops++) {
                 if (at === row.id || hops > INVENTORY_ROW_CAP) throw new AppError(409, 'inventory_link_cycle');
             }
-            return cur?.linked_from_row === old.id ? null : {...(cur ?? NEW_DECISION), linked_from_row: old.id};
+            return cur?.linked_from_mac === old.mac ? null : {...(cur ?? NEW_DECISION), linked_from_mac: old.mac};
         });
     }
     unlink(actor: Actor, rowId: unknown): InventoryDeviceDTO {
         this.requireDecider(actor);
-        return this.decide(actor, rowId, 'inventory_unlink', (_row, cur) => cur && cur.linked_from_row !== null ? {...cur, linked_from_row: null} : null);
+        return this.decide(actor, rowId, 'inventory_unlink', (_row, cur) => cur && cur.linked_from_mac !== null ? {...cur, linked_from_mac: null} : null);
     }
     /** The parent's tick for "Private Wi-Fi Address is off on this device". Allowed for a child's enrolled device too. */
     confirmStable(actor: Actor, rowId: unknown, value: unknown): InventoryDeviceDTO {
