@@ -152,13 +152,13 @@ The image healthcheck (`healthcheck.mjs`) only opens a TCP connection to the man
 
 ### Health and version (`GET /health`)
 
-`GET /health` (HEAD also works; every other method is 405) is unauthenticated by design and content-free. It needs no cookie and no feature flag, never contacts the router, and is rate limited (120 per minute, shared). It answers exactly:
+`GET /health` (HEAD also works; every other method is 405) is unauthenticated by design and content-free. It needs no cookie and no feature flag, never contacts the router, and is rate limited (1200 per minute, one shared budget). It answers exactly:
 
 ```json
-{"ok":true,"version":"<release>","uptimeSeconds":123,"schemaVersion":14,"lastInventoryOkAgeSeconds":null}
+{"ok":true,"version":"<release>","uptimeSeconds":123,"schemaVersion":14,"inventoryFresh":null}
 ```
 
-`ok` means the process answers and the database answers a trivial read; a database failure is a bare `503 {"ok":false}`. `lastInventoryOkAgeSeconds` is the age of the last good inventory poll, or `null` when inventory is off or has not polled. Use it for a heartbeat or monitor: `curl -fsS https://<name>/health`. It carries no person, device, MAC, hostname, account, address, path or router data; keep it that way (the key set is pinned by `service/tests/health.test.ts`). It is not a replacement for the TCP image healthcheck below, which is unchanged.
+`ok` means the process answers and the database answers a trivial read; a database failure is a bare `503 {"ok":false}`. `inventoryFresh` is `true` when the last good inventory poll was within 3 poll intervals (180 s), `false` when older, and `null` when inventory is off or has not polled; the exact age is deliberately not public and appears only in the admin-only `/auth/session` response. Use it for a heartbeat or monitor: `curl -fsS https://<name>/health`. It carries no person, device, MAC, hostname, account, address, path or router data; keep it that way (the key set is pinned by `service/tests/health.test.ts`). The budget is global because callers behind the proxy share its address and forwarded headers are not trusted, so one noisy client could exhaust it: **a monitor must treat HTTP 429 from `/health` as "process is up"** (the service answered), and per-client limiting belongs in the reverse proxy (NPM). It is not a replacement for the TCP image healthcheck below, which is unchanged.
 
 `version` is read from a `VERSION` file next to `package.json` (the Dockerfile copies it when present; the deploy writes it, for example `git rev-parse --short HEAD > VERSION` before `docker build`), else `<package.json version>-dev`. The service never runs `git`. The signed-in UI shows the same value and the schema version in its footer.
 

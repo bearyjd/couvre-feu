@@ -28,7 +28,7 @@ import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
 import { Health } from './health.ts';
-import type { SessionInfoDTO } from '../../shared/src/contracts.ts';
+import type { SessionDTO, SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -137,6 +137,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const untrusted = (address: string | undefined) => trusted !== undefined && !trusted.includes(remoteIPv4(address) ?? '');
     // Unauthenticated and content-free by design; see service/src/health.ts for the only fields it may carry.
     const health = new Health(auth.store, () => inventory?.lastOkAt() ?? null, clock);
+    // Build identity for every signed-in caller; the exact inventory age only for admins.
+    const sessionInfo = (dto: SessionDTO): SessionInfoDTO => ({...dto, version: health.version, schemaVersion: health.schemaVersion(), ...(dto.actor.role === 'admin' ? {lastInventoryOkAgeSeconds: health.inventoryAge()} : {})});
     const handler = async (request: IncomingMessage, response: ServerResponse) => {
         if (untrusted(request.socket.remoteAddress)) {
             request.socket.destroy();
@@ -225,7 +227,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                             return;
                         }
                         response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`]);
-                        send(response, 200, {...result.dto, version: health.version, schemaVersion: health.schemaVersion()} satisfies SessionInfoDTO);
+                        send(response, 200, sessionInfo(result.dto));
                         return;
                     }
                 }
@@ -327,7 +329,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             const session = auth.session(sessionToken, jar.cf_browser);
             if (path === '/auth/session') {
-                send(response, 200, {...session.dto, version: health.version, schemaVersion: health.schemaVersion()} satisfies SessionInfoDTO);
+                send(response, 200, sessionInfo(session.dto));
                 return;
             }
             if (path === '/people') {

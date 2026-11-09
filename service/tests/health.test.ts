@@ -5,14 +5,15 @@ import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db.ts';
-import { Auth } from '../src/auth.ts';
+import { Auth, issueBootstrap } from '../src/auth.ts';
+import { TestAuthenticator } from './authenticator.ts';
 import { seedAccounts } from '../src/fixtures.ts';
 import { FakeRouter } from '../../demo-router/src/router.ts';
 import { PolicyService } from '../src/policy.ts';
 import { appServer } from '../src/http.ts';
-import { Health, HEALTH_RATE_PER_MINUTE, buildVersion } from '../src/health.ts';
+import { Health, HEALTH_RATE_PER_MINUTE, INVENTORY_FRESH_SECONDS, buildVersion } from '../src/health.ts';
 
-const KEYS = ['lastInventoryOkAgeSeconds', 'ok', 'schemaVersion', 'uptimeSeconds', 'version'];
+const KEYS = ['inventoryFresh', 'ok', 'schemaVersion', 'uptimeSeconds', 'version'];
 
 async function boot(offset: number) {
     const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-health-')), port = 30000 + (process.pid + offset) % 10000, origin = `http://localhost:${port}`;
@@ -40,7 +41,8 @@ test('GET /health answers without a session, with an exact key set, no-store, an
         assert.equal(typeof body.version, 'string');
         assert.ok(Number.isInteger(body.uptimeSeconds) && body.uptimeSeconds >= 0);
         assert.equal(body.schemaVersion, h.store.get<{user_version: number}>('PRAGMA user_version')!.user_version);
-        assert.equal(body.lastInventoryOkAgeSeconds, null);
+        assert.equal(body.inventoryFresh, null);
+        assert.doesNotMatch(text, /AgeSeconds/);
         // Leak guard: no MAC-, IPv4- or hostname-looking text, no demo manifest or account strings.
         assert.doesNotMatch(text, /[0-9a-f]{2}(:[0-9a-f]{2}){5}/i);
         assert.doesNotMatch(text, /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/);
@@ -74,9 +76,10 @@ test('a database failure is a bare 503 {ok:false}', async () => {
     } finally { h.server.close(); h.server.closeAllConnections(); }
 });
 
-test('the rate limit trips after the modest cap and answers identically', async () => {
+test('the rate limit is the generous global 1200/min and trips after the modest cap and answers identically', async () => {
     const h = await boot(4);
     try {
+        assert.equal(HEALTH_RATE_PER_MINUTE, 1200);
         let last = 200;
         for (let i = 0; i < HEALTH_RATE_PER_MINUTE + 1; i++) last = (await h.get('/health')).status;
         assert.equal(last, 429);
@@ -84,11 +87,17 @@ test('the rate limit trips after the modest cap and answers identically', async 
     } finally { h.close(); }
 });
 
-test('Health reports the inventory age and clamps a future timestamp to zero', () => {
+test('Health coarsens the inventory age to fresh/stale/unknown; the exact age stays in inventoryAge()', () => {
     const store = new Store(':memory:');
     try {
-        assert.equal(new Health(store, () => 1000, () => 1090, 'v').answer()?.lastInventoryOkAgeSeconds, 90);
-        assert.equal(new Health(store, () => 2000, () => 1090, 'v').answer()?.lastInventoryOkAgeSeconds, 0);
+        const at = (ok: number | null, now: number) => new Health(store, () => ok, () => now, 'v');
+        assert.equal(at(1000, 1000 + INVENTORY_FRESH_SECONDS).answer()?.inventoryFresh, true);
+        assert.equal(at(1000, 1000 + INVENTORY_FRESH_SECONDS + 1).answer()?.inventoryFresh, false);
+        assert.equal(at(2000, 1090).answer()?.inventoryFresh, true, 'a future timestamp is fresh, not negative');
+        assert.equal(at(null, 1090).answer()?.inventoryFresh, null);
+        assert.equal(INVENTORY_FRESH_SECONDS, 180);
+        assert.equal(at(1000, 1090).inventoryAge(), 90);
+        assert.equal(at(2000, 1090).inventoryAge(), 0);
         assert.equal(new Health(store, () => { throw new Error('/secret/path'); }, () => 0, 'v').answer(), null);
     } finally { store.close(); }
 });
@@ -103,4 +112,29 @@ test('buildVersion prefers a VERSION file, never leaks a malformed one, and fall
     writeFileSync(join(dir, 'VERSION'), '/etc/passwd secret\n');
     assert.equal(buildVersion(root), '1.2.3-dev');
     assert.match(buildVersion(), /-dev$|^[A-Za-z0-9._+-]+$/);
+});
+
+test('the exact inventory age is in the session info for admins only, never for parents', async () => {
+    const h = await boot(5);
+    try {
+        const origin = `http://localhost:${(h.server.address() as {port: number}).port}`;
+        const info = async (account: 'jd' | 'bryn') => {
+            let cookie = '';
+            const call = async (path: string, body?: unknown) => {
+                const res = await fetch(origin + path, {method: body ? 'POST' : 'GET', headers: {Origin: origin, Cookie: cookie, ...(body ? {'Content-Type': 'application/json'} : {})}, body: body ? JSON.stringify(body) : undefined});
+                const jar = new Map(cookie.split('; ').filter(Boolean).map(c => c.split('=') as [string, string]));
+                for (const set of res.headers.getSetCookie()) { const [k, v] = set.split(';')[0].split('='); jar.set(k, v); }
+                cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+                return res.json();
+            };
+            const options = await call('/auth/register/options', {token: issueBootstrap(h.store, account, 1791691200)});
+            await call('/auth/register/verify', {challengeId: options.challengeId, response: new TestAuthenticator().register(options.options, origin)});
+            return call('/auth/session');
+        };
+        const admin = await info('jd'), parent = await info('bryn');
+        assert.equal(admin.actor.role, 'admin');
+        assert.equal(admin.lastInventoryOkAgeSeconds, null);
+        assert.equal(parent.actor.role, 'parent');
+        assert.equal('lastInventoryOkAgeSeconds' in parent, false);
+    } finally { h.close(); }
 });

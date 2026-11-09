@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { Store } from './db.ts';
+import { INVENTORY_POLL_SECONDS } from './inventory-store.ts';
 
 /** Everything /health may say. Add a field here only if it is safe for an unauthenticated caller to read. */
 export interface HealthBody {
@@ -8,9 +9,11 @@ export interface HealthBody {
     version: string;
     uptimeSeconds: number;
     schemaVersion: number;
-    lastInventoryOkAgeSeconds: number | null;
+    /** Coarse on purpose: true within 3 poll intervals of the last good poll, false if older, null if never polled or the feature is off. */
+    inventoryFresh: boolean | null;
 }
-export const HEALTH_RATE_PER_MINUTE = 120;
+export const HEALTH_RATE_PER_MINUTE = 1200;
+export const INVENTORY_FRESH_SECONDS = 3 * INVENTORY_POLL_SECONDS;
 const BUILD = /^[A-Za-z0-9._+-]{1,64}$/;
 
 /** Release identity baked at deploy time: a VERSION file next to package.json, else the package.json version plus "dev". Never shells out. */
@@ -45,13 +48,18 @@ export class Health {
         this.hits.push(at);
         return false;
     }
+    /** Exact age of the last good inventory poll. Authenticated admin callers only; /health itself never says it. */
+    inventoryAge(): number | null {
+        const ok = this.inventoryLastOk();
+        return ok === null ? null : Math.max(0, this.now() - ok);
+    }
     /** A trivial DB read only; never touches the router. A failure is a bare null, with no detail. */
     answer(): HealthBody | null {
         try {
             this.store.get('SELECT 1');
-            const at = this.now(), ok = this.inventoryLastOk();
+            const age = this.inventoryAge();
             return {ok: true, version: this.version, uptimeSeconds: Math.floor(process.uptime()), schemaVersion: this.schemaVersion(),
-                lastInventoryOkAgeSeconds: ok === null ? null : Math.max(0, at - ok)};
+                inventoryFresh: age === null ? null : age <= INVENTORY_FRESH_SECONDS};
         } catch { return null; }
     }
 }
