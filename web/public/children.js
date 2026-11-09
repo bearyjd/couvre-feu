@@ -443,7 +443,7 @@ export function createInventory({ session, gate, offline, time, children, versio
       ...(picking === device.mac && !locked ? picker(device, short) : []));
   }
   function draw() {
-    if (!enabled() || !data) { drawn = ''; mounted = false; root.hidden = true; root.replaceChildren(); live.textContent = ''; return; }
+    if (!enabled() || !data) { drawn = ''; mounted = false; root.hidden = true; delete root.dataset.newCount; root.replaceChildren(); live.textContent = ''; return; }
     if (!mounted) { root.replaceChildren(title, live, body); mounted = true; }
     const liveText = refreshNote || notice;
     if (live.textContent !== liveText) live.textContent = liveText;
@@ -452,6 +452,7 @@ export function createInventory({ session, gate, offline, time, children, versio
     const ordered = sorted(data.devices);
     const status = inventoryStatus(data.status, nowSeconds(), time);
     const newCount = ordered.filter((d) => d.flags.new).length;
+    root.dataset.newCount = String(newCount); // read by the tab bar for the Devices badge
     const clear = status.clear && !stale && newCount === 0;
     const summary = clear ? 'No new devices.' : newCount ? `${newCount} new device${newCount === 1 ? '' : 's'} to review.` : '';
     const signature = JSON.stringify([data, reason, stale, loadedAt, status.text, summary, notice, refreshNote, picking, busy, children.entries()]);

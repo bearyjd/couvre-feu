@@ -1,10 +1,11 @@
-import { test, expect, enroll, virtualAuthenticator } from './browser-fixture.ts';
+import { test, expect, enroll, virtualAuthenticator, openTab } from './browser-fixture.ts';
 
 test.use({ serviceWorkers: 'block' });
 test.setTimeout(60000);
 
 test('admin adds a parent and a device: token shown once, pending device shows its pairing code, approval lets it sign in, removal ends it', async ({ page, browser, demo }) => {
   await enroll(page, demo, 'jd');
+  await openTab(page, 'more');
   const panel = page.locator('#accounts-panel');
   await expect(panel.getByRole('heading', { name: 'Devices and accounts' })).toBeVisible();
   await expect(panel.getByRole('list', { name: 'Your passkeys' })).toContainText('this device');
@@ -65,6 +66,7 @@ test('admin adds a parent and a device: token shown once, pending device shows i
 
 test('the only admin cannot remove their last passkey, and the refusal is explained', async ({ page, demo }) => {
   await enroll(page, demo, 'jd');
+  await openTab(page, 'more');
   const panel = page.locator('#accounts-panel');
   await panel.getByRole('button', { name: 'Remove my passkey Passkey (this device)' }).click();
   await expect(panel.getByRole('status')).toContainText('At least one active admin must keep a working passkey.');

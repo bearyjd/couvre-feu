@@ -1,4 +1,4 @@
-import { test, expect, enroll } from './browser-fixture.ts';
+import { test, expect, enroll, openTab } from './browser-fixture.ts';
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 const delta = (person: string, over: object = {}) => ({ person, mac: '02:00:00:00:02:01', windowStart: nowSeconds() - 60, windowEnd: nowSeconds(),
@@ -8,6 +8,7 @@ test('parent sees a badge and persisted alerts for assigned children only, ackno
   const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message));
   demo.alerts.reconcile({ now: nowSeconds(), activity: [delta('alex'), delta('blair')], timeRequests: [{ person: 'alex', requestId: 'r1', createdAt: nowSeconds() - 30 }] });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'alerts');
   await expect(page.locator('#parent-alerts')).toBeVisible();
   await expect(page.locator('#alert-badge')).toHaveText('2');
   const rows = page.locator('#parent-alert-feed .parent-alert');
@@ -32,6 +33,7 @@ test('parent sees a badge and persisted alerts for assigned children only, ackno
 test('an admin also sees alerts for every child, and a resolved alert leaves the badge', async ({ page, demo }) => {
   demo.alerts.reconcile({ now: nowSeconds(), activity: [delta('blair')] });
   await enroll(page, demo, 'jd');
+  await openTab(page, 'alerts');
   await expect(page.locator('#alert-badge')).toHaveText('1');
   await expect(page.locator('#parent-alert-feed')).toContainText('Blair (fictional)');
   demo.alerts.reconcile({ now: nowSeconds() + 120, activity: [delta('blair', { txBytes: 0, windowStart: nowSeconds() + 60, windowEnd: nowSeconds() + 120 })] });
@@ -47,6 +49,7 @@ test('an admin sees a router_scope_change alert with counts only and its matched
   // The demo database has no router_scope_change kind, so the server response is fixed here; the real server path is covered in service tests.
   await page.route('**/alerts', (route) => route.fulfill({ json: { alerts: [alert(2, false, 'critical'), alert(1, true, 'info')], nextBefore: null, openCount: 2 } }));
   await enroll(page, demo, 'jd');
+  await openTab(page, 'alerts');
   const feed = page.locator('#parent-alert-feed');
   await expect(feed.locator('.parent-alert')).toHaveCount(2);
   await expect(feed).toContainText('Router device list changed');
@@ -63,6 +66,7 @@ test('an admin sees new_device and inventory_stalled alerts with titles and coun
   // The demo database has no inventory kinds, so the response is fixed here; the real server path is covered in service tests.
   await page.route('**/alerts', (route) => route.fulfill({ json: { alerts: [alert(3, 'inventory_stalled', { cause: 'no_complete_poll', count: 45 }), alert(2, 'new_device', { count: 3 }), alert(1, 'new_device', { count: 1 })], nextBefore: null, openCount: 3 } }));
   await enroll(page, demo, 'jd');
+  await openTab(page, 'alerts');
   const feed = page.locator('#parent-alert-feed');
   await expect(feed.locator('.parent-alert')).toHaveCount(3);
   await expect(feed).toContainText('Network inventory has not completed recently');
