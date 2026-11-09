@@ -1,0 +1,35 @@
+# Couvre-feu heartbeat (root). Install to /etc/systemd/system/ with deploy/heartbeat.sh as
+# /usr/local/sbin/couvrefeu-heartbeat (0700 root). See docs/runbooks/deploy.md "Monitoring (heartbeat)".
+[Unit]
+Description=Couvre-feu heartbeat push
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/couvrefeu-heartbeat
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectHome=read-only
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# NOT empty: root needs CAP_DAC_OVERRIDE to reach the agent socket in /run/couvrefeu (0700, owned by couvrefeu).
+# ProtectHome=read-only (not yes) because the push URL lives under /root/couvrefeu-key.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+MemoryMax=64M
+TasksMax=32
