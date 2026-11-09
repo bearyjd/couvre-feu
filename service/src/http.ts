@@ -22,7 +22,7 @@ import { TimeRequestService } from './time-requests.ts';
 import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
 import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
-import { inventoryGet, inventoryPost } from './inventory-http.ts';
+import { INVENTORY_LINK_PATH, inventoryDelete, inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
 import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
@@ -301,6 +301,16 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const written = await contentFilter.put(session, path, payload);
                 if (!written) throw new AppError(405, 'method_not_allowed');
                 send(response, written.status, {...provenance, ...written.body as object});
+                return;
+            }
+            if (request.method === 'DELETE' && inventory?.triage && INVENTORY_LINK_PATH.test(path)) {
+                // Without inventoryUi.triage this is any other DELETE (405). No body is read: the row id in the path is the whole request.
+                if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
+                request.resume();
+                const session = auth.session(sessionToken, jar.cf_browser);
+                auth.csrf(session, request.headers['x-csrf-token']);
+                const removed = inventoryDelete(inventory, session, path)!;
+                send(response, removed.status, {...provenance, ...removed.body as object});
                 return;
             }
             if (request.method !== 'GET') {
