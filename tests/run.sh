@@ -23,7 +23,8 @@ preflight_suites() {
         test-live-rehearsal.py \
         test-permanent-install.py \
         test-deploy-units.py \
-        test-service-key-entry.py
+        test-service-key-entry.py \
+        test-heartbeat.py
 }
 run_preflight_suite() {
     preflight_suites | grep -Fqx -- "$1" || { printf 'unknown preflight suite: %s\n' "$1" >&2; exit 2; }

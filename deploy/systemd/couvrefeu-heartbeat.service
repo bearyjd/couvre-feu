@@ -1,0 +1,21 @@
+# Couvre-feu heartbeat (root). Install to /etc/systemd/system/ with deploy/heartbeat.sh as
+# /usr/local/sbin/couvrefeu-heartbeat (0700 root). See docs/runbooks/deploy.md "Monitoring (heartbeat)".
+[Unit]
+Description=Couvre-feu heartbeat push
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/couvrefeu-heartbeat
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
