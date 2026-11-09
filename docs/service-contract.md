@@ -348,3 +348,19 @@ Both routes require an admin. The existing admin DTO retains MACs for assignment
 protected management devices are filtered, child names remain viewer-scoped, and inventory row text does not
 render raw MACs. `inScope` is additive HTTP metadata; the strict `rpc-inventory` router protocol
 and its shared wire types are unchanged. No new assignment UI is introduced.
+
+### Hint fields (UI plan C)
+
+Each inventory device DTO also carries these additive, admin-only fields. They are derived on read from data the DTO already holds; nothing
+is stored, and none of it reaches alerts, `audit`, `parent_audit`, `inventory_state` or logs (a leak test pins this). They are hints, never
+identity, and the strict `rpc-inventory` wire protocol and its golden fixtures are unchanged.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | number | The inventory row id, the same value audit outcomes use (`inventory_row:<id>`). Never a MAC. |
+| `vendor` | string, optional | Maker of the OUI prefix from the vendored table (`shared/src/oui.ts`, see `docs/oui-table.md`). Absent for randomized (locally-administered) addresses and unlisted prefixes; the table is incomplete, so absent does not mean "no maker". `QEMU/KVM (virtual)` is the one named locally-administered convention (`52:54:00`). |
+| `kind` | `phone` \| `tablet` \| `computer` \| `console` \| `tv` \| `speaker` \| `appliance` \| `virtual` \| `network` \| `unknown` | A guess from the hostname (ordered regex rules, first match wins) and, failing that, the vendor (`shared/src/inventory-hints.ts`). Hostname text is chosen by the device. Makers of general phones and PCs say nothing alone. |
+| `presence` | `online` \| `lease_only` \| `recent` \| `quiet` | From `source` and `lastSeen` against the service clock (poll interval 60 s). `online`: neighbour source (`neigh`/`both`) seen within 120 s. `lease_only`: `lease` source with a neighbour last seen within 900 s. `recent`: neighbour source, 121-900 s. `quiet`: older than 900 s (a lease alone never proves presence). A `lastSeen` in the future counts as now. |
+| `suggestedReplaces` | number, optional | Row id this randomized-address row may replace. Only when the hostname is non-empty and not generic (`android`, `iphone`, `iPhone-13-Pro`, `localhost`, names under 4 characters, ...), the row is the only active randomized row with that name (case-insensitive), neither row is a protected MAC, and exactly one older row with that name is `quiet` (the one last seen most recently; a tie gives no suggestion). Rotation is still never merged: both rows stay and the old one keeps its own New/acknowledged state. |
+
+Visibility is unchanged: only admins receive the DTO (parents get 403), and the page shows vendor and kind only as a "Guess:" line.
