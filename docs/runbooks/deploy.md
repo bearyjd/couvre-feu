@@ -150,6 +150,18 @@ Host side (same layout as Option 1): `/var/lib/couvrefeu` and `/etc/couvrefeu` o
 
 The image healthcheck (`healthcheck.mjs`) only opens a TCP connection to the manifest's `listen` address and sends no HTTP, so it needs no allowlist exception. It proves only that the listener accepts TCP: the TCP handshake completes before the service drops an untrusted source, so a healthy container does **not** show that the allowlist is in force. Verify that separately with the `ss` and off-proxy `curl` checks above. Do not add an HTTP healthcheck or put the host's own address in `trustedProxies`.
 
+### Health and version (`GET /health`)
+
+`GET /health` (HEAD also works; every other method is 405) is unauthenticated by design and content-free. It needs no cookie and no feature flag, never contacts the router, and is rate limited (120 per minute, shared). It answers exactly:
+
+```json
+{"ok":true,"version":"<release>","uptimeSeconds":123,"schemaVersion":14,"lastInventoryOkAgeSeconds":null}
+```
+
+`ok` means the process answers and the database answers a trivial read; a database failure is a bare `503 {"ok":false}`. `lastInventoryOkAgeSeconds` is the age of the last good inventory poll, or `null` when inventory is off or has not polled. Use it for a heartbeat or monitor: `curl -fsS https://<name>/health`. It carries no person, device, MAC, hostname, account, address, path or router data; keep it that way (the key set is pinned by `service/tests/health.test.ts`). It is not a replacement for the TCP image healthcheck below, which is unchanged.
+
+`version` is read from a `VERSION` file next to `package.json` (the Dockerfile copies it when present; the deploy writes it, for example `git rev-parse --short HEAD > VERSION` before `docker build`), else `<package.json version>-dev`. The service never runs `git`. The signed-in UI shows the same value and the schema version in its footer.
+
 ### Agent socket exposure
 
 Any process in the container, and anyone who can `docker exec` into it, can use the mounted agent socket to run the service's constrained `cfctl` commands on the router as root. Restrict `docker exec` and membership of the `docker` group to the operator, and give the loaded key a lifetime where practical (`ssh-add -t <LIFETIME>`; the key must then be re-added by a human after it expires). `ssh-add -c` (confirm every use) needs an askpass program reachable by the agent and so does not suit a headless service; use it only if you provide one. The same applies to local users who can reach `/run/couvrefeu` in Option 1: keep it `0700`.

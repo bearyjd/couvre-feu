@@ -27,6 +27,8 @@ import type { InventoryStore } from './inventory-store.ts';
 import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
+import { Health } from './health.ts';
+import type { SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -87,6 +89,10 @@ function send(response: ServerResponse, status: number, value: unknown) {
     });
     response.end(JSON.stringify(value));
 }
+function healthSend(response: ServerResponse, request: IncomingMessage, status: number, value: object) {
+    response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8'});
+    response.end(request.method === 'HEAD' ? undefined : JSON.stringify(value));
+}
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
 type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'> & Partial<Pick<ParentAlerts, 'reconcile'>>;
 /** Node reports IPv4 peers on dual-stack sockets as ::ffff:a.b.c.d; compare the plain IPv4 literal. */
@@ -129,6 +135,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
     const trusted = config.trustedProxies;
     const untrusted = (address: string | undefined) => trusted !== undefined && !trusted.includes(remoteIPv4(address) ?? '');
+    // Unauthenticated and content-free by design; see service/src/health.ts for the only fields it may carry.
+    const health = new Health(auth.store, () => inventory?.lastOkAt() ?? null, clock);
     const handler = async (request: IncomingMessage, response: ServerResponse) => {
         if (untrusted(request.socket.remoteAddress)) {
             request.socket.destroy();
@@ -156,6 +164,17 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const path = request.url ?? '';
             if (path.includes('?') || path.includes('%') || path.includes('#')) {
                 throw new AppError(400, 'invalid_path');
+            }
+            if (path === '/health') {
+                if (request.method !== 'GET' && request.method !== 'HEAD') {
+                    response.setHeader('Allow', 'GET, HEAD');
+                    healthSend(response, request, 405, {ok: false});
+                    return;
+                }
+                if (health.limited()) { healthSend(response, request, 429, {ok: false}); return; }
+                const answer = health.answer();
+                healthSend(response, request, answer ? 200 : 503, answer ?? {ok: false});
+                return;
             }
             if (!requests && ['/request.html', '/request.js'].includes(path)) {
                 throw new AppError(404, 'route_not_found');
@@ -206,7 +225,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                             return;
                         }
                         response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`]);
-                        send(response, 200, result.dto);
+                        send(response, 200, {...result.dto, version: health.version, schemaVersion: health.schemaVersion()} satisfies SessionInfoDTO);
                         return;
                     }
                 }
@@ -308,7 +327,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             const session = auth.session(sessionToken, jar.cf_browser);
             if (path === '/auth/session') {
-                send(response, 200, session.dto);
+                send(response, 200, {...session.dto, version: health.version, schemaVersion: health.schemaVersion()} satisfies SessionInfoDTO);
                 return;
             }
             if (path === '/people') {

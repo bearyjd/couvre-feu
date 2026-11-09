@@ -20,6 +20,11 @@ export interface SessionDTO extends Provenance {
     csrfToken: string;
     expiresAt: number;
 }
+/** GET /auth/session: the session plus the running build, so the UI can compare it with the loaded one. */
+export interface SessionInfoDTO extends SessionDTO {
+    version: string;
+    schemaVersion: number;
+}
 export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow';
 export interface ScheduleWindowDTO {
     id: string;
