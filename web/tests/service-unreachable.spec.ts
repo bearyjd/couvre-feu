@@ -144,6 +144,6 @@ test('losing the session while the banner is up does not leave it over the sign-
 
 test('the service worker shell cache is renamed so installs drop the old app.js', async ({ page, demo }) => {
   const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
-  expect(sw).toContain("'cf-shell-v7'");
-  expect(sw).not.toContain('cf-shell-v6');
+  expect(sw).toContain("'cf-shell-v9'");
+  expect(sw).not.toContain('cf-shell-v8');
 });
