@@ -47,8 +47,8 @@ NFT_RULES = [
     'ip daddr <DNS_IP> tcp dport 53 accept', 'ip daddr <NTP_IP> udp dport 123 accept',
     'ct state established,related accept', 'meta l4proto { icmp, ipv6-icmp } accept',
 ]
-DOCKERIGNORE = ['*', '!package.json', '!package-lock.json', '!LICENSE', '!shared/src', '!service/src', '!service/migrations',
-                '!web/public', '!deploy/docker/healthcheck.mjs']
+DOCKERIGNORE = ['*', '!package.json', '!package-lock.json', '!LICENSE', '!VERSION', '!shared/src', '!service/src',
+                '!service/migrations', '!web/public', '!deploy/docker/healthcheck.mjs']
 SERVICE_READABLE = ('/etc/couvrefeu/', '/var/lib/couvrefeu/', '/opt/couvrefeu/', '/run/couvrefeu/', '/tmp/', '/home/')
 ALLOWED_ETC = {'manifest.json', 'known_hosts', 'service_key.pub'}
 IPV4 = re.compile(r'(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\w.])')
