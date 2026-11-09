@@ -233,6 +233,11 @@ export class InventoryStore {
         } catch { /* devices alone decide */ }
         return owners;
     }
+    /** Time of the last successful poll in the current generation, or null. Read-only, for the content-free /health. */
+    lastOkAt(): number | null {
+        const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1');
+        return s?.generation === this.generation ? s.last_ok_at : null;
+    }
     list(actor: Actor): InventoryDTO {
         this.requireAdmin(actor);
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1'), current = s?.generation === this.generation ? s : undefined;

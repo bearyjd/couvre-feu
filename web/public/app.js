@@ -507,6 +507,8 @@ function render() {
     $('#account-actions').innerHTML = account ? `<div class="account-actions"><span class="account-name">${escape(account.displayName)} · ${escape(account.role)}</span><button id="logout" class="button secondary" type="button">Sign out</button></div>` : '';
     $('#logout')?.addEventListener('click', () => void logout());
   }
+  const build = hasStatus && state.session?.version ? `${String(state.session.version).slice(0, 64)} · schema ${Number(state.session.schemaVersion)}` : '';
+  $('#build-info').textContent = build;
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
     renderConnection(); renderPeople(); renderControlState(); rewardTime.afterRender();

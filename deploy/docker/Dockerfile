@@ -17,7 +17,7 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin couvrefeu
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY package.json LICENSE ./
+COPY package.json LICENSE VERSION* ./
 COPY shared/src ./shared/src
 COPY service/src ./service/src
 COPY service/migrations ./service/migrations

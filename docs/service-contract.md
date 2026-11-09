@@ -18,6 +18,12 @@ Track service desired revision, router desired/confirmed revision, operation ID,
 
 Reject stale revisions and same-revision conflicting policy. On reconnect, first fetch the router desired revision and preserve the exact normalized payload for an equal-revision replay, including expired metadata retained for equality. Removing expired pause records changes that payload and requires a greater revision; never replay an obsolete grant or resurrect an expired pause. Router-local pause/resume also advance revisions. A proposed service transaction must allocate monotonically beyond both stored and observed revisions, reconcile concurrent router changes, and refuse or explicitly resolve conflicts rather than silently clobber them. Idempotency keys and revision preconditions are required at the service boundary; conflict ownership/resolution remains a future service design decision. Router-local cron, not service availability, owns expiry.
 
+## Health and build identity
+
+- `GET /health` (and `HEAD`): no authentication, no cookies, no flag. Body is exactly `{ok, version, uptimeSeconds, schemaVersion, inventoryFresh}` (`inventoryFresh` is `boolean | null`: true if the last good inventory poll is within 3 x 60 s, false if older, null if never polled or inventory is off), `Cache-Control: no-store`. `503 {"ok":false}` when the database does not answer a trivial read, `429 {"ok":false}` over 1200 requests per minute (one global budget; monitors must treat 429 as "process is up", and per-client limiting belongs in the reverse proxy), `405 {"ok":false}` for other methods. It never calls the router and carries no person, device, MAC, hostname, account, address, path or manifest data. Adding a field requires changing the pinned key set in `service/tests/health.test.ts` on purpose.
+- `GET /auth/session` and the sign-in verify responses add `version` and `schemaVersion` (`SessionInfoDTO` in `shared/src/contracts.ts`) so the UI can compare the loaded build with the server. Admins also get `lastInventoryOkAgeSeconds` (`number | null`); parents do not get the key at all.
+- `version` comes from a `VERSION` file next to `package.json` if present, else `<package.json version>-dev`; no runtime `git`. `schemaVersion` is the database `user_version`.
+
 ## Proposed API and result semantics
 
 | Route | Proposed responsibility |
