@@ -10,6 +10,7 @@ import { IntegrationWorker } from './integration-worker.ts';
 import { inventoryRetentionDays } from './inventory-store.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import { auditFor } from './parent-audit.ts';
+import { InstallReadiness } from './install-readiness.ts';
 import { wireContentFilter } from './content-filter-wiring.ts';
 import type { AsyncRouter } from './router-transport.ts';
 
@@ -32,7 +33,7 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
     const filter = wireContentFilter(config, store, env);
     const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => {
         const policy = new IntegrationPolicy(store);
-        return appServer(auth, policy, serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory, filter?.routes(auth, policy));
+        return appServer(auth, policy, serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory, filter?.routes(auth, policy), config.installReadiness?.enabled ? new InstallReadiness(auth, worker.inventory) : undefined);
     };
     return {worker, activity, prune, app};
 }

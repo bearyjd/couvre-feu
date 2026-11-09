@@ -24,6 +24,7 @@ import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
 import { inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
+import type { InstallReadiness } from './install-readiness.ts';
 import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
@@ -96,7 +97,7 @@ export function remoteIPv4(address: string | undefined): string | undefined {
 /** The Idempotency-Key header, dropped when it uses the `tr-` prefix reserved for the time-request service (the route then reports the key as missing). */
 const clientKey = (value: string | string[] | undefined): string | undefined => typeof value === 'string' && !value.startsWith('tr-') ? value : undefined;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore, contentFilter?: ContentFilterRoutes) {
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore, contentFilter?: ContentFilterRoutes, installReadiness?: InstallReadiness) {
     // Demo: always on. Real-router integration: per the private manifest's timeRequests mode (default off); child routes and the timer run in any mode but off.
     const gated = timeRequests === undefined && auth.provenance.source === 'real-router-integration';
     const mode = timeRequestMode((config as {timeRequests?: unknown}).timeRequests), ownerAccountId = (config as {ownerAccountId?: string}).ownerAccountId;
@@ -236,6 +237,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, inventoryWrite.status, {...provenance, ...inventoryWrite.body as object});
                     return;
                 }
+                const readinessWrite = await installReadiness?.post(session, path, payload);
+                if (readinessWrite) {
+                    send(response, readinessWrite.status, {...provenance, ...readinessWrite.body as object});
+                    return;
+                }
                 const filterStepUp = await contentFilter?.post(session, path, payload);
                 if (filterStepUp) {
                     send(response, filterStepUp.status, {...provenance, ...filterStepUp.body as object});
@@ -313,7 +319,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 // rewardTime: one viewer-level boolean, present only when the reward route would answer for this viewer (never per child).
-                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(auditOn() ? {auditLog: true} : {})});
+                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(auditOn() ? {auditLog: true} : {}), ...(installReadiness && session.dto.actor.role === 'admin' ? {installReadiness: true} : {})});
                 return;
             }
             const childRead = childrenGet(children, session, path);
@@ -324,6 +330,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const inventoryRead = inventoryGet(inventory ?? null, session, path);
             if (inventoryRead) {
                 send(response, inventoryRead.status, {...provenance, ...inventoryRead.body as object});
+                return;
+            }
+            const readinessRead = installReadiness?.get(session, path);
+            if (readinessRead) {
+                send(response, readinessRead.status, {...provenance, ...readinessRead.body as object});
                 return;
             }
             const filterRead = contentFilter?.get(session, path);
