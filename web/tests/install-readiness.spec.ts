@@ -1,7 +1,6 @@
 import { test, expect, signIn, K2, NAMES } from './bulk-fixture.ts';
 import type { World } from './bulk-fixture.ts';
 import { readFile } from 'node:fs/promises';
-import { decisions } from '../../service/src/install-readiness.ts';
 
 test.use({ readiness: true });
 const MAC_PATTERN = /[0-9a-f]{2}(:[0-9a-f]{2}){5}/i;
@@ -35,10 +34,7 @@ test('admin reviews the list at phone width: children, warnings, digest, no hori
 
 test('approve with a passkey records the review; download gives the JSON for the current digest', async ({ page, integration: f }) => {
   seed(f);
-  const real = { ...decisions };
-  decisions.adultsAvailable = true; // the adapter stub is replaced by D's data; the review is then complete
-  test.info().annotations.push({ type: 'adapter', description: 'adultsAvailable forced on' });
-  try { await approveAndDownload(page, f); } finally { Object.assign(decisions, real); }
+  await approveAndDownload(page, f);
 });
 
 async function approveAndDownload(page: import('@playwright/test').Page, f: World) {
@@ -53,13 +49,25 @@ async function approveAndDownload(page: import('@playwright/test').Page, f: Worl
   expect(file.suggestedFilename()).toBe(`install-list-${digest.slice(0, 12)}.json`);
   const body = JSON.parse(await readFile((await file.path())!, 'utf8'));
   expect(body.digest).toBe(digest); expect(body.reviewed).toBe(true);
+  expect(body.adults[0].mac).toBe(f.config.protectedMacs[0]); // adult addresses appear only in the export
   expect(JSON.stringify(body.children)).toContain(K2);
   expect(f.store.all<{ action: string }>("SELECT action FROM audit WHERE action LIKE 'install_list_%' ORDER BY id").map((r) => r.action)).toEqual(['install_list_reviewed', 'install_list_exported']);
   expect(JSON.stringify(f.store.all("SELECT * FROM audit WHERE action LIKE 'install_list_%'"))).not.toMatch(MAC_PATTERN);
 }
 
-test('while adult devices are unavailable the review says so and Approve is disabled', async ({ page, integration: f }) => {
+test('adults are a count from the protected set, never raw MACs in the page', async ({ page, integration: f }) => {
   seed(f);
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('[data-adults] h3')).toHaveText('Protected devices (existing protected set)');
+  await expect(panel(page).locator('[data-adult-count]')).toHaveText('1 protected device');
+  await expect(panel(page).locator('[data-adults-notice]')).toHaveCount(0);
+  expect(await page.locator('body').innerText()).not.toContain(f.config.protectedMacs[0]);
+  expect(await page.content()).not.toContain(f.config.protectedMacs[0]);
+});
+
+test('with no protected set the review says so and Approve is disabled', async ({ page, integration: f }) => {
+  seed(f);
+  f.config.protectedMacs = [];
   await signIn(page, f, 'operator');
   await expect(panel(page).locator('[data-adults-notice]')).toHaveText('Adult devices are not included in this review yet.');
   await expect(panel(page).getByRole('button', { name: 'Approve this list (passkey)' })).toBeDisabled();

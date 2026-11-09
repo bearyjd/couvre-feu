@@ -75,7 +75,10 @@ test('admin reads the list: enrolled child devices, adapter adults, vendor and p
         const child = r.body.children.find((c: any) => c.name === 'Explicit test person');
         assert.deepEqual(child.devices.map((d: any) => ({label: d.label, mac: d.mac, stable: d.stable, inScope: d.inScope, enrolled: d.enrolled, presence: d.presence})),
             [{label: 'Explicit test device', mac: PILOT_MAC, stable: false, inScope: true, enrolled: true, presence: 'online'}]);
-        assert.deepEqual(r.body.adults, []);
+        // adults come from the protected baseline; the GET never carries their addresses
+        assert.deepEqual(r.body.adults.map((a: any) => ({...a})), [{label: 'Protected device', vendor: null, stable: false, inScope: r.body.adults[0].inScope, enrolled: false, presence: 'unknown'}]);
+        assert.equal(r.body.adultsSource, 'protected-baseline'); assert.equal(r.body.adultsAvailable, true);
+        assert.ok(!r.text.includes(w.config.protectedMacs[0]), 'GET carries no protected MAC');
         assert.equal((await admin.call('GET', '/people')).body.installReadiness, true); // the page's one gate; admins only
         assert.match(r.body.digest, /^[0-9a-f]{64}$/);
         assert.equal(r.body.reviewedAt, null);
@@ -209,20 +212,39 @@ test('digest binds child ids: two same-name children swapping devices change it;
     assert.notEqual(readinessDigest(one), sha256(canonical({children: one.children, adults: []})), 'the {v:1} prefix is part of the digest input');
 });
 
-test('adults list: unavailable while the adapter is a stub, available when it is not', async () => {
+test('adults come from protectedMacs: GET has no MACs, export has them; empty set is unavailable and cannot be approved', async () => {
     const w = await world();
     try {
-        const admin = await w.client('operator');
-        assert.equal((await admin.get()).body.adultsAvailable, false);
-        const real = {...decisions};
-        decisions.adultsAvailable = true; decisions.adultDevices = () => [{label: 'Bryn phone', mac: STABLE_MAC}];
+        const admin = await w.client('operator'), protectedMac = w.config.protectedMacs[0];
+        const full = await admin.get();
+        assert.equal(full.body.adultsAvailable, true); assert.equal(full.body.adults.length, 1); assert.ok(!('mac' in full.body.adults[0]));
+        const exported = (await admin.exportList(full.body.digest)).body.export;
+        assert.equal(exported.adultsAvailable, true); assert.equal(exported.adultsSource, 'protected-baseline');
+        assert.equal(exported.adults[0].mac, protectedMac);
+        // the audit trail still holds only the digest
+        assert.ok(!JSON.stringify(w.audit()).includes(protectedMac));
+        // a new protected MAC changes the digest the approval binds to
+        w.config.protectedMacs = [...w.config.protectedMacs, STABLE_MAC];
+        const grown = await admin.get();
+        assert.notEqual(grown.body.digest, full.body.digest); assert.equal(grown.body.adults.length, 2);
+        // none: partial, and the service itself refuses to approve it
+        w.config.protectedMacs = [];
+        const none = await admin.get();
+        assert.equal(none.body.adultsAvailable, false); assert.deepEqual(none.body.adults, []);
+        err(await admin.approve(none.body.digest, await admin.challenge(none.body.digest)), 409, 'install_list_incomplete');
+        assert.equal(w.audit().filter(r => r.action === 'install_list_reviewed').length, 0);
+    } finally { await w.cleanup(); }
+});
+
+test('the TODO(D) seam adds extra adults on top of the protected baseline, without duplicates', async () => {
+    const w = await world();
+    try {
+        const admin = await w.client('operator'), real = {...decisions};
+        decisions.adultDevices = () => [{label: 'Bryn phone', mac: STABLE_MAC}, {label: 'dup', mac: w.config.protectedMacs[0]}];
         try {
             const r = await admin.get();
-            assert.equal(r.body.adultsAvailable, true); assert.equal(r.body.adults[0].label, 'Bryn phone');
-            assert.equal((await admin.exportList(r.body.digest)).body.export.adultsAvailable, true);
+            assert.deepEqual(r.body.adults.map((a: any) => a.label).sort(), ['Bryn phone', 'Protected device']);
         } finally { Object.assign(decisions, real); }
-        const digest = (await admin.get()).body.digest;
-        assert.equal((await admin.exportList(digest)).body.export.adultsAvailable, false);
     } finally { await w.cleanup(); }
 });
 

@@ -71,7 +71,9 @@ export function createInstallReadiness({ session, people, offline }) {
     if (list) {
       view.push(...list.children.map((child) => group(child.name, child.devices, 'No device yet.')));
       if (list.adultsAvailable !== true) view.push(el('p', { role: 'status', 'data-adults-notice': '', textContent: 'Adult devices are not included in this review yet.' }));
-      view.push(group('Adults (protect list)', list.adults, 'No adult devices listed yet.'));
+      view.push(el('section', { class: 'readiness-group', 'data-adults': '' }, el('h3', { textContent: 'Protected devices (existing protected set)' }),
+        el('p', { 'data-adult-count': '', textContent: `${list.adults.length} protected ${list.adults.length === 1 ? 'device' : 'devices'}` }),
+        el('p', { class: 'fine-print', textContent: "From the service's protected set, the baseline the router install preserves. Addresses are in the download only." })));
       view.push(el('section', { class: 'readiness-group' }, el('h3', { textContent: 'Warnings' }),
         list.warnings.length ? el('ul', { role: 'list', 'data-warnings': '' }, ...list.warnings.map((w) => el('li', { textContent: (WARNING[w.code] ?? (() => 'Check this list.'))(w) })))
           : el('p', { class: 'fine-print', textContent: 'No warnings.' })));

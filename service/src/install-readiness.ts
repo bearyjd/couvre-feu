@@ -20,8 +20,13 @@ const DIGEST = /^[0-9a-f]{64}$/;
 export type ReadinessPresence = InventoryPresence | 'unknown';
 export interface ReadinessDevice { label: string; mac: string; vendor: string | null; stable: boolean; inScope: boolean; enrolled: boolean; presence: ReadinessPresence }
 export interface ReadinessWarning { code: 'private_address_unconfirmed' | 'device_quiet' | 'device_unseen' | 'child_no_device'; child: string | null; device: string | null }
-export interface ReadinessDTO { children: {id: string; name: string; devices: ReadinessDevice[]}[]; adults: ReadinessDevice[]; adultsAvailable: boolean; warnings: ReadinessWarning[]; digest: string; reviewedAt: number | null }
-export interface ReadinessExport { version: 1; digest: string; generatedAt: number; reviewed: boolean; children: ReadinessDTO['children']; adults: ReadinessDevice[]; adultsAvailable: boolean; warnings: ReadinessWarning[] }
+export type ReadinessAdult = Omit<ReadinessDevice, 'mac'>;
+export const ADULTS_SOURCE = 'protected-baseline';
+export const PROTECTED_LABEL = 'Protected device';
+/** The full list, addresses included: only the export (and the digest) use it as is; GET answers with `view` (adult addresses stripped). */
+export interface ReadinessDTO { children: {id: string; name: string; devices: ReadinessDevice[]}[]; adults: ReadinessDevice[]; adultsAvailable: boolean; adultsSource: typeof ADULTS_SOURCE; warnings: ReadinessWarning[]; digest: string; reviewedAt: number | null }
+export interface ReadinessView extends Omit<ReadinessDTO, 'adults'> { adults: ReadinessAdult[] }
+export interface ReadinessExport { version: 1; digest: string; generatedAt: number; reviewed: boolean; children: ReadinessDTO['children']; adults: ReadinessDevice[]; adultsAvailable: boolean; adultsSource: typeof ADULTS_SOURCE; warnings: ReadinessWarning[] }
 
 /** JSON with every object's keys sorted, so equal data always serialises to the same bytes. */
 export function canonical(value: unknown): string {
@@ -45,8 +50,6 @@ export function readinessDigest(list: {children: {id: string; name: string; devi
  * stableConfirmed, and role='adult' rows for adultDevices. Until then no private address counts as confirmed and no adult is listed.
  */
 export const decisions = {
-    /** False while adultDevices is a stub: the review is then partial and the page must say so and not offer approval. */
-    adultsAvailable: false,
     stableConfirmed: (_mac: string): boolean => false,
     adultDevices: (): {label: string; mac: string}[] => [],
 };
@@ -87,10 +90,12 @@ export class InstallReadiness {
         const children = activeChildren(store).filter(c => c.kind === 'child').map(c => ({id: c.id, name: c.name,
             devices: devicesOf(store, c.id).filter(d => d.state !== 'removing').map(d => this.device({label: d.label, mac: d.identifier}, true, seen, now)).sort(byText(d => d.mac))}))
             .sort(byText(c => c.id));
-        const adults = decisions.adultDevices().map(d => this.device(d, false, seen, now)).sort(byText(d => d.mac));
+        // The adults are the protected baseline the router install preserves (config.protectedMacs), plus whatever D's roles add later.
+        const baseline = store.config.protectedMacs, extra = decisions.adultDevices().filter(d => !baseline.includes(d.mac));
+        const adults = [...baseline.map(mac => ({label: PROTECTED_LABEL, mac})), ...extra].map(d => this.device(d, false, seen, now)).sort(byText(d => d.mac));
         const sum = readinessDigest({children, adults});
         const reviewed = store.get<{at: number | null}>("SELECT MAX(timestamp) at FROM audit WHERE action='install_list_reviewed' AND outcome=?", `digest:${sum}`);
-        return {children, adults, adultsAvailable: decisions.adultsAvailable, warnings: this.warnings([...children.map(c => ({child: c.name, devices: c.devices})), {child: null, devices: adults}], seen, now), digest: sum, reviewedAt: reviewed?.at ?? null};
+        return {children, adults, adultsAvailable: baseline.length > 0, adultsSource: ADULTS_SOURCE, warnings: this.warnings(children.map(c => ({child: c.name, devices: c.devices})), seen, now), digest: sum, reviewedAt: reviewed?.at ?? null};
     }
     private current(input: unknown): ReadinessDTO {
         if (typeof input !== 'string' || !DIGEST.test(input)) throw new AppError(400, 'invalid_digest');
@@ -104,7 +109,8 @@ export class InstallReadiness {
     get(session: AuthSession, path: string): Routed | null {
         if (path !== '/admin/install-readiness') return null;
         this.admin(session.dto.actor);
-        return {status: 200, body: this.build()};
+        const list = this.build();
+        return {status: 200, body: {...list, adults: list.adults.map(({mac: _mac, ...rest}): ReadinessAdult => rest)} satisfies ReadinessView};
     }
     async post(session: AuthSession, path: string, payload: unknown): Promise<Routed | null> {
         if (path === '/step-up/options') {
@@ -119,7 +125,9 @@ export class InstallReadiness {
     }
     private async approve(session: AuthSession, payload: unknown): Promise<Routed> {
         this.admin(session.dto.actor);
-        const body = object(payload, ['digest'], ['stepUp']), sum = this.current(body.digest).digest;
+        const body = object(payload, ['digest'], ['stepUp']), current = this.current(body.digest), sum = current.digest;
+        // A review without the protect list is partial: it cannot be approved.
+        if (!current.adultsAvailable) throw new AppError(409, 'install_list_incomplete');
         const proof = await this.auth.stepUpVerify(session, body.stepUp, binding(sum));
         this.auth.store.transaction(() => {
             const actor = this.auth.commitStepUp(session, proof);
@@ -135,7 +143,7 @@ export class InstallReadiness {
         this.admin(session.dto.actor);
         const list = this.current(object(payload, ['digest']).digest);
         this.auth.store.transaction(() => { this.record(session.dto.actor.id, 'install_list_exported', list.digest); });
-        const file: ReadinessExport = {version: 1, digest: list.digest, generatedAt: this.auth.now(), reviewed: list.reviewedAt !== null, children: list.children, adults: list.adults, adultsAvailable: list.adultsAvailable, warnings: list.warnings};
+        const file: ReadinessExport = {version: 1, digest: list.digest, generatedAt: this.auth.now(), reviewed: list.reviewedAt !== null, children: list.children, adults: list.adults, adultsAvailable: list.adultsAvailable, adultsSource: ADULTS_SOURCE, warnings: list.warnings};
         return {status: 200, body: {export: file}};
     }
 }
