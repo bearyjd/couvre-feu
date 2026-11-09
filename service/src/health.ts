@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { Store } from './db.ts';
-import { INVENTORY_POLL_SECONDS } from './inventory-store.ts';
+import { INVENTORY_POLL_SECONDS } from '../../shared/src/inventory-hints.ts';
 
 /** Everything /health may say. Add a field here only if it is safe for an unauthenticated caller to read. */
 export interface HealthBody {
