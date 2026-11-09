@@ -84,7 +84,7 @@ test('an existing integration database with a live operation migrates in place: 
         db.close(); chmodSync(path, 0o600);
         const store = new IntegrationStore(config);
         try {
-            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 11, '013 widens the parent audit actions again');
+            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12, '014 widens the parent audit actions again');
             assert.equal(store.integrationState().active_operation_id, 'op1');
             assert.equal(store.all('PRAGMA foreign_key_check').length, 0);
             assert.equal(store.get<{n: number}>('PRAGMA foreign_keys' as string) !== undefined, true);
@@ -217,7 +217,9 @@ test('removing devices: confirmed unenroll deletes the row, the last device take
         f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d_tmp',?,'T','mac',?,'active',1)", child, OUTSIDE);
         await assert.rejects(f.act(op, 'child_remove', child, {}), code('child_has_devices'));
         f.store.run("DELETE FROM devices WHERE id='d_tmp'");
+        f.store.run("INSERT INTO content_filter_desired(person_id,revision,desired_json,desired_sha256,state,state_at,updated_at,updated_by) VALUES(?,1,'{}',?,'pending',1,1,'operator'),('pilot',1,'{}',?,'pending',1,1,'operator')", child, 'a'.repeat(64), 'a'.repeat(64));
         assert.deepEqual((await f.act(op, 'child_remove', child, {})).body, {removed: child});
+        assert.deepEqual(f.store.all<{person_id: string}>('SELECT person_id FROM content_filter_desired').map(r => r.person_id), ['pilot'], "the removed child's desired filter is deleted with it, another child's is kept");
         assert.ok(!f.admin.list(fresh(op)).children.some(c => c.id === child));
     } finally { f.cleanup(); }
 });

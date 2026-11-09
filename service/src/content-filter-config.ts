@@ -15,7 +15,7 @@ export interface ContentFilterConfig {
     mode: ContentFilterMode; apiKeyFile?: string; defaultProfile?: string; profiles?: Readonly<Record<string, string>>;
 }
 /**
- * The NextDNS profile id rule. A later PR asserts this equals the NextDNS client's own pattern.
+ * The NextDNS profile id rule. content-filter-state.test.ts asserts this equals the NextDNS client's own pattern.
  * The key and profile ids are separate things: this validates profile ids only.
  */
 export const PROFILE_ID_PATTERN = /^[A-Za-z0-9]{4,32}$/;

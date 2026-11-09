@@ -14,7 +14,7 @@ const SCOPE_MAX = 64;
 const REFUSED_MAX = 20;
 const REFUSED_WINDOW_SECONDS = 60;
 
-export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end', 'reward_add', 'focus_start', 'owner_guard_refused'] as const;
+export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end', 'reward_add', 'focus_start', 'owner_guard_refused', 'content_filter_set', 'content_filter_loosened'] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 /** applied: accepted and queued (the router's own outcome stays on the operation). refused: rejected before anything was queued. failed: could not be carried out. */
 export type AuditResult = 'applied' | 'failed' | 'refused';
@@ -30,7 +30,7 @@ export interface AuditContext<T> {
 }
 
 /**
- * Who did what, per child. Stores ids and enums only (see migrations 010 to 013) and is written only when the manifest's auditLog.enabled is true.
+ * Who did what, per child. Stores ids and enums only (see migrations 010 to 014) and is written only when the manifest's auditLog.enabled is true.
  * A failed write is logged by tag and swallowed: an audit problem must never turn a router operation that succeeded into an error.
  */
 export class ParentAudit {
@@ -49,6 +49,17 @@ export class ParentAudit {
             const write = () => { for (const person of people) this.store.run('INSERT OR IGNORE INTO parent_audit(at,actor_id,action,person_id,operation_id,result) VALUES(?,?,?,?,?,?)', at, entry.actor, entry.action, person, entry.operationId ?? null, entry.result); };
             if (this.store.db.isTransaction) write(); else this.store.transaction(write);
         } catch { process.stderr.write('parent_audit_write_failed\n'); }
+    }
+
+    /**
+     * Like record, for a change that must not exist without its audit row: a failed insert throws (so the caller's transaction rolls back).
+     * Does nothing when the log is off. No refusal flood limit: it is for accepted changes only.
+     */
+    recordOrThrow(entry: AuditEntry): void {
+        if (!this.enabled) return;
+        const at = entry.at ?? this.now(), people = entry.people.length ? [...new Set(entry.people)] : [null];
+        const write = () => { for (const person of people) this.store.run('INSERT INTO parent_audit(at,actor_id,action,person_id,operation_id,result) VALUES(?,?,?,?,?,?)', at, entry.actor, entry.action, person, entry.operationId ?? null, entry.result); };
+        if (this.store.db.isTransaction) write(); else this.store.transaction(write);
     }
 
     /** Refused rows carry no operation id, so nothing else dedupes them: an actor's flood of refusals stops being stored after REFUSED_MAX in REFUSED_WINDOW_SECONDS. */

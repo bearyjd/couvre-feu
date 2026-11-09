@@ -40,9 +40,9 @@ const MAX_PAGE_ITEMS = 1000;
 // UNVERIFIED alphabets: the docs show only "abc123". Wide enough for hex or base36, narrow enough that no separator,
 // dot
 // or escape can pass.
-const PROFILE_ID = /^[A-Za-z0-9]{4,32}$/;
-const SERVICE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const DOMAIN = /^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]{0,251}[a-z0-9_])?$/;
+export const PROFILE_ID = /^[A-Za-z0-9]{4,32}$/;
+export const SERVICE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+export const DOMAIN = /^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]{0,251}[a-z0-9_])?$/;
 const CURSOR = /^[A-Za-z0-9_.=-]{1,128}$/;
 const API_KEY = /^[\x21-\x7e]{8,256}$/;
 const PROFILE_NAME = /^[^\u0000-\u001f\u007f]{0,100}$/u;
@@ -107,7 +107,7 @@ export class NextDnsEnvironmentError extends Error {
 }
 const OFF_VALUES = new Set(['', '0', 'false']);
 /**
- * Startup guard, to be called once by the service before it builds a client (wired in a later PR). The API key travels
+ * Startup guard, to be called once by the service before it builds a client (wired in wireContentFilter). The API key travels
  * in a request
  * header, so refuse an environment that would expose it: TLS verification disabled, or Node's env-proxy support
  * switched on (an
