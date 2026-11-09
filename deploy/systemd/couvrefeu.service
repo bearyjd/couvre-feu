@@ -21,6 +21,13 @@ WorkingDirectory=/opt/couvrefeu
 ExecStart=/usr/local/bin/node /opt/couvrefeu/service/src/integration-main.ts /etc/couvrefeu/manifest.json
 Restart=always
 RestartSec=5
+# Back off 5s -> 5min over 5 steps (needs systemd >= 254; Debian 13 ships 257) so a persistent runtime failure
+# does not restart ~17k times a day.
+RestartSteps=5
+RestartMaxDelaySec=5min
+# integration-main.ts exits 78 (EX_CONFIG) when it refuses to start (manifest, database version or migration, key files).
+# That is deterministic: do not loop. The unit stays stopped until a human reads `journalctl -u couvrefeu`.
+RestartPreventExitStatus=78
 UMask=0077
 # Node closes the listener and the database on SIGTERM.
 TimeoutStopSec=30

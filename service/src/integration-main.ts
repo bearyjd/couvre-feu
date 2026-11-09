@@ -9,13 +9,18 @@ import { startNotifications } from './push-runtime.ts';
 import type { Server as HTTPSServer } from 'node:https';
 
 if (process.argv.length !== 3) throw new Error('usage_integration_start_absolute_manifest');
-const config = integrationConfig(process.argv[2]), store = new IntegrationStore(config);
+// A refused start (manifest, database version/migration, key files) is deterministic: exit 78 (EX_CONFIG) so the systemd
+// unit's RestartPreventExitStatus=78 stops instead of looping. Anything else keeps exit 1 and is restarted.
+function refuseStart<T>(start: () => T): T {
+    try { return start(); } catch (error) { process.stderr.write(`startup_refused ${(error as Error).message}\n`); process.exit(78); }
+}
+const config = refuseStart(() => integrationConfig(process.argv[2])), store = refuseStart(() => new IntegrationStore(config));
 // SSH is disabled unless the private manifest explicitly enables a new owner epoch.
-const {worker, prune, app} = wireIntegration(config, store, new SSHRouter(config));
+const {worker, prune, app} = refuseStart(() => wireIntegration(config, store, new SSHRouter(config)));
 const automatic = config.dispatch?.enabled ? new AutomaticDispatch(worker) : null;
 if (!automatic) store.stopDispatch();
 const auth = new Auth(store, config.origin, undefined, {provenance: config.provenance, rpName: 'Couvre-feu private integration'});
-checkOwnerAccount(config, store);
+refuseStart(() => checkOwnerAccount(config, store));
 prune();
 const pruneTimer = setInterval(prune, 3600000);
 // Off unless push.enabled; a bad ntfy setting or any init failure is logged and leaves notifications off, and no later failure reaches request handling.

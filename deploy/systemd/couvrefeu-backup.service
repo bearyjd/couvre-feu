@@ -13,8 +13,9 @@ ExecStart=/usr/local/bin/node /opt/couvrefeu/deploy/backup.mjs
 UMask=0077
 TimeoutStartSec=10min
 
-# Hardening as the main unit. The database is opened read-only; /var/lib/couvrefeu is listed as writable only
-# because a WAL reader must be able to maintain the -shm index file next to the live database.
+# Hardening as the main unit. The database is opened read-only. /var/lib/couvrefeu is in ReadWritePaths only because a
+# WAL reader must maintain the -shm index file next to the live database; the service user already owns that
+# directory, so this adds no uid-level privilege.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

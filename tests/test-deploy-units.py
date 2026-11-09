@@ -27,7 +27,7 @@ APP_EXPECTED = [
     'After=network-online.target couvrefeu-agent.service', 'Wants=network-online.target', 'Requires=couvrefeu-agent.service',
     '[Service]', 'Type=simple', 'User=couvrefeu', 'Group=couvrefeu', 'WorkingDirectory=/opt/couvrefeu',
     'ExecStart=/usr/local/bin/node /opt/couvrefeu/service/src/integration-main.ts /etc/couvrefeu/manifest.json',
-    'StartLimitIntervalSec=0', 'Restart=always', 'RestartSec=5', 'UMask=0077', 'TimeoutStopSec=30', 'ReadWritePaths=/var/lib/couvrefeu',
+    'StartLimitIntervalSec=0', 'Restart=always', 'RestartSec=5', 'RestartSteps=5', 'RestartMaxDelaySec=5min', 'RestartPreventExitStatus=78', 'UMask=0077', 'TimeoutStopSec=30', 'ReadWritePaths=/var/lib/couvrefeu',
     'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX', 'TasksMax=64', 'MemoryMax=512M', *SANDBOX,
     '[Install]', 'WantedBy=multi-user.target',
 ]
@@ -44,7 +44,10 @@ HEARTBEAT_EXPECTED = [
     '[Unit]', 'Description=Couvre-feu heartbeat push', DOC_URL, 'After=network-online.target', 'Wants=network-online.target',
     '[Service]', 'Type=oneshot', 'ExecStart=/usr/local/sbin/couvrefeu-heartbeat', 'TimeoutStartSec=60', 'UMask=0077',
     'NoNewPrivileges=yes', 'ProtectSystem=strict', 'PrivateTmp=yes', 'ProtectKernelTunables=yes', 'ProtectKernelModules=yes',
-    'ProtectControlGroups=yes', 'RestrictRealtime=yes', 'LockPersonality=yes',
+    'ProtectControlGroups=yes', 'RestrictRealtime=yes', 'LockPersonality=yes', 'ProtectHome=read-only', 'PrivateDevices=yes',
+    'ProtectKernelLogs=yes', 'ProtectClock=yes', 'ProtectHostname=yes', 'RestrictNamespaces=yes', 'RestrictSUIDSGID=yes',
+    'SystemCallArchitectures=native', 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6', 'CapabilityBoundingSet=CAP_DAC_OVERRIDE',
+    'MemoryMax=64M', 'TasksMax=32',
 ]
 HEARTBEAT_TIMER_EXPECTED = [
     '[Unit]', 'Description=Couvre-feu heartbeat every minute', DOC_URL,
@@ -148,8 +151,20 @@ class DeployFiles(unittest.TestCase):
         self.assertIn('StartLimitIntervalSec=0', lines(unit))
         self.assertIn('Restart=always', lines(service))
         self.assertIn('RestartSec=5', lines(service))
+        self.assertEqual(sorted(l for l in lines(service) if l.startswith('Restart') and l != 'Restart=always'),
+                         ['RestartMaxDelaySec=5min', 'RestartPreventExitStatus=78', 'RestartSec=5', 'RestartSteps=5'])
         self.assertNotIn('StartLimitBurst', text)
         self.assertNotIn('WatchdogSec', text)
+
+    def test_heartbeat_keeps_cap_dac_override_to_reach_the_agent_socket(self):
+        caps = [l for l in lines(read('deploy', 'systemd', 'couvrefeu-heartbeat.service')) if l.startswith('CapabilityBoundingSet=')]
+        self.assertEqual(caps, ['CapabilityBoundingSet=CAP_DAC_OVERRIDE'])
+        self.assertNotIn('ProtectHome=yes', lines(read('deploy', 'systemd', 'couvrefeu-heartbeat.service')))
+
+    def test_exit_78_is_the_startup_refusal_code_in_the_service(self):
+        main = read('service', 'src', 'integration-main.ts')
+        self.assertIn('process.exit(78)', main)
+        self.assertIn('RestartPreventExitStatus=78', read('deploy', 'systemd', 'couvrefeu.service'))
 
     def test_heartbeat_and_backup_units_have_exactly_the_reviewed_directives(self):
         for name, expected in (('couvrefeu-heartbeat.service', HEARTBEAT_EXPECTED), ('couvrefeu-heartbeat.timer', HEARTBEAT_TIMER_EXPECTED),
@@ -242,7 +257,7 @@ class DeployFiles(unittest.TestCase):
         script = read('deploy', 'heartbeat.sh')
         pushes = [l for l in script.splitlines() if '?status=' in l and 'curl' in l]
         self.assertEqual(len(pushes), 1)
-        self.assertRegex(pushes[0], r"printf 'url = \"%s\?status=%s&msg=%s\"\\n' \"\$URL\" \"\$status\" \"\$msg\" \| curl -fsS -m 10 -K - >/dev/null")
+        self.assertRegex(pushes[0], r"printf 'url = \"%s\?status=%s&msg=%s\"\\n' \"\$URL\" \"\$status\" \"\$msg\" \| curl -q -fsS -m 10 --proto \"=\$PROTO\" --proto-redir \"=\$PROTO\" -K - >/dev/null")
         doc = DOC_PATH.read_text()
         self.assertNotIn('?status=...', doc)
         self.assertIn('bare monitor push URL', doc)
@@ -271,11 +286,23 @@ class DeployFiles(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze is not installed')
     def test_systemd_analyze_verify(self):
-        unit_paths = [UNITS / name for name in ('couvrefeu-agent.service', 'couvrefeu.service', 'couvrefeu-heartbeat.service',
-                      'couvrefeu-heartbeat.timer', 'couvrefeu-backup.service', 'couvrefeu-backup.timer')]
-        result = subprocess.run(['systemd-analyze', 'verify', *map(str, unit_paths)],
-                                capture_output=True, text=True, timeout=60)
-        # Only the interpreter binary may be absent on the machine running this check.
+        names = ('couvrefeu-agent.service', 'couvrefeu.service', 'couvrefeu-heartbeat.service',
+                 'couvrefeu-heartbeat.timer', 'couvrefeu-backup.service', 'couvrefeu-backup.timer')
+        version = subprocess.run(['systemd-analyze', '--version'], capture_output=True, text=True, timeout=60)
+        match = re.match(r'systemd (\d+)', version.stdout)
+        old_systemd = bool(match) and int(match.group(1)) < 254  # RestartSteps/RestartMaxDelaySec arrived in 254
+        with tempfile.TemporaryDirectory() as tmp:
+            unit_paths = []
+            for name in names:
+                text = (UNITS / name).read_text()
+                if old_systemd:
+                    text = ''.join(l for l in text.splitlines(True) if not l.startswith(('RestartSteps=', 'RestartMaxDelaySec=')))
+                path = Path(tmp) / name
+                path.write_text(text)
+                unit_paths.append(path)
+            result = subprocess.run(['systemd-analyze', 'verify', *map(str, unit_paths)],
+                                    capture_output=True, text=True, timeout=60)
+        # Only the interpreter/script binaries may be absent on the machine running this check.
         problems = unit_verify_problems(result.stderr, unit_paths)
         self.assertEqual(problems, [], result.stderr)
 

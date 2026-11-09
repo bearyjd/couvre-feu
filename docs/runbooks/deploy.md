@@ -103,7 +103,7 @@ Either way, alert when the agent is empty: the heartbeat in [Monitoring (heartbe
 
 The agent starts empty after every reboot or agent restart, so router dispatch fails closed until a human re-adds the key. Do not remove the passphrase to avoid this.
 
-The app unit uses `Restart=always`, `RestartSec=5` and `StartLimitIntervalSec=0`, so systemd keeps restarting it after any exit and never parks it in a start-limit `failed` state. There is deliberately no `WatchdogSec`; the heartbeat watches it from outside.
+The app unit uses `Restart=always`, `RestartSec=5` and `StartLimitIntervalSec=0`, so systemd restarts it after any exit and never parks it in a start-limit `failed` state. `RestartSteps=5` and `RestartMaxDelaySec=5min` back the delay off from 5 s to 5 min on repeated failures (they need systemd 254 or newer; Debian 13 ships 257), and `RestartPreventExitStatus=78` stops the loop for a deterministic startup refusal, because `integration-main.ts` exits 78 (`EX_CONFIG`) when the manifest, database version or migration, or key files are refused. There is deliberately no `WatchdogSec`; the heartbeat watches it from outside.
 
 The units use strict sandboxing (`ProtectSystem=strict` with only the data directory writable, `NoNewPrivileges`, empty capability set, syscall and address-family filters). `MemoryDenyWriteExecute` is deliberately not set on the app because V8 needs it. In some unprivileged LXC setups a sandbox option can fail to start (`status=218/CAPABILITIES`, `226/NAMESPACE`); remove only the offending line, record it, and keep the rest.
 
@@ -154,7 +154,7 @@ Passkeys are bound to the RP ID, which is the hostname of `publicOrigin` (`cf.ex
 
 [`deploy/heartbeat.sh`](../../deploy/heartbeat.sh) runs every minute from `couvrefeu-heartbeat.timer` (`OnBootSec=2min`, `OnUnitActiveSec=1min`) and pushes one result to a monitor you operate. It reports `status=up` only if `couvrefeu` and `couvrefeu-agent` are both **enabled** at boot, `couvrefeu` is active, the agent holds a key and, when `HEARTBEAT_HEALTH_URL` is set, a content-free `GET` of it returns 200 with `"ok":true`. Otherwise it reports `status=down` with one fixed `msg` token: `service-disabled`, `service-down`, `agent-empty` or `health-failed`.
 
-Keep the **bare monitor push URL** (no query string) in a root-only file, because it is a credential. The script reads it inside, hands it to `curl` on stdin (`-K -`) and never prints it or puts it in argv (`ps` and `/proc/<pid>/cmdline` would show it). A missing or malformed file makes the run log to the journal and exit non-zero without pushing.
+Keep the **bare monitor push URL** (no query string) in a root-only file, because it is a credential: the script refuses a symlink or anything not owned by root with mode `0600`, so `chmod 0600` it. The script reads it inside, hands it to `curl` on stdin (`-K -`) and never prints it or puts it in argv (`ps` and `/proc/<pid>/cmdline` would show it). A missing, unsafe or malformed file makes the run log to the journal and exit non-zero without pushing. URLs (push and health) must be `https://` and use only `A-Za-z0-9._~:/@+%-`; anything else is refused (a bad health URL reports `health-failed`). `curl` runs with `-q` (ignores `~/.curlrc`), pinned to https, a 10 s limit and, for `/health`, a 64 KiB size limit. Plain `http://` is accepted only with `HEARTBEAT_ALLOW_HTTP=1` in the same drop-in; that is fine on a LAN for the content-free `/health` (`http://<APP_IP>:4273/health`) but do not use it for a push URL that crosses the internet.
 
 ```sh
 # as root, from the unpacked release in /opt/couvrefeu
@@ -166,11 +166,19 @@ systemctl enable --now couvrefeu-heartbeat.timer
 journalctl -u couvrefeu-heartbeat -n 5 --no-pager   # "status=up msg=ok"
 ```
 
-Defaults are `HEARTBEAT_URL_FILE=/root/couvrefeu-key/heartbeat-push-url` and the agent socket `/run/couvrefeu/agent.sock`; set `HEARTBEAT_URL_FILE=/root/couvrefeu-key/<PUSH_URL_FILE>` (and optionally `HEARTBEAT_HEALTH_URL=http://<APP_IP>:4273/health`, once /health is deployed) with `systemctl edit couvrefeu-heartbeat.service`. Configure the monitor to alert on `status=down` **and** on missing beats, which also covers a dead host. Do not add a check that sends router commands unless it is a reviewed, read-only status call.
+Defaults are `HEARTBEAT_URL_FILE=/root/couvrefeu-key/heartbeat-push-url` and the agent socket `/run/couvrefeu/agent.sock`; set `HEARTBEAT_URL_FILE=/root/couvrefeu-key/<PUSH_URL_FILE>` (and optionally `HEARTBEAT_HEALTH_URL=https://cf.example.invalid/health`, or `http://<APP_IP>:4273/health` together with `HEARTBEAT_ALLOW_HTTP=1`, once /health is deployed) with `systemctl edit couvrefeu-heartbeat.service`. The unit is sandboxed but keeps `CapabilityBoundingSet=CAP_DAC_OVERRIDE` (root needs it to reach the agent socket in `/run/couvrefeu`, which is `0700` owned by the service user) and `ProtectHome=read-only` (the push URL file lives under `/root`). To also restrict where it can connect, add an optional drop-in (`systemctl edit couvrefeu-heartbeat.service`) with placeholders:
+
+```ini
+[Service]
+IPAddressDeny=any
+IPAddressAllow=<MONITOR_IP> <APP_IP>
+```
+
+Configure the monitor to alert on `status=down` **and** on missing beats, which also covers a dead host. If the app exits with code 78 (it refused to start: bad manifest, database version or migration, key files) systemd deliberately does not restart it (`RestartPreventExitStatus=78`); the heartbeat then reports `service-down` until a human reads `journalctl -u couvrefeu`, fixes the cause and runs `systemctl start couvrefeu`. Do not add a check that sends router commands unless it is a reviewed, read-only status call.
 
 ## Backups
 
-`couvrefeu-backup.timer` runs `deploy/backup.mjs` daily (03:30 plus up to 30 minutes of random delay, `Persistent=true` so a missed run happens at next boot) as the service user. It needs no `sqlite3` CLI: it opens the live database read-only, makes a consistent online copy with `VACUUM INTO`, syncs it, verifies it (`PRAGMA integrity_check` is `ok` and `user_version` equals the source) and only then renames it to `/var/backups/couvrefeu/integration-YYYY-MM-DD.sqlite` (mode `0600`). It keeps the newest 14 and never deletes or overwrites anything that is not named exactly `integration-YYYY-MM-DD.sqlite`. A second run on the same day is a no-op while the existing copy is good; a same-day file that is damaged or from an older schema is replaced only by a verified new copy. The unit lists the data directory as writable only because a WAL reader must maintain the `-shm` file; the script never writes the database.
+`couvrefeu-backup.timer` runs `deploy/backup.mjs` daily (03:30 plus up to 30 minutes of random delay, `Persistent=true` so a missed run happens at next boot) as the service user. It needs no `sqlite3` CLI: it opens the live database read-only, makes a consistent online copy with `VACUUM INTO`, syncs it, verifies it (`PRAGMA integrity_check` is `ok` and `user_version` equals the source) and only then renames it to `/var/backups/couvrefeu/integration-YYYY-MM-DD.sqlite` (mode `0600`). It keeps the newest 14 and never deletes or overwrites anything that is not named exactly `integration-YYYY-MM-DD.sqlite`. A second run on the same day is a no-op while the existing copy is good; a same-day file that is damaged or from an older schema is replaced only by a verified new copy. The script never modifies the database, but the unit lists the data directory under `ReadWritePaths` because a WAL reader must maintain the `-shm` file; the service user already owns that directory, so this adds no uid-level privilege. The backup directory must be owned by the service user with no group/other access, or the script refuses to run.
 
 ```sh
 install -d -o couvrefeu -g couvrefeu -m 0700 /var/backups/couvrefeu
@@ -181,13 +189,14 @@ systemctl start couvrefeu-backup.service && journalctl -u couvrefeu-backup -n 5 
 ls -l /var/backups/couvrefeu
 ```
 
-Backups live on the same host, so copy them off it with a job you already operate. Treat them like the database: they hold household data.
+**Off-host copy is required.** A backup on the same host dies with the host. The backups hold children, device and audit data, so copy them off the LXC with an **encrypted** tool such as `age` or `restic`, with the encryption key held off the LXC (never in `/var/lib/couvrefeu` or `/etc/couvrefeu`), and test that you can decrypt one. Never ship the plain `.sqlite` files.
 
 **Restore.** Restoring replaces the whole database, so every enrolled session and policy returns to the backup's state.
 
 ```sh
 systemctl stop couvrefeu
-mkdir /var/lib/couvrefeu/aside-$(date +%F) && mv /var/lib/couvrefeu/integration.sqlite* /var/lib/couvrefeu/aside-$(date +%F)/
+ASIDE=/var/lib/couvrefeu/aside-$(date +%F)
+mkdir "$ASIDE" && mv /var/lib/couvrefeu/integration.sqlite* "$ASIDE"/
 install -m 0600 -o couvrefeu -g couvrefeu /var/backups/couvrefeu/integration-<YYYY-MM-DD>.sqlite /var/lib/couvrefeu/integration.sqlite
 node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; const d = new DatabaseSync(process.argv[1], {readOnly: true}); console.log(d.prepare('PRAGMA user_version').get(), d.prepare('PRAGMA integrity_check').get())" /var/lib/couvrefeu/integration.sqlite   # user_version = expected schema, integrity_check = ok
 systemctl start couvrefeu

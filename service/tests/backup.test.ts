@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -22,8 +22,11 @@ function fixture() {
     return {root, dest, db, live, cleanup: () => { live.close(); rmSync(root, {recursive: true, force: true}); }};
 }
 function backup(f: {db: string, dest: string}, date: string, ...extra: string[]) {
+    return backupEnv(f, date, {}, ...extra);
+}
+function backupEnv(f: {db: string, dest: string}, date: string, env: Record<string, string>, ...extra: string[]) {
     return spawnSync(process.execPath, [SCRIPT, '--db', f.db, '--dest', f.dest, '--date', date, ...extra],
-        {encoding: 'utf8', timeout: RUN_MS});
+        {encoding: 'utf8', timeout: RUN_MS, env: {...process.env, ...env}});
 }
 function rows(path: string) {
     const db = new DatabaseSync(path, {readOnly: true});
@@ -149,5 +152,83 @@ test('a same-day copy with an older schema version is replaced after a migration
         const result = backup(f, '2026-03-01');
         assert.equal(result.status, 0, result.stderr);
         assert.equal(rows(join(f.dest, 'integration-2026-03-01.sqlite')).version, 15);
+    } finally { f.cleanup(); }
+});
+
+test('an impossible calendar date in a file name is foreign and never evicts real backups', () => {
+    const f = fixture();
+    try {
+        for (const d of ['2099-99-99', '2026-02-30', '2026-13-01']) writeFileSync(join(f.dest, `integration-${d}.sqlite`), 'fake');
+        for (let i = 1; i <= 14; i++) writeFileSync(join(f.dest, `integration-${day(i)}.sqlite`), 'old');
+        const result = backup(f, '2026-02-01');
+        assert.equal(result.status, 0, result.stderr);
+        const names = readdirSync(f.dest);
+        for (const d of ['2099-99-99', '2026-02-30', '2026-13-01']) assert.ok(names.includes(`integration-${d}.sqlite`), d);
+        const real = names.filter((n) => /^integration-2026-0[12]-\d{2}\.sqlite$/.test(n) && !n.includes('02-30')).sort();
+        assert.equal(real.length, 14);
+        assert.ok(!names.includes('integration-2026-01-01.sqlite'), 'the oldest real backup is pruned, not a real one kept for a fake');
+        assert.ok(names.includes('integration-2026-01-14.sqlite') && names.includes('integration-2026-02-01.sqlite'));
+    } finally { f.cleanup(); }
+});
+
+test('a backup directory with group or other access is refused', () => {
+    const f = fixture();
+    try {
+        for (const mode of [0o755, 0o750, 0o707]) {
+            chmodSync(f.dest, mode);
+            const result = backup(f, '2026-03-01');
+            assert.notEqual(result.status, 0, mode.toString(8));
+            assert.match(result.stderr, /no group\/other access/);
+            assert.deepEqual(readdirSync(f.dest), []);
+        }
+        chmodSync(f.dest, 0o700);
+        assert.equal(backup(f, '2026-03-01').status, 0);
+    } finally { f.cleanup(); }
+});
+
+test('the copy is created private even under a permissive umask', () => {
+    const f = fixture();
+    try {
+        const result = spawnSync('sh', ['-c', 'umask 000; exec "$0" "$@"', process.execPath, SCRIPT, '--db', f.db, '--dest', join(f.root, 'fresh'), '--date', '2026-03-01'],
+            {encoding: 'utf8', timeout: RUN_MS});
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(statSync(join(f.root, 'fresh')).mode & 0o777, 0o700);
+        assert.equal(statSync(join(f.root, 'fresh', 'integration-2026-03-01.sqlite')).mode & 0o777, 0o600);
+    } finally { f.cleanup(); }
+});
+
+for (const fault of ['truncate-partial', 'change-user-version']) {
+    test(`injected fault ${fault} after VACUUM INTO fails closed: no partial, earlier backups byte-identical`, () => {
+        const f = fixture();
+        try {
+            assert.equal(backup(f, '2026-03-01').status, 0);
+            const earlier = join(f.dest, 'integration-2026-03-01.sqlite');
+            const digest = sha(earlier), before = readdirSync(f.dest);
+            const result = backupEnv(f, '2026-03-02', {NODE_ENV: 'test', COUVREFEU_BACKUP_TEST_FAULT: fault});
+            assert.notEqual(result.status, 0);
+            assert.match(result.stderr, /copy failed verification/);
+            assert.deepEqual(readdirSync(f.dest), before);
+            assert.equal(sha(earlier), digest);
+            // The seam is inert without NODE_ENV=test, so production can never trigger it.
+            const inert = backupEnv(f, '2026-03-02', {NODE_ENV: 'production', COUVREFEU_BACKUP_TEST_FAULT: fault});
+            assert.equal(inert.status, 0, inert.stderr);
+            assert.deepEqual(rows(join(f.dest, 'integration-2026-03-02.sqlite')), rows(f.db));
+        } finally { f.cleanup(); }
+    });
+}
+
+test('a briefly locked rollback-journal source is waited for (busy timeout) instead of failing at once', async () => {
+    const f = fixture();
+    try {
+        const path = join(f.root, 'journal.sqlite');
+        const locker = new DatabaseSync(path);
+        locker.exec("PRAGMA journal_mode=DELETE; PRAGMA user_version=3; CREATE TABLE child (id INTEGER PRIMARY KEY, name TEXT NOT NULL); INSERT INTO child (name) VALUES ('a'); BEGIN EXCLUSIVE;");
+        const child = spawn(process.execPath, [SCRIPT, '--db', path, '--dest', f.dest, '--date', '2026-03-01'], {stdio: 'pipe'});
+        const exit = new Promise<number | null>((resolve) => child.on('close', resolve));
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        locker.exec('COMMIT');
+        locker.close();
+        assert.equal(await exit, 0);
+        assert.equal(rows(join(f.dest, 'integration-2026-03-01.sqlite')).version, 3);
     } finally { f.cleanup(); }
 });
