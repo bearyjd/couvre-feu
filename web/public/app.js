@@ -31,12 +31,17 @@ const inventory = createInventory({ session: () => state.session, gate: () => co
   version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
-  session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
+  session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine, serviceDown: null,
   busy: false, needsRefresh: true, refreshing: false, localUnknown: false, operation: null,
   generation: 0, renderKey: '', logoutRequired: needsServerLogout(), durations: new Map(),
   authController: null,
   scheduleClockBasis: null,
 };
+
+// The service did not answer in its own protocol: dead service, proxy error page, or a reply that is not Couvre-feu JSON.
+class UnreachableError extends Error {
+  constructor(status) { super('Couvre-feu is not responding.'); this.status = status; }
+}
 
 class APIError extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
@@ -47,9 +52,17 @@ async function api(path, { method = 'GET', body, headers = {}, signal } = {}) {
     method, credentials: 'same-origin', cache: 'no-store', headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
     body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12000)]) : AbortSignal.timeout(12000),
   });
-  const result = await response.json();
+  let result;
+  try { result = await response.json(); } catch { throw new UnreachableError(response.status); }
   if (!response.ok) throw new APIError(response.status, result.error?.code ?? 'request_failed', result.error?.message ?? 'The request could not be completed.');
   return result;
+}
+
+// Phone online but the service did not answer: remember when it first failed (retries keep the stamp).
+function noteFailure(error) {
+  const unreachable = navigator.onLine && !(error instanceof APIError);
+  state.offline = !navigator.onLine || !(error instanceof APIError);
+  state.serviceDown = unreachable ? { since: state.serviceDown?.since ?? Math.floor(Date.now() / 1000), status: error instanceof UnreachableError && error.status ? error.status : null } : null;
 }
 
 function announce(message, error = false) {
@@ -91,7 +104,7 @@ function deviceEvidenceLabel(device) {
 function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
 // Why mutating controls are unavailable right now (null = available). One source for per-person controls and the bulk panel.
 function controlBlock() {
-  if (state.offline) return 'Offline';
+  if (state.offline) return state.serviceDown ? 'Couvre-feu is not responding' : 'Offline';
   if (state.busy || unsettled()) return 'A change is already in progress';
   const fresh = state.session && state.people && !state.refreshing && !state.needsRefresh && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now();
   return fresh ? null : 'Status is out of date — refresh';
@@ -102,7 +115,7 @@ function resetView() {
   state.generation++;
   state.authController?.abort(); state.authController = null;
   state.session = null; state.snapshotActor = null; state.snapshotExpiresAt = null; state.people = null; state.savedAt = null; state.scheduleClockBasis = null;
-  state.operation = null; state.localUnknown = false; state.needsRefresh = true; state.renderKey = '';
+  state.operation = null; state.localUnknown = false; state.serviceDown = null; state.needsRefresh = true; state.renderKey = '';
   state.busy = false; state.refreshing = false; state.durations.clear();
   clearStatusCache();
   alertJournal.clear();
@@ -148,7 +161,7 @@ async function completePendingLogout() {
 
 async function refresh({ quiet = false } = {}) {
   if (state.refreshing || state.busy || state.logoutRequired && state.offline) return false;
-  if (state.offline || !navigator.onLine) { state.offline = true; state.needsRefresh = true; render(); return false; }
+  if (!navigator.onLine || state.offline && !state.serviceDown) { state.offline = true; state.serviceDown = null; state.needsRefresh = true; render(); return false; }
   const generation = state.generation;
   state.refreshing = true;
   renderConnection(); renderControlState(); renderAuthControls();
@@ -162,7 +175,7 @@ async function refresh({ quiet = false } = {}) {
     const people = await api('/people');
     if (generation !== state.generation) return false;
     if (people.source !== session.source || (people.integrationScope ?? null) !== (session.integrationScope ?? null)) throw new APIError(401, 'installation_scope_changed', 'The installation changed. Reload and sign in again.');
-    state.people = people; state.savedAt = now(); state.offline = false; state.needsRefresh = false;
+    state.people = people; state.savedAt = now(); state.offline = false; state.serviceDown = null; state.needsRefresh = false;
     state.scheduleClockBasis = {wall: Date.now() / 1000, started: performance.now() / 1000};
     const latest = state.operation && people.people.find((person) => person.id === state.operation.personId)?.latestOperation;
     if (latest?.id === state.operation?.id) state.operation = latest;
@@ -181,9 +194,10 @@ async function refresh({ quiet = false } = {}) {
       resetView();
       if (hadStatus || !quiet) announce('Your session or permissions changed. Sign in again to see permitted status.', true);
     } else {
-      state.offline = !navigator.onLine || !(error instanceof APIError);
+      noteFailure(error);
       if (!state.people && state.offline) showCachedStatus();
-      if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
+      if (state.serviceDown) announce('');
+      else if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
     }
     return false;
   } finally {
@@ -313,8 +327,11 @@ async function mutate(personId, action, presetSeconds, minutes) {
     } else {
       outcome = { sent: false, reason: 'The outcome is unknown; check the pause status before trying again.' };
       state.localUnknown = true;
-      state.offline = !navigator.onLine;
-      announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
+      // Same banner as refresh/followOperation, with the unknown-outcome wording (localUnknown is set); only the offline flag differs:
+      // a lost mutation response must not block the Refresh that resolves it.
+      noteFailure(error); state.offline = !navigator.onLine;
+      if (state.serviceDown) announce('');
+      else announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
     }
   } finally {
     if (generation === state.generation) { state.busy = false; render(); }
@@ -368,8 +385,10 @@ async function followOperation(id, generation) {
       if (error instanceof APIError && [401, 403, 404].includes(error.status)) {
         resetView(); announce('Operation access changed. Sign in again to refresh permitted status.', true);
       } else {
-        state.needsRefresh = true; state.localUnknown = true; state.offline = !navigator.onLine || !(error instanceof APIError);
-        announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true); render();
+        state.needsRefresh = true; state.localUnknown = true; noteFailure(error);
+        if (state.serviceDown) announce('');
+        else announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true);
+        render();
       }
       return;
     }
@@ -393,7 +412,7 @@ function renderConnection() {
   if (!state.people) return;
   const stale = age() > FRESH_SECONDS || state.needsRefresh;
   const diagnosticsOpen = $('#connection details')?.open;
-  const status = state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : isReal() ? 'Connected · cached router observation' : 'Connected · current synthetic observation';
+  const status = state.serviceDown ? 'Not responding · read-only snapshot' : state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : isReal() ? 'Connected · cached router observation' : 'Connected · current synthetic observation';
   $('#connection').className = `connection${state.offline ? ' offline' : stale ? ' stale' : ''}`;
   $('#connection').innerHTML = `<strong>${escape(status)}</strong>Observed ${escape(time(state.people.observedAt))} · <span data-age>${Number.isFinite(age()) ? escape(duration(age())) + ' ago' : 'age unavailable'}</span>${state.savedAt ? ` · cached ${escape(time(state.savedAt))}` : ''}<details class="diagnostics" ${diagnosticsOpen ? 'open' : ''}><summary>${isReal() ? 'Router observation details' : 'Advanced demo status'}</summary><p>Service desired ${escape(state.people.serviceDesiredRevision)} · router desired ${escape(state.people.routerDesiredRevision ?? 'unknown')} · router confirmed ${escape(state.people.routerConfirmedRevision ?? 'unconfirmed')}${state.people.errors.length ? `<br>Observation errors: ${escape(state.people.errors.join(', '))}` : ''}<br>Source: ${isReal() ? 'real router integration · packet acceptance unmeasured' : 'synthetic fake router · target compatibility unverified'}</p></details>`;
 }
@@ -465,7 +484,19 @@ function renderAlerts() {
   panel.hidden = false;
 }
 
+function renderServiceDown() {
+  const box = $('#service-down'), down = state.serviceDown;
+  box.hidden = !down;
+  if (!down) { delete box.dataset.since; return; }
+  box.dataset.since = String(down.since);
+  const at = new Date(down.since * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  $('#service-down-text').textContent = unsettled() ? `Couvre-feu is not responding (since ${at}). A change you just made may or may not have gone through. Check the status once it is back.` : `Couvre-feu is not responding (since ${at}). Nothing was changed. Check your connection, then tap Retry.`;
+  $('#service-down-detail').textContent = down.status ? `The service answered with status ${down.status}.` : 'The service did not answer.';
+  $('#service-retry').disabled = state.refreshing;
+}
+
 function render() {
+  renderServiceDown();
   const hasStatus = Boolean(state.people && actor());
   $('#auth-view').hidden = hasStatus;
   $('#status-view').hidden = !hasStatus;
@@ -550,9 +581,9 @@ $('#people').addEventListener('click', (event) => {
   const button = event.target.closest('[data-control], [data-quick-pause]');
   if (button && !button.disabled) void mutate(button.dataset.personId, button.dataset.quickPause ? 'pause' : button.dataset.control, button.dataset.quickPause);
 });
-window.addEventListener('offline', () => { state.offline = true; state.needsRefresh = true; render(); announce('Offline. Last observed status is read-only; no control requests will be queued.'); });
+window.addEventListener('offline', () => { state.offline = true; state.serviceDown = null; state.needsRefresh = true; render(); announce('Offline. Last observed status is read-only; no control requests will be queued.'); });
 window.addEventListener('online', async () => {
-  state.offline = false; state.needsRefresh = true; render();
+  state.offline = false; state.serviceDown = null; state.needsRefresh = true; render();
   if (state.logoutRequired || needsServerLogout()) {
     try { await completePendingLogout(); announce('Server sign-out completed. Sign in again to refresh permitted status.'); }
     catch { announce('Server sign-out is still unconfirmed. Local status remains cleared.', true); }
@@ -573,9 +604,10 @@ window.addEventListener('storage', (event) => {
     state.logoutRequired = false;
   }
 });
+$('#service-retry').addEventListener('click', () => void refresh({ quiet: true }));
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.session && !state.busy) void refresh({ quiet: true }); });
 setInterval(tick, 1000);
-setInterval(() => { if (state.session && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh) void refresh({ quiet: true }); }, 10000);
+setInterval(() => { if (state.session && !state.busy && !state.refreshing && (state.serviceDown || !state.offline && !state.needsRefresh)) void refresh({ quiet: true }); }, 10000);
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { /* Online UI remains usable; offline installation is not claimed. */ });
 render();

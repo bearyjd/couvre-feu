@@ -1,0 +1,45 @@
+# Couvre-feu daily database backup. Runs as the service user. See docs/runbooks/deploy.md "Backups".
+# /var/backups/couvrefeu must exist, owned by couvrefeu, mode 0700 (ProtectSystem=strict needs it to exist).
+[Unit]
+Description=Couvre-feu database backup
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+
+[Service]
+Type=oneshot
+User=couvrefeu
+Group=couvrefeu
+WorkingDirectory=/opt/couvrefeu
+ExecStart=/usr/local/bin/node /opt/couvrefeu/deploy/backup.mjs
+UMask=0077
+TimeoutStartSec=10min
+
+# Hardening as the main unit. The database is opened read-only. /var/lib/couvrefeu is in ReadWritePaths only because a
+# WAL reader must maintain the -shm index file next to the live database; the service user already owns that
+# directory, so this adds no uid-level privilege.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/backups/couvrefeu /var/lib/couvrefeu
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+LimitCORE=0
+TasksMax=32
+MemoryMax=512M
