@@ -459,7 +459,7 @@ export function createInventory({ session, gate, offline, time, children, versio
     body.replaceChildren(
       el('p', { class: 'fine-print' }, 'What the router has seen. Device names are chosen by the devices themselves and are not verified. Protected devices are never listed.'),
       el('p', { class: 'notice', 'data-inventory-status': status.kind }, status.text, ...(summary ? [' ', el('strong', clear ? { 'data-all-clear': '' } : {}, summary)] : [])),
-      ...(stale ? [el('p', { class: 'fine-print', 'data-inventory-snapshot': '' }, `Showing a saved list from ${time(loadedAt)}. It updates when the connection returns.`)] : []),
+      ...(stale ? [el('p', { class: 'fine-print', 'data-inventory-snapshot': '' }, offline() ? `Showing a saved list from ${time(loadedAt)}. It updates when the connection returns.` : `Showing a saved list from ${time(loadedAt)}. Couvre-feu did not answer, so it may be out of date. Use Refresh now to try again.`)] : []),
       el('p', { class: 'fine-print', 'data-inventory-reason': '', hidden: !reason }, reason),
       el('div', { class: 'inventory-actions' }, el('button', { class: 'button secondary', type: 'button', disabled: locked, onclick: () => void refreshNow() }, 'Refresh now')),
       el('ul', { class: 'account-list', 'aria-label': 'Devices on the network' }, ...ordered.map((device) => deviceRow(device, locked))));
