@@ -1,10 +1,10 @@
 # Roadmap
 
-Status as of 2026-10-29; planned additions added 2026-10-27. This is the current plan; the original proposal was an internal planning note that is no longer kept in the repository. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
+Status as of 2026-10-29 (items 11-13 added 2026-11-08); planned additions added 2026-10-27. This is the current plan; the original proposal was an internal planning note that is no longer kept in the repository. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
 
 ## Planned additions at a glance
 
-Ten additions picked from the comparable-products research (PR #90), phased in. Details, owner decisions and rules: [Planned additions](#planned-additions) and [Plan](#plan).
+Ten additions picked from the comparable-products research (PR #90), plus three content-filtering items (11-13, [PRP-006](prp/PRP-006-content-filtering.md), owner decision 2026-11-08), phased in. Items 11-13 use PRP-006's own phases A-C, separate from Phases 0-5. Details, owner decisions and rules: [Planned additions](#planned-additions) and [Plan](#plan).
 
 | # | Addition | Phase | State |
 |---|---|---|---|
@@ -18,6 +18,9 @@ Ten additions picked from the comparable-products research (PR #90), phased in. 
 | 10 | Guest / visitor profile (internet only, no LAN) | 4 | Not started |
 | 8 | Per-child daily online time, labelled an estimate | 5 | Not started |
 | 9 | DNS hardening (wider DoH list; port 853 is already blocked for kids). The VPN/Tor list (9c) is NOT BUILT, see [Do not build](#do-not-build) | 5 (or 4) | Rule lifted for the kids' firewall DNS rules only (2026-10-27); VPN/Tor list decided not to build (2026-10-28) |
+| 11 | Content filtering: per-child NextDNS profiles managed by the service ([PRP-006](prp/PRP-006-content-filtering.md), [stack and risks](content-filtering-stack.md)) | A (no router) | Proposal only (2026-11-08); owner decided NextDNS + CLI on router, Family Link off-network |
+| 12 | Filter delivery: NextDNS CLI on the router, child MAC → profile, strict default | B (router; needs exception E1 to `AGENTS.md:39`) | Proposal only; blocked on E1 and a read-only inspection |
+| 13 | Device coverage matrix and bypass detection (traffic without DNS, single long flow, per-child DNS-reject attribution), counts only | C (service first; attribution rides the Phase 4 release) | Proposal only |
 
 Phase 0 (prove what already exists) comes before all of them.
 
@@ -99,11 +102,11 @@ Also avoid OpenAppFilter code (GPL-2.0, not combinable with this AGPL-3.0 projec
   - `service/src/http.ts`: one route PR per phase; rebase, do not stack.
   - `shared/src/router-schema.ts`: only Phase 4 (new desired-JSON fields) and Phase 3 if S5 is taken.
   - `web/public/app.js`: one UI PR in flight at a time; the planned split of tab logic out of `app.js` (Follow-ups) goes before Phase 3 if it can.
-  - `router/` release bytes: at most two new release ids for all ten items (Phase 4, and Phase 5 only if DNS is not ready in time).
+  - `router/` release bytes: at most two new release ids for items 1-10; items 11-13 (PRP-006) add the E1 delivery release and C3/C5 counters, where the read-only C3/C5 counters ride the Phase 4 release and the E1 delivery release needs E1 first (Phase 4, and Phase 5 only if DNS is not ready in time).
 
 ### Privacy design gate
 
-Every PR in Phases 1-5 states in its description how it meets these; reviewers block on a miss.
+Every PR in Phases 1-5 and PRP-006 phases A-C states in its description how it meets these; reviewers block on a miss.
 
 - No domains, URLs, page titles, search terms or content anywhere: database, logs, alerts, pushes, digests.
 - Counts and action types only. Alert `details` keep the existing rule: at most 1024 bytes; counts, windows, operation ids; never MACs, addresses, domains or router diagnostics.
