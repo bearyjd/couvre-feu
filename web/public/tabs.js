@@ -2,8 +2,8 @@
 // that is shown or hidden around them, so the modules that fill the panels never know the tabs exist.
 const TABS = [
   { id: 'home', label: 'Home', heading: '#people-title' },
-  { id: 'kids', label: 'Kids', heading: '#kids-heading', needsInfrastructure: true },
-  { id: 'devices', label: 'Devices', heading: '#devices-heading', needsInfrastructure: true },
+  { id: 'kids', label: 'Kids', heading: '#children-title', needsInfrastructure: true },
+  { id: 'devices', label: 'Devices', heading: '#inventory-title', needsInfrastructure: true },
   { id: 'alerts', label: 'Alerts', heading: '#alerts-heading' },
   { id: 'more', label: 'More', heading: '#more-heading' },
 ];
@@ -11,7 +11,7 @@ const TABS = [
 const SUBS = {
   home: { requests: '#time-requests', bulk: '#bulk-panel' },
   alerts: { parent: '#parent-alerts', browser: '#operational-alerts' },
-  more: { schedules: '#schedule-editor', activity: '#activity-panel', audit: '#audit-panel', accounts: '#accounts-panel' },
+  more: { schedules: '#schedule-editor', activity: '#activity-panel', audit: '#audit-panel', accounts: '#accounts-panel', about: '#about-panel' },
 };
 const ROUTE = /^#(home|kids|devices|alerts|more)(?:\/([a-z-]+))?$/;
 const SUB_SECONDS = 6; // a sub-hash target that loads late is scrolled to once, but only soon after the link was opened
@@ -41,8 +41,19 @@ export function createTabs({ bar = document.querySelector('#tabbar') } = {}) {
   function showEmptyNotes() {
     for (const { panel } of tabs.values()) {
       const note = panel.querySelector(':scope > .tab-empty');
-      if (note) setHidden(note, [...panel.children].some((child) => child !== note && !child.matches('.tab-heading') && !child.hidden));
+      if (note) setHidden(note, [...panel.children].some((child) => child !== note && !child.matches('.tab-heading, .more-jump') && !child.hidden));
     }
+  }
+
+  // The jump list on More offers only the sections that are showing.
+  function syncJump() {
+    const jump = document.querySelector('#more-jump');
+    let any = false;
+    for (const link of jump.querySelectorAll('a[data-target]')) {
+      const target = document.querySelector(link.dataset.target), shown = Boolean(target) && !target.hidden;
+      setHidden(link, !shown); any ||= shown;
+    }
+    setHidden(jump, !any);
   }
 
   function applySub(route) {
@@ -65,14 +76,17 @@ export function createTabs({ bar = document.querySelector('#tabbar') } = {}) {
 
   function focusHeading(id) {
     window.scrollTo(0, 0);
-    document.querySelector(tabs.get(id).heading)?.focus({ preventScroll: true });
+    // The panel's own title when it is showing; the panel itself while that title is not (e.g. its data has not loaded).
+    const title = document.querySelector(tabs.get(id).heading), target = title && !title.closest('[hidden]') ? title : tabs.get(id).panel;
+    target.tabIndex = -1;
+    target.focus({ preventScroll: true });
   }
 
   /** Reconcile the page with location.hash. Focus moves only when the viewer arrived at a tab on purpose (never on load, never for #main). */
   function sync({ moveFocus = false } = {}) {
     setHidden(bar, !signedIn);
     for (const spec of TABS) setHidden(tabs.get(spec.id).link, !available(spec));
-    if (!signedIn) return;
+    if (!signedIn) { current = null; pendingSub = null; lastHash = null; return; } // no stale tab survives a sign-out
     let route = parseRoute(location.hash), next = current ?? 'home';
     if (route && !available(tabs.get(route.tab))) { history.replaceState(null, '', '#home'); route = parseRoute('#home'); }
     if (route) next = route.tab;
@@ -84,16 +98,17 @@ export function createTabs({ bar = document.querySelector('#tabbar') } = {}) {
       const selector = route?.sub ? SUBS[next]?.[route.sub] : null;
       pendingSub = selector ? { selector, until: Date.now() + SUB_SECONDS * 1000 } : null;
     }
-    showEmptyNotes();
+    showEmptyNotes(); syncJump();
     if (arrived && moveFocus) { forceFocus = null; focusHeading(next); }
     applySub(route);
   }
 
+  /** A tab tap replaces the history entry (tapping around must not fill Back); linked navigation and show() push. */
   function go(id) {
     if (!tabs.has(id) || !available(tabs.get(id))) return;
-    if (location.hash === `#${id}`) { sync(); focusHeading(id); return; } // already there: just hand focus to the heading
-    forceFocus = id; // the route may already be on this tab (e.g. #main or no hash): focus must still move
-    location.hash = id; // hashchange does the rest, so Back and Forward take the very same path
+    if (location.hash !== `#${id}`) history.replaceState(null, '', `#${id}`);
+    forceFocus = id; // the same tab again still hands focus to its heading
+    sync({ moveFocus: true });
   }
 
   list.addEventListener('click', (event) => {
@@ -120,7 +135,13 @@ export function createTabs({ bar = document.querySelector('#tabbar') } = {}) {
   const readAlerts = () => setBadge('alerts', alertBadge.hidden ? 0 : Number(alertBadge.textContent), (n) => `${n} ${n === 1 ? 'alert needs' : 'alerts need'} attention`);
   new MutationObserver(readDevices).observe(inventory, { attributes: true, attributeFilter: ['data-new-count', 'hidden'] });
   new MutationObserver(readAlerts).observe(alertBadge, { attributes: true, attributeFilter: ['hidden'], childList: true, characterData: true, subtree: true });
-  new MutationObserver(() => { showEmptyNotes(); applySub(parseRoute(location.hash)); }).observe(document.querySelector('#status-view'), { attributes: true, attributeFilter: ['hidden'], subtree: true });
+  new MutationObserver(() => { showEmptyNotes(); syncJump(); applySub(parseRoute(location.hash)); }).observe(document.querySelector('#status-view'), { attributes: true, attributeFilter: ['hidden'], subtree: true });
+  // On a phone the on-screen keyboard would float the pinned bar over the field being typed in: step aside while a text field has focus.
+  const typing = (element) => Boolean(element?.matches?.('input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]), textarea, select'));
+  const setTyping = (on) => bar.classList.toggle('is-typing', on);
+  document.addEventListener('focusin', (event) => setTyping(typing(event.target)));
+  document.addEventListener('focusout', () => setTyping(false));
+  window.visualViewport?.addEventListener('resize', () => setTyping(window.innerHeight - window.visualViewport.height > 150 || typing(document.activeElement)));
   readDevices(); readAlerts();
 
   return {

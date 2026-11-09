@@ -60,17 +60,17 @@
           <section id="bulk-panel" class="alert-panel" aria-labelledby="bulk-title" hidden></section>
         </div>
         <div id="panel-kids" class="tab-panel" role="tabpanel" aria-labelledby="tab-kids" hidden>
-          <div class="tab-heading"><h2 id="kids-heading" class="tab-title" tabindex="-1">Kids</h2><button class="button secondary" type="button" data-refresh>Refresh status</button></div>
+          <div class="tab-heading"><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
           <section id="children-panel" class="alert-panel" aria-labelledby="children-title" hidden></section>
-          <p class="tab-empty fine-print" hidden>Nothing to show here right now. If this stays empty, open Home and choose Refresh status.</p>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
         </div>
         <div id="panel-devices" class="tab-panel" role="tabpanel" aria-labelledby="tab-devices" hidden>
-          <div class="tab-heading"><h2 id="devices-heading" class="tab-title" tabindex="-1">Devices</h2><button class="button secondary" type="button" data-refresh>Refresh status</button></div>
+          <div class="tab-heading"><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
           <section id="inventory-panel" class="alert-panel" aria-labelledby="inventory-title" hidden></section>
-          <p class="tab-empty fine-print" hidden>Nothing to show here right now. If this stays empty, open Home and choose Refresh status.</p>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
         </div>
         <div id="panel-alerts" class="tab-panel" role="tabpanel" aria-labelledby="tab-alerts" hidden>
-          <div class="tab-heading"><h2 id="alerts-heading" class="tab-title" tabindex="-1">Alerts</h2><button class="button secondary" type="button" data-refresh>Refresh status</button></div>
+          <div class="tab-heading"><h2 id="alerts-heading" class="tab-title" tabindex="-1">Alerts</h2><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
           <section id="parent-alerts" class="alert-panel" aria-labelledby="parent-alerts-title" hidden>
             <h2 id="parent-alerts-title">Parent alerts <span id="alert-badge" class="alert-badge" hidden>0</span></h2>
             <p class="fine-print">Saved by the service for your permitted people and kept for 90 days. They resolve on their own when the condition clears. The badge also counts current warnings from this browser, listed below.</p>
@@ -84,16 +84,27 @@
             <label class="alert-preference"><input id="hide-recovery" type="checkbox"> Hide recovery history</label>
             <ul id="alert-feed" aria-label="Recent operational alerts" aria-live="polite"></ul>
           </section>
-          <p class="tab-empty fine-print" hidden>Nothing to show here right now. If this stays empty, open Home and choose Refresh status.</p>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
         </div>
         <div id="panel-more" class="tab-panel" role="tabpanel" aria-labelledby="tab-more" hidden>
-          <div class="tab-heading"><h2 id="more-heading" class="tab-title" tabindex="-1">More</h2><button class="button secondary" type="button" data-refresh>Refresh status</button></div>
+          <div class="tab-heading"><h2 id="more-heading" class="tab-title" tabindex="-1">More</h2><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
+          <nav id="more-jump" class="more-jump" aria-label="On this page">
+            <a href="#more/schedules" data-target="#schedule-editor">Schedules</a>
+            <a href="#more/activity" data-target="#activity-panel">Activity</a>
+            <a href="#more/audit" data-target="#audit-panel">Audit log</a>
+            <a href="#more/accounts" data-target="#accounts-panel">Accounts</a>
+            <a href="#more/about" data-target="#about-panel">About</a>
+          </nav>
           <section id="schedule-editor" class="schedule-editor" aria-labelledby="schedules-title" hidden></section>
           <section id="activity-panel" class="activity-panel" aria-label="Estimated network activity" hidden></section>
+          <section id="activity-boundary" class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No app, domain or screen-time measurement is included. The estimated network activity above comes from router byte counters only.</p></section>
           <section id="audit-panel" class="alert-panel" aria-labelledby="audit-title" hidden></section>
           <section id="accounts-panel" class="alert-panel" aria-labelledby="accounts-title" hidden></section>
-          <section class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No app, domain or screen-time measurement is included. The estimated network activity above comes from router byte counters only.</p></section>
-          <p class="tab-empty fine-print" hidden>Nothing to show here right now. If this stays empty, open Home and choose Refresh status.</p>
+          <section id="about-panel" class="alert-panel about-panel" aria-labelledby="about-title">
+            <h2 id="about-title">About</h2>
+            <p class="fine-print" id="about-source">Couvre-feu parent app. This service does not report a version yet.</p>
+          </section>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
         </div>
         <p class="source-footnote">Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.</p>
       </section>

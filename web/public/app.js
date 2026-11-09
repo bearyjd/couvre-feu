@@ -17,6 +17,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
 const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 const FRESH_SECONDS = 30;
+const WELCOME_SECONDS = 6;
 let alertStorage;
 try { alertStorage = localStorage; } catch { alertStorage = null; }
 const alertJournal = createAlertJournal(alertStorage);
@@ -239,7 +240,12 @@ async function authenticate(kind, token) {
     acceptSession(session);
     state.busy = false;
     await refresh({ quiet: true });
-    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
+    if (state.people) {
+      const welcome = `Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`;
+      announce(welcome);
+      // Said once, then out of the way: it would otherwise sit above every tab for the whole session.
+      setTimeout(() => { if ($('#notice').textContent === welcome) announce(''); }, WELCOME_SECONDS * 1000);
+    }
   } catch (error) {
     if (generation !== state.generation) return;
     const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.'

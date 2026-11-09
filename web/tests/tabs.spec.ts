@@ -136,28 +136,29 @@ test('a parent sees three tabs; a deep link to #devices falls back to Home', asy
   await expect(tab(page, 'home')).toHaveAttribute('aria-selected', 'true');
 });
 
-test('Back and Forward walk the tabs', async ({ page, integration: f }) => {
+test('tab taps replace the history entry; a deep link pushes one, and Back returns to the previous page state', async ({ page, integration: f }) => {
   await signIn(page, f, 'operator');
+  const before = await page.evaluate(() => history.length);
   await tab(page, 'kids').click();
   await tab(page, 'devices').click();
   await tab(page, 'more').click();
   expect(await hash(page)).toBe('#more');
+  expect(await page.evaluate(() => history.length)).toBe(before); // taps never add entries
+  await page.goto(`${f.origin}/#alerts`); // linked navigation pushes
+  await expect(tab(page, 'alerts')).toHaveAttribute('aria-selected', 'true');
+  expect(await page.evaluate(() => history.length)).toBe(before + 1);
   await page.goBack();
-  await expect(tab(page, 'devices')).toHaveAttribute('aria-selected', 'true');
-  expect(await visiblePanels(page)).toEqual(['panel-devices']);
-  await page.goBack();
-  await expect(tab(page, 'kids')).toHaveAttribute('aria-selected', 'true');
-  await page.goBack();
-  await expect(tab(page, 'home')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('#people-title')).toBeFocused();
+  await expect(tab(page, 'more')).toHaveAttribute('aria-selected', 'true'); // the entry the taps replaced
+  expect(await visiblePanels(page)).toEqual(['panel-more']);
+  await expect(page.locator('#more-heading')).toBeFocused();
   await page.goForward();
-  await page.goForward();
-  await expect(tab(page, 'devices')).toHaveAttribute('aria-selected', 'true');
-  expect(await hash(page)).toBe('#devices');
+  await expect(tab(page, 'alerts')).toHaveAttribute('aria-selected', 'true');
 });
 
 test('choosing a tab moves focus to that panel heading; the same tab again does too', async ({ page, integration: f }) => {
   await signIn(page, f, 'operator');
+  await expect(page.locator('#children-title')).toBeAttached();
+  await expect(page.locator('#inventory-title')).toBeAttached();
   for (const name of ['kids', 'devices', 'alerts', 'more', 'home']) {
     await tab(page, name).click();
     await expect(tab(page, name)).toHaveAttribute('aria-selected', 'true');
@@ -166,9 +167,9 @@ test('choosing a tab moves focus to that panel heading; the same tab again does 
   await page.locator('#people-title').evaluate((e) => (e as HTMLElement).blur());
   await tab(page, 'home').click(); // already selected: still hands focus to the heading
   await expect(page.locator('#people-title')).toBeFocused();
-  // Back/Forward moves focus the same way.
-  await tab(page, 'devices').click();
-  await expect(tab(page, 'devices')).toHaveAttribute('aria-selected', 'true');
+  // Linked navigation and Back move focus the same way.
+  await page.goto(`${f.origin}/#devices`);
+  await expect(page.locator('#inventory-title')).toBeFocused();
   await page.goBack();
   await expect(page.locator('#people-title')).toBeFocused();
 });
@@ -203,7 +204,7 @@ test('keyboard: one tab stop, arrows move between tabs and wrap, Home/End jump, 
   await page.keyboard.press('Enter');
   await expect(tab(page, 'devices')).toHaveAttribute('aria-selected', 'true');
   expect(await hash(page)).toBe('#devices');
-  await expect(page.locator('#devices-heading')).toBeFocused(); // choosing a tab hands focus to its panel; the arrows work from the tab again
+  await expect(page.locator('#inventory-title')).toBeFocused(); // choosing a tab hands focus to its panel; the arrows work from the tab again
   await tab(page, 'devices').focus();
   await page.keyboard.press('ArrowRight');
   await page.keyboard.press('ArrowRight');
@@ -276,6 +277,7 @@ test('the unreachable banner stays above the tabs and visible on every tab, and 
   await probe();
   const banner = page.locator('#service-down');
   await expect(banner).toBeVisible();
+  expect((await banner.boundingBox())!.height).toBeLessThan(130); // compact: text and Retry share a row
   for (const name of ['alerts', 'more', 'home']) {
     await tab(page, name).click();
     await expect(banner).toBeVisible();
@@ -319,6 +321,7 @@ test('an empty tab says so instead of showing a blank page', async ({ page, inte
   await page.reload();
   await tab(page, 'kids').click();
   await expect(panel(page, 'kids').locator('.tab-empty')).toBeVisible();
+  expect(await panel(page, 'kids').locator('.tab-empty').innerText()).not.toMatch(/refresh/i); // never points at a control that is on screen
 });
 
 test('"Add to a child" on a device opens the Kids tab with the form focused, and Back returns to Devices', async ({ page, integration: f }) => {
@@ -334,4 +337,114 @@ test('"Add to a child" on a device opens the Kids tab with the form focused, and
   expect(await hash(page)).toBe('#kids');
   await page.goBack();
   await expect(tab(page, 'devices')).toHaveAttribute('aria-selected', 'true');
+});
+
+test('each tab has one heading that takes focus, with no stacked duplicate title', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  await expect(page.locator('#children-title')).toBeAttached();
+  await expect(page.locator('#inventory-title')).toBeAttached();
+  for (const name of ADMIN_TABS) {
+    await tab(page, name).click();
+    await expect.poll(() => page.evaluate((id) => document.activeElement === document.querySelector(`#panel-${id}`)!.querySelector('h1, h2, h3'), name)).toBe(true);
+    expect(await page.locator(`#panel-${name}`).locator('h1:visible, .tab-title:visible').count()).toBeLessThanOrEqual(1);
+    if (name === 'devices') expect(await page.locator('#panel-devices').getByRole('heading', { name: /^Devices/ }).count()).toBe(1); // not "Devices" plus "Devices on the network"
+    if (name === 'kids') expect(await page.locator('#panel-kids').getByRole('heading', { name: /^(Kids|Children)/ }).count()).toBe(1);
+  }
+});
+
+test('one refresh control per tab: text button on Home, a single icon button elsewhere, wired to the same handler', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  for (const name of ADMIN_TABS) {
+    await tab(page, name).click();
+    const buttons = page.getByRole('button', { name: 'Refresh status' });
+    await expect(buttons).toHaveCount(1);
+    if (name !== 'home') expect((await buttons.innerText()).trim()).toBe('');
+    expect((await buttons.boundingBox())!.width).toBeGreaterThanOrEqual(44);
+  }
+  await tab(page, 'devices').click();
+  const requested = page.waitForRequest((r) => new URL(r.url()).pathname === '/people');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await requested;
+});
+
+test('the "Signed in as" notice collapses by itself', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  await expect(page.locator('#notice')).toBeHidden({ timeout: 15000 });
+});
+
+test('More is ordered Schedules, Activity, Audit log, Accounts, About, with a jump list to the visible ones', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  await tab(page, 'more').click();
+  expect(await page.evaluate(() => [...document.querySelectorAll('#panel-more > [id]')].map((e) => e.id).filter((id) => id !== 'more-heading'))).toEqual(
+    ['more-jump', 'schedule-editor', 'activity-panel', 'activity-boundary', 'audit-panel', 'accounts-panel', 'about-panel']);
+  await expect(page.locator('#about-panel')).toBeVisible();
+  const links = page.locator('#more-jump a:visible');
+  expect(await links.allInnerTexts()).toContain('Accounts');
+  expect(await links.allInnerTexts()).toContain('About');
+  await page.setViewportSize({ width: 390, height: 500 });
+  await page.locator('#more-jump').getByRole('link', { name: 'Accounts' }).click();
+  expect(await hash(page)).toBe('#more/accounts');
+  await expect.poll(() => page.evaluate(() => Math.round(document.querySelector('#accounts-panel')!.getBoundingClientRect().top))).toBeLessThanOrEqual(2);
+});
+
+const luminance = ([r, g, b]: number[]) => { const c = [r, g, b].map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+const ratio = (a: number[], b: number[]) => { const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x); return (hi + 0.05) / (lo + 0.05); };
+const rgb = (css: string) => (css.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+
+test('tab contrast: labels at least 4.5:1, the active tab is a filled pill, badges are ringed and legible', async ({ page, integration: f }) => {
+  seedNewDevices(f);
+  await signIn(page, f, 'operator');
+  const style = (sel: string, prop: string) => page.locator(sel).evaluate((e, p) => getComputedStyle(e).getPropertyValue(p), prop);
+  const bar = rgb(await style('#tabbar', 'background-color'));
+  expect(ratio(rgb(await style('#tab-kids', 'color')), bar)).toBeGreaterThanOrEqual(4.5);
+  const fill = rgb(await style('#tab-home', 'background-color'));
+  expect(ratio(rgb(await style('#tab-home', 'color')), fill)).toBeGreaterThanOrEqual(4.5);
+  expect(ratio(fill, bar)).toBeGreaterThanOrEqual(3); // the selected tab is a visible shape, not only a thin line
+  expect(Number(await style('#tab-home', 'font-weight'))).toBeGreaterThan(Number(await style('#tab-kids', 'font-weight')));
+  const badge = page.locator('#tab-devices .tab-badge');
+  await expect(badge).toBeVisible();
+  expect((await badge.boundingBox())!.height).toBeGreaterThanOrEqual(16);
+  expect(await style('#tab-devices .tab-badge', 'box-shadow')).toMatch(/2px/);
+  expect(ratio(rgb(await style('#tab-devices .tab-badge', 'color')), rgb(await style('#tab-devices .tab-badge', 'background-color')))).toBeGreaterThanOrEqual(4.5);
+});
+
+test('on a phone the bar steps aside while a text field is focused, and returns after; a desktop keeps it', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  await tab(page, 'more').click();
+  await expect(page.locator('#new-account-name')).toBeVisible();
+  await page.locator('#new-account-name').focus();
+  await expect(page.locator('#tabbar')).toBeHidden();
+  await page.locator('#new-account-name').blur();
+  await expect(page.locator('#tabbar')).toBeVisible();
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.locator('#new-account-name').focus();
+  await expect(page.locator('#tabbar')).toBeVisible();
+});
+
+test('the pinned bar never covers the end of the page on a tall panel at 390x844', async ({ page, integration: f }) => {
+  seedNewDevices(f);
+  await signIn(page, f, 'operator');
+  for (const name of ['devices', 'more']) {
+    await tab(page, name).click();
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    const bar = (await page.locator('#tabbar').boundingBox())!;
+    const last = await page.evaluate(() => Math.max(...[...document.querySelectorAll('footer > *, .source-footnote')].map((e) => e.getBoundingClientRect().bottom)));
+    expect(last, name).toBeLessThanOrEqual(bar.y + 1);
+    const lastCard = await page.evaluate((id) => { const kids = [...document.querySelectorAll(`#panel-${id} > *`)].filter((e) => !(e as HTMLElement).hidden); return kids[kids.length - 1].getBoundingClientRect().bottom; }, name);
+    expect(lastCard, name).toBeLessThanOrEqual(bar.y + 1);
+  }
+});
+
+test('signing out resets the tab state: a later sign-in with an unknown hash lands on Home, not the old tab', async ({ page, integration: f }) => {
+  await signIn(page, f, 'operator');
+  await tab(page, 'devices').click();
+  await expect(tab(page, 'devices')).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await expect(page.locator('#auth-view')).toBeVisible();
+  await page.evaluate(() => history.replaceState(null, '', '#bogus'));
+  await page.getByRole('button', { name: 'Sign in with a passkey' }).click();
+  await expect(page.locator('#status-view')).toBeVisible();
+  await expect(tab(page, 'home')).toHaveAttribute('aria-selected', 'true');
+  expect(await visiblePanels(page)).toEqual(['panel-home']);
+  expect(await page.locator('[role="tab"][aria-selected="true"]').count()).toBe(1);
 });
