@@ -400,6 +400,19 @@ input,select {
   overflow-wrap:anywhere
 }
 
+.service-down p {
+  margin:0 0 12px
+}
+
+.service-down .button {
+  min-height:44px;
+  min-width:44px
+}
+
+.service-down details {
+  margin-top:12px
+}
+
 .notice.error {
   border-left-color:var(--red)
 }
