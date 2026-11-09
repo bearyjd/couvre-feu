@@ -1006,3 +1006,8 @@ footer {
 .audit-result { justify-self: start; padding: 2px 8px; border-radius: var(--radius); background: var(--amber-soft); }
 .audit-failed { background: var(--amber-soft); border-left: 4px solid var(--amber); }
 .audit-note { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* Install readiness review: stacked cards like the inventory list; addresses and labels wrap, never widen the page. */
+#install-readiness-panel .button { min-height: 44px; margin-right: 8px; }
+#install-readiness-panel .inventory-row { overflow-wrap: anywhere; }
+#install-readiness-panel code { overflow-wrap: anywhere; word-break: break-all; }
