@@ -1,6 +1,8 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { isPrivateAddress } from '../../shared/src/router-inventory.ts';
 import type { InventorySource, RouterInventory } from '../../shared/src/router-inventory.ts';
+import { INVENTORY_POLL_SECONDS, kindHint, presenceOf, suggestReplacements } from '../../shared/src/inventory-hints.ts';
+import { lookupVendor } from '../../shared/src/oui.ts';
 import type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
 export type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
@@ -10,7 +12,6 @@ import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
 
-export const INVENTORY_POLL_SECONDS = 60;
 /** One accepted refresh request per this many seconds, across all admins. */
 export const REFRESH_MIN_SECONDS = 10;
 export const ALERT_MIN_INTERVAL_SECONDS = 3600;
@@ -48,7 +49,7 @@ interface StateRow {
     incomplete_since: number | null; last_stall_alert_at: number | null;
 }
 interface DeviceRow {
-    mac: string; ipv4_json: string; hostname: string | null; source: InventorySource; first_seen: number; last_seen: number; acknowledged_at: number | null;
+    id: number; mac: string; ipv4_json: string; hostname: string | null; source: InventorySource; first_seen: number; last_seen: number; acknowledged_at: number | null;
 }
 const presence = (source: InventorySource) => source !== 'lease';
 
@@ -236,20 +237,28 @@ export class InventoryStore {
         this.requireAdmin(actor);
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1'), current = s?.generation === this.generation ? s : undefined;
         const lookup = this.lookup(), baseline = current?.baseline_at ?? null, hidden = new Set(this.store.config.protectedMacs);
-        const rows = this.store.all<DeviceRow>('SELECT mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? ORDER BY last_seen DESC, mac ASC LIMIT ?', this.generation, INVENTORY_ROW_CAP);
+        const rows = this.store.all<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? ORDER BY last_seen DESC, mac ASC LIMIT ?', this.generation, INVENTORY_ROW_CAP);
+        const now = this.now(), shown = rows.filter(r => !hidden.has(r.mac)), replaces = this.replacements(rows, hidden, lookup.owners, now);
         return {
             status: {baselineAt: baseline, lastOkAt: current?.last_ok_at ?? null, lastAttemptAt: current?.last_attempt_at ?? null, lastError: current?.last_error ?? null,
                 refreshRequestedAt: current?.refresh_requested_at ?? null, pollSeconds: INVENTORY_POLL_SECONDS, retentionDays: this.retentionDays},
-            devices: rows.filter(r => !hidden.has(r.mac)).map(r => this.dto(r, baseline, lookup, actor))
+            devices: shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id)))
         };
+    }
+    /** Enrolled or scoped child devices (any owner) and protected MACs are never linked by a hint, on either side. */
+    private replacements(rows: DeviceRow[], hidden: Set<string>, owners: Map<string, string>, now: number): Map<number, number> {
+        return suggestReplacements(rows.map(r => ({id: r.id, mac: r.mac, hostname: r.hostname, firstSeen: r.first_seen, lastSeen: r.last_seen, source: r.source, protectedRow: hidden.has(r.mac) || owners.has(r.mac)})), now);
     }
     private lookup(): {owners: Map<string, string>; names: Map<string, string>} {
         return {owners: this.owners(), names: new Map(this.store.all<{id: string; name: string}>('SELECT id,name FROM people WHERE active=1').map(p => [p.id, p.name]))};
     }
     /** The owner is named only to a viewer who manages that child; for anyone else it is null (the device still counts as assigned). */
-    private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor): InventoryDeviceDTO {
+    private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor, now: number, replaces?: number): InventoryDeviceDTO {
         const owner = lookup.owners.get(r.mac), visible = owner !== undefined && viewer.personIds.includes(owner) && lookup.names.has(owner);
-        return {mac: r.mac, inScope: this.scope.inRouterScope(r.mac, this.policy), ipv4: JSON.parse(r.ipv4_json) as string[], hostname: r.hostname, reportedByDevice: true, source: r.source, firstSeen: r.first_seen, lastSeen: r.last_seen, acknowledgedAt: r.acknowledged_at,
+        const vendor = lookupVendor(r.mac);
+        return {id: r.id, ...(vendor ? {vendor} : {}), kind: kindHint({hostname: r.hostname, vendor}), presence: presenceOf({source: r.source, lastSeen: r.last_seen, now}),
+            ...(replaces === undefined ? {} : {suggestedReplaces: replaces}),
+            mac: r.mac, inScope: this.scope.inRouterScope(r.mac, this.policy), ipv4: JSON.parse(r.ipv4_json) as string[], hostname: r.hostname, reportedByDevice: true, source: r.source, firstSeen: r.first_seen, lastSeen: r.last_seen, acknowledgedAt: r.acknowledged_at,
             personId: visible ? owner : null, personName: visible ? lookup.names.get(owner)! : null,
             flags: {new: baseline !== null && r.acknowledged_at === null && r.first_seen > baseline, private: isPrivateAddress(r.mac), unassigned: owner === undefined}};
     }
@@ -258,15 +267,18 @@ export class InventoryStore {
         this.requireAdmin(actor);
         if (typeof mac !== 'string' || !CANONICAL_MAC.test(mac)) throw new AppError(400, 'invalid_mac');
         return this.atomic(() => {
-            const g = this.generation, row = this.store.get<DeviceRow & {id: number}>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND mac=?', g, mac);
+            const g = this.generation, row = this.store.get<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND mac=?', g, mac);
             if (!row || this.store.config.protectedMacs.includes(mac)) throw new AppError(404, 'inventory_device_not_found');
             if (row.acknowledged_at === null) {
                 this.store.run('UPDATE inventory_devices SET acknowledged_at=?,acknowledged_by=? WHERE generation=? AND mac=?', this.now(), actor.id, g, mac);
                 // The row id, never the MAC: the audit trail must not become a second device list.
                 this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, 'inventory_acknowledge', this.now(), `inventory_row:${row.id}`);
             }
-            return this.dto(this.store.get<DeviceRow>('SELECT mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND mac=?', g, mac)!,
-                this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')?.baseline_at ?? null, this.lookup(), actor);
+            const lookup = this.lookup(), now = this.now(), hidden = new Set(this.store.config.protectedMacs);
+            // Only rows sharing this hostname can matter to its suggestion.
+            const group = this.store.all<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND (mac=? OR (hostname IS NOT NULL AND lower(hostname)=lower(?)))', g, mac, row.hostname);
+            const fresh = group.find(r => r.mac === mac)!;
+            return this.dto(fresh, this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')?.baseline_at ?? null, lookup, actor, now, this.replacements(group, hidden, lookup.owners, now).get(fresh.id));
         });
     }
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Couvre-feu heartbeat every minute
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

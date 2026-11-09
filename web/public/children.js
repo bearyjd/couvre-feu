@@ -426,9 +426,11 @@ export function createInventory({ session, gate, offline, time, children, versio
   function deviceRow(device, locked) {
     const name = device.hostname ?? 'No name reported', short = name.slice(0, 40);
     const flags = FLAGS.filter(([flag]) => device.flags[flag]);
+    const hints = [device.vendor, device.kind && device.kind !== 'unknown' ? `${device.kind}?` : null].filter(Boolean); // maker from the address and a kind guess from the name: hints, never proof
     return el('li', { class: 'passkey-row inventory-row' },
       el('span', { class: 'inventory-name', 'data-name': '', dir: 'auto' }, name),
       ...(device.hostname === null ? [] : [el('span', { class: 'fine-print' }, 'name reported by device')]),
+      ...(hints.length ? [el('span', { class: 'fine-print', 'data-hints': '' }, `Guess: ${hints.join(' · ')}`)] : []),
       ...(flags.length ? [el('span', { class: 'inventory-flags' }, ...flags.map(([flag, label]) => el('span', { class: `inventory-flag flag-${flag}`, 'data-flag': flag }, label)))] : []),
       ...(device.flags.private ? [el('span', { class: 'fine-print' }, `Private address: ${PRIVATE_HINT}`)] : []),
       el('span', { class: 'fine-print' }, `${device.ipv4.length ? device.ipv4.join(', ') : 'No IPv4 address'} · Last seen ${time(device.lastSeen)}`),
