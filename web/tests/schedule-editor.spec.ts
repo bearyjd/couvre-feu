@@ -1,4 +1,4 @@
-import { test, expect, enroll, browserAPI } from './browser-fixture.ts';
+import { test, expect, enroll, browserAPI, openTab } from './browser-fixture.ts';
 import type { Page } from '@playwright/test';
 
 const editor = (page: Page) => page.locator('#schedule-editor');
@@ -13,6 +13,7 @@ async function fillWindow(page: Page, name: string, days: string[], start: strin
 test('create, edit and delete a cross-midnight window with plain-language preview', async ({ page, demo }) => {
   const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message));
   await enroll(page, demo);
+  await openTab(page, 'more');
   await expect(editor(page).getByRole('heading', { name: 'Schedules for Alex (fictional)' })).toBeVisible();
   await expect(editor(page).locator('[data-schedule-id="browser_fixture"]')).toBeVisible();
   await expect(editor(page).getByText('Blair')).toHaveCount(0);
@@ -51,6 +52,7 @@ test('create, edit and delete a cross-midnight window with plain-language previe
 
 test('client validation explains errors and sends nothing; overlaps are allowed with an explanation', async ({ page, demo }) => {
   await enroll(page, demo);
+  await openTab(page, 'more');
   let writes = 0; page.on('request', (request) => { if (request.method() === 'POST' && /\/schedules/.test(request.url())) writes++; });
   await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
   await editor(page).getByLabel('Name', { exact: true }).fill('Bad Name');
@@ -80,6 +82,7 @@ test('client validation explains errors and sends nothing; overlaps are allowed 
 
 test('server-side validation and permissions stay authoritative', async ({ page, demo }) => {
   await enroll(page, demo);
+  await openTab(page, 'more');
   const state = await browserAPI(page, '/people');
   const headers = (key: string) => ({ 'If-Match': state.body.revisionToken, 'Idempotency-Key': key });
   const blair = await browserAPI(page, '/people/blair/schedules', { id: 'sneaky', weekdays: ['Mon'], start: '22:00', stop: '06:30' }, headers('blair-attempt-000000001'));
@@ -92,6 +95,7 @@ test('server-side validation and permissions stay authoritative', async ({ page,
 
 test('a revision advanced elsewhere cancels the edit, reloads, and keeps the draft for a deliberate retry', async ({ page, demo }) => {
   await enroll(page, demo);
+  await openTab(page, 'more');
   let writes = 0; page.on('request', (request) => { if (request.method() === 'POST' && /\/schedules/.test(request.url())) writes++; });
   await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
   await fillWindow(page, 'weekend', ['Sat', 'Sun'], '23:00', '08:00');

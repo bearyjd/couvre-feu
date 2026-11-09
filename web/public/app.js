@@ -7,6 +7,7 @@ import { createTimeRequests } from './time-requests.js';
 import { createRewardTime } from './reward-time.js';
 import { createAuditLog } from './audit.js';
 import { createAccounts } from './accounts.js';
+import { createTabs } from './tabs.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
@@ -26,8 +27,11 @@ const rewardTime = createRewardTime({ session: () => state.session, people: () =
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
+const tabs = createTabs();
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
-const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children,
+// The add form lives on the Kids tab: opening it from a Devices row must show that tab first, or the form could not take focus.
+const childrenFromDevices = { ...children, startAdd: (id, values) => { tabs.show('kids'); return children.startAdd(id, values); } };
+const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children: childrenFromDevices,
   version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
@@ -404,7 +408,7 @@ function renderControlState() {
   for (const button of document.querySelectorAll('[data-control], [data-quick-pause], [data-reward-minutes]:not([data-reward-busy])')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   bulk.update();
-  $('#refresh').disabled = state.busy || state.refreshing || state.offline;
+  for (const button of document.querySelectorAll('[data-refresh]')) button.disabled = state.busy || state.refreshing || state.offline;
   scheduleEditor.render();
 }
 
@@ -519,6 +523,7 @@ function render() {
     state.renderKey = '';
     scheduleEditor.render();
   }
+  tabs.update({ signedIn: hasStatus, infrastructure: hasStatus && isReal() && account.role === 'admin' });
   renderAuthControls();
   renderAlerts();
   parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
@@ -570,7 +575,8 @@ $('#enroll-form').addEventListener('submit', (event) => {
   $('#enrollment-token').value = '';
   if (token) void authenticate('register', token);
 });
-$('#refresh').addEventListener('click', () => void refresh());
+// One Refresh status button per tab heading (Home keeps #refresh), so the "refresh" advice on any tab has a button to act on.
+document.addEventListener('click', (event) => { if (event.target.closest('[data-refresh]')) void refresh(); });
 $('#hide-recovery').addEventListener('change', event => { alertJournal.setHideRecovery(event.target.checked, now()); renderAlerts(); });
 $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);

@@ -1006,3 +1006,30 @@ footer {
 .audit-result { justify-self: start; padding: 2px 8px; border-radius: var(--radius); background: var(--amber-soft); }
 .audit-failed { background: var(--amber-soft); border-left: 4px solid var(--amber); }
 .audit-note { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* Tab bar: five hash-routed sections. A pinned bar on a phone, a plain row under the masthead from 900 px. */
+.tab-panel[hidden], .tabbar[hidden], .tab[hidden], .tab-badge[hidden], .tab-empty[hidden] { display: none; }
+.tabbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: var(--surface); border-top: 1px solid var(--line); padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+.tablist { display: flex; max-width: 640px; margin: 0 auto; }
+.tab { position: relative; flex: 1 1 0; min-width: 44px; min-height: 56px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 6px 4px 5px; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .01em; text-decoration: none; border-top: 3px solid transparent; -webkit-tap-highlight-color: transparent; }
+.tab[aria-selected="true"] { color: var(--ink); border-top-color: var(--ink); }
+.tab-icon { flex: none; }
+.tab-badge { position: absolute; top: 4px; left: calc(50% + 6px); min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--red); color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; }
+.tab:focus-visible { outline: 3px solid var(--focus); outline-offset: -5px; }
+.tab-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 4px 0 16px; }
+.tab-heading .button { flex: none; }
+.tab-title { margin: 0; font-size: clamp(28px, 5vw, 38px); letter-spacing: -.02em; }
+.tab-title:focus-visible, #people-title:focus-visible { outline: 3px solid var(--focus); outline-offset: 6px; }
+.tab-title:focus:not(:focus-visible), #people-title:focus:not(:focus-visible) { outline: none; }
+.tab-empty { margin: 8px 0; }
+/* Room for the pinned bar: the page must be able to scroll its last line clear of it. */
+body:has(#tabbar:not([hidden])) footer { padding-bottom: calc(32px + 64px + env(safe-area-inset-bottom)); }
+@media (min-width: 900px) {
+  .tabbar { position: static; margin: 0 0 24px; padding: 0; background: none; border-top: 0; border-bottom: 1px solid var(--line); }
+  .tablist { max-width: none; margin: 0; gap: 4px; }
+  .tab { flex: 0 0 auto; flex-direction: row; gap: 8px; min-height: 48px; padding: 0 18px; font-size: 15px; border-top: 0; border-bottom: 3px solid transparent; margin-bottom: -1px; }
+  .tab[aria-selected="true"] { border-bottom-color: var(--ink); }
+  .tab-badge { position: static; margin-left: 2px; }
+  .tab:focus-visible { outline-offset: -3px; }
+  body:has(#tabbar:not([hidden])) footer { padding-bottom: 32px; }
+}
