@@ -7,6 +7,11 @@
     <meta name="description" content="Fictional, local Couvre-feu parent-control prototype.">
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Couvre-feu">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <link rel="stylesheet" href="/styles.css">
     <link rel="stylesheet" href="/schedule-editor.css">
     <title>Couvre-feu · synthetic demo</title>
@@ -25,6 +30,8 @@
         <button id="service-retry" class="button secondary" type="button">Retry</button>
         <details><summary>Details</summary><p id="service-down-detail" class="fine-print"></p></details>
       </div>
+      <div id="update-banner" class="notice" role="status" hidden><p>Update available · <button id="update-reload" class="button secondary" type="button">Reload</button></p></div>
+      <div id="session-grace" class="notice" role="status" hidden><p id="session-grace-text"></p><button id="session-grace-dismiss" class="button secondary" type="button">Dismiss</button></div>
       <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
       <section id="auth-view" class="auth-layout" aria-labelledby="welcome-title">
         <div class="intro"><p class="eyebrow">Local prototype / 002</p><h1 id="welcome-title">Make space<br>for the moment.</h1><p>See each person’s manual pause and schedule, then make a deliberate change.</p><div class="honesty-note"><span aria-hidden="true">○</span><p>This demo changes a fake router. It does not control a household connection.</p></div></div>

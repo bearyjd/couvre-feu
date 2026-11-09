@@ -8,6 +8,7 @@ import { createRewardTime } from './reward-time.js';
 import { createAuditLog } from './audit.js';
 import { createAccounts } from './accounts.js';
 import { createTabs } from './tabs.js';
+import { composeAbort, createUpdatePrompt, createSessionGrace } from './pwa-update.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
@@ -27,6 +28,8 @@ const timeRequests = createTimeRequests({ session: () => state.session, people: 
 const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
+const updatePrompt = createUpdatePrompt({ banner: $('#update-banner'), reloadButton: $('#update-reload') });
+const sessionGrace = createSessionGrace({ root: $('#session-grace'), text: $('#session-grace-text'), dismiss: $('#session-grace-dismiss') });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const tabs = createTabs();
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
@@ -53,14 +56,17 @@ class APIError extends Error {
 }
 
 async function api(path, { method = 'GET', body, headers = {}, signal } = {}) {
-  const response = await fetch(path, {
-    method, credentials: 'same-origin', cache: 'no-store', headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12000)]) : AbortSignal.timeout(12000),
-  });
-  let result;
-  try { result = await response.json(); } catch { throw new UnreachableError(response.status); }
-  if (!response.ok) throw new APIError(response.status, result.error?.code ?? 'request_failed', result.error?.message ?? 'The request could not be completed.');
-  return result;
+  const abort = composeAbort(signal, 12000);
+  try {
+    const response = await fetch(path, {
+      method, credentials: 'same-origin', cache: 'no-store', headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body), signal: abort.signal,
+    });
+    let result;
+    try { result = await response.json(); } catch { throw new UnreachableError(response.status); }
+    if (!response.ok) throw new APIError(response.status, result.error?.code ?? 'request_failed', result.error?.message ?? 'The request could not be completed.');
+    return result;
+  } finally { abort.release(); }
 }
 
 // Phone online but the service did not answer: remember when it first failed (retries keep the stamp).
@@ -149,6 +155,8 @@ function acceptSession(session) {
   }
   if (state.session && state.session.expiresAt !== session.expiresAt) alertJournal.clear();
   state.session = session;
+  updatePrompt.observe(session.version);
+  sessionGrace.update(session);
   state.snapshotActor = null;
   state.snapshotExpiresAt = null;
   broadcastScope(actorScope(session.actor));
@@ -564,6 +572,7 @@ function tick() {
     label.textContent = remaining > 0 ? `${duration(remaining)} until the expiry time; router observation remains authoritative.` : 'Expiry time reached. Waiting for a fresh router observation; this countdown cannot confirm expiry.';
   }
   if (state.people && currentAge > FRESH_SECONDS && !state.needsRefresh) { state.needsRefresh = true; renderConnection(); }
+  sessionGrace.update(state.session);
   if (state.session && state.session.expiresAt <= now()) { resetView(); announce('Your session expired. Sign in again; local status was cleared.', true); }
   if (state.snapshotExpiresAt && state.snapshotExpiresAt <= now()) { resetView(); announce('The cached session expired. Local status was cleared; reconnect and sign in again.', true); }
   if (state.people && actor()) { alertJournal.ingest(state.people, now(), false); renderAlerts(); }
