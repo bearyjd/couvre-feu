@@ -115,7 +115,7 @@ function resetView() {
   state.generation++;
   state.authController?.abort(); state.authController = null;
   state.session = null; state.snapshotActor = null; state.snapshotExpiresAt = null; state.people = null; state.savedAt = null; state.scheduleClockBasis = null;
-  state.operation = null; state.localUnknown = false; state.needsRefresh = true; state.renderKey = '';
+  state.operation = null; state.localUnknown = false; state.serviceDown = null; state.needsRefresh = true; state.renderKey = '';
   state.busy = false; state.refreshing = false; state.durations.clear();
   clearStatusCache();
   alertJournal.clear();
@@ -196,7 +196,8 @@ async function refresh({ quiet = false } = {}) {
     } else {
       noteFailure(error);
       if (!state.people && state.offline) showCachedStatus();
-      if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
+      if (state.serviceDown) announce('');
+      else if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
     }
     return false;
   } finally {
@@ -326,8 +327,11 @@ async function mutate(personId, action, presetSeconds, minutes) {
     } else {
       outcome = { sent: false, reason: 'The outcome is unknown; check the pause status before trying again.' };
       state.localUnknown = true;
-      state.offline = !navigator.onLine; state.serviceDown = null;
-      announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
+      // Same banner as refresh/followOperation, with the unknown-outcome wording (localUnknown is set); only the offline flag differs:
+      // a lost mutation response must not block the Refresh that resolves it.
+      noteFailure(error); state.offline = !navigator.onLine;
+      if (state.serviceDown) announce('');
+      else announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
     }
   } finally {
     if (generation === state.generation) { state.busy = false; render(); }
@@ -382,7 +386,9 @@ async function followOperation(id, generation) {
         resetView(); announce('Operation access changed. Sign in again to refresh permitted status.', true);
       } else {
         state.needsRefresh = true; state.localUnknown = true; noteFailure(error);
-        announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true); render();
+        if (state.serviceDown) announce('');
+        else announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true);
+        render();
       }
       return;
     }
@@ -484,7 +490,7 @@ function renderServiceDown() {
   if (!down) { delete box.dataset.since; return; }
   box.dataset.since = String(down.since);
   const at = new Date(down.since * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-  $('#service-down-text').textContent = `Couvre-feu is not responding (since ${at}). Your phone is online. Nothing was changed.`;
+  $('#service-down-text').textContent = unsettled() ? `Couvre-feu is not responding (since ${at}). A change you just made may or may not have gone through. Check the status once it is back.` : `Couvre-feu is not responding (since ${at}). Nothing was changed. Check your connection, then tap Retry.`;
   $('#service-down-detail').textContent = down.status ? `The service answered with status ${down.status}.` : 'The service did not answer.';
   $('#service-retry').disabled = state.refreshing;
 }
@@ -601,7 +607,7 @@ window.addEventListener('storage', (event) => {
 $('#service-retry').addEventListener('click', () => void refresh({ quiet: true }));
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.session && !state.busy) void refresh({ quiet: true }); });
 setInterval(tick, 1000);
-setInterval(() => { if (state.session && (!state.offline || state.serviceDown) && !state.busy && !state.refreshing && !state.needsRefresh) void refresh({ quiet: true }); }, 10000);
+setInterval(() => { if (state.session && !state.busy && !state.refreshing && (state.serviceDown || !state.offline && !state.needsRefresh)) void refresh({ quiet: true }); }, 10000);
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { /* Online UI remains usable; offline installation is not claimed. */ });
 render();

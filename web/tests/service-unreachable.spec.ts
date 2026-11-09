@@ -14,8 +14,9 @@ test('a stopped service shows the unreachable banner, never Offline, and Retry r
   await demo.stopService();
   await probe(page);
   await expect(banner(page)).toBeVisible();
-  await expect(banner(page)).toContainText(/Couvre-feu is not responding \(since \d{1,2}:\d{2}[^)]*\)\. Your phone is online\. Nothing was changed\./);
-  await expect(banner(page)).not.toContainText(/offline/i);
+  await expect(banner(page)).toContainText(/Couvre-feu is not responding \(since \d{1,2}:\d{2}[^)]*\)\. Nothing was changed\. Check your connection, then tap Retry\./);
+  await expect(banner(page)).not.toContainText(/offline|phone is online/i);
+  await expect(page.locator('#notice')).toBeHidden(); // the banner is the only announcement
   await expect(page.locator('#connection')).not.toContainText(/offline/i);
   await expect(page.locator('#connection')).toContainText('read-only snapshot');
   await expect(page.locator('[data-person="alex"]')).toBeVisible();
@@ -94,4 +95,55 @@ test('the banner fits 390 px with a 44 px Retry target, keeps focus and uses a s
   expect(box!.height).toBeGreaterThanOrEqual(44);
   expect(box!.width).toBeGreaterThanOrEqual(44);
   expect(await page.evaluate(() => document.activeElement?.id)).toBe('main');
+});
+
+test('a pause whose request is lost says the outcome is unknown, never that nothing changed', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await page.route('**/people/alex/pause', (route) => route.abort('connectionreset'));
+  await page.getByRole('button', { name: 'Pause Alex (fictional)', exact: true }).click();
+  await expect(banner(page)).toBeVisible();
+  await expect(banner(page)).toContainText('A change you just made may or may not have gone through. Check the status once it is back.');
+  await expect(banner(page)).not.toContainText('Nothing was changed');
+  await expect(page.locator('#notice')).toBeHidden();
+});
+
+test('an operation being followed when the service dies gets the unknown-outcome wording', async ({ page, demo }) => {
+  await enroll(page, demo);
+  demo.router.scenario('pending');
+  await page.getByRole('button', { name: 'Pause Alex (fictional)', exact: true }).click();
+  await expect(page.locator('.operation')).toContainText('Pause pending');
+  await demo.stopService();
+  await expect(banner(page)).toBeVisible();
+  await expect(banner(page)).toContainText('may or may not have gone through');
+  await expect(banner(page)).not.toContainText('Nothing was changed');
+});
+
+test('the periodic probe clears the banner without tapping Retry', async ({ page, demo }) => {
+  await page.clock.install();
+  await enroll(page, demo);
+  await demo.stopService();
+  await probe(page);
+  await expect(banner(page)).toBeVisible();
+  await demo.startService();
+  await page.clock.runFor(11000); // fake time: fires the 10 s probe without a real wait
+  await expect(banner(page)).toBeHidden();
+  await expect(page.locator('#connection')).toContainText('Connected');
+});
+
+test('losing the session while the banner is up does not leave it over the sign-in screen', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await page.route('**/people', (route) => route.fulfill({ status: 502, contentType: 'text/html', body: 'Bad Gateway' }));
+  await probe(page);
+  await expect(banner(page)).toBeVisible();
+  await page.unroute('**/people');
+  await page.route('**/auth/session', (route) => route.fulfill({ status: 401, json: { error: { code: 'unauthenticated', message: 'Sign in.' } } }));
+  await probe(page);
+  await expect(page.locator('#auth-view')).toBeVisible();
+  await expect(banner(page)).toBeHidden();
+});
+
+test('the service worker shell cache is renamed so installs drop the old app.js', async ({ page, demo }) => {
+  const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
+  expect(sw).toContain("'cf-shell-v6'");
+  expect(sw).not.toContain('cf-shell-v5');
 });
