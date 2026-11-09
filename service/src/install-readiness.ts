@@ -19,12 +19,12 @@ const DIGEST = /^[0-9a-f]{64}$/;
 
 export type ReadinessPresence = InventoryPresence | 'unknown';
 export interface ReadinessDevice { label: string; mac: string; vendor: string | null; stable: boolean; inScope: boolean; enrolled: boolean; presence: ReadinessPresence }
-export interface ReadinessWarning { code: 'private_address_unconfirmed' | 'device_quiet' | 'child_no_device'; child: string | null; device: string | null }
-export interface ReadinessDTO { children: {name: string; devices: ReadinessDevice[]}[]; adults: ReadinessDevice[]; warnings: ReadinessWarning[]; digest: string; reviewedAt: number | null }
-export interface ReadinessExport { version: 1; digest: string; generatedAt: number; reviewed: boolean; children: ReadinessDTO['children']; adults: ReadinessDevice[]; warnings: ReadinessWarning[] }
+export interface ReadinessWarning { code: 'private_address_unconfirmed' | 'device_quiet' | 'device_unseen' | 'child_no_device'; child: string | null; device: string | null }
+export interface ReadinessDTO { children: {id: string; name: string; devices: ReadinessDevice[]}[]; adults: ReadinessDevice[]; adultsAvailable: boolean; warnings: ReadinessWarning[]; digest: string; reviewedAt: number | null }
+export interface ReadinessExport { version: 1; digest: string; generatedAt: number; reviewed: boolean; children: ReadinessDTO['children']; adults: ReadinessDevice[]; adultsAvailable: boolean; warnings: ReadinessWarning[] }
 
 /** JSON with every object's keys sorted, so equal data always serialises to the same bytes. */
-function canonical(value: unknown): string {
+export function canonical(value: unknown): string {
     if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
     if (value !== null && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`).join(',')}}`;
     return JSON.stringify(value);
@@ -35,9 +35,9 @@ const identity = (d: {mac: string; label: string; stable: boolean; inScope: bool
  * What the install consumes, and nothing that moves between polls: presence, vendor and warnings are left out, so the digest an operator
  * quotes only changes when the list itself does. Independent of key order and of row order.
  */
-export function readinessDigest(list: {children: {name: string; devices: ReturnType<typeof identity>[]}[]; adults: ReturnType<typeof identity>[]}): string {
-    const children = list.children.map(c => ({name: c.name, devices: c.devices.map(identity).sort(byText(d => d.mac))})).sort(byText(c => c.name));
-    return sha256(canonical({children, adults: list.adults.map(identity).sort(byText(d => d.mac))}));
+export function readinessDigest(list: {children: {id: string; name: string; devices: ReturnType<typeof identity>[]}[]; adults: ReturnType<typeof identity>[]}): string {
+    const children = list.children.map(c => ({id: c.id, name: c.name, devices: c.devices.map(identity).sort(byText(d => d.mac))})).sort(byText(c => c.id));
+    return sha256(canonical({v: 1, children, adults: list.adults.map(identity).sort(byText(d => d.mac))}));
 }
 
 /**
@@ -45,6 +45,8 @@ export function readinessDigest(list: {children: {name: string; devices: ReturnT
  * stableConfirmed, and role='adult' rows for adultDevices. Until then no private address counts as confirmed and no adult is listed.
  */
 export const decisions = {
+    /** False while adultDevices is a stub: the review is then partial and the page must say so and not offer approval. */
+    adultsAvailable: false,
     stableConfirmed: (_mac: string): boolean => false,
     adultDevices: (): {label: string; mac: string}[] => [],
 };
@@ -73,7 +75,8 @@ export class InstallReadiness {
             for (const d of devices) {
                 if (!d.stable) out.push({code: 'private_address_unconfirmed', child, device: d.label});
                 const row = seen.get(d.mac);
-                if (!row || now - row.last_seen > QUIET_SECONDS) out.push({code: 'device_quiet', child, device: d.label});
+                if (!row) out.push({code: 'device_unseen', child, device: d.label});
+                else if (now - row.last_seen > QUIET_SECONDS) out.push({code: 'device_quiet', child, device: d.label});
             }
         }
         return out.sort(byText(w => `${w.code}\n${w.child ?? ''}\n${w.device ?? ''}`));
@@ -81,13 +84,13 @@ export class InstallReadiness {
     private build(): ReadinessDTO {
         const {store} = this.inventory, now = this.inventory.now();
         const seen = new Map(store.all<SeenRow>('SELECT mac,source,last_seen FROM inventory_devices WHERE generation=?', store.config.router.generation).map(r => [r.mac, r]));
-        const children = activeChildren(store).filter(c => c.kind === 'child').map(c => ({name: c.name,
+        const children = activeChildren(store).filter(c => c.kind === 'child').map(c => ({id: c.id, name: c.name,
             devices: devicesOf(store, c.id).filter(d => d.state !== 'removing').map(d => this.device({label: d.label, mac: d.identifier}, true, seen, now)).sort(byText(d => d.mac))}))
-            .sort(byText(c => c.name));
+            .sort(byText(c => c.id));
         const adults = decisions.adultDevices().map(d => this.device(d, false, seen, now)).sort(byText(d => d.mac));
         const sum = readinessDigest({children, adults});
         const reviewed = store.get<{at: number | null}>("SELECT MAX(timestamp) at FROM audit WHERE action='install_list_reviewed' AND outcome=?", `digest:${sum}`);
-        return {children, adults, warnings: this.warnings([...children.map(c => ({child: c.name, devices: c.devices})), {child: null, devices: adults}], seen, now), digest: sum, reviewedAt: reviewed?.at ?? null};
+        return {children, adults, adultsAvailable: decisions.adultsAvailable, warnings: this.warnings([...children.map(c => ({child: c.name, devices: c.devices})), {child: null, devices: adults}], seen, now), digest: sum, reviewedAt: reviewed?.at ?? null};
     }
     private current(input: unknown): ReadinessDTO {
         if (typeof input !== 'string' || !DIGEST.test(input)) throw new AppError(400, 'invalid_digest');
@@ -132,7 +135,7 @@ export class InstallReadiness {
         this.admin(session.dto.actor);
         const list = this.current(object(payload, ['digest']).digest);
         this.auth.store.transaction(() => { this.record(session.dto.actor.id, 'install_list_exported', list.digest); });
-        const file: ReadinessExport = {version: 1, digest: list.digest, generatedAt: this.auth.now(), reviewed: list.reviewedAt !== null, children: list.children, adults: list.adults, warnings: list.warnings};
+        const file: ReadinessExport = {version: 1, digest: list.digest, generatedAt: this.auth.now(), reviewed: list.reviewedAt !== null, children: list.children, adults: list.adults, adultsAvailable: list.adultsAvailable, warnings: list.warnings};
         return {status: 200, body: {export: file}};
     }
 }

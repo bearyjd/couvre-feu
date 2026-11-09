@@ -6,6 +6,7 @@ import { getPasskey } from './auth-client.js';
 const WARNING = {
   private_address_unconfirmed: (w) => `${w.device} uses a private (changing) address that has not been confirmed as fixed.`,
   device_quiet: (w) => `${w.device} has not been seen for more than 7 days.`,
+  device_unseen: (w) => `${w.device} has not been seen.`,
   child_no_device: (w) => `${w.child} has no device on the list.`,
 };
 const PRESENCE = { online: 'Online now', lease_only: 'Recently on the network', recent: 'Seen recently', quiet: 'Quiet', unknown: 'Not seen' };
@@ -69,13 +70,14 @@ export function createInstallReadiness({ session, people, offline }) {
     if (notice) view.push(el('p', { role: 'status', 'data-readiness-notice': '', textContent: notice }));
     if (list) {
       view.push(...list.children.map((child) => group(child.name, child.devices, 'No device yet.')));
+      if (list.adultsAvailable !== true) view.push(el('p', { role: 'status', 'data-adults-notice': '', textContent: 'Adult devices are not included in this review yet.' }));
       view.push(group('Adults (protect list)', list.adults, 'No adult devices listed yet.'));
       view.push(el('section', { class: 'readiness-group' }, el('h3', { textContent: 'Warnings' }),
         list.warnings.length ? el('ul', { role: 'list', 'data-warnings': '' }, ...list.warnings.map((w) => el('li', { textContent: (WARNING[w.code] ?? (() => 'Check this list.'))(w) })))
           : el('p', { class: 'fine-print', textContent: 'No warnings.' })));
       view.push(el('p', { class: 'fine-print' }, 'Digest: ', el('code', { 'data-digest': '', textContent: list.digest })));
       view.push(el('p', { 'data-reviewed': '', textContent: Number.isFinite(list.reviewedAt) ? `Approved ${when(list.reviewedAt)}.` : 'Not approved yet.' }));
-      view.push(el('button', { class: 'button', type: 'button', 'data-action': 'approve', 'aria-disabled': busy ? 'true' : 'false', textContent: 'Approve this list (passkey)' }),
+      view.push(el('button', { class: 'button', type: 'button', 'data-action': 'approve', 'aria-disabled': busy || list.adultsAvailable !== true ? 'true' : 'false', textContent: 'Approve this list (passkey)' }),
         el('button', { class: 'button secondary', type: 'button', 'data-action': 'download', 'aria-disabled': busy ? 'true' : 'false', textContent: 'Download' }));
     } else if (failed) view.push(el('button', { class: 'button secondary', type: 'button', 'data-action': 'retry', textContent: 'Try again' }));
     root.replaceChildren(...view);
@@ -103,7 +105,7 @@ export function createInstallReadiness({ session, people, offline }) {
     return error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : error.message;
   };
   async function approve() {
-    if (busy || !list) return;
+    if (busy || !list || list.adultsAvailable !== true) return;
     busy = true; notice = 'Confirm with your passkey to approve this list.'; draw();
     const mine = epoch, digest = list.digest;
     try {

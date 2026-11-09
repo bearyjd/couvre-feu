@@ -5,7 +5,8 @@ import { createServer } from 'node:http';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
-import { InstallReadiness, readinessDigest, QUIET_SECONDS } from '../src/install-readiness.ts';
+import { InstallReadiness, readinessDigest, canonical, decisions, QUIET_SECONDS } from '../src/install-readiness.ts';
+import { digest as sha256 } from '../src/auth.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import type { InventoryDevice } from '../../shared/src/router-inventory.ts';
 
@@ -50,16 +51,16 @@ async function world(options: {enabled?: boolean} = {}) {
     }
     const audit = () => f.store.all<Record<string, unknown>>("SELECT * FROM audit WHERE action LIKE 'install_list_%' ORDER BY id").map(r => ({...r}));
     const cleanup = async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); f.cleanup(); };
-    return {...f, client, poll, audit, cleanup, origin};
+    return {...f, auth, client, poll, audit, cleanup, origin};
 }
 const err = (r: {status: number; body: Record<string, any>}, status: number, code: string) => { assert.equal(r.status, status, JSON.stringify(r.body)); assert.equal(r.body.error?.code, code); };
 
 test('digest is stable across key order and list order, and changes with the list', () => {
-    const a = {children: [{name: 'A', devices: [{mac: 'x', label: 'p', stable: true, inScope: true, enrolled: true}, {mac: 'y', label: 'q', stable: false, inScope: false, enrolled: false}]}], adults: []};
-    const b = {adults: [], children: [{devices: [{enrolled: true, inScope: true, stable: true, label: 'p', mac: 'x'}, {enrolled: false, inScope: false, stable: false, label: 'q', mac: 'y'}], name: 'A'}]};
+    const a = {children: [{id: 'a', name: 'A', devices: [{mac: 'x', label: 'p', stable: true, inScope: true, enrolled: true}, {mac: 'y', label: 'q', stable: false, inScope: false, enrolled: false}]}], adults: []};
+    const b = {adults: [], children: [{id: 'a', devices: [{enrolled: true, inScope: true, stable: true, label: 'p', mac: 'x'}, {enrolled: false, inScope: false, stable: false, label: 'q', mac: 'y'}], name: 'A'}]};
     assert.equal(readinessDigest(a), readinessDigest(b));
     assert.match(readinessDigest(a), /^[0-9a-f]{64}$/);
-    const c = {...a, children: [{name: 'A', devices: [{mac: 'x', label: 'p', stable: false, inScope: true, enrolled: true}, a.children[0].devices[1]]}]};
+    const c = {...a, children: [{id: 'a', name: 'A', devices: [{mac: 'x', label: 'p', stable: false, inScope: true, enrolled: true}, a.children[0].devices[1]]}]};
     assert.notEqual(readinessDigest(a), readinessDigest(c));
 });
 
@@ -191,6 +192,82 @@ test('flag off: the routes do not exist', async () => {
         assert.ok(!('installReadiness' in (await admin.call('GET', '/people')).body));
         assert.notEqual((await admin.call('POST', '/step-up/options', {action: 'install_list_approve', digest: 'a'.repeat(64)})).status, 200);
         assert.equal((await admin.exportList('a'.repeat(64))).status, 404);
+        assert.equal(w.audit().length, 0);
+    } finally { await w.cleanup(); }
+});
+
+test('canonical sorts keys at every depth (removing the sort must fail this)', () => {
+    assert.equal(canonical({b: {y: 1, x: [{d: 1, c: 2}]}, a: null}), canonical({a: null, b: {x: [{c: 2, d: 1}], y: 1}}));
+    assert.equal(canonical({b: 1, a: 2}), '{"a":2,"b":1}');
+});
+
+test('digest binds child ids: two same-name children swapping devices change it; input is versioned', () => {
+    const d = (mac: string) => ({mac, label: 'p', stable: true, inScope: true, enrolled: true});
+    const one = {children: [{id: 'a', name: 'Sam', devices: [d('x')]}, {id: 'b', name: 'Sam', devices: [d('y')]}], adults: []};
+    const swapped = {children: [{id: 'a', name: 'Sam', devices: [d('y')]}, {id: 'b', name: 'Sam', devices: [d('x')]}], adults: []};
+    assert.notEqual(readinessDigest(one), readinessDigest(swapped));
+    assert.notEqual(readinessDigest(one), sha256(canonical({children: one.children, adults: []})), 'the {v:1} prefix is part of the digest input');
+});
+
+test('adults list: unavailable while the adapter is a stub, available when it is not', async () => {
+    const w = await world();
+    try {
+        const admin = await w.client('operator');
+        assert.equal((await admin.get()).body.adultsAvailable, false);
+        const real = {...decisions};
+        decisions.adultsAvailable = true; decisions.adultDevices = () => [{label: 'Bryn phone', mac: STABLE_MAC}];
+        try {
+            const r = await admin.get();
+            assert.equal(r.body.adultsAvailable, true); assert.equal(r.body.adults[0].label, 'Bryn phone');
+            assert.equal((await admin.exportList(r.body.digest)).body.export.adultsAvailable, true);
+        } finally { Object.assign(decisions, real); }
+        const digest = (await admin.get()).body.digest;
+        assert.equal((await admin.exportList(digest)).body.export.adultsAvailable, false);
+    } finally { await w.cleanup(); }
+});
+
+test('no inventory row is device_unseen; exactly 7 days is not quiet, 7 days and 1 second is', async () => {
+    const w = await world();
+    try {
+        const admin = await w.client('operator'), codes = async () => (await admin.get()).body.warnings.map((x: any) => x.code).filter((c: string) => c.startsWith('device_'));
+        assert.deepEqual(await codes(), ['device_unseen']);
+        w.poll([dev(PILOT_MAC, 'pilot-phone', 20)]);
+        assert.deepEqual(await codes(), []);
+        w.store.run('UPDATE inventory_devices SET last_seen=?', w.now() - QUIET_SECONDS);
+        assert.deepEqual(await codes(), []);
+        w.store.run('UPDATE inventory_devices SET last_seen=?', w.now() - QUIET_SECONDS - 1);
+        assert.deepEqual(await codes(), ['device_quiet']);
+    } finally { await w.cleanup(); }
+});
+
+test('the list changing during the passkey step is refused (409) and records nothing', async () => {
+    const w = await world();
+    try {
+        w.poll([dev(PILOT_MAC, 'pilot-phone', 20)]);
+        const admin = await w.client('operator'), {body: {digest}} = await admin.get(), proof = await admin.challenge(digest);
+        const verify = w.auth.stepUpVerify.bind(w.auth);
+        w.auth.stepUpVerify = async (...args: Parameters<typeof verify>) => {
+            const result = await verify(...args);
+            w.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d9','pilot','Late','mac',?, 'active',1)", STABLE_MAC);
+            return result;
+        };
+        err(await admin.approve(digest, proof), 409, 'install_list_stale');
+        assert.equal(w.audit().length, 0);
+    } finally { await w.cleanup(); }
+});
+
+test('an admin demoted during the passkey step is refused and records nothing', async () => {
+    const w = await world();
+    try {
+        w.poll([dev(PILOT_MAC, 'pilot-phone', 20)]);
+        const admin = await w.client('operator'), {body: {digest}} = await admin.get(), proof = await admin.challenge(digest);
+        const verify = w.auth.stepUpVerify.bind(w.auth);
+        w.auth.stepUpVerify = async (...args: Parameters<typeof verify>) => {
+            const result = await verify(...args);
+            w.store.run("UPDATE accounts SET role='parent' WHERE id='operator'");
+            return result;
+        };
+        err(await admin.approve(digest, proof), 403, 'admin_required');
         assert.equal(w.audit().length, 0);
     } finally { await w.cleanup(); }
 });

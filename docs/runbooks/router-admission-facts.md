@@ -319,3 +319,13 @@ The existing vendor admission runbook says the helper avoids a temporary launche
 
 There are 294 stable fact rows (190 path witnesses, 54 explicit runtime-only groups, and 50 tool/system/envelope facts). Patterned runtime groups enumerate their exact type/owner/mode/link-count/size/device/inode/mount/clock relations without exposing private values. The bounded metadata update adds only the three named vendor exceptions above; firmware pins and strict rules remain unchanged. The saved complete facts fixture reports 218 PASS, 0 FAIL, 0 MISSING and 76 SKIP. This means no observed contradiction; runtime-unobservable and optional-absence rows remain SKIP and the verdict remains INCOMPLETE, never live admission.
 
+
+## Install readiness list (UI plan I)
+
+The parent app can export the list the permanent install protects (adults) and allows (children): `installReadiness.enabled` in the manifest, admin-only, approved with a passkey bound to the list digest. The export is an input to the operator, not an authority:
+
+- Recompute the digest yourself from the file's `children` and `adults` (sha256 of the canonical JSON `{v:1, children, adults}`, keys sorted at every depth, children by `id`, devices by `mac`, each device reduced to `mac,label,stable,inScope,enrolled`; see `readinessDigest` in `service/src/install-readiness.ts`).
+- Compare it with the digest the owner quotes in the live-step request and with the `install_list_reviewed` audit row (`outcome` is `digest:<sha256>`). Refuse on any mismatch.
+- Ignore the file's own `reviewed` field and its `digest` field: both are unauthenticated text in a file that can be edited.
+- A file with `adultsAvailable: false` is partial: it has no protect list and must not be used for the install.
+- Nothing in this feature touches the router; the install itself still needs the exact-invocation approval described above.

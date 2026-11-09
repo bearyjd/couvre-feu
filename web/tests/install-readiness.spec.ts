@@ -1,6 +1,7 @@
 import { test, expect, signIn, K2, NAMES } from './bulk-fixture.ts';
 import type { World } from './bulk-fixture.ts';
 import { readFile } from 'node:fs/promises';
+import { decisions } from '../../service/src/install-readiness.ts';
 
 test.use({ readiness: true });
 const MAC_PATTERN = /[0-9a-f]{2}(:[0-9a-f]{2}){5}/i;
@@ -34,6 +35,13 @@ test('admin reviews the list at phone width: children, warnings, digest, no hori
 
 test('approve with a passkey records the review; download gives the JSON for the current digest', async ({ page, integration: f }) => {
   seed(f);
+  const real = { ...decisions };
+  decisions.adultsAvailable = true; // the adapter stub is replaced by D's data; the review is then complete
+  test.info().annotations.push({ type: 'adapter', description: 'adultsAvailable forced on' });
+  try { await approveAndDownload(page, f); } finally { Object.assign(decisions, real); }
+});
+
+async function approveAndDownload(page: import('@playwright/test').Page, f: World) {
   await signIn(page, f, 'operator');
   const digest = await panel(page).locator('[data-digest]').innerText();
   await panel(page).getByRole('button', { name: 'Approve this list (passkey)' }).click();
@@ -48,6 +56,25 @@ test('approve with a passkey records the review; download gives the JSON for the
   expect(JSON.stringify(body.children)).toContain(K2);
   expect(f.store.all<{ action: string }>("SELECT action FROM audit WHERE action LIKE 'install_list_%' ORDER BY id").map((r) => r.action)).toEqual(['install_list_reviewed', 'install_list_exported']);
   expect(JSON.stringify(f.store.all("SELECT * FROM audit WHERE action LIKE 'install_list_%'"))).not.toMatch(MAC_PATTERN);
+}
+
+test('while adult devices are unavailable the review says so and Approve is disabled', async ({ page, integration: f }) => {
+  seed(f);
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('[data-adults-notice]')).toHaveText('Adult devices are not included in this review yet.');
+  await expect(panel(page).getByRole('button', { name: 'Approve this list (passkey)' })).toBeDisabled();
+  await expect(panel(page).getByRole('button', { name: 'Download' })).toBeEnabled();
+  await panel(page).getByRole('button', { name: 'Approve this list (passkey)' }).click({ force: true });
+  expect(f.store.all("SELECT * FROM audit WHERE action LIKE 'install_list_%'")).toEqual([]);
+});
+
+test('a hostile device label stays inert text', async ({ page, integration: f }) => {
+  seed(f);
+  f.store.run("UPDATE devices SET label=? WHERE id='d_kid2'", HOSTILE);
+  await signIn(page, f, 'operator');
+  await expect(panel(page).locator('[data-name]').filter({ hasText: HOSTILE })).toBeVisible();
+  expect(await panel(page).locator('img').count()).toBe(0);
+  expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
 });
 
 test('a parent never sees the review', async ({ page, integration: f }) => {
