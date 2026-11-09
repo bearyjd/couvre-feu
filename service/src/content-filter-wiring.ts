@@ -20,7 +20,7 @@ export function wireContentFilter(config: IntegrationConfig, store: IntegrationS
     const filters = new ContentFilterStore(store, () => Math.floor(Date.now() / 1000));
     const reconciler = new ContentFilterReconciler({
         // PRP-006 A3: parent-entered denylist/allowlist entries are managed (stored in the DB, sent to NextDNS), never written to audit/logs/alerts/errors;
-        // owner decision 2026-11-08 (keep client gate, PR3 opts in). This is the only place the opt-in is set. `testing` (transport, key source) is for tests; production uses the HTTPS default and the key file.
+        // owner decision D8, 2026-11-09 (client gate kept; this wiring opts in). This is the only place the opt-in is set. `testing` (transport, key source) is for tests; production uses the HTTPS default and the key file.
         client: client ?? createNextDnsClient({apiKey: testing.apiKey ?? contentFilterApiKey(settings.apiKeyFile!), allowDomainLists: true, ...(testing.transport ? {transport: testing.transport} : {})}), profiles: settings.profiles!, store: filters,
     });
     return {filters, reconciler, routes: (auth: Auth, policy: IntegrationPolicy) => new ContentFilterRoutes({
