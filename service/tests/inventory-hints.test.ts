@@ -52,17 +52,43 @@ test('suggestedReplaces: a rotated phone points at the quiet row by ROW ID, neve
         assert.ok(!('suggestedReplaces' in f.byMac(PRIV_A)), 'old row is live again: not a replacement');
     } finally { f.cleanup(); }
 });
-test('suggestedReplaces: generic names and protected rows never link', () => {
+test('suggestedReplaces: generic names never link', () => {
+    const f = world();
+    try { f.poll([dev(APPLE, 'iPhone')]); f.advance(3600); f.poll([dev(PRIV_A, 'iPhone')]); assert.ok(!('suggestedReplaces' in f.byMac(PRIV_A))); } finally { f.cleanup(); }
+});
+test('suggestedReplaces: protected rows never link on either side (config is read live; a poll would purge them, so mark them after it)', () => {
+    for (const side of [APPLE, PRIV_B]) {
+        const f = world();
+        try {
+            f.poll([dev(APPLE, 'jacks-pixel-9')]); f.advance(3600); f.poll([dev(PRIV_B, 'jacks-pixel-9')]);
+            assert.ok(f.byMac(PRIV_B).suggestedReplaces !== undefined, 'precondition');
+            f.config.protectedMacs.push(side);
+            const shown = f.inv.list(actor).devices;
+            assert.ok(!shown.some(d => d.mac === side), 'the protected row is hidden');
+            assert.ok(!shown.some(d => d.suggestedReplaces !== undefined), `protected ${side}`);
+        } finally { f.cleanup(); }
+    }
+});
+test('suggestedReplaces: enrolled child devices never link, as predecessor or as the new row, in list and acknowledge', () => {
+    const enrol = (f: ReturnType<typeof world>, mac: string) => f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES(?,?,?,'mac',?,'active',?)", 'dev-x', f.config.person.id, 'x', mac, f.now());
+    const control = world();
+    try { control.poll([dev(APPLE, 'jacks-pixel-9')]); control.advance(3600); control.poll([dev(PRIV_B, 'jacks-pixel-9')]); assert.ok(control.byMac(PRIV_B).suggestedReplaces !== undefined, 'precondition'); } finally { control.cleanup(); }
+    for (const enrolled of [APPLE, PRIV_B]) {
+        const f = world();
+        try {
+            enrol(f, enrolled);
+            f.poll([dev(APPLE, 'jacks-pixel-9')]); f.advance(3600); f.poll([dev(PRIV_B, 'jacks-pixel-9')]);
+            assert.ok(!f.inv.list(actor).devices.some(d => d.suggestedReplaces !== undefined), `enrolled ${enrolled}`);
+            assert.ok(!('suggestedReplaces' in f.inv.acknowledge(actor, PRIV_B)), 'acknowledge agrees');
+        } finally { f.cleanup(); }
+    }
+});
+test('acknowledge carries the suggestion exactly like the list, from one clock', () => {
     const f = world();
     try {
-        f.poll([dev(APPLE, 'iPhone')]); f.advance(3600); f.poll([dev(PRIV_A, 'iPhone')]);
-        assert.ok(!('suggestedReplaces' in f.byMac(PRIV_A)));
-        const g = world();
-        try {
-            g.poll([dev(APPLE, 'jacks-pixel-9')]); g.advance(3600); g.poll([dev(PRIV_B, 'jacks-pixel-9')]);
-            g.config.protectedMacs.push(APPLE); // the protected row is filtered from the list AND from suggestions
-            assert.ok(!('suggestedReplaces' in g.byMac(PRIV_B)));
-        } finally { g.cleanup(); }
+        f.poll([dev(APPLE, 'jacks-pixel-9')]); f.advance(3600); f.poll([dev(PRIV_B, 'jacks-pixel-9')]);
+        assert.deepEqual(f.inv.acknowledge(actor, PRIV_B), f.byMac(PRIV_B));
+        assert.equal(f.inv.acknowledge(actor, PRIV_B).suggestedReplaces, f.byMac(APPLE).id);
     } finally { f.cleanup(); }
 });
 test('acknowledge returns the same enriched DTO', () => {

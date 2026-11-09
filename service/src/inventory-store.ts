@@ -1,7 +1,7 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { isPrivateAddress } from '../../shared/src/router-inventory.ts';
 import type { InventorySource, RouterInventory } from '../../shared/src/router-inventory.ts';
-import { kindHint, presenceOf, suggestReplacements } from '../../shared/src/inventory-hints.ts';
+import { INVENTORY_POLL_SECONDS, kindHint, presenceOf, suggestReplacements } from '../../shared/src/inventory-hints.ts';
 import { lookupVendor } from '../../shared/src/oui.ts';
 import type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
 export type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
@@ -12,7 +12,6 @@ import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
 
-export const INVENTORY_POLL_SECONDS = 60;
 /** One accepted refresh request per this many seconds, across all admins. */
 export const REFRESH_MIN_SECONDS = 10;
 export const ALERT_MIN_INTERVAL_SECONDS = 3600;
@@ -239,22 +238,25 @@ export class InventoryStore {
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1'), current = s?.generation === this.generation ? s : undefined;
         const lookup = this.lookup(), baseline = current?.baseline_at ?? null, hidden = new Set(this.store.config.protectedMacs);
         const rows = this.store.all<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? ORDER BY last_seen DESC, mac ASC LIMIT ?', this.generation, INVENTORY_ROW_CAP);
-        const now = this.now(), shown = rows.filter(r => !hidden.has(r.mac));
-        const replaces = suggestReplacements(rows.map(r => ({id: r.id, mac: r.mac, hostname: r.hostname, firstSeen: r.first_seen, lastSeen: r.last_seen, source: r.source, protectedRow: hidden.has(r.mac)})), now);
+        const now = this.now(), shown = rows.filter(r => !hidden.has(r.mac)), replaces = this.replacements(rows, hidden, lookup.owners, now);
         return {
             status: {baselineAt: baseline, lastOkAt: current?.last_ok_at ?? null, lastAttemptAt: current?.last_attempt_at ?? null, lastError: current?.last_error ?? null,
                 refreshRequestedAt: current?.refresh_requested_at ?? null, pollSeconds: INVENTORY_POLL_SECONDS, retentionDays: this.retentionDays},
-            devices: shown.map(r => this.dto(r, baseline, lookup, actor, replaces.get(r.id)))
+            devices: shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id)))
         };
+    }
+    /** Enrolled or scoped child devices (any owner) and protected MACs are never linked by a hint, on either side. */
+    private replacements(rows: DeviceRow[], hidden: Set<string>, owners: Map<string, string>, now: number): Map<number, number> {
+        return suggestReplacements(rows.map(r => ({id: r.id, mac: r.mac, hostname: r.hostname, firstSeen: r.first_seen, lastSeen: r.last_seen, source: r.source, protectedRow: hidden.has(r.mac) || owners.has(r.mac)})), now);
     }
     private lookup(): {owners: Map<string, string>; names: Map<string, string>} {
         return {owners: this.owners(), names: new Map(this.store.all<{id: string; name: string}>('SELECT id,name FROM people WHERE active=1').map(p => [p.id, p.name]))};
     }
     /** The owner is named only to a viewer who manages that child; for anyone else it is null (the device still counts as assigned). */
-    private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor, replaces?: number): InventoryDeviceDTO {
+    private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor, now: number, replaces?: number): InventoryDeviceDTO {
         const owner = lookup.owners.get(r.mac), visible = owner !== undefined && viewer.personIds.includes(owner) && lookup.names.has(owner);
         const vendor = lookupVendor(r.mac);
-        return {id: r.id, ...(vendor ? {vendor} : {}), kind: kindHint({hostname: r.hostname, vendor}), presence: presenceOf({source: r.source, lastSeen: r.last_seen, now: this.now()}),
+        return {id: r.id, ...(vendor ? {vendor} : {}), kind: kindHint({hostname: r.hostname, vendor}), presence: presenceOf({source: r.source, lastSeen: r.last_seen, now}),
             ...(replaces === undefined ? {} : {suggestedReplaces: replaces}),
             mac: r.mac, inScope: this.scope.inRouterScope(r.mac, this.policy), ipv4: JSON.parse(r.ipv4_json) as string[], hostname: r.hostname, reportedByDevice: true, source: r.source, firstSeen: r.first_seen, lastSeen: r.last_seen, acknowledgedAt: r.acknowledged_at,
             personId: visible ? owner : null, personName: visible ? lookup.names.get(owner)! : null,
@@ -272,7 +274,11 @@ export class InventoryStore {
                 // The row id, never the MAC: the audit trail must not become a second device list.
                 this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, 'inventory_acknowledge', this.now(), `inventory_row:${row.id}`);
             }
-            return this.list(actor).devices.find(d => d.mac === mac)!; // the same enriched DTO the list shows
+            const lookup = this.lookup(), now = this.now(), hidden = new Set(this.store.config.protectedMacs);
+            // Only rows sharing this hostname can matter to its suggestion.
+            const group = this.store.all<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND (mac=? OR (hostname IS NOT NULL AND lower(hostname)=lower(?)))', g, mac, row.hostname);
+            const fresh = group.find(r => r.mac === mac)!;
+            return this.dto(fresh, this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')?.baseline_at ?? null, lookup, actor, now, this.replacements(group, hidden, lookup.owners, now).get(fresh.id));
         });
     }
 }

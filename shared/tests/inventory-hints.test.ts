@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { kindHint, presenceOf, suggestReplacements, ONLINE_SECONDS, RECENT_SECONDS, isGenericHostname } from '../src/inventory-hints.ts';
+import { kindHint, presenceOf, suggestReplacements, ONLINE_SECONDS, RECENT_SECONDS, INVENTORY_POLL_SECONDS, isGenericHostname } from '../src/inventory-hints.ts';
 import type { HintRow } from '../src/inventory-hints.ts';
 
 const kind = (hostname: string | null, vendor?: string) => kindHint({hostname, vendor});
@@ -42,7 +42,7 @@ test('kindHint never throws on hostile text and returns only the closed set', ()
 const T = 1_000_000;
 test('presenceOf: precise boundaries', () => {
     const p = (source: 'lease' | 'neigh' | 'both', age: number) => presenceOf({source, lastSeen: T - age, now: T});
-    assert.deepEqual([ONLINE_SECONDS, RECENT_SECONDS], [120, 900]);
+    assert.deepEqual([INVENTORY_POLL_SECONDS, ONLINE_SECONDS, RECENT_SECONDS], [60, 120, 900]);
     assert.equal(p('both', 0), 'online'); assert.equal(p('neigh', 120), 'online'); assert.equal(p('neigh', 121), 'recent');
     assert.equal(p('both', 900), 'recent'); assert.equal(p('both', 901), 'quiet');
     assert.equal(p('lease', 0), 'lease_only'); assert.equal(p('lease', 900), 'lease_only'); assert.equal(p('lease', 901), 'quiet');
@@ -85,6 +85,12 @@ test('suggestReplacements: false-positive guards', () => {
     cases.push(['different hostname', [old('jacks-pixel'), fresh('jacks-pixel-2')]]);
     cases.push(['same MAC cannot replace itself', [(() => { const r = fresh('jacks-pixel'); return r; })()]]);
     for (const [name, rows] of cases) assert.equal(suggestReplacements(rows, T).size, 0, name);
+});
+test('suggestReplacements: two quiet predecessors last seen at the SAME second tie -> no suggestion; a later one wins; two active randomized rows -> none', () => {
+    assert.equal(suggestReplacements([old('jacks-pixel'), old('jacks-pixel'), fresh('jacks-pixel')], T).size, 0);
+    const a = old('jacks-pixel', {lastSeen: T - 5000}), b = old('jacks-pixel', {lastSeen: T - 4999}), c = fresh('jacks-pixel');
+    assert.deepEqual([...suggestReplacements([a, b, c], T)], [[c.id, b.id]]);
+    assert.equal(suggestReplacements([old('jacks-pixel'), fresh('jacks-pixel'), fresh('jacks-pixel')], T).size, 0);
 });
 test('isGenericHostname', () => {
     for (const g of ['android', 'IPHONE', 'localhost', 'iPhone-13-Pro-Max', 'Galaxy-S23-Ultra', 'pixel', 'ab', '']) assert.equal(isGenericHostname(g), true, g);

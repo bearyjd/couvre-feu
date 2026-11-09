@@ -47,7 +47,9 @@ export function kindHint(input: {hostname?: string | null; vendor?: string | nul
  *   quiet       anything older. A lease alone never proves the device is still there.
  * A last_seen in the future (clock skew) counts as just now.
  */
-export const ONLINE_SECONDS = 120;
+/** The service polls the router this often; ONLINE_SECONDS tolerates one missed poll. */
+export const INVENTORY_POLL_SECONDS = 60;
+export const ONLINE_SECONDS = 2 * INVENTORY_POLL_SECONDS;
 export const RECENT_SECONDS = 900;
 export function presenceOf(row: {source: InventorySource; lastSeen: number; now: number}): InventoryPresence {
     const age = row.now - row.lastSeen; // negative (clock skew) is "just now"
