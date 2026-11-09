@@ -2,6 +2,7 @@
 // passkey confirmation (step-up) bound to that exact change; device changes then go through the router rpc-sync path.
 // All dynamic text is rendered with textContent. createBulk (same file, same helpers) is the Block all / Unblock all panel for admins and parents.
 import { getPasskey } from './auth-client.js';
+import { triageOn, triageView, triageStatus, groupCounts, roleWord, UNDO_SECONDS } from './inventory-triage.js';
 
 const KIND_LABEL = { child: 'Child', device_group: 'Device group' };
 const STATE_LABEL = { enrolling: 'Adding…', removing: 'Removing…', moving: 'Moving…' };
@@ -23,7 +24,7 @@ async function readJson(response) {
   try { const body = await response.json(); return body !== null && typeof body === 'object' ? body : null; } catch { return null; }
 }
 
-function el(tag, props = {}, ...children) {
+export function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
     if (key === 'class') node.className = value;
@@ -309,6 +310,9 @@ const DISPATCH_OFF = 'Inventory polling is off until router dispatch is enabled'
 const REFRESH_FAILURES = new Map([['inventory_dispatch_disabled', DISPATCH_OFF], ['inventory_refresh_rate_limited', RATE_LIMITED]]); // a Map: a code like "constructor" finds nothing
 const REFRESH_STATUS = new Map([[409, DISPATCH_OFF], [429, RATE_LIMITED]]);
 const NOTE_SECONDS = 30;
+// Triage wording (plain, for a parent who cannot fix the router): what to do, never router vocabulary.
+const TRIAGE_REFRESH_OFF = "Refresh isn't switched on yet. Tell JD.";
+const TRIAGE_FAILURES = new Map([[404, 'That device is no longer listed.'], [409, 'That device already belongs to a child.'], [429, 'Too many changes at once. Wait a minute and try again.']]);
 
 function causeText(error) {
   if (error === 'inventory_unavailable:old_router') return 'Router too old for inventory.';
@@ -332,7 +336,7 @@ export function inventoryStatus(status, nowSeconds, time) {
 
 export function createInventory({ session, gate, offline, time, children, version }) {
   const root = document.querySelector('#inventory-panel');
-  let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null;
+  let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null, filter = 'new', undo = null, undoTimer = null;
   let serverNow = null, loadedPerf = 0, mounted = false, fetched = false, inFlight = false, swallowed = false; // swallowed: the first version bump was dropped as a duplicate of the in-flight first load, so a failure of that load must retry itself. fetched: a list request was issued for this session key. serverNow: the service clock at the last load, advanced by this page's own elapsed time
   const title = el('h2', { id: 'inventory-title', tabindex: -1 }, 'Devices on the network');
   const live = el('p', { class: 'fine-print', role: 'status', 'aria-live': 'polite', 'data-live': '', 'data-refresh-status': '' }); // one node for the life of the panel, so screen readers hear changes
@@ -403,9 +407,38 @@ export function createInventory({ session, gate, offline, time, children, versio
       await call('/admin/inventory/refresh', {});
       setNote('Refresh requested. The list updates when the router answers.');
       clearTimeout(timer); timer = setTimeout(() => void load(), 5000);
-    } catch (error) { setNote(REFRESH_FAILURES.get(error.code) ?? REFRESH_STATUS.get(error.status) ?? error.message); }
+    } catch (error) { setNote(triageOn(data) && REFRESH_STATUS.get(error.status) === DISPATCH_OFF ? TRIAGE_REFRESH_OFF : REFRESH_FAILURES.get(error.code) ?? REFRESH_STATUS.get(error.status) ?? error.message); }
     busy = false;
     draw();
+    if (triageOn(data)) void load(); // the list itself is re-read too, so Refresh also retries a failed load
+  }
+  // Triage decisions (UI plan F). Rows are addressed by id, never by address. Adult, Home, Infra and Hide apply at once and can be undone for UNDO_SECONDS.
+  const patch = (device) => { const devices = data.devices.map((d) => (d.id === device.id ? device : d)); data = { ...data, devices, newCount: devices.filter((d) => d.flags.new).length }; };
+  async function decide(device, action, body, done) {
+    if (closed()) { draw(); return; }
+    busy = true; notice = ''; refreshNote = ''; draw();
+    try { done((await call(`/admin/inventory/${device.id}/${action}`, body)).device); } catch (error) { notice = TRIAGE_FAILURES.get(error.status) ?? "Couldn't save that. Nothing was changed."; }
+    busy = false; draw();
+  }
+  function classify(device, role) {
+    return decide(device, 'classify', { role }, (updated) => {
+      patch(updated); clearTimeout(undoTimer);
+      undo = { id: device.id, text: `${role === 'ignored' ? 'Hid' : 'Moved'} ${(device.hostname ?? 'device').slice(0, 40)}${role === 'ignored' ? '.' : ` to ${roleWord(role)}.`}` };
+      undoTimer = setTimeout(() => { undo = null; draw(); }, UNDO_SECONDS * 1000);
+    });
+  }
+  function undoLast() {
+    const last = undo;
+    return last ? decide({ id: last.id }, 'undo', {}, (updated) => { patch(updated); undo = null; clearTimeout(undoTimer); }) : undefined;
+  }
+  async function linkSame(device) {
+    await decide(device, 'link', { replaces: device.suggestedReplaces }, patch);
+    await load();
+  }
+  function startChild(device, child) {
+    if (closed()) { draw(); return; }
+    if (!children.startAdd(child.id, { label: device.hostname ?? '', mac: device.mac })) { notice = "Couldn't open the add form. Try Refresh."; draw(); return; }
+    notice = `The add form for ${child.name} is open below.`; draw();
   }
   function startAssign(device) {
     if (closed()) { draw(); return; }
@@ -454,10 +487,22 @@ export function createInventory({ session, gate, offline, time, children, versio
     const newCount = ordered.filter((d) => d.flags.new).length;
     const clear = status.clear && !stale && newCount === 0;
     const summary = clear ? 'No new devices.' : newCount ? `${newCount} new device${newCount === 1 ? '' : 's'} to review.` : '';
-    const signature = JSON.stringify([data, reason, stale, loadedAt, status.text, summary, notice, refreshNote, picking, busy, children.entries()]);
+    const triage = triageOn(data);
+    const signature = JSON.stringify([data, reason, stale, loadedAt, status.text, summary, notice, refreshNote, picking, busy, children.entries(), triage, filter, undo]);
     if (signature === drawn) return; // never rebuild (and drop keyboard focus) when nothing changed
     if (root.contains(document.activeElement) && document.activeElement.matches('select')) { drawn = ''; return; }
     drawn = signature;
+    if (triage) {
+      const toSort = groupCounts(data.devices).new;
+      body.replaceChildren(
+        el('p', { class: 'fine-print' }, 'Names come from the devices themselves and are not verified.'),
+        ...triageView({ data, filter, undo, statusText: triageStatus(data.status, status, nowSeconds(), toSort), failed: loadFailed && !offline(), locked, nowSeconds: nowSeconds(), children: children.entries(),
+          h: { onFilter: (next) => { filter = next; draw(); }, onRole: (d, role) => void classify(d, role), onChild: startChild, onLink: (d) => void linkSame(d), onUndo: () => void undoLast(), onRetry: () => void load(), onRefresh: () => void refreshNow() } }),
+        ...(offline() ? [el('p', { class: 'fine-print', 'data-inventory-snapshot': '' }, `Showing a saved list from ${time(loadedAt)}. It updates when the connection returns.`)] : []),
+        el('p', { class: 'fine-print', 'data-inventory-reason': '', hidden: !reason }, reason));
+      root.hidden = false;
+      return;
+    }
     body.replaceChildren(
       el('p', { class: 'fine-print' }, 'What the router has seen. Device names are chosen by the devices themselves and are not verified. Protected devices are never listed.'),
       el('p', { class: 'notice', 'data-inventory-status': status.kind }, status.text, ...(summary ? [' ', el('strong', clear ? { 'data-all-clear': '' } : {}, summary)] : [])),
@@ -470,7 +515,7 @@ export function createInventory({ session, gate, offline, time, children, versio
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
     if (next !== key) {
-      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; fetched = false; inFlight = false; swallowed = false; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer);
+      key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; fetched = false; inFlight = false; swallowed = false; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer); clearTimeout(undoTimer); filter = 'new'; undo = null;
       draw(); if (next) void load(); return;
     }
     const seen = version();
