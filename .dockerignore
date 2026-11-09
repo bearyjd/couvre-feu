@@ -3,6 +3,7 @@
 !package.json
 !package-lock.json
 !LICENSE
+!VERSION
 !shared/src
 !service/src
 !service/migrations
