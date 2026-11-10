@@ -60,50 +60,64 @@ export function createContentFilter({ session, people }) {
     return result;
   }
 
+  // The heading, intro and one live region are built once; only the cards are replaced, so the live region stays attached and is announced.
+  const live = el('p', { class: 'filter-live', role: 'status', 'aria-live': 'polite' });
+  const list = el('div', { 'data-filter-list': '' });
+  const skeleton = [el('h2', { id: 'filter-title', textContent: 'Content filter' }),
+    el('p', { class: 'fine-print', textContent: 'What each child can reach, set through NextDNS. It filters websites by name only; it cannot see apps that avoid it, and each state below says what NextDNS has and has not confirmed. Unverified on this router.' }), live, list];
+  const announce = (person, text) => { live.textContent = text ? `${person.name}: ${text}` : ''; };
+  function reset() { root.replaceChildren(); root.hidden = true; list.replaceChildren(); live.textContent = ''; }
   function sync() {
     const next = sessionKey();
-    if (next !== key) { key = next; epoch++; off = false; cards.clear(); root.replaceChildren(); root.hidden = true; }
+    if (next !== key) { key = next; epoch++; off = false; cards.clear(); reset(); }
     return key;
   }
 
+  // Resolves to 'changed', 'same' or 'failed'. A newer save or read for the same child supersedes an older one (seq), so a slow answer never overwrites a fresher card.
   async function loadOne(person) {
     const mine = epoch;
-    const entry = cards.get(person.id) ?? { status: 'loading', record: null, draft: null, notice: '', busy: false, dirty: false, typed: {}, fetchedAt: 0, noticeNode: el('p', { class: 'fine-print', role: 'status', 'aria-live': 'polite', 'data-filter-notice': '' }) };
+    const entry = cards.get(person.id) ?? { status: 'loading', record: null, draft: null, notice: '', busy: false, dirty: false, typed: {}, fetchedAt: 0, seq: 0 };
     cards.set(person.id, entry);
+    const token = ++entry.seq, before = JSON.stringify([entry.status, entry.record]);
     try {
       const record = await call(`/people/${encodeURIComponent(person.id)}/filter`);
-      if (mine !== epoch) return;
-      entry.status = 'ready'; entry.record = record; entry.fetchedAt = Date.now(); if (!entry.dirty || !entry.draft) { entry.draft = desiredOf(record.desired); entry.dirty = false; }
+      if (mine !== epoch || token !== entry.seq) return 'same';
+      entry.status = 'ready'; entry.record = record; entry.fetchedAt = Date.now();
+      if (!entry.dirty || !entry.draft) { entry.draft = desiredOf(record.desired); entry.dirty = false; }
     } catch (error) {
-      if (mine !== epoch) return;
-      if (entry.status === 'ready' && error.status !== 404) { entry.fetchedAt = Date.now(); return; } // a failed refresh keeps what is shown
-      if (error.status === 404 && error.code === 'route_not_found') { off = true; return; }
-      if (error.status === 404 && error.code === 'filter_not_set') { entry.status = 'unset'; entry.draft ??= desiredOf(BASELINE); }
+      if (mine !== epoch || token !== entry.seq) return 'same';
+      entry.fetchedAt = Date.now();
+      if (error.status === 404 && error.code === 'route_not_found') { off = true; return 'changed'; }
+      if (error.status === 404 && error.code === 'filter_not_set') { entry.status = 'unset'; entry.record = null; entry.draft ??= desiredOf(BASELINE); }
       else if (error.status === 404) entry.status = 'none'; // not a child this account manages, or not mapped: no card, and not asked again this session
+      else if (entry.status === 'ready' || entry.status === 'unset') return 'failed'; // a failed read never replaces a card that is showing
       else entry.status = 'error';
     }
+    return JSON.stringify([entry.status, entry.record]) === before ? 'same' : 'changed';
   }
   const REFRESH_MS = 10000;
   async function loadAll() {
     if (!sync() || loadingEpoch === epoch) return;
     const mine = epoch; loadingEpoch = mine;
+    let changed = false;
     try {
-      const due = (entry) => !entry || (entry.status === 'ready' && !entry.busy && Date.now() - entry.fetchedAt >= REFRESH_MS);
-      // Errors are retried only by the person (Try again); everything else is asked once, and ready cards are refreshed at most every 10 s.
-      await Promise.all((people() ?? []).filter((person) => { const entry = cards.get(person.id); return !entry || due(entry); }).map(loadOne));
+      const due = (entry) => !entry || ((entry.status === 'ready' || (entry.status === 'unset' && !entry.dirty)) && !entry.busy && Date.now() - entry.fetchedAt >= REFRESH_MS);
+      // Errors are retried only by the person (Try again). Ready and unset cards are re-read at most every 10 s, and the page is redrawn only if something changed.
+      const results = await Promise.all((people() ?? []).filter((person) => due(cards.get(person.id))).map(loadOne));
+      changed = results.includes('changed');
     } finally { if (loadingEpoch === mine) loadingEpoch = -1; }
-    if (mine === epoch) draw();
+    if (mine === epoch && changed) draw();
   }
 
   const toggleIn = (list, id, on) => (on ? [...new Set([...list, id])] : list.filter((item) => item !== id));
 
   function checkbox(entry, group, id, label) {
-    const input = el('input', { type: 'checkbox', checked: entry.draft[group].includes(id), disabled: entry.busy, 'data-filter-field': `${group}:${id}` });
+    const input = el('input', { type: 'checkbox', checked: entry.draft[group].includes(id), disabled: entry.busy, 'data-filter-field': `${group}:${id}`, 'data-focus-key': `field:${group}:${id}` });
     input.addEventListener('change', () => { entry.draft[group] = toggleIn(entry.draft[group], id, input.checked); entry.dirty = true; });
     return el('label', { class: 'alert-preference' }, input, ` ${label}`);
   }
   function flag(entry, name, label) {
-    const input = el('input', { type: 'checkbox', checked: entry.draft[name], disabled: entry.busy, 'data-filter-field': name });
+    const input = el('input', { type: 'checkbox', checked: entry.draft[name], disabled: entry.busy, 'data-filter-field': name, 'data-focus-key': `field:${name}` });
     input.addEventListener('change', () => { entry.draft[name] = input.checked; entry.dirty = true; });
     return el('label', { class: 'alert-preference' }, input, ` ${label}`);
   }
@@ -112,8 +126,8 @@ export function createContentFilter({ session, people }) {
     return entry.draft[group].filter((id) => !known.some(([knownId]) => knownId === id)).map((id) => checkbox(entry, group, id, id));
   }
   function domains(person, entry, group, title) {
-    const input = el('input', { type: 'text', value: entry.typed[group] ?? '', inputMode: 'url', autocapitalize: 'none', autocomplete: 'off', spellcheck: false, maxLength: 253, 'aria-label': `${title}: add a site`, disabled: entry.busy, 'data-filter-input': group });
-    const add = el('button', { class: 'button secondary', type: 'button', disabled: entry.busy, textContent: 'Add' });
+    const input = el('input', { type: 'text', value: entry.typed[group] ?? '', inputMode: 'url', autocapitalize: 'none', autocomplete: 'off', spellcheck: false, maxLength: 253, 'aria-label': `${title}: add a site`, disabled: entry.busy, 'data-filter-input': group, 'data-focus-key': `input:${group}` });
+    const add = el('button', { class: 'button secondary', type: 'button', disabled: entry.busy, textContent: 'Add', 'data-focus-key': `add:${group}` });
     const problem = el('p', { class: 'fine-print', role: 'alert', hidden: true, textContent: 'Enter just the site name, like example.com.' });
     input.addEventListener('input', () => { entry.typed[group] = input.value; });
     const submit = () => {
@@ -123,13 +137,13 @@ export function createContentFilter({ session, people }) {
       problem.hidden = true;
       if (entry.draft[group].length >= MAX_DOMAINS) { problem.textContent = 'That list is full.'; problem.hidden = false; return; }
       entry.draft[group] = [...new Set([...entry.draft[group], host])].sort(); entry.typed[group] = ''; entry.dirty = true;
-      entry.notice = ''; draw(person.id, `${group}-input`);
+      entry.notice = ''; draw(person.id, `input:${group}`);
     };
     add.addEventListener('click', submit);
     input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); submit(); } });
     const rows = entry.draft[group].map((host) => {
-      const remove = el('button', { class: 'button secondary', type: 'button', disabled: entry.busy, 'aria-label': `Remove ${host} from ${title}`, textContent: 'Remove' });
-      remove.addEventListener('click', () => { entry.draft[group] = entry.draft[group].filter((item) => item !== host); entry.dirty = true; entry.notice = ''; draw(person.id, `${group}-input`); });
+      const remove = el('button', { class: 'button secondary', type: 'button', disabled: entry.busy, 'aria-label': `Remove ${host} from ${title}`, textContent: 'Remove', 'data-focus-key': `remove:${group}` });
+      remove.addEventListener('click', () => { entry.draft[group] = entry.draft[group].filter((item) => item !== host); entry.dirty = true; entry.notice = ''; draw(person.id, `input:${group}`); });
       return el('li', {}, el('span', { textContent: host }), ' ', remove);
     });
     return el('fieldset', { class: 'filter-domains' }, el('legend', { textContent: title }),
@@ -137,34 +151,51 @@ export function createContentFilter({ session, people }) {
       el('div', {}, input, ' ', add), problem);
   }
 
+  const BEFORE_COMMIT = [400, 401, 403, 404, 409, 422, 429];
   async function save(person, entry) {
     if (entry.busy) return;
-    entry.busy = true; entry.notice = ''; draw(person.id);
+    // Site text typed but not added is added now if valid; if it is not a site name the save waits, so nothing typed is silently dropped.
+    for (const group of ['denylist', 'allowlist']) {
+      const typed = (entry.typed[group] ?? '').trim();
+      if (!typed) continue;
+      const host = normalizeDomain(typed);
+      if (!host) { entry.notice = 'Finish or clear the site you typed first. Nothing changed.'; announce(person, entry.notice); draw(person.id, `input:${group}`); return; }
+      entry.draft[group] = [...new Set([...entry.draft[group], host])].sort(); entry.typed[group] = '';
+    }
+    entry.busy = true; entry.seq++; entry.notice = ''; draw(person.id, 'save');
     const path = `/people/${encodeURIComponent(person.id)}/filter`, desired = { ...entry.draft };
+    let result = null;
     try {
       try {
-        entry.record = await call(path, { method: 'PUT', json: { desired } });
+        result = await call(path, { method: 'PUT', json: { desired } });
       } catch (error) {
         if (error.status !== 403 || error.code !== 'step_up_required') throw error;
-        entry.notice = 'Confirm with your passkey to continue.'; draw(person.id);
-        let start;
-        try { start = await call('/step-up/options', { json: { action: 'content_filter_set', person: person.id, desired } }); } catch (failed) { failed.beforeCommit = true; throw failed; } // nothing is stored before the challenge exists
-        const response = await getPasskey(start.options);
-        entry.record = await call(path, { method: 'PUT', json: { desired, stepUp: { challengeId: start.challengeId, response } } });
+        entry.notice = 'Confirm with your passkey to continue.'; announce(person, entry.notice); draw(person.id, 'save');
+        let start, response;
+        try { start = await call('/step-up/options', { json: { action: 'content_filter_set', person: person.id, desired } }); response = await getPasskey(start.options); }
+        catch (failed) { failed.beforeCommit = true; throw failed; } // nothing is stored until the proof is sent
+        result = await call(path, { method: 'PUT', json: { desired, stepUp: { challengeId: start.challengeId, response } } });
       }
-      entry.status = 'ready'; entry.draft = desiredOf(entry.record.desired); entry.dirty = false; entry.typed = {}; entry.fetchedAt = Date.now();
+      entry.record = result; entry.status = 'ready'; entry.draft = desiredOf(result.desired); entry.dirty = false; entry.typed = {}; entry.fetchedAt = Date.now();
       entry.notice = 'Saved here. NextDNS has not confirmed it yet.';
     } catch (error) {
-      // Only outcomes that happened before anything was stored may say "Nothing changed"; a timeout or a server error may have saved.
-      const before = error.name === 'NotAllowedError' || error.beforeCommit === true || [400, 401, 403, 404, 429].includes(error.status);
+      // Only an outcome that happened before anything was stored may say "Nothing changed"; a timeout or a server error may have saved.
+      const before = error.name === 'NotAllowedError' || error.beforeCommit === true || BEFORE_COMMIT.includes(error.status);
       entry.notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.'
         : error.status === 429 ? 'Too many changes just now. Try again in a minute.'
         : error.status === 400 ? 'The service did not accept that filter. Nothing changed.'
         : before ? 'The filter could not be changed. Nothing changed.'
-        : 'Could not confirm whether this saved. Checking…';
-      if (!before) { entry.busy = false; draw(person.id, null, 'filterSave'); await loadOne(person); entry.notice = 'Could not confirm whether your change saved. The state above is what the service holds now.'; }
+        : 'Could not confirm whether your change saved.';
+      if (!before) {
+        // Stays busy through the re-read, so nothing can be edited or saved on top of an unknown state.
+        entry.dirty = false; // the draft is only what was being sent; what the service holds is what decides
+        const outcome = await loadOne(person);
+        entry.notice = outcome === 'failed' ? 'Could not confirm whether your change saved, and could not re-read the filter. Check again before saving.'
+          : 'Could not confirm your change saved. The card now shows what the service holds.';
+        if (outcome === 'failed') entry.dirty = true;
+      }
     }
-    entry.busy = false; draw(person.id, null, 'filterSave');
+    entry.busy = false; announce(person, entry.notice); draw(person.id, 'save');
   }
 
   function card(person, entry) {
@@ -173,6 +204,7 @@ export function createContentFilter({ session, people }) {
     if (entry.status === 'loading') body.push(el('p', { class: 'fine-print', textContent: 'Loading…' }));
     else if (entry.status === 'error') {
       const retry = el('button', { class: 'button secondary', type: 'button', textContent: 'Try again' });
+      retry.dataset.focusKey = 'retry';
       retry.addEventListener('click', () => { cards.delete(person.id); void loadAll(); });
       body.push(el('p', { class: 'fine-print', role: 'alert', textContent: "Couldn't load this filter." }), retry);
     } else {
@@ -186,33 +218,32 @@ export function createContentFilter({ session, people }) {
         el('fieldset', {}, el('legend', { textContent: 'Blocked apps and sites' }), ...SERVICES.map(([id, label]) => checkbox(entry, 'services', id, label)), ...extras(entry, 'services', SERVICES)),
         el('fieldset', {}, el('legend', { textContent: 'Protections' }), ...TOGGLES.map(([name, label]) => flag(entry, name, label))),
         domains(person, entry, 'denylist', 'Always block these sites'), domains(person, entry, 'allowlist', 'Always allow these sites'));
-      const saveButton = el('button', { class: 'button primary', type: 'button', disabled: entry.busy, 'aria-disabled': entry.busy ? 'true' : 'false', textContent: entry.status === 'unset' ? 'Save filter' : 'Save changes', 'data-filter-save': '' });
+      const saveButton = el('button', { class: 'button primary', type: 'button', 'aria-disabled': entry.busy ? 'true' : 'false', textContent: entry.status === 'unset' ? 'Save filter' : 'Save changes', 'data-filter-save': '', 'data-focus-key': 'save' });
       saveButton.addEventListener('click', () => void save(person, entry));
-      body.push(saveButton, (entry.noticeNode.textContent = entry.notice, entry.noticeNode));
+      body.push(saveButton, el('p', { class: 'fine-print', 'data-filter-notice': '', textContent: entry.notice }));
     }
     return el('section', { class: 'filter-card', 'aria-labelledby': title, 'data-filter-person': person.id }, el('h3', { id: title, textContent: person.name }), ...body);
   }
 
-  function draw(focusPerson, focusField, focusKey) {
-    if (!sync() || off || ![...cards.values()].some((entry) => entry.status !== 'none')) { root.replaceChildren(); root.hidden = true; return; }
-    const active = root.contains(document.activeElement) ? document.activeElement : null;
-    const had = !focusField && !focusKey && active?.dataset?.filterField ? active.dataset.filterField : null;
-    const hadSave = !focusField && !focusKey && active?.dataset?.filterSave !== undefined ? active.closest('[data-filter-person]')?.dataset.filterPerson : null;
+  function draw(focusPerson, focusKey) {
+    if (!sync() || off || ![...cards.values()].some((entry) => entry.status !== 'none')) { reset(); return; }
+    // What had focus (and the caret in a text box) is put back after the cards are rebuilt, unless an action named where focus should go.
+    const active = list.contains(document.activeElement) ? document.activeElement : null;
+    const keep = !focusKey && active?.dataset?.focusKey ? { person: active.closest('[data-filter-person]')?.dataset.filterPerson, key: active.dataset.focusKey, start: active.selectionStart, end: active.selectionEnd } : null;
     const listed = (people() ?? []).filter((person) => cards.has(person.id) && cards.get(person.id).status !== 'none');
-    root.replaceChildren(
-      el('h2', { id: 'filter-title', textContent: 'Content filter' }),
-      el('p', { class: 'fine-print', textContent: 'What each child can reach, set through NextDNS. It filters websites by name only; it cannot see apps that avoid it, and each state below says what NextDNS has and has not confirmed. Unverified on this router.' }),
-      ...listed.map((person) => card(person, cards.get(person.id))));
+    if (!root.contains(list)) root.replaceChildren(...skeleton);
+    list.replaceChildren(...listed.map((person) => card(person, cards.get(person.id))));
     root.hidden = false;
-    if (focusField) document.querySelector(`#filter-panel [data-filter-person="${CSS.escape(focusPerson)}"] [data-filter-input="${CSS.escape(focusField.replace(/-input$/, ''))}"]`)?.focus();
-    else if (focusKey === 'filterSave' && focusPerson) document.querySelector(`#filter-panel [data-filter-person="${CSS.escape(focusPerson)}"] [data-filter-save]`)?.focus();
-    else if (hadSave) document.querySelector(`#filter-panel [data-filter-person="${CSS.escape(hadSave)}"] [data-filter-save]`)?.focus();
-    else if (had) document.querySelector(`#filter-panel [data-filter-field="${CSS.escape(had)}"]`)?.focus();
+    const target = focusKey ? { person: focusPerson, key: focusKey } : keep;
+    if (!target?.person) return;
+    const node = list.querySelector(`[data-filter-person="${CSS.escape(target.person)}"] [data-focus-key="${CSS.escape(target.key)}"]`);
+    node?.focus();
+    if (node && keep && typeof keep.start === 'number' && node.setSelectionRange) try { node.setSelectionRange(keep.start, keep.end); } catch { /* not a text box */ }
   }
 
   return {
     update() {
-      if (!sync() || off) { if (off) { root.replaceChildren(); root.hidden = true; } return; }
+      if (!sync() || off) { if (off) reset(); return; }
       void loadAll();
     },
   };

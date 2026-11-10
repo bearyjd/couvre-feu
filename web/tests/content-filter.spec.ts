@@ -123,7 +123,7 @@ test('MOCK: a server error on save does not claim nothing changed, and re-reads 
   await enroll(page, demo);
   await card(page).locator('[data-filter-field="blockBypass"]').uncheck();
   await card(page).getByRole('button', { name: 'Save changes' }).click();
-  await expect(card(page).locator('[data-filter-notice]')).toContainText('Could not confirm whether your change saved');
+  await expect(card(page).locator('[data-filter-notice]')).toContainText('Could not confirm your change saved');
   await expect(card(page).locator('[data-filter-notice]')).not.toContainText('Nothing changed');
   await expect(card(page).locator('[data-filter-state]')).toContainText('Sending');
 });
@@ -139,4 +139,30 @@ test('MOCK: a failing read is not retried on every refresh, and an unsaved edit 
   const retry = card(page).getByRole('button', { name: 'Try again' });
   await retry.click();
   await expect.poll(() => m.gets.length).toBeGreaterThan(before);
+});
+
+test('MOCK: a site typed but not added is saved if valid, and blocks the save if it is not a site name', async ({ page, demo }) => {
+  const m = await mock(page, { get: refuse(404, 'filter_not_set') });
+  await enroll(page, demo);
+  const input = card(page).locator('[data-filter-input="allowlist"]');
+  await input.fill('not a site!');
+  await card(page).getByRole('button', { name: 'Save filter' }).click();
+  await expect(card(page).locator('[data-filter-notice]')).toContainText('Nothing changed');
+  expect(m.puts).toHaveLength(0);
+  await input.fill('School.Example.org');
+  await card(page).getByRole('button', { name: 'Save filter' }).click();
+  await expect(card(page).locator('[data-filter-notice]')).toHaveText('Saved here. NextDNS has not confirmed it yet.');
+  expect((m.puts[0] as any).desired.allowlist).toEqual(['school.example.org']);
+});
+
+test('MOCK: text typed in a site box survives a refresh', async ({ page, demo }) => {
+  await mock(page, { get: (route) => route.fulfill({ json: record('applied') }) });
+  await enroll(page, demo);
+  const input = card(page).locator('[data-filter-input="denylist"]');
+  await input.fill('exam');
+  await card(page).locator('[data-filter-field="safeSearch"]').uncheck();
+  await input.focus();
+  await page.locator('#refresh').click();
+  await page.waitForTimeout(600);
+  await expect(card(page).locator('[data-filter-input="denylist"]')).toHaveValue('exam');
 });
