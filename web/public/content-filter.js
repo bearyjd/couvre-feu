@@ -61,12 +61,13 @@ export function createContentFilter({ session, people }) {
   }
 
   // The heading, intro and one live region are built once; only the cards are replaced, so the live region stays attached and is announced.
+  let drawnPeople = '[]';
   const live = el('p', { class: 'filter-live', role: 'status', 'aria-live': 'polite' });
   const list = el('div', { 'data-filter-list': '' });
   const skeleton = [el('h2', { id: 'filter-title', textContent: 'Content filter' }),
     el('p', { class: 'fine-print', textContent: 'What each child can reach, set through NextDNS. It filters websites by name only; it cannot see apps that avoid it, and each state below says what NextDNS has and has not confirmed. Unverified on this router.' }), live, list];
   const announce = (person, text) => { live.textContent = text ? `${person.name}: ${text}` : ''; };
-  function reset() { root.replaceChildren(); root.hidden = true; list.replaceChildren(); live.textContent = ''; }
+  function reset() { root.replaceChildren(); root.hidden = true; list.replaceChildren(); live.textContent = ''; drawnPeople = '[]'; }
   function sync() {
     const next = sessionKey();
     if (next !== key) { key = next; epoch++; off = false; cards.clear(); reset(); }
@@ -229,12 +230,16 @@ export function createContentFilter({ session, people }) {
     return el('section', { class: 'filter-card', 'aria-labelledby': title, 'data-filter-person': person.id }, el('h3', { id: title, textContent: person.name }), ...body);
   }
 
+  // Which children (id and name) the cards were drawn for: when the people list changes or empties, the old names must not stay on screen.
+
+  const peopleKey = () => JSON.stringify((people() ?? []).filter((person) => cards.get(person.id)?.status && cards.get(person.id).status !== 'none').map((person) => [person.id, person.name]));
   function draw(focusPerson, focusKey) {
     if (!sync() || off || ![...cards.values()].some((entry) => entry.status !== 'none')) { reset(); return; }
     // What had focus (and the caret in a text box) is put back after the cards are rebuilt, unless an action named where focus should go.
     const active = list.contains(document.activeElement) ? document.activeElement : null;
     const keep = !focusKey && active?.dataset?.focusKey ? { person: active.closest('[data-filter-person]')?.dataset.filterPerson, key: active.dataset.focusKey, start: active.selectionStart, end: active.selectionEnd } : null;
     const listed = (people() ?? []).filter((person) => cards.has(person.id) && cards.get(person.id).status !== 'none');
+    drawnPeople = peopleKey();
     if (!root.contains(list)) root.replaceChildren(...skeleton);
     list.replaceChildren(...listed.map((person) => card(person, cards.get(person.id))));
     root.hidden = false;
@@ -248,6 +253,7 @@ export function createContentFilter({ session, people }) {
   return {
     update() {
       if (!sync() || off) { if (off) reset(); return; }
+      if (peopleKey() !== drawnPeople) draw();
       void loadAll();
     },
   };
