@@ -142,7 +142,7 @@ export function createContentFilter({ session, people }) {
     add.addEventListener('click', submit);
     input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); submit(); } });
     const rows = entry.draft[group].map((host) => {
-      const remove = el('button', { class: 'button secondary', type: 'button', disabled: entry.busy, 'aria-label': `Remove ${host} from ${title}`, textContent: 'Remove', 'data-focus-key': `remove:${group}` });
+      const remove = el('button', { class: 'button secondary', type: 'button', disabled: entry.busy, 'aria-label': `Remove ${host} from ${title}`, textContent: 'Remove', 'data-focus-key': `remove:${group}:${host}` });
       remove.addEventListener('click', () => { entry.draft[group] = entry.draft[group].filter((item) => item !== host); entry.dirty = true; entry.notice = ''; draw(person.id, `input:${group}`); });
       return el('li', {}, el('span', { textContent: host }), ' ', remove);
     });
@@ -160,7 +160,8 @@ export function createContentFilter({ session, people }) {
       if (!typed) continue;
       const host = normalizeDomain(typed);
       if (!host) { entry.notice = 'Finish or clear the site you typed first. Nothing changed.'; announce(person, entry.notice); draw(person.id, `input:${group}`); return; }
-      entry.draft[group] = [...new Set([...entry.draft[group], host])].sort(); entry.typed[group] = '';
+      if (entry.draft[group].length >= MAX_DOMAINS && !entry.draft[group].includes(host)) { entry.notice = 'That list is full. Nothing changed.'; announce(person, entry.notice); draw(person.id, `input:${group}`); return; }
+      entry.draft[group] = [...new Set([...entry.draft[group], host])].sort(); entry.typed[group] = ''; entry.dirty = true;
     }
     entry.busy = true; entry.seq++; entry.notice = ''; draw(person.id, 'save');
     const path = `/people/${encodeURIComponent(person.id)}/filter`, desired = { ...entry.draft };
@@ -195,7 +196,10 @@ export function createContentFilter({ session, people }) {
         if (outcome === 'failed') entry.dirty = true;
       }
     }
-    entry.busy = false; announce(person, entry.notice); draw(person.id, 'save');
+    entry.busy = false; announce(person, entry.notice);
+    // Focus returns to Save only if it was left on the page body or inside this card; it never leaves another card's control.
+    const here = list.querySelector(`[data-filter-person="${CSS.escape(person.id)}"]`), at = document.activeElement;
+    draw(person.id, at === document.body || at === null || here?.contains(at) || !list.contains(at) ? 'save' : undefined);
   }
 
   function card(person, entry) {

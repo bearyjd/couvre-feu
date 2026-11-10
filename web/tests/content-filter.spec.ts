@@ -166,3 +166,17 @@ test('MOCK: text typed in a site box survives a refresh', async ({ page, demo })
   await page.waitForTimeout(600);
   await expect(card(page).locator('[data-filter-input="denylist"]')).toHaveValue('exam');
 });
+
+test('MOCK: a typed site survives a failed save and is sent on the next one', async ({ page, demo }) => {
+  let fail = true;
+  const m = await mock(page, { get: (route) => route.fulfill({ json: record('applied') }), put: (route, body) => fail ? refuse(429, 'content_filter_rate_limited')(route) : route.fulfill({ json: record('pending', body.desired) }) });
+  await enroll(page, demo);
+  await card(page).locator('[data-filter-input="allowlist"]').fill('keep.example.org');
+  await card(page).getByRole('button', { name: 'Save changes' }).click();
+  await expect(card(page).locator('[data-filter-notice]')).toContainText('Try again in a minute');
+  await expect(card(page).getByText('keep.example.org', { exact: true })).toBeVisible();
+  fail = false;
+  await card(page).getByRole('button', { name: 'Save changes' }).click();
+  await expect(card(page).locator('[data-filter-notice]')).toContainText('Saved here');
+  expect((m.puts[1] as any).desired.allowlist).toEqual(['keep.example.org']);
+});
