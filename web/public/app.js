@@ -6,6 +6,7 @@ import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
 import { createRewardTime } from './reward-time.js';
 import { createAuditLog } from './audit.js';
+import { createContentFilter } from './content-filter.js';
 import { createAccounts } from './accounts.js';
 import { createTabs } from './tabs.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
@@ -25,6 +26,7 @@ const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.s
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
 const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
+const contentFilter = createContentFilter({ session: () => state.session, people: () => state.people?.people ?? [] });
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
@@ -540,6 +542,7 @@ function render() {
   bulk.update();
   children.update();
   inventory.update();
+  contentFilter.update();
   auditLog.update();
 }
 

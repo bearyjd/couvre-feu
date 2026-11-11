@@ -1056,3 +1056,10 @@ body:has(#tabbar:not([hidden])) footer { padding-bottom: calc(32px + 64px + env(
   .tab-badge { position: static; margin-left: 2px; }
   body:has(#tabbar:not([hidden])) footer { padding-bottom: 32px; }
 }
+.filter-card { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); overflow-wrap: anywhere; }
+.filter-card fieldset { margin: 12px 0; border: 0; padding: 0; min-width: 0; }
+.filter-card legend { font-weight: 650; }
+.filter-card .button, .filter-card input[type="text"] { min-height: 44px; }
+.filter-card input[type="text"] { max-width: 100%; }
+.filter-card ul { list-style: none; padding: 0; }
+.filter-live { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
