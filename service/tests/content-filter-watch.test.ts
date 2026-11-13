@@ -4,7 +4,7 @@ import { integrationFixture } from './fixtures/integration.ts';
 import { ParentAlerts } from '../src/parent-alerts.ts';
 import { ContentFilterReconciler } from '../src/content-filter-reconcile.ts';
 import { ContentFilterStore } from '../src/content-filter-state.ts';
-import { ContentFilterWatch, UNREACHABLE_AFTER, UNREACHABLE_REPEAT } from '../src/content-filter-watch.ts';
+import { ContentFilterWatch, UNREACHABLE_AFTER, UNREACHABLE_REPEAT, startContentFilterWatch } from '../src/content-filter-watch.ts';
 import type { Transport } from '../src/nextdns-client.ts';
 import { DESIRED, PROFILE_ID, SECRET_ALLOWED, SECRET_DOMAIN, fakeWorld } from './fixtures/content-filter.ts';
 
@@ -102,4 +102,66 @@ test('an unrelated reconcile pass never resolves a filter_drift alert; only an a
     s.alerts.raise({kind: 'filter_drift', personId: 'pilot', severity: 'warning', details: {cause: 'changed'}});
     s.alerts.reconcile({now: s.now() + 100000, timeRequests: [], activity: []});
     assert.equal(s.rows()[0]!.state, 'open');
+});
+
+test('a filter that was never applied is retried quietly: no alert, and it becomes applied', async () => {
+    const s = world();
+    s.filters.put('pilot', DESIRED, 'operator'); // pending: a save whose write never reached NextDNS
+    await s.watch.tick();
+    assert.equal(s.rows().length, 0);
+    assert.equal(s.filters.get('pilot')!.state, 'applied');
+});
+
+test('a match whose stored state is not applied is brought to applied without an alert', async () => {
+    const s = world();
+    await s.applied();
+    s.store.run("UPDATE content_filter_desired SET state='not_confirmed'");
+    await s.watch.tick();
+    assert.equal(s.rows().length, 0);
+    assert.equal(s.filters.get('pilot')!.state, 'applied');
+});
+
+test('a filter that cannot converge never re-raises: drift already seen is retried quietly', async () => {
+    const s = world(next => async req => { const res = await next(req); if (req.method === 'PUT' && req.path.endsWith('/denylist')) s.profile.denylist.length = 0; return res; });
+    await s.applied();
+    assert.equal(s.filters.get('pilot')!.state, 'drift');
+    for (let i = 0; i < 3; i++) await s.watch.tick();
+    assert.equal(s.rows().length, 0, 'the filter never reached applied, so nothing "changed"');
+});
+
+test('a store failure ends one pass without rejecting; the timer helper survives it', async () => {
+    const s = world();
+    await s.applied();
+    s.store.run("UPDATE content_filter_desired SET desired_json='not json'");
+    await assert.doesNotReject(s.watch.tick());
+    const stop = startContentFilterWatch(s.watch, 5, 1);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    stop();
+});
+
+test('a read that overlaps a save is discarded even when the save finishes inside it', async () => {
+    let slow!: () => void; const gate = new Promise<void>(resolve => { slow = resolve; });
+    let held = false;
+    const s = world(next => async req => { if (req.method === 'GET' && held) { held = false; await gate; } return next(req); });
+    await s.applied();
+    held = true;
+    const check = s.reconciler.check('pilot');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    s.profile.parentalControl.safeSearch = false; // half-written state a concurrent save would leave
+    await s.reconciler.reconcile('pilot');
+    slow();
+    assert.equal(await check, 'skipped');
+});
+
+test('a revision change during the read skips the result', async () => {
+    let slow!: () => void; const gate = new Promise<void>(resolve => { slow = resolve; });
+    let held = false;
+    const s = world(next => async req => { if (req.method === 'GET' && held) { held = false; await gate; } return next(req); });
+    await s.applied();
+    held = true;
+    const check = s.reconciler.check('pilot');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    s.filters.put('pilot', DESIRED, 'operator');
+    slow();
+    assert.equal(await check, 'skipped');
 });

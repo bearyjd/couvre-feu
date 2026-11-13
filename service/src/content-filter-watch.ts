@@ -25,11 +25,11 @@ export class ContentFilterWatch {
             for (const person of this.reconciler.people()) {
                 try { await this.watch(person); } catch { /* one child's failure never stops the others */ }
             }
-        } finally { this.running = false; }
+        } catch { /* a store failure ends this pass only; the next hourly pass tries again */ } finally { this.running = false; }
     }
 
     private async watch(person: string): Promise<void> {
-        const result = await this.reconciler.check(person);
+        const {result, state} = await this.reconciler.inspect(person);
         if (result === 'skipped' || result === 'none') return;
         if (result === 'unreachable') {
             const failed = (this.failures.get(person) ?? 0) + 1;
@@ -38,9 +38,10 @@ export class ContentFilterWatch {
             return;
         }
         this.failures.delete(person);
-        if (result === 'differs') this.raise(person, 'changed');
-        // A difference is put right now; a match whose stored state is not 'applied' (pending, not confirmed) is retried too.
-        if (result === 'differs') await this.reconciler.reconcile(person);
+        // Only a filter that was applied can have drifted: a difference there is a change made in NextDNS and is reported. Any other stored
+        // state (never applied, not confirmed, drift already seen) is retried quietly, so a filter that cannot converge never re-raises hourly.
+        if (result === 'differs' && state === 'applied') this.raise(person, 'changed');
+        if (result === 'differs' || state !== 'applied') await this.reconciler.reconcile(person);
     }
     private raise(person: string, cause: 'changed' | 'unreachable'): void {
         try { this.alerts.raise({kind: 'filter_drift', personId: person, severity: cause === 'changed' ? 'warning' : 'info', details: {cause}}); } catch { /* alerts are best effort */ }
@@ -49,7 +50,7 @@ export class ContentFilterWatch {
 
 /** Starts the hourly check; the first one runs after `firstDelayMs`. The timers never keep the process alive. Returns a stop function. */
 export function startContentFilterWatch(watch: ContentFilterWatch, intervalMs = WATCH_INTERVAL_SECONDS * 1000, firstDelayMs = 60_000): () => void {
-    const run = () => { void watch.tick(); };
+    const run = () => { watch.tick().catch(() => undefined); };
     const first = setTimeout(run, firstDelayMs), every = setInterval(run, intervalMs);
     first.unref(); every.unref();
     return () => { clearTimeout(first); clearInterval(every); };
