@@ -74,6 +74,22 @@ export class ContentFilterReconciler {
         const expired = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), this.options.waitMs ?? this.options.budgetMs ?? RECONCILE_BUDGET_MS); });
         try { return await Promise.race([this.reconcile(person), expired]) ?? this.options.store.get(person); } finally { clearTimeout(timer); }
     }
+    /**
+     * Read-only: does NextDNS still hold the filter set here? Writes nothing and keeps nothing from NextDNS beyond the comparison.
+     * 'skipped' when a write is running or started meanwhile (so a PUT in flight is never mistaken for drift); 'none' when there is no stored filter.
+     */
+    async check(person: string): Promise<'match' | 'differs' | 'unreachable' | 'skipped' | 'none'> {
+        const {store, profiles, client} = this.options, before = store.get(person);
+        if (!before || !this.configured(person)) return 'none';
+        if (this.slots.has(person)) return 'skipped';
+        let observed: ContentFilterDesired;
+        try { observed = await readBack(client, profiles[person]!, {signal: AbortSignal.timeout(this.options.budgetMs ?? RECONCILE_BUDGET_MS)}); } catch { return 'unreachable'; }
+        const after = store.get(person);
+        if (this.slots.has(person) || !after || after.revision !== before.revision) return 'skipped';
+        return desiredSha256(observed) === before.desiredSha256 ? 'match' : 'differs';
+    }
+    /** Children with a stored filter and a NextDNS profile. */
+    people(): string[] { return Object.keys(this.options.profiles).filter(person => this.options.store.get(person) !== undefined); }
     private start(person: string): Promise<FilterRecord | undefined> {
         const run = this.run(person);
         this.slots.set(person, run);

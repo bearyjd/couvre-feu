@@ -9,6 +9,7 @@ const TITLES = {
   router_scope_change: 'Router device list changed',
   new_device: 'New device on the network',
   inventory_stalled: 'Network inventory has not completed recently',
+  filter_drift: 'Content filter needs a look',
 };
 const SEVERITIES = ['info', 'warning', 'critical'];
 const STATES = ['open', 'acknowledged', 'resolved'];
@@ -37,6 +38,9 @@ export function alertSummary(alert) {
     case 'inventory_stalled':
       return d.cause === 'row_cap' ? 'The router lists more devices than the inventory can keep, so some may be missing.'
         : `No complete device scan for about ${count(d.count).toLocaleString()} minute${count(d.count) === 1 ? '' : 's'}. New devices may go unnoticed until the router answers.`;
+    case 'filter_drift': // The cause only; what changed at NextDNS is never put in an alert.
+      return d.cause === 'unreachable' ? "Couvre-feu could not check this child's content filter at NextDNS for several hours, so it cannot confirm it is in force."
+        : "This child's content filter at NextDNS no longer matched what you set here. Couvre-feu tried to put it back; check the filter card to see whether it is confirmed.";
     default: return '';
   }
 }
