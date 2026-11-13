@@ -109,7 +109,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const timeRequestsEnabled = !gated || mode !== 'off';
     // Who may see and decide requests (parent routes) and read their alert: everyone unless the manifest narrows it to the owner account.
     const mayDecide = (actor: Actor) => !gated || mode === 'parents' || (mode === 'owner' && actor.id === ownerAccountId);
-    const hiddenAlerts = (actor: Actor): readonly string[] => mayDecide(actor) ? [] : ['time_request_pending'];
+    const hiddenAlerts = (actor: Actor): readonly string[] => [...(mayDecide(actor) ? [] : ['time_request_pending']), ...(contentFilter?.visibleTo(actor) === true ? [] : ['filter_drift'])];
     const clock = (policy as {now?: () => number}).now ?? auth.now;
     // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
     const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
