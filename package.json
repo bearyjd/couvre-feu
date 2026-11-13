@@ -19,6 +19,6 @@
     "test:web": "playwright test --config web/playwright.config.ts",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": { "@simplewebauthn/server": "13.3.3" },
+  "dependencies": { "@simplewebauthn/server": "14.1.0" },
   "devDependencies": { "@levischuck/tiny-cbor": "0.2.11", "@playwright/test": "1.61.0", "@types/node": "26.6.5", "typescript": "7.0.2" }
 }
