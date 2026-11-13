@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
       - name: Install router-matching BusyBox 1.33.1
@@ -51,7 +51,7 @@ jobs:
           - suites: 'test-permanent-install.py'
           - suites: 'test-install-recovery-primitives.py test-pinned-helper-security.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py test-heartbeat.py'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
       - name: Install router-matching BusyBox 1.33.1
@@ -79,7 +79,7 @@ jobs:
           - suite: test-penn-pilot.py
             partition: 4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash runtime
         run: sudo apt-get update && sudo apt-get install -y busybox
       - name: Install router-matching BusyBox 1.33.1
@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require successful preflight and every matrix job
         env:
           PREFLIGHT_RESULT: ${{ needs.fixture_preflight.result }}
@@ -138,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install router-matching BusyBox for the marked runtime fixture
         uses: ./.github/actions/pinned-busybox
       - uses: actions/setup-node@v4
