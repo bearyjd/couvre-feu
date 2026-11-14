@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
       - name: Install router-matching BusyBox 1.33.1
@@ -32,7 +32,7 @@ jobs:
           sh tests/acceptance.sh --preflight
           python3 tests/run-fixtures.py --write-plan "$RUNNER_TEMP/couvre-feu-plan.json"
       - name: Publish complete source-bound partition plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fixture-plan
           path: ${{ runner.temp }}/couvre-feu-plan.json
@@ -51,7 +51,7 @@ jobs:
           - suites: 'test-permanent-install.py'
           - suites: 'test-install-recovery-primitives.py test-pinned-helper-security.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py test-heartbeat.py'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
       - name: Install router-matching BusyBox 1.33.1
@@ -79,12 +79,12 @@ jobs:
           - suite: test-penn-pilot.py
             partition: 4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash runtime
         run: sudo apt-get update && sudo apt-get install -y busybox
       - name: Install router-matching BusyBox 1.33.1
         uses: ./.github/actions/pinned-busybox
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: fixture-plan
           path: .ci-fixture-plan
@@ -99,7 +99,7 @@ jobs:
           python3 tests/run-fixtures.py --shard '${{ matrix.suite }}' --partition '${{ matrix.partition }}' --plan .ci-fixture-plan/couvre-feu-plan.json --receipt "$RUNNER_TEMP/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json"
       - name: Publish unique shard coverage receipt
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fixture-receipt-${{ matrix.suite }}-${{ matrix.partition }}
           path: ${{ runner.temp }}/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json
@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require successful preflight and every matrix job
         env:
           PREFLIGHT_RESULT: ${{ needs.fixture_preflight.result }}
@@ -121,11 +121,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y busybox
       - name: Install router-matching BusyBox 1.33.1
         uses: ./.github/actions/pinned-busybox
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: fixture-plan
           path: .ci-fixture-plan
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: fixture-receipt-*
           merge-multiple: true
@@ -138,10 +138,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install router-matching BusyBox for the marked runtime fixture
         uses: ./.github/actions/pinned-busybox
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '26.13.1'
           cache: npm
