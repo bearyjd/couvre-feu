@@ -40,6 +40,13 @@ CREATE INDEX parent_alerts_person ON parent_alerts(person_id, id);
 
 -- 3. Inventory snapshot, scoped by generation. last_seen advances only for source neigh or both; alerted_at is when a "New" device was
 -- last counted in an alert (NULL = not yet alerted, so a device whose alert was coalesced away still alerts on a later complete poll).
+-- NOTE (migration 015): inventory_decisions is bound to (generation, mac) with a foreign key, but the row id used by routes and audit is this table's implicit rowid
+-- (no INTEGER PRIMARY KEY). Any rebuild of this table must preserve (generation, mac), should preserve rowids, and must run with the service's decision sweep.
+-- REBUILD RULES (inventory_decisions has ON DELETE CASCADE to this table): (1) rebuild ONLY through IntegrationStore.runMigration, which turns
+-- foreign keys OFF before BEGIN: dropping this table with foreign keys ON cascade-deletes every inventory_decisions row, and PRAGMA foreign_keys
+-- is a no-op inside a transaction. (2) Use CREATE inventory_devices_next / copy / DROP inventory_devices / ALTER ... RENAME TO inventory_devices.
+-- NEVER rename this table away (ALTER ... RENAME TO inventory_devices_old): on SQLite >= 3.26 that rewrites the REFERENCES in inventory_decisions
+-- to the old name and every later decision insert fails with 'no such table'.
 CREATE TABLE IF NOT EXISTS inventory_devices (
  generation TEXT NOT NULL CHECK(length(generation)=64),
  mac TEXT NOT NULL CHECK(length(mac)=17 AND mac GLOB '[0-9a-f][0-9a-f]:*'),

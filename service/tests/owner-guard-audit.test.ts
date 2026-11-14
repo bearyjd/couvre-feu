@@ -163,7 +163,7 @@ const insertAudit = (db: DatabaseSync, at: number, action: string, op: string | 
 test('migration 013 keeps rows and ids, the three indexes, STRICT and the CHECKs, and admits owner_guard_refused', () => {
     const m = preThirteen(db => { insertAudit(db, 1, 'pause', 'op_one'); insertAudit(db, 2, 'focus_start', null); insertAudit(db, 3, 'resume', 'op_three'); });
     try {
-        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 14);
+        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 15);
         assert.deepEqual(m.store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), [
             {id: 1, at: 1, actor_id: 'parent', action: 'pause', person_id: 'pilot', operation_id: 'op_one', result: 'applied'},
             {id: 2, at: 2, actor_id: 'parent', action: 'focus_start', person_id: 'pilot', operation_id: null, result: 'applied'},

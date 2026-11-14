@@ -356,7 +356,7 @@ test('batch: first-run completion refuses later setup with confirmed nonseed dev
 test('batch: tables stay additive, but migration 014 raises the version so the pre-014 binary refuses the database', () => {
     const f = world();
     try {
-        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 12);
+        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 13);
         assert.equal(f.count('people'), 1); assert.equal(f.count('devices'), 1);
         const sql = f.store.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE name='admin_batches'")!.sql;
         assert.match(sql, /UNIQUE\s*\(actor_id,\s*client_key\)/i);

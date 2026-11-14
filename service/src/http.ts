@@ -22,7 +22,7 @@ import { TimeRequestService } from './time-requests.ts';
 import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
 import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
-import { inventoryGet, inventoryPost } from './inventory-http.ts';
+import { INVENTORY_LINK_PATH, inventoryDelete, inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
 import type { InstallReadiness } from './install-readiness.ts';
 import { auditFor } from './parent-audit.ts';
@@ -188,7 +188,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v9'", `'cf-shell-integration-${provenance.integrationScope}-v8'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v10'", `'cf-shell-integration-${provenance.integrationScope}-v8'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
@@ -328,6 +328,18 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const written = await contentFilter.put(session, path, payload);
                 if (!written) throw new AppError(405, 'method_not_allowed');
                 send(response, written.status, {...provenance, ...written.body as object});
+                return;
+            }
+            if (request.method === 'DELETE' && inventory && INVENTORY_LINK_PATH.test(path)) {
+                // Session and CSRF first, so an anonymous caller learns nothing about the flag; then without inventoryUi.triage this is any other DELETE (405).
+                // No body is read: the row id in the path is the whole request.
+                if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
+                request.resume();
+                const session = auth.session(sessionToken, jar.cf_browser);
+                auth.csrf(session, request.headers['x-csrf-token']);
+                const removed = inventoryDelete(inventory, session, path);
+                if (!removed) throw new AppError(405, 'method_not_allowed');
+                send(response, removed.status, {...provenance, ...removed.body as object});
                 return;
             }
             if (request.method !== 'GET') {
