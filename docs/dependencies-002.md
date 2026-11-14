@@ -26,8 +26,8 @@ The audit response is private task evidence, not a source file. Independent
 application review and the acceptance runbooks cover behavior and deployment
 gates separately.
 
-The demo pins Node 26.8.1 and npm 11.19.0. It uses Node's built-in SQLite API;
-the [version-matched documentation](https://nodejs.org/download/release/v26.8.1/docs/api/sqlite.html)
+The demo pins Node 26.13.1 and npm 11.19.0. It uses Node's built-in SQLite API;
+the [version-matched documentation](https://nodejs.org/download/release/v26.13.1/docs/api/sqlite.html)
 labels that API release candidate. The acceptance tests must establish the
 tested durability behavior; this runtime selection makes no target-router or
 production deployment claim.

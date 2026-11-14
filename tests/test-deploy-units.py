@@ -203,7 +203,7 @@ class DeployFiles(unittest.TestCase):
 
     def test_dockerfile_pins_node_by_version_and_digest_and_runs_unprivileged(self):
         text = read('deploy', 'docker', 'Dockerfile')
-        self.assertEqual(len(re.findall(r'^FROM node:26\.8\.1-slim@sha256:[0-9a-f]{64}( AS \w+)?$', text, re.M)), 2)
+        self.assertEqual(len(re.findall(r'^FROM node:26\.13\.1-slim@sha256:[0-9a-f]{64}( AS \w+)?$', text, re.M)), 2)
         self.assertEqual(text.count('FROM '), 2)
         self.assertIn('USER 10001:10001', text)
         self.assertIn('HEALTHCHECK', text)

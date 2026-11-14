@@ -4,7 +4,7 @@ This offline prototype evaluates preconstructed fictional browser-focus interval
 
 Router byte-counter estimates of network activity are a separate feature described in [activity-service.md](activity-service.md); this prototype does not feed it.
 
-Run its deterministic fixtures with the repository's Node 26.8.1:
+Run its deterministic fixtures with the repository's Node 26.13.1:
 
 ```sh
 node --test shared/tests/activity-evidence.test.ts

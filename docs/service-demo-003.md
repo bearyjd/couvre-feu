@@ -4,7 +4,7 @@ This runs fictional controls against the separate file-backed fake router. It ne
 
 ## Start and enroll
 
-Use the repository root with Node **26.8.1** and npm **11.19.0**. Install the pinned lockfile with a project-local temporary cache:
+Use the repository root with Node **26.13.1** and npm **11.19.0**. Install the pinned lockfile with a project-local temporary cache:
 
 ```sh
 npm ci --ignore-scripts --cache /tmp/couvre-feu-npm-cache

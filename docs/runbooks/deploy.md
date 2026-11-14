@@ -21,10 +21,10 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
 
 ## Common prerequisites
 
-1. Node **26.8.1** and npm **11.19.0** (`package.json` `engines`). Install from the official tarball after verifying it, or use the pinned image below:
+1. Node **26.13.1** and npm **11.19.0** (`package.json` `engines`). Install from the official tarball after verifying it, or use the pinned image below:
 
    ```sh
-   V=26.8.1; T=node-v$V-linux-x64.tar.xz     # use the -linux-arm64 tarball on arm64
+   V=26.13.1; T=node-v$V-linux-x64.tar.xz     # use the -linux-arm64 tarball on arm64
    curl -fsSLO https://nodejs.org/dist/v$V/$T
    curl -fsSLO https://nodejs.org/dist/v$V/SHASUMS256.txt
    curl -fsSLO https://nodejs.org/dist/v$V/SHASUMS256.txt.sig
@@ -34,7 +34,7 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
    gpg --verify SHASUMS256.txt.sig SHASUMS256.txt
    sha256sum -c --ignore-missing SHASUMS256.txt     # must report: $T: OK
    mkdir -p /opt/node-v$V && tar -xJf $T -C /opt/node-v$V --strip-components=1
-   ln -sfn /opt/node-v$V/bin/node /usr/local/bin/node && node --version   # v26.8.1
+   ln -sfn /opt/node-v$V/bin/node /usr/local/bin/node && node --version   # v26.13.1
    ```
 2. A service user with a **fixed uid/gid 10001** so the systemd and Docker options are interchangeable: `useradd --system --uid 10001 --user-group --home-dir /var/lib/couvrefeu --shell /usr/sbin/nologin couvrefeu`.
 3. Private directories, owned by that user and `0700`: `/var/lib/couvrefeu` (manifest `dataDir`) and `/etc/couvrefeu` (manifest, `known_hosts`, public key). The service rejects symlinks, wrong owners, group/world access and writable ancestors (`unsafe_private_path`, `unsafe_private_ancestor`). The manifest must be outside the source tree.
@@ -115,7 +115,7 @@ Create an unprivileged container (`--unprivileged 1`), `--onboot 1`, a small roo
 
 ## Option 2: Docker / Compose
 
-Files: [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile), [`deploy/docker/compose.yaml`](../../deploy/docker/compose.yaml), [`.dockerignore`](../../.dockerignore). The image is `node:26.8.1-slim` pinned by the multi-arch index digest, runs as uid/gid 10001, has no build step and contains only the runtime tree plus `openssh-client`.
+Files: [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile), [`deploy/docker/compose.yaml`](../../deploy/docker/compose.yaml), [`.dockerignore`](../../.dockerignore). The image is `node:26.13.1-slim` pinned by the multi-arch index digest, runs as uid/gid 10001, has no build step and contains only the runtime tree plus `openssh-client`.
 
 ```sh
 docker build -f deploy/docker/Dockerfile -t couvrefeu:local .    # or: podman build ...
