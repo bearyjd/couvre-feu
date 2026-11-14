@@ -376,7 +376,7 @@ test('More is ordered Schedules, Activity, Audit log, Accounts, About, with a ju
   await signIn(page, f, 'operator');
   await tab(page, 'more').click();
   expect(await page.evaluate(() => [...document.querySelectorAll('#panel-more > [id]')].map((e) => e.id).filter((id) => id !== 'more-heading'))).toEqual(
-    ['more-jump', 'schedule-editor', 'activity-panel', 'activity-boundary', 'audit-panel', 'accounts-panel', 'about-panel']);
+    ['more-jump', 'schedule-editor', 'activity-panel', 'activity-boundary', 'audit-panel', 'accounts-panel', 'install-readiness-panel', 'about-panel']);
   await expect(page.locator('#about-panel')).toBeVisible();
   const links = page.locator('#more-jump a:visible');
   expect(await links.allInnerTexts()).toContain('Accounts');
