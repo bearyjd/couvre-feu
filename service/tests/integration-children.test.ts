@@ -1,5 +1,6 @@
 import { OBSERVATION_FRESH_SECONDS } from '../src/integration-policy.ts';
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -85,7 +86,7 @@ test('an existing integration database with a live operation migrates in place: 
         db.close(); chmodSync(path, 0o600);
         const store = new IntegrationStore(config);
         try {
-            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 13, '015 widens the parent audit actions again');
+            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 14, '016 adds the counts tables');
             assert.equal(store.integrationState().active_operation_id, 'op1');
             assert.equal(store.all('PRAGMA foreign_key_check').length, 0);
             assert.equal(store.get<{n: number}>('PRAGMA foreign_keys' as string) !== undefined, true);
@@ -310,7 +311,7 @@ test('account scope_all: only a scope_all admin grants it, and the account then 
 });
 
 test('HTTP: child admin routes are admin-only, CSRF/Origin-checked, and step-up options route by action', async () => {
-    const f = fixture(), port = 36000 + process.pid % 9000, base = `http://localhost:${port}`;
+    const f = fixture(), port = await freePort(), base = `http://localhost:${port}`;
     const auth = new Auth(f.store, base, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: base, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');

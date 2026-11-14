@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
@@ -9,7 +10,7 @@ import { TestAuthenticator } from './authenticator.ts';
 
 /** The owner-account guard is wired by http.ts only in real-router owner mode: the same admin request is allowed in parents mode and refused in owner mode. */
 async function issueTokenFor(mode: 'owner' | 'parents', portOffset: number): Promise<{status: number; error?: string}> {
-    const f = integrationFixture(), port = 36000 + (process.pid + portOffset) % 10000, origin = `http://localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`, timeRequests: {mode}, ownerAccountId: 'parent'} as typeof f.config);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -42,7 +43,7 @@ test('HTTP: another admin issuing a token for the owner account is allowed in pa
 
 /** Operator and parent are both admins, parent is the owner account: the operator acts on the parent's credential and account over HTTP. */
 async function operatorActsOnParent(mode: 'owner' | 'parents', portOffset: number): Promise<Record<string, {status: number; error?: string}>> {
-    const f = integrationFixture(), port = 36000 + (process.pid + portOffset) % 10000, origin = `http://localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     f.store.run("UPDATE accounts SET role='admin' WHERE id='parent'");
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`, timeRequests: {mode}, ownerAccountId: 'parent'} as typeof f.config);

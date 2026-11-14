@@ -245,3 +245,23 @@ test('snapshot: no failure or success path leaks the key, its file path, or key 
         assert.equal(readContentFilterKey(target), FAKE_KEY);
     });
 });
+
+test('contentFilter.counts: absent is off, {enabled} is a strict boolean, anything else is refused', () => {
+    assert.equal(parseContentFilter(valid)?.counts, undefined);
+    assert.deepEqual(plain(parseContentFilter({...valid, counts: {enabled: true}})), {...valid, counts: {enabled: true}});
+    assert.deepEqual(plain(parseContentFilter({...valid, counts: {enabled: false}})), {...valid, counts: {enabled: false}});
+    assert.deepEqual(plain(parseContentFilter({...valid, mode: 'parents', counts: {enabled: true}})), {...valid, mode: 'parents', counts: {enabled: true}});
+    const bad: unknown[] = [{}, {enabled: 1}, {enabled: 'true'}, {enabled: null}, {enabled: true, alert: false}, {enabled: true, extra: 1}, {alert: true}, null, true, [], 'on', [{enabled: true}]];
+    for (const counts of bad) assert.throws(() => parseContentFilter({...valid, counts}), {message: 'invalid_content_filter'}, JSON.stringify(counts));
+});
+
+test('contentFilter.counts is accepted and ignored under mode off, so the rollback to off never fails validation', () => {
+    assert.deepEqual(plain(parseContentFilter({mode: 'off', counts: {enabled: true}})), {mode: 'off', counts: {enabled: true}});
+    assert.throws(() => parseContentFilter({mode: 'off', counts: {enabled: 'yes'}}), {message: 'invalid_content_filter'});
+});
+
+test('the manifest carries contentFilter.counts through integrationConfig strict parsing', () => {
+    const manifest = parseContentFilter({...valid, counts: {enabled: true}});
+    assert.equal(manifest?.counts?.enabled, true);
+    assert.ok(Object.isFrozen(manifest) && Object.isFrozen(manifest?.counts));
+});

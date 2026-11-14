@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { integrationFixture } from './fixtures/integration.ts';
@@ -10,7 +11,7 @@ import { TestAuthenticator } from './authenticator.ts';
 let runs = 0;
 /** Starts the real-integration HTTP server; returns how many 5 s time-request timers it armed. */
 async function run(enabled: boolean | undefined, body: (origin: string, timers: number[]) => Promise<void>) {
-    const f = integrationFixture(), port = 38000 + process.pid % 10000 + runs++, origin = `http://localhost:${port}`, host = `localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`, host = `localhost:${port}`;
     const config = {...f.config, port, origin, host, ...(enabled === undefined ? {} : {timeRequests: {enabled}})};
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const timers: number[] = [], original = globalThis.setInterval;
@@ -53,7 +54,7 @@ test('integration time requests mount only when the manifest enables them', asyn
 });
 
 test('after time requests are switched off, owed restores still drain and then the timer stops', async () => {
-    const f = integrationFixture(), port = 38000 + process.pid % 10000 + runs++, origin = `http://localhost:${port}`, host = `localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`, host = `localhost:${port}`;
     const person = f.config.person.id, now = f.now();
     // State left behind by an approval made while the flag was on: pause lifted, restore owed, allowance over.
     f.store.run('INSERT INTO request_links(id,person_id,token_hash,created_by,created_at,revoked_at,revoked_by) VALUES(?,?,?,?,?,?,?)', 'link-1', person, 'h'.repeat(64), 'parent', now - 2000, now - 100, 'parent');
@@ -89,7 +90,7 @@ test('after time requests are switched off, owed restores still drain and then t
 
 /** Per-account gate: a pending request exists; each of owner / other parent / admin asks the parent routes and the alert feed. */
 async function gated(timeRequests: unknown, ownerAccountId: string | undefined, body: (who: (account: string) => Promise<(path: string, input?: unknown) => Promise<{status: number; body: Record<string, any>}>>, ctx: {origin: string; timers: number[]; requestId: string}) => Promise<void>) {
-    const f = integrationFixture(), port = 38000 + process.pid % 10000 + runs++, origin = `http://localhost:${port}`, host = `localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`, host = `localhost:${port}`;
     const person = f.config.person.id, now = f.now(), requestId = '11111111-1111-4111-8111-111111111111';
     f.store.run('INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES(?,?,?,?,?)', 'parent2', 'Second parent', 'parent', JSON.stringify([person]), 'w'.repeat(43));
     f.store.run('INSERT INTO request_links(id,person_id,token_hash,created_by,created_at) VALUES(?,?,?,?,?)', 'link-1', person, 'b'.repeat(64), 'parent', now - 100);

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
@@ -16,7 +17,7 @@ import { Health, HEALTH_RATE_PER_MINUTE, INVENTORY_FRESH_SECONDS, buildVersion }
 const KEYS = ['inventoryFresh', 'ok', 'schemaVersion', 'uptimeSeconds', 'version'];
 
 async function boot(offset: number) {
-    const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-health-')), port = 30000 + (process.pid + offset) % 10000, origin = `http://localhost:${port}`;
+    const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-health-')), port = await freePort(), origin = `http://localhost:${port}`;
     const store = new Store(join(dir, 'service.sqlite'));
     seedAccounts(store);
     const now = 1791691200, router = new FakeRouter(join(dir, 'fake.sqlite'), {now: () => now, delay: 1});

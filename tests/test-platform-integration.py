@@ -27,6 +27,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 from pinned_helper import fixture_environment, fixture_source
+import partition
 BB = shutil.which('busybox')
 if not BB and not os.environ.get('CF_TEST_SHELL'):
     raise SystemExit('Native BusyBox ash required: set CF_TEST_SHELL to its absolute binary and ash')
@@ -992,4 +993,4 @@ vp_classify
 
 
 if __name__ == '__main__':
-    unittest.main()
+    partition.main(sys.argv)
