@@ -62,6 +62,13 @@ interface DecisionRow {
     generation: string; mac: string; role: InventoryRole; label: string | null; previous_role: InventoryRole | null; linked_from_mac: string | null; stable_confirmed: number; stable_at: number | null; decided_by: string; decided_at: number;
     row_id: number; linked_from_row: number | null;
 }
+/**
+ * A device a child now owns is a kid by enrolment, so a parent's earlier decision for that address (adult, guest, ...) must not outlive it:
+ * called in the enrol transaction. Silent: the enrolment's own audit row records the change, and nothing here names an address.
+ */
+export function dropDecisionOnEnrol(store: IntegrationStore, mac: string): void {
+    store.run('DELETE FROM inventory_decisions WHERE generation=? AND mac=?', store.config.router.generation, mac);
+}
 type DecisionFields = Pick<DecisionRow, 'role' | 'label' | 'previous_role' | 'linked_from_mac' | 'stable_confirmed' | 'stable_at'>;
 const NEW_DECISION: DecisionFields = {role: 'new', label: null, previous_role: null, linked_from_mac: null, stable_confirmed: 0, stable_at: null};
 /** Decisions with the row ids their natural keys resolve to. A decision whose row is gone is not returned, so a renumbered rowid can never attach one to another device. */

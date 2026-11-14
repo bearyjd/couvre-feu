@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { once } from 'node:events';
@@ -302,7 +303,7 @@ test('a schedule override hook can be plugged in later and is consulted before a
 });
 
 test('HTTP: child routes need only the body token; parent routes need session and CSRF; no cookies are set for children', async () => {
-    const f = fixture({schedule: false}), port = 46000 + process.pid % 10000, origin = `http://localhost:${port}`;
+    const f = fixture({schedule: false}), port = await freePort(), origin = `http://localhost:${port}`;
     const server = appServer(new Auth(f.store, origin, () => f.now()), f.policy, {port, origin, host: `localhost:${port}`, dataDir: f.dir}, undefined, undefined, f.svc);
     server.listen(port, '127.0.0.1');
     await once(server, 'listening');

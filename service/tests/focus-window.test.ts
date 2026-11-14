@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
@@ -321,7 +322,7 @@ const insertAudit = (db: DatabaseSync, at: number, action: string, op: string | 
 test('migration 012 on a seeded pre-012 database keeps rows and ids, the three indexes, STRICT and the CHECKs, and admits focus_start', () => {
     const m = preTwelve(db => { insertAudit(db, 1, 'pause', 'op_one'); insertAudit(db, 2, 'reward_add', null); insertAudit(db, 3, 'resume', 'op_three'); });
     try {
-        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 15);
+        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16);
         assert.deepEqual(m.store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), [
             {id: 1, at: 1, actor_id: 'parent', action: 'pause', person_id: 'pilot', operation_id: 'op_one', result: 'applied'},
             {id: 2, at: 2, actor_id: 'parent', action: 'reward_add', person_id: 'pilot', operation_id: null, result: 'applied'},
@@ -378,11 +379,10 @@ async function serve(r: Awaited<ReturnType<typeof focusWorld>>, port: number) {
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     return {o, close: async () => { server.close(); await once(server, 'close'); }};
 }
-let ports = 28000 + process.pid % 5000;
 
 test('HTTP: POST /people/:id/focus queues one timed pause (202 + Location), is idempotent and audited once; GET, query strings, extra fields and bad CSRF are refused', async () => {
     const r = await focusWorld(); r.w.f.config.timeRequests = {mode: 'parents'};
-    const s = await serve(r, ports++);
+    const s = await serve(r, await freePort());
     try {
         const who = await session(r.w.f, s.o, 'operator'), pre = await who.token();
         const first = await who.post('/people/pilot/focus', {minutes: 45}, KEY, pre);
@@ -414,7 +414,7 @@ test('HTTP: flag off, time requests off, out-of-scope child and the owner-mode g
         const r = await focusWorld({}, {focus: c.focus, audit: true});
         if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
         if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
-        const s = await serve(r, ports++);
+        const s = await serve(r, await freePort());
         try {
             const who = await session(r.w.f, s.o, c.account);
             const out = await who.post(`/people/${c.person}/focus`, {minutes: 30});
