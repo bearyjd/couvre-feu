@@ -1,6 +1,6 @@
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
-import type { RegistrationResponseJSON, AuthenticationResponseJSON, AuthenticatorTransportFuture } from '@simplewebauthn/server';
+import type { RegistrationResponseJSON, AuthenticationResponseJSON, AuthenticatorTransport } from '@simplewebauthn/server';
 import type { Actor, SessionDTO, Provenance } from '../../shared/src/contracts.ts';
 import { provenance } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
@@ -233,7 +233,7 @@ export class Auth {
         const existing = this.store.all<{id: string; transports: string}>('SELECT id,transports FROM credentials WHERE account_id=?', account.id);
         if (existing.length >= PASSKEYS_PER_ACCOUNT) throw new AppError(409, 'passkey_limit_reached');
         const options = await generateRegistrationOptions({
-            excludeCredentials: existing.map(c => ({id: c.id, transports: JSON.parse(c.transports) as AuthenticatorTransportFuture[]})),
+            excludeCredentials: existing.map(c => ({id: c.id, transports: JSON.parse(c.transports) as AuthenticatorTransport[]})),
             rpName: this.rpName, rpID: this.rpID,
             userName: account.display_name, userDisplayName: account.display_name, userID: Buffer.from(account.webauthn_user_id, 'base64url'),
             attestationType: 'none', authenticatorSelection: {
@@ -346,7 +346,7 @@ export class Auth {
             result = await verifyAuthenticationResponse({
                 response, expectedChallenge: challenge.challenge, expectedOrigin: this.origin, expectedRPID: this.rpID, requireUserVerification: true,
                 credential: {
-                    id: credential.id, publicKey: Uint8Array.from(credential.public_key), counter: credential.counter, transports: JSON.parse(credential.transports) as AuthenticatorTransportFuture[]
+                    id: credential.id, publicKey: Uint8Array.from(credential.public_key), counter: credential.counter, transports: JSON.parse(credential.transports) as AuthenticatorTransport[]
                 }
             });
         }
@@ -428,7 +428,7 @@ export class Auth {
         const options = await generateAuthenticationOptions({
             rpID: this.rpID, userVerification: 'required', timeout: 120000,
             ...(nonce === undefined ? {} : {challenge: createHash('sha256').update(binding + nonce).digest()}),
-            allowCredentials: credentials.map(c => ({id: c.id, transports: JSON.parse(c.transports) as AuthenticatorTransportFuture[]}))
+            allowCredentials: credentials.map(c => ({id: c.id, transports: JSON.parse(c.transports) as AuthenticatorTransport[]}))
         });
         const id = secret();
         this.store.transaction(() => {
@@ -459,7 +459,7 @@ export class Auth {
         try {
             result = await verifyAuthenticationResponse({
                 response, expectedChallenge: row.challenge, expectedOrigin: this.origin, expectedRPID: this.rpID, requireUserVerification: true,
-                credential: {id: credential.id, publicKey: Uint8Array.from(credential.public_key), counter: credential.counter, transports: JSON.parse(credential.transports) as AuthenticatorTransportFuture[]}
+                credential: {id: credential.id, publicKey: Uint8Array.from(credential.public_key), counter: credential.counter, transports: JSON.parse(credential.transports) as AuthenticatorTransport[]}
             });
         } catch { throw new AppError(401, 'passkey_verification_failed'); }
         if (!result.verified || !result.authenticationInfo.userVerified) throw new AppError(401, 'passkey_verification_failed');
