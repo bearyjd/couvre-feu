@@ -208,7 +208,8 @@ const parseReasonItem = (v: unknown): { readonly id: string; readonly queries: n
 const addSafe = (a: number, b: number): number => Number.isSafeInteger(a + b) ? a + b : fail();
 function toStatus(items: readonly { readonly status: string; readonly queries: number }[]): AnalyticsStatus {
     return Object.freeze({ total: items.reduce((n, i) => addSafe(n, i.queries), 0),
-        blocked: items.filter(i => i.status === 'blocked').reduce((n, i) => addSafe(n, i.queries), 0) });
+        // No overflow check needed: blocked is a subset of total, which was just checked (object literal evaluates in order).
+        blocked: items.filter(i => i.status === 'blocked').reduce((n, i) => n + i.queries, 0) });
 }
 function toClassCounts(items: readonly { readonly id: string; readonly queries: number }[]): readonly ClassCount[] {
     const sums = new Map<ClassCode, number>();
@@ -337,7 +338,7 @@ const num = (v: number | undefined, fallback: number): number => typeof v === 'n
 function resolveConfig(o: NextDnsClientOptions): Config {
     return {
         apiKey: o.apiKey, transport: o.transport ?? createFetchTransport(), sleep: o.sleep ?? abortableSleep,
-            now: o.now ?? Date.now, random: o.random ?? Math.random,
+            now: typeof o.now === 'function' ? o.now : Date.now, random: o.random ?? Math.random,
         // Non-finite or negative numbers fall back to the default: NaN/Infinity must not disable a bound.
         maxAttempts: Math.max(1, Math.floor(num(o.maxAttempts, 4))), maxPages: Math.max(1, Math.floor(num(o.maxPages, 20))),
             baseDelay: num(o.baseDelayMs, 500), maxDelay: num(o.maxDelayMs, 10_000),
@@ -482,7 +483,8 @@ const ANALYTICS = Object.freeze({ status: '/analytics/status', reasons: '/analyt
 function analyticsPath(profile: string, which: keyof typeof ANALYTICS, range: AnalyticsRange, nowMs: number): string {
     const o = obj(range, ['from', 'to']);
     const from = count(o.from), to = count(o.to);
-    if (from >= to || to - from > MAX_ANALYTICS_SPAN_S || to * 1000 > nowMs) fail();
+    if (from >= to || to - from > MAX_ANALYTICS_SPAN_S || !Number.isFinite(nowMs)
+        || to * 1000 > nowMs) fail(); // a broken clock fails closed
     return `${profilePath(profile, ANALYTICS[which])}?from=${from}&to=${to}${which === 'reasons' ? '&limit=500' : ''}`;
 }
 /**

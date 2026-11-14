@@ -225,3 +225,40 @@ test('P1 surface: no method, path or source literal reaches logs, domains, devic
     assert.ok(!/['"`]\/logs/.test(src));
     assert.deepEqual([...src.matchAll(/\/analytics\/([A-Za-z]+)/g)].map(m => m[1]).filter((v, i, a) => a.indexOf(v) === i).sort(), ['reasons', 'status']);
 });
+
+test('a clock that is not a finite number fails closed: no request, invalid_request', async () => {
+    for (const bad of [Number.NaN, Infinity, -Infinity]) {
+        const { api, c } = setup(undefined, {}, { now: () => bad });
+        assert.equal(await codeOf(() => c.getAnalyticsStatus(PROFILE, RANGE)), 'invalid_request', String(bad));
+        assert.equal(await codeOf(() => c.getAnalyticsReasons(PROFILE, RANGE)), 'invalid_request', String(bad));
+        assert.equal(api.requests.length, 0);
+    }
+    const { api, c } = setup(undefined, {}, { now: 'not a function' as never });
+    await c.getAnalyticsStatus(PROFILE, { from: 0, to: 90_000 });
+    assert.equal(api.requests.length, 1, 'a non-function now falls back to the real clock');
+});
+
+test('finished-day boundary: to equal to now is accepted, one second later is refused', async () => {
+    const nowS = RANGE.to + 3600;
+    const { api, c } = setup(undefined, {}, { now: () => nowS * 1000 });
+    await c.getAnalyticsStatus(PROFILE, { from: nowS - 3600, to: nowS });
+    assert.equal(api.requests.length, 1);
+    assert.equal(await codeOf(() => c.getAnalyticsStatus(PROFILE, { from: nowS - 3600, to: nowS + 1 })), 'invalid_request');
+    assert.equal(api.requests.length, 1);
+});
+
+test('per-class sums that overflow a safe integer are bad_response, not returned', async () => {
+    const big = (id: string) => ({ id, name: 'n', queries: Number.MAX_SAFE_INTEGER });
+    const { c } = setup({ status: [], reasons: [big('unknown-a'), big('unknown-b')] });
+    assert.equal(await codeOf(() => c.getAnalyticsReasons(PROFILE, RANGE)), 'bad_response');
+    const ok = setup({ status: [], reasons: [big('unknown-a'), big('porn')] });
+    assert.equal((await ok.c.getAnalyticsReasons(PROFILE, RANGE)).length, 2, 'different classes do not add');
+});
+
+test('an own __proto__ key in an analytics item is bad_response', async () => {
+    const { api, c } = setup();
+    api.enqueue({ status: 200, headers: {}, body: '{"data":[{"status":"blocked","queries":1,"__proto__":{"x":1}}]}' });
+    assert.equal(await codeOf(() => c.getAnalyticsStatus(PROFILE, RANGE)), 'bad_response');
+    api.enqueue({ status: 200, headers: {}, body: '{"data":[{"id":"porn","name":"n","queries":1,"__proto__":{"x":1}}]}' });
+    assert.equal(await codeOf(() => c.getAnalyticsReasons(PROFILE, RANGE)), 'bad_response');
+});
