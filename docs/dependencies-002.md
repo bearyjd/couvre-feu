@@ -7,7 +7,7 @@ lockfile; their source and browser binaries are not vendored into this repositor
 
 | Direct dependency | Locked version | Declared license | Purpose |
 |---|---|---|---|
-| `@simplewebauthn/server` | 13.3.3 | MIT | Server-side passkey verification |
+| `@simplewebauthn/server` | 14.1.0 | MIT | Server-side passkey verification |
 | `@levischuck/tiny-cbor` | 0.2.11 | MIT | Signed test-credential encoding |
 | `@playwright/test` | 1.61.0 | Apache-2.0 | Browser acceptance tests |
 | `@types/node` | 26.6.5 | MIT | Development types |
