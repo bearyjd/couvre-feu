@@ -117,7 +117,7 @@ export interface ContentFilterCountsOptions {
     readonly now?: () => number;
     readonly monotonicMs?: () => number;
     readonly budgetMs?: number;
-    /** Was this child's network active that day (activity feature)? Zero lookups on such a day is `suspect_zero`, not "0 blocked". Absent: never suspect. */
+    /** Was this child's network active that day (activity feature)? A day with zero lookups is `suspect_zero` unless this says no. Absent or failing: suspect (unknown is not clean). */
     readonly wasOnline?: (person: string, day: string) => boolean;
 }
 const wholeDay = (day: string): {readonly from: number; readonly to: number} => localDayBounds(day);
@@ -149,38 +149,60 @@ export class ContentFilterCounts {
 
     private clock(): number { return (this.options.now ?? (() => Math.floor(Date.now() / 1000)))(); }
 
-    /** 'stop' ends the whole pass (rate limit, budget spent); 'next' moves on to the next child. */
+    /**
+     * 'stop' ends the whole pass (rate limit, budget spent); 'next' moves on to the next child. A failed day is a gap and the child's newer days
+     * are still tried; only an error that every later day of this child would share (key rejected, profile unknown) ends the child early.
+     * The budget is checked between days, so a pass can overrun it by up to one day's calls: two calls, each bounded by COUNTS_CALL_BUDGET_MS (about 40 s).
+     */
     private async child(person: string, today: string, now: number, spent: () => boolean): Promise<'stop' | 'next'> {
         const {store, client, profiles} = this.options, profile = profiles[person]!;
-        const have = new Map(store.days(person, addDays(today, -COUNTS_WINDOW_DAYS), addDays(today, -1)).map(d => [d.day, d.state]));
+        const window = store.days(person, addDays(today, -COUNTS_WINDOW_DAYS), addDays(today, -1)), have = new Map(window.map(d => [d.day, d.state]));
+        // A day with no answer, a gap, or a logs_off stamp is read (again): logs_off is retryable, so a stamp never hides a day logs covered.
         const wanted = dayRange(addDays(today, -COUNTS_WINDOW_DAYS), addDays(today, -1))
-            .filter(day => now >= wholeDay(day).to + COUNTS_SETTLE_SECONDS && (have.get(day) ?? 'unavailable') === 'unavailable');
+            .filter(day => now >= wholeDay(day).to + COUNTS_SETTLE_SECONDS && ['unavailable', 'logs_off'].includes(have.get(day) ?? 'unavailable'));
         if (wanted.length === 0) return 'next';
         const call = () => ({signal: AbortSignal.timeout(COUNTS_CALL_BUDGET_MS)});
         let logsOn: boolean;
-        try { logsOn = (await client.getSettings(profile, call())).logs.enabled; } catch (error) { return this.gap(person, wanted[0]!, now, error); }
+        try { logsOn = (await client.getSettings(profile, call())).logs.enabled; } catch (error) { return this.fate(person, wanted[0]!, now, error) === 'stop' ? 'stop' : 'next'; }
+        // Logs are off now. Only days after the newest answered day can be "logging was off"; an earlier day may have been logged (service down), so it stays a gap.
+        const lastAnswered = window.filter(d => d.state === 'ok' || d.state === 'suspect_zero').map(d => d.day).sort().pop() ?? '';
         for (const day of wanted) {
-            if (!logsOn) { store.put(person, {day, state: 'logs_off', total: null, blocked: null, classes: {}}, now); continue; }
+            if (!logsOn) {
+                try {
+                    if (day > lastAnswered) store.put(person, {day, state: 'logs_off', total: null, blocked: null, classes: {}}, now);
+                    else if (!have.has(day)) store.markUnavailable(person, day, now);
+                } catch { /* the next pass sees the day as it was */ }
+                continue;
+            }
             if (spent()) return 'stop';
             try {
                 const range = wholeDay(day);
                 // Both answers or neither: nothing is written until the second one is in.
                 const status = await client.getAnalyticsStatus(profile, range, call()), reasons = await client.getAnalyticsReasons(profile, range, call());
+                // A day with no lookups at all reads like a clean day and may be a bypass, a paused filter or the plan limit: it is suspect
+                // unless the activity callback (when wired) says the child's network was quiet that day.
                 const state = status.total === 0 && this.online(person, day) ? 'suspect_zero' : 'ok';
                 store.put(person, {day, state, total: status.total, blocked: status.blocked, classes: Object.fromEntries(reasons.map(r => [r.class, r.queries]))}, now);
-            } catch (error) { return this.gap(person, day, now, error); }
+            } catch (error) {
+                const fate = this.fate(person, day, now, error);
+                if (fate !== 'continue') return fate;
+            }
         }
         return 'next';
     }
 
+    /** Unknown means suspect: no callback, or one that fails, says the child may have been online. */
     private online(person: string, day: string): boolean {
-        try { return this.options.wasOnline?.(person, day) === true; } catch { return false; }
+        const wasOnline = this.options.wasOnline;
+        if (wasOnline === undefined) return true;
+        try { return wasOnline(person, day); } catch { return true; }
     }
 
-    /** Records the gap (best effort). A rate limit ends the pass; any other failure ends this child's pass, since its later days would fail the same way. */
-    private gap(person: string, day: string, now: number, error: unknown): 'stop' | 'next' {
+    /** Records the gap (best effort) and says what to do next: a rate limit ends the pass, a rejected key or unknown profile ends this child, anything else goes on to the next day. */
+    private fate(person: string, day: string, now: number, error: unknown): 'stop' | 'next' | 'continue' {
         try { this.options.store.markUnavailable(person, day, now); } catch { /* the next pass sees the day as missing */ }
-        return error instanceof NextDnsError && error.code === 'rate_limited' ? 'stop' : 'next';
+        if (!(error instanceof NextDnsError)) return 'continue';
+        return error.code === 'rate_limited' ? 'stop' : error.code === 'unauthorized' || error.code === 'not_found' ? 'next' : 'continue';
     }
 }
 

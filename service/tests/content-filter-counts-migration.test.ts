@@ -40,6 +40,8 @@ function assertMigrated(store: Store): void {
     for (const code of CLASS_CODES) cls(store, {class: code});
     for (const bad of ['porn', 'denylist:secret.test', 'ADULT', '']) assert.throws(() => cls(store, {class: bad}), /CHECK/, bad);
     assert.throws(() => cls(store, {queries: -1}), /CHECK/); assert.throws(() => cls(store, {queries: 0.5}), /datatype|CHECK|cannot store/);
+    for (const bad of ['2026-1-10', '2026-11-10T01:00', 'yesterday', '']) assert.throws(() => cls(store, {day: bad}), /CHECK/, `class day ${bad}`);
+    assert.throws(() => cls(store, {person_id: ''}), /CHECK/); assert.throws(() => cls(store, {person_id: 'x'.repeat(65)}), /CHECK/);
     assert.throws(() => cls(store, {day: '2026-11-11'}), /FOREIGN KEY/, 'a class row needs its day');
     assert.equal(store.get<{n: number}>('SELECT count(*) n FROM content_filter_day_class')!.n, CLASS_CODES.length);
     store.run("DELETE FROM content_filter_day WHERE day='2026-11-10'");

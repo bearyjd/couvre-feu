@@ -14,8 +14,8 @@ CREATE TABLE content_filter_day (
  CHECK((state IN ('ok','suspect_zero')) = (total IS NOT NULL AND blocked IS NOT NULL))
 ) STRICT;
 CREATE TABLE content_filter_day_class (
- person_id TEXT NOT NULL,
- day TEXT NOT NULL,
+ person_id TEXT NOT NULL CHECK(length(person_id) BETWEEN 1 AND 64),
+ day TEXT NOT NULL CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
  class TEXT NOT NULL CHECK(class IN ('adult','gambling','dating','piracy','social','gaming','video','apps','bypass','denylist','ads_trackers','security','other')),
  queries INTEGER NOT NULL CHECK(queries >= 0),
  PRIMARY KEY(person_id, day, class),

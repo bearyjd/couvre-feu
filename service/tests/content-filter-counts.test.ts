@@ -132,7 +132,7 @@ test('an unavailable day is retried and becomes ok; a failed pass leaves no part
     try {
         await s.counts.tick();
         for (const person of ['pilot', 'blake']) {
-            assert.deepEqual(s.rows(person), [{day: FIRST, state: 'unavailable', total: null, blocked: null, classes: {}}], 'status alone is never stored: the oldest day is a gap, the rest untried');
+            assert.deepEqual(s.rows(person).map(d => [d.state, d.total, d.blocked, d.classes]), Array(7).fill(['unavailable', null, null, {}]), 'status alone is never stored: every day is a gap');
         }
         assert.equal(s.db.get<{n: number}>('SELECT count(*) n FROM content_filter_day_class')!.n, 0);
         assert.equal(s.db.get<{n: number}>('SELECT attempts n FROM content_filter_day WHERE person_id=?', 'pilot')!.n, 1);
@@ -143,14 +143,14 @@ test('an unavailable day is retried and becomes ok; a failed pass leaves no part
     } finally { s.cleanup(); }
 });
 
-test('one child failing does not stop the others, and the failing child stops after its first gap', async () => {
+test('one child failing does not stop the others; each of its days is a gap and is tried', async () => {
     const tried: string[] = [];
     const s = world({wrap: next => async req => { if (!req.path.startsWith(`/profiles/${PILOT}/`) || !req.path.includes('/analytics/')) return next(req); tried.push(req.path); return fail500(); }});
     try {
         await s.counts.tick();
-        assert.deepEqual(s.rows('pilot').map(d => [d.day, d.state]), [[FIRST, 'unavailable']]);
+        assert.deepEqual(s.rows('pilot').map(d => d.state), Array(7).fill('unavailable'));
         assert.deepEqual(s.rows('blake').map(d => d.state), Array(7).fill('ok'));
-        assert.equal(new Set(tried.map(path => s.range({path}).from)).size, 1, 'one day tried, then the child is left until the next pass');
+        assert.equal(new Set(tried.map(path => s.range({path}).from)).size, 7);
     } finally { s.cleanup(); }
 });
 
@@ -183,7 +183,7 @@ test('NextDNS down, a rejected key and a garbled answer all fail quietly: no out
         try {
             const out = await captured(() => s.counts.tick());
             assert.equal(out, '');
-            assert.deepEqual(s.rows('pilot').map(d => d.state), ['unavailable']);
+            assert.ok(s.rows('pilot').length >= 1 && s.rows('pilot').every(d => d.state === 'unavailable'));
             assert.equal(s.db.get<{n: number}>('SELECT count(*) n FROM content_filter_day_class')!.n, 0);
             assert.equal(s.db.get<{n: number}>('SELECT count(*) n FROM parent_alerts')!.n, 0);
             assert.equal(s.db.get<{n: number}>('SELECT count(*) n FROM parent_audit')!.n, 0);
@@ -232,19 +232,70 @@ test('logs turned off in NextDNS: logs_off for each settled day, and no analytic
     } finally { s.cleanup(); }
 });
 
-test('zero lookups while the device was online is suspect_zero, never "0 blocked"; otherwise an honest ok with zeros', async () => {
-    const s = world({analytics: {status: [], reasons: []}, options: {wasOnline: (person, day) => person === 'pilot' && day === '2026-11-09'}});
+test('zero lookups is suspect_zero, never a clean "0 blocked", unless the activity callback says the child was offline; a non-zero total is ok', async () => {
+    const empty = {status: [], reasons: []};
+    const plain = world({analytics: empty});
+    try {
+        await plain.counts.tick();
+        assert.deepEqual(plain.rows('pilot').map(d => [d.state, d.total, d.blocked]), Array(7).fill(['suspect_zero', 0, 0]));
+        assert.deepEqual(plain.rows('pilot')[0], {day: FIRST, state: 'suspect_zero', total: 0, blocked: 0, classes: {}});
+    } finally { plain.cleanup(); }
+    const mixed = world({analytics: empty, options: {wasOnline: (person, day) => !(person === 'pilot' && day === '2026-11-09')}});
+    try {
+        await mixed.counts.tick();
+        assert.deepEqual(mixed.rows('pilot').filter(d => d.state === 'ok').map(d => [d.day, d.total, d.blocked]), [['2026-11-09', 0, 0]], 'offline all day: an honest zero');
+        assert.equal(mixed.rows('pilot').filter(d => d.state === 'suspect_zero').length, 6);
+    } finally { mixed.cleanup(); }
+    const throwing = world({analytics: empty, options: {wasOnline: () => { throw new Error('activity store down'); }}});
+    try { await throwing.counts.tick(); assert.deepEqual(throwing.rows('pilot').map(d => d.state), Array(7).fill('suspect_zero'), 'unknown is suspect'); } finally { throwing.cleanup(); }
+    const busy = world();
+    try { await busy.counts.tick(); assert.deepEqual(busy.rows('pilot').map(d => d.state), Array(7).fill('ok')); } finally { busy.cleanup(); }
+    const offline = world({options: {wasOnline: () => false}});
+    try { await offline.counts.tick(); assert.deepEqual(offline.rows('pilot').map(d => d.state), Array(7).fill('ok'), 'a non-zero total is never suspect'); } finally { offline.cleanup(); }
+});
+
+test('one poisoned day in the middle does not block the newer days: it is a gap, the rest are stored, and it is retried', async () => {
+    const poisoned = localDayBounds('2026-11-10').from;
+    let poison = true;
+    const s = world({wrap: next => async req => poison && req.path.includes('/analytics/status') && s_range(req.path) === poisoned ? json(200, {data: [{status: 'blocked', queries: -4}]}) : next(req)});
+    function s_range(path: string): number { return Number(new URL(path, 'https://x').searchParams.get('from')); }
     try {
         await s.counts.tick();
-        assert.deepEqual(s.rows('pilot').map(d => [d.day, d.state, d.total, d.blocked]).filter(r => r[1] === 'suspect_zero'), [['2026-11-09', 'suspect_zero', 0, 0]]);
-        assert.deepEqual(s.rows('pilot').filter(d => d.state === 'ok').length, 6);
-        assert.deepEqual(s.rows('blake').map(d => d.state), Array(7).fill('ok'));
-        assert.deepEqual(s.rows('blake')[0], {day: FIRST, state: 'ok', total: 0, blocked: 0, classes: {}});
+        for (const person of ['pilot', 'blake']) {
+            assert.deepEqual(s.rows(person).map(d => [d.day, d.state]), dayRange(FIRST, LAST).map(day => [day, day === '2026-11-10' ? 'unavailable' : 'ok']));
+        }
+        poison = false;
+        await s.counts.tick();
+        assert.deepEqual(s.rows('pilot').map(d => d.state), Array(7).fill('ok'));
     } finally { s.cleanup(); }
-    const throwing = world({analytics: {status: [], reasons: []}, options: {wasOnline: () => { throw new Error('activity store down'); }}});
-    try { await throwing.counts.tick(); assert.deepEqual(throwing.rows('pilot').map(d => d.state), Array(7).fill('ok')); } finally { throwing.cleanup(); }
-    const busy = world({options: {wasOnline: () => true}});
-    try { await busy.counts.tick(); assert.deepEqual(busy.rows('pilot').map(d => d.state), Array(7).fill('ok'), 'a non-zero total is never suspect'); } finally { busy.cleanup(); }
+});
+
+test('a rejected key or an unknown profile ends that child for the pass; a 429 ends the pass', async () => {
+    for (const status of [401, 404]) {
+        const tried: string[] = [];
+        const s = world({wrap: next => async req => { if (req.path.startsWith(`/profiles/${PILOT}/`) && req.path.includes('/analytics/')) { tried.push(req.path); return json(status, {errors: [{code: 'x'}]}); } return next(req); }});
+        try {
+            await s.counts.tick();
+            assert.deepEqual(s.rows('pilot').map(d => [d.day, d.state]), [[FIRST, 'unavailable']], String(status));
+            assert.equal(new Set(tried.map(path => Number(new URL(path, 'https://x').searchParams.get('from')))).size, 1);
+            assert.deepEqual(s.rows('blake').map(d => d.state), Array(7).fill('ok'), 'the other child goes on');
+        } finally { s.cleanup(); }
+    }
+});
+
+test('logs switched off part-way through the window: past days that logs covered are gaps, not logs_off, and every one is retried when logs are back', async () => {
+    const s = world();
+    try {
+        s.store.put('pilot', {day: '2026-11-09', state: 'ok', total: 5, blocked: 1, classes: {adult: 1}}, 1);
+        s.fake.profiles.get(PILOT)!.settings = structuredClone(SETTINGS);
+        await s.counts.tick();
+        assert.deepEqual(s.rows('pilot').map(d => [d.day, d.state]), [[FIRST, 'unavailable'], ['2026-11-08', 'unavailable'], ['2026-11-09', 'ok'], ['2026-11-10', 'logs_off'], ['2026-11-11', 'logs_off'], ['2026-11-12', 'logs_off'], [LAST, 'logs_off']]);
+        assert.ok(s.analyticsRequests().every(r => !r.path.includes(PILOT)));
+        s.fake.profiles.get(PILOT)!.settings = logsOn();
+        await s.counts.tick();
+        assert.deepEqual(s.rows('pilot').map(d => d.state), ['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+        assert.equal(s.rows('pilot')[2]!.total, 5, 'the finished day was not re-read');
+    } finally { s.cleanup(); }
 });
 
 test('prune: days older than the retention are deleted at the end of each pass, the boundary day is kept', async () => {
