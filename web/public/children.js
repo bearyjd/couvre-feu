@@ -2,6 +2,7 @@
 // passkey confirmation (step-up) bound to that exact change; device changes then go through the router rpc-sync path.
 // All dynamic text is rendered with textContent. createBulk (same file, same helpers) is the Block all / Unblock all panel for admins and parents.
 import { getPasskey } from './auth-client.js';
+import { createWizard } from './inventory-wizard.js';
 import { triageOn, triageView, triageStatus, groupCounts, roleWord, UNDO_SECONDS } from './inventory-triage.js';
 
 const KIND_LABEL = { child: 'Child', device_group: 'Device group' };
@@ -345,6 +346,7 @@ export function createInventory({ session, gate, offline, time, children, versio
   // Scan age is measured on the SERVER's clock. Unknown (an older service) counts as stalled: never an all-clear on a guess.
   const nowSeconds = () => (serverNow === null ? Number.POSITIVE_INFINITY : serverNow + Math.floor((performance.now() - loadedPerf) / 1000));
   const closed = () => busy || Boolean(gate());
+  const wizard = createWizard({ data: () => data, load: () => load(), now: () => nowSeconds(), call: (path, body) => call(path, body), children }); // hoisted: call and load are declared below
   const sorted = (list) => [...list].sort((a, b) => b.firstSeen - a.firstSeen || b.lastSeen - a.lastSeen);
   function setNote(text) {
     refreshNote = text; clearTimeout(noteTimer);
@@ -476,7 +478,7 @@ export function createInventory({ session, gate, offline, time, children, versio
       ...(picking === device.mac && !locked ? picker(device, short) : []));
   }
   function draw() {
-    if (!enabled() || !data) { drawn = ''; mounted = false; root.hidden = true; delete root.dataset.newCount; root.replaceChildren(); live.textContent = ''; return; }
+    if (!enabled() || !data) { wizard.close({ restore: false }); drawn = ''; mounted = false; root.hidden = true; delete root.dataset.newCount; root.replaceChildren(); live.textContent = ''; return; }
     if (!mounted) { root.replaceChildren(title, live, body); mounted = true; }
     const liveText = refreshNote || notice;
     if (live.textContent !== liveText) live.textContent = liveText;
@@ -500,7 +502,8 @@ export function createInventory({ session, gate, offline, time, children, versio
         ...triageView({ data, filter, undo, statusText: triageStatus(data.status, status, nowSeconds(), toSort), failed: loadFailed && !offline(), locked, nowSeconds: nowSeconds(), children: children.entries(),
           h: { onFilter: (next) => { filter = next; draw(); }, onRole: (d, role) => void classify(d, role), onChild: startChild, onLink: (d) => void linkSame(d), onUndo: () => void undoLast(), onRetry: () => void load(), onRefresh: () => void refreshNow() } }),
         ...(offline() ? [el('p', { class: 'fine-print', 'data-inventory-snapshot': '' }, `Showing a saved list from ${time(loadedAt)}. It updates when the connection returns.`)] : []),
-        el('p', { class: 'fine-print', 'data-inventory-reason': '', hidden: !reason }, reason));
+        el('p', { class: 'fine-print', 'data-inventory-reason': '', hidden: !reason }, reason),
+        ...(data.wizard === true ? [wizard.button()] : []));
       root.hidden = false;
       return;
     }
@@ -516,6 +519,7 @@ export function createInventory({ session, gate, offline, time, children, versio
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
     if (next !== key) {
+      wizard.close({ restore: false });
       key = next; data = null; loadedAt = null; loadFailed = false; notice = ''; refreshNote = ''; picking = null; choice = ''; lastVersion = null; fetched = false; inFlight = false; swallowed = false; drawn = ''; serverNow = null; clearTimeout(timer); clearTimeout(noteTimer); clearTimeout(undoTimer); filter = 'new'; undo = null;
       draw(); if (next) void load(); return;
     }

@@ -45,7 +45,7 @@ export interface IntegrationManifest {
     dnsHardening?: {dohList: boolean};
     /** Content filtering (PRP-006): off unless set; 'owner' lets only ownerAccountId edit filters, 'parents' every parent. Names the root-only API key file, never holds the key; nothing enforces it yet. */
     contentFilter?: ContentFilterConfig;
-    /** Admin inventory UI switches (device decisions, wizard, install readiness); absent is all off. Only `triage` is used so far. */
+    /** Admin inventory UI switches (device decisions, wizard, install readiness); absent is all off. `triage` and `wizard` are used so far. */
     inventoryUi?: InventoryUiConfig;
     /** Install readiness review and export (UI plan I): admin routes that list what the permanent install will protect and allow; absent is off. Never touches the router. */
     installReadiness?: {enabled: boolean};
