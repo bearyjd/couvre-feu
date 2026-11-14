@@ -353,6 +353,8 @@ Rules:
   18 hours. Accepted; the alternative (ask NextDNS at send time) fails F8.
 - Numbers pass the existing `count()` coercion; text is constants + integers only.
 
+**As built (C4, deviations from the text above).** The number is on its own line: `N blocked lookups last week.`, or `N blocked lookups last week (x of 7 days counted).` when fewer than 7 days were counted. A week with zero counted days omits the line (not "blocked lookups unavailable"). A day counts only if every configured child (the keys of `contentFilter.profiles`) is `ok` for it; `suspect_zero`, `logs_off` and gaps do not count, so one child stuck in such a state means the line never appears (remedy: enable NextDNS logs for every profile, check the child's profile). A parent cannot tell "counts broken" from "counts off" from the push alone; the app card shows it. A failing read logs the fixed tag `digest_blocked_failed`. See `docs/service-contract.md`.
+
 ### 7.2 In-app (filter card, `web/public/content-filter.js`)
 
 Below the existing state pill, a collapsed "Last 7 days" block per child, fetched from the counts route:

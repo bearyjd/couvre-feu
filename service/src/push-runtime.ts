@@ -4,6 +4,7 @@ import { digestTick, latestDigestSlot } from './digest.ts';
 import type { DigestStateStore } from './digest.ts';
 import { NtfyPush, ntfySettings, safeLog } from './push-sender.ts';
 import type { DigestCounts, PushEnv, PushOptions } from './push-sender.ts';
+import type { BlockedWeek } from './digest-blocked.ts';
 
 export const NOTIFY_POLL_MS = 60000;
 /** Shutdown waits for a pass in flight at most this long (the service unit allows 30 s to stop). */
@@ -18,16 +19,23 @@ function stateStore(db: Db, key: string): DigestStateStore & {exists(): boolean}
 }
 
 /** Numbers only: requests made, grants approved and pause operations in the window. No ids, names or text are selected. */
-export function weeklyCounts(db: Pick<IntegrationStore, 'get'>, from: number, to: number): DigestCounts {
+export function weeklyCounts(db: Pick<IntegrationStore, 'get'>, from: number, to: number, blocked?: (slot: number) => BlockedWeek, log?: (line: string) => unknown): DigestCounts {
     const n = (sql: string) => db.get<{n: number}>(sql, from, to)!.n;
     return {
         requests: n('SELECT count(*) n FROM time_requests WHERE created_at > ? AND created_at <= ?'),
         grants: n("SELECT count(*) n FROM time_requests WHERE state='approved' AND decided_at > ? AND decided_at <= ?"),
-        pauses: n("SELECT count(*) n FROM operations WHERE action IN ('pause','pause_all') AND state IN ('pending','confirmed','unknown') AND created_at > ? AND created_at <= ?")};
+        pauses: n("SELECT count(*) n FROM operations WHERE action IN ('pause','pause_all') AND state IN ('pending','confirmed','unknown') AND created_at > ? AND created_at <= ?"),
+        ...blockedPart(blocked, to, log)};
+}
+/** Counts failing or unreadable must never cost the digest: the line is simply left out. */
+function blockedPart(blocked: ((slot: number) => BlockedWeek) | undefined, slot: number, log?: (line: string) => unknown): {blocked?: BlockedWeek} {
+    if (!blocked) return {};
+    try { return {blocked: blocked(slot)}; } catch { log?.('digest_blocked_failed\n'); return {}; }
 }
 
 export interface Notifications { tick(): Promise<void>; stop(): Promise<void> }
-export interface NotificationDeps { env?: PushEnv; options?: PushOptions; now?: () => number; slot?: (epoch: number) => number }
+/** `blocked` reads the household week from the counts store; it is used only when contentFilter.counts.enabled is also true. */
+export interface NotificationDeps { env?: PushEnv; options?: PushOptions; now?: () => number; slot?: (epoch: number) => number; blocked?: (slot: number) => BlockedWeek }
 /** Setup errors with these fixed codes (from ntfySettings) may be named in the log; anything else is logged by tag only. */
 const SETTING_CODE = /^(invalid_ntfy_(url|topic|token)|ntfy_token_requires_https)$/;
 
@@ -50,7 +58,7 @@ export function startNotifications(config: IntegrationConfig, store: Db, deps: N
 
 function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log: (line: string) => unknown): Notifications {
     const push = new NtfyPush(ntfySettings(deps.env ?? process.env), config.origin, {...deps.options, log});
-    const now = deps.now ?? (() => Math.floor(Date.now() / 1000)), slotOf = deps.slot ?? latestDigestSlot, digestOn = config.digest?.enabled === true;
+    const now = deps.now ?? (() => Math.floor(Date.now() / 1000)), slotOf = deps.slot ?? latestDigestSlot, digestOn = config.digest?.enabled === true, blockedOn = digestOn && config.contentFilter !== undefined && config.contentFilter.mode !== 'off' && config.contentFilter.counts?.enabled === true;
     const alerts = stateStore(store, 'alert_push_id'), digest = digestOn ? stateStore(store, 'digest_slot') : null;
     // First enable starts from now: no backlog of old alerts and no catch-up digest for the week before. (Turning push or digest off and on again later keeps the old marks, so it sends one backlog push and one catch-up digest.)
     if (!alerts.exists()) alerts.write(store.get<{m: number}>('SELECT COALESCE(MAX(id),0) m FROM parent_alerts')!.m);
@@ -65,7 +73,7 @@ function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log
     const shutdown = new AbortController();
     const pass = async () => {
         try { await alertPass(); } catch { log('push_alert_pass_failed\n'); }
-        try { if (digest && !shutdown.signal.aborted) await digestTick({now, slot: slotOf, counts: (from, to) => weeklyCounts(store, from, to), send: m => push.send(m, shutdown.signal), state: digest, log, deferralLogged}); } catch { log('digest_pass_failed\n'); }
+        try { if (digest && !shutdown.signal.aborted) await digestTick({now, slot: slotOf, counts: (from, to) => weeklyCounts(store, from, to, blockedOn ? deps.blocked : undefined, log), send: m => push.send(m, shutdown.signal), state: digest, log, deferralLogged}); } catch { log('digest_pass_failed\n'); }
     };
     const tick = (): Promise<void> => {
         if (flight) return flight;
