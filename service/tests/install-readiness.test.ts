@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
-import { InstallReadiness, readinessDigest, canonical, QUIET_SECONDS } from '../src/install-readiness.ts';
+import { InstallReadiness, readinessDigest, canonical, QUIET_SECONDS, DIGEST_VERSION } from '../src/install-readiness.ts';
 import { digest as sha256 } from '../src/auth.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import type { InventoryDevice } from '../../shared/src/router-inventory.ts';
@@ -381,5 +381,22 @@ test('an admin demoted during the passkey step is refused and records nothing', 
         };
         err(await admin.approve(digest, proof), 403, 'admin_required');
         assert.equal(w.audit().length, 0);
+    } finally { await w.cleanup(); }
+});
+
+test('the digest is the documented recipe: sha256 over canonical {v:2, children, adults with source}; a v:1 input differs; the export names the digest version', async () => {
+    const id = (mac: string, label: string) => ({mac, label, stable: true, inScope: false, enrolled: false});
+    const children = [{id: 'b', name: 'B', devices: [{...id('y', 'q'), enrolled: true}, {...id('x', 'p'), enrolled: true}]}, {id: 'a', name: 'A', devices: []}];
+    const adults = [{...id('n', 'Protected device'), source: 'baseline' as const}, {...id('m', 'Bryn'), source: 'role' as const}];
+    const by = (k: string) => (a: any, b: any) => (a[k] < b[k] ? -1 : 1);
+    const hand = (v: number) => sha256(`{"adults":[${[...adults].sort(by('mac')).map(a => `{"enrolled":false,"inScope":false,"label":${JSON.stringify(a.label)},"mac":"${a.mac}","source":"${a.source}","stable":true}`).join(',')}],"children":[{"devices":[],"id":"a","name":"A"},{"devices":[${['x', 'y'].map(m => `{"enrolled":true,"inScope":false,"label":"${m === 'x' ? 'p' : 'q'}","mac":"${m}","stable":true}`).join(',')}],"id":"b","name":"B"}],"v":${v}}`);
+    assert.equal(readinessDigest({children, adults}), hand(2));
+    assert.equal(DIGEST_VERSION, 2);
+    assert.notEqual(readinessDigest({children, adults}), hand(1));
+    const w = await world();
+    try {
+        const admin = await w.client('operator'), g = await admin.get(), exported = (await admin.exportList(g.body.digest)).body.export;
+        assert.equal(exported.version, 1); assert.equal(exported.digestVersion, 2);
+        assert.equal(readinessDigest({children: exported.children, adults: exported.adults}), exported.digest);
     } finally { await w.cleanup(); }
 });

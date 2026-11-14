@@ -9,7 +9,8 @@ import { integrationFixture, actor } from './fixtures/integration.ts';
 import { Auth, digest, issueOperatorBootstrap } from '../src/auth.ts';
 import { ChildBatchAdmin } from '../src/admin-children-batch.ts';
 import { AppError } from '../../shared/src/errors.ts';
-import { ChildAdmin } from '../src/admin-children.ts';
+import { ChildAdmin, macInput } from '../src/admin-children.ts';
+import { InstallReadiness } from '../src/install-readiness.ts';
 import { BulkOps } from '../src/integration-bulk.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
@@ -759,5 +760,38 @@ test('batch: refusal remains stored if parent audit insertion fails', async () =
         assert.equal(f.count('admin_batches'), 1);
         assert.equal(f.count('parent_audit'), 0);
         assert.equal(f.store.get<{outcome: string}>("SELECT outcome FROM audit WHERE outcome LIKE 'refused:%'")?.outcome, 'refused:device_not_ready:1');
+    } finally { f.cleanup(); }
+});
+
+test('enrolling a device clears a stale adult decision on the batch and single paths; readiness lists it under the child only', async () => {
+    const f = world();
+    try {
+        f.config.inventoryUi = {triage: true, wizard: false, installReadiness: true};
+        const who = await f.signIn(); await f.observe(); f.ready([mac(1), mac(2)]);
+        const decide = (m: string) => f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, m);
+        const decisionFor = (m: string) => f.store.get('SELECT 1 FROM inventory_decisions WHERE mac=?', m);
+        const readiness = new InstallReadiness(f.auth, f.inventory);
+        const list = () => (readiness.get(who.session(), '/admin/install-readiness')!.body as {children: {devices: {label: string}[]}[]; adults: {label: string}[]});
+        decide(mac(1)); decide(mac(2));
+        assert.equal(list().adults.length, 3);
+        // batch path
+        const stepUp = await f.proof(who, [add(1)]);
+        assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+        assert.equal(decisionFor(mac(1)), undefined); assert.ok(decisionFor(mac(2)));
+        let view = list();
+        assert.deepEqual(view.adults.map(a => a.label).sort(), ['Bryn', 'Protected device']);
+        assert.ok(view.children.some(c => c.devices.some(d => d.label === 'Private device 1')));
+        await f.dispatch(f.store.get<{id: string}>('SELECT id FROM operations')!.id);
+        // single path, with a hand-typed upper-case, dashed address that normalises to the stored lower-case one
+        const typed = mac(2).toUpperCase().replaceAll(':', '-');
+        assert.equal(macInput(typed), mac(2));
+        const single = new ChildAdmin(f.auth, f.policy), params = {label: 'Private device 2', mac: typed, precondition: f.token()};
+        const o = await single.stepUpOptions(who.session(), {action: 'device_add', target: 'pilot', params});
+        const done = await single.perform(who.session(), 'device_add', 'pilot', {...params, stepUp: {challengeId: o.challengeId, response: who.key.login(o.options, origin)}});
+        assert.equal(done.status, 202, JSON.stringify(done.body));
+        assert.equal(decisionFor(mac(2)), undefined);
+        view = list();
+        assert.deepEqual(view.adults.map(a => a.label), ['Protected device']);
+        assert.ok(view.children.some(c => c.devices.some(d => d.label === 'Private device 2')));
     } finally { f.cleanup(); }
 });

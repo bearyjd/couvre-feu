@@ -29,7 +29,7 @@ export const PROTECTED_LABEL = 'Protected device';
 /** The full list, addresses included: only the export (and the digest) use it as is; GET answers with `view` (adult addresses stripped). */
 export interface ReadinessDTO { children: {id: string; name: string; devices: ReadinessDevice[]}[]; adults: ReadinessAdultDevice[]; adultsAvailable: boolean; adultsSource: typeof ADULTS_SOURCE; warnings: ReadinessWarning[]; digest: string; reviewedAt: number | null }
 export interface ReadinessView extends Omit<ReadinessDTO, 'adults'> { adults: ReadinessAdult[] }
-export interface ReadinessExport { version: 1; digest: string; generatedAt: number; reviewed: boolean; children: ReadinessDTO['children']; adults: ReadinessAdultDevice[]; adultsAvailable: boolean; adultsSource: typeof ADULTS_SOURCE; warnings: ReadinessWarning[] }
+export interface ReadinessExport { version: 1; digestVersion: typeof DIGEST_VERSION; digest: string; generatedAt: number; reviewed: boolean; children: ReadinessDTO['children']; adults: ReadinessAdultDevice[]; adultsAvailable: boolean; adultsSource: typeof ADULTS_SOURCE; warnings: ReadinessWarning[] }
 
 /** JSON with every object's keys sorted, so equal data always serialises to the same bytes. */
 export function canonical(value: unknown): string {
@@ -46,9 +46,11 @@ const adultIdentity = (d: Parameters<typeof identity>[0] & {source: AdultSource}
  */
 export function readinessDigest(list: {children: {id: string; name: string; devices: ReturnType<typeof identity>[]}[]; adults: ReturnType<typeof adultIdentity>[]}): string {
     const children = list.children.map(c => ({id: c.id, name: c.name, devices: c.devices.map(identity).sort(byText(d => d.mac))})).sort(byText(c => c.id));
-    return sha256(canonical({v: 2, children, adults: list.adults.map(adultIdentity).sort(byText(d => d.mac))}));
+    return sha256(canonical({v: DIGEST_VERSION, children, adults: list.adults.map(adultIdentity).sort(byText(d => d.mac))}));
 }
 
+/** The `v` in the digest input; bumped whenever what the digest covers changes. The export's own `version` is the file format. */
+export const DIGEST_VERSION = 2;
 export const ADULT_LABEL = 'Adult device';
 interface DecisionFact { mac: string; role: string; label: string | null; stable_confirmed: number }
 
@@ -158,7 +160,7 @@ export class InstallReadiness {
         this.admin(session.dto.actor);
         const list = this.current(object(payload, ['digest']).digest);
         this.auth.store.transaction(() => { this.record(session.dto.actor.id, 'install_list_exported', list.digest); });
-        const file: ReadinessExport = {version: 1, digest: list.digest, generatedAt: this.auth.now(), reviewed: list.reviewedAt !== null, children: list.children, adults: list.adults, adultsAvailable: list.adultsAvailable, adultsSource: ADULTS_SOURCE, warnings: list.warnings};
+        const file: ReadinessExport = {version: 1, digestVersion: DIGEST_VERSION, digest: list.digest, generatedAt: this.auth.now(), reviewed: list.reviewedAt !== null, children: list.children, adults: list.adults, adultsAvailable: list.adultsAvailable, adultsSource: ADULTS_SOURCE, warnings: list.warnings};
         return {status: 200, body: {export: file}};
     }
 }
