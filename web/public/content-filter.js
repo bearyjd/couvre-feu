@@ -14,11 +14,34 @@ const GENERIC_STATE = { text: 'Unknown', note: 'The service gave no clear state.
 export const CATEGORIES = [['porn', 'Adult content'], ['gambling', 'Gambling'], ['dating', 'Dating'], ['piracy', 'Piracy'], ['social-networks', 'Social networks'], ['gaming', 'Gaming'], ['video-streaming', 'Video streaming']];
 export const SERVICES = [['tiktok', 'TikTok'], ['instagram', 'Instagram'], ['snapchat', 'Snapchat'], ['discord', 'Discord'], ['roblox', 'Roblox'], ['youtube', 'YouTube']];
 const TOGGLES = [['safeSearch', 'Safe search'], ['youtubeRestrictedMode', 'YouTube restricted mode'], ['blockBypass', 'Block ways around the filter']];
+// Labels for the service's closed class codes (shared/src/content-filter-classes.ts; a test keeps the two tables equal). Anything else reads "Other".
+export const CLASS_LABELS = { adult: 'Adult content', gambling: 'Gambling', dating: 'Dating', piracy: 'Piracy', social: 'Social networks', gaming: 'Gaming', video: 'Video streaming', apps: 'Blocked apps and services', bypass: 'Ways around the filter', denylist: 'Sites you blocked by hand', ads_trackers: 'Ads and trackers', security: 'Security protections', other: 'Other' };
+const HEADLINE = ['adult', 'gambling', 'dating', 'piracy', 'social', 'gaming', 'video', 'apps', 'bypass', 'denylist'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const DAY_WORDS = {
+  logs_off: 'Logging was off at NextDNS, so nothing was counted.',
+  suspect_zero: 'No lookups recorded: the phone may have been off or not using this network.',
+  gap: 'Not counted yet.',
+};
+const COUNTS_NOTE = 'Counts only. Couvre-feu does not see or keep which sites. Blocked lookups also come from ads, app prefetching and accidental taps; a number is a reason to talk, not proof. To see sites, open the NextDNS Logs tab (kept one week). Unverified on this router.';
 const HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const MAX_DOMAINS = 500;
 const BASELINE = { categories: ['porn', 'gambling', 'dating', 'piracy'], services: [], safeSearch: true, youtubeRestrictedMode: true, blockBypass: true, denylist: [], allowlist: [] };
 
 const stateOf = (value) => (Object.hasOwn(STATE, value) ? STATE[value] : GENERIC_STATE);
+const whole = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : 0);
+const labelOf = (code) => (Object.hasOwn(CLASS_LABELS, code) ? CLASS_LABELS[code] : CLASS_LABELS.other);
+const dayText = (day) => { const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(String(day)); return m && MONTHS[Number(m[1]) - 1] ? `${MONTHS[Number(m[1]) - 1]} ${Number(m[2])}` : null; };
+// What the counts route answered, reduced to what the block draws: seven rows (a known state, a short date, whole numbers) and per-class sums over counted days.
+export const summarize = (value) => {
+  const rows = (Array.isArray(value?.days) ? value.days : []).slice(0, 7).map((d) => ({ text: dayText(d?.day), state: d?.state === 'ok' || Object.hasOwn(DAY_WORDS, d?.state) ? d.state : 'gap', blocked: whole(d?.blocked), classes: d?.classes && typeof d.classes === 'object' ? d.classes : {} })).filter((row) => row.text);
+  const sums = new Map();
+  for (const row of rows.filter((r) => r.state === 'ok')) for (const [code, n] of Object.entries(row.classes)) { const key = Object.hasOwn(CLASS_LABELS, code) ? code : 'other'; sums.set(key, (sums.get(key) ?? 0) + whole(n)); }
+  const counted = rows.filter((r) => r.state === 'ok').length;
+  const filter = [...sums].filter(([code]) => code === 'other' || HEADLINE.includes(code)).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  return { rows, counted, filterTotal: [...sums].filter(([code]) => HEADLINE.includes(code)).reduce((n, [, q]) => n + q, 0), filter, ads: sums.get('ads_trackers') ?? 0, security: sums.get('security') ?? 0 };
+};
+
 const strings = (value) => (Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []);
 const desiredOf = (value) => ({
   categories: strings(value?.categories), services: strings(value?.services), denylist: strings(value?.denylist), allowlist: strings(value?.allowlist),
@@ -45,7 +68,7 @@ export function createContentFilter({ session, people }) {
   const root = document.querySelector('#filter-panel');
   // id -> { status: 'loading'|'ready'|'unset'|'error', record, draft, notice, busy }
   const cards = new Map();
-  let key = '', epoch = 0, off = false, loadingEpoch = -1;
+  let key = '', epoch = 0, off = false, countsOff = false, loadingEpoch = -1;
   const sessionKey = () => { const current = session(); return current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : ''; };
 
   async function call(path, body) {
@@ -70,16 +93,16 @@ export function createContentFilter({ session, people }) {
   function reset() { root.replaceChildren(); root.hidden = true; list.replaceChildren(); live.textContent = ''; drawnPeople = '[]'; }
   function sync() {
     const next = sessionKey();
-    if (next !== key) { key = next; epoch++; off = false; cards.clear(); reset(); }
+    if (next !== key) { key = next; epoch++; off = false; countsOff = false; cards.clear(); reset(); }
     return key;
   }
 
   // Resolves to 'changed', 'same' or 'failed'. A newer save or read for the same child supersedes an older one (seq), so a slow answer never overwrites a fresher card.
   async function loadOne(person) {
     const mine = epoch;
-    const entry = cards.get(person.id) ?? { status: 'loading', record: null, draft: null, notice: '', busy: false, dirty: false, typed: {}, fetchedAt: 0, seq: 0 };
+    const entry = cards.get(person.id) ?? { status: 'loading', record: null, counts: null, draft: null, notice: '', busy: false, dirty: false, typed: {}, fetchedAt: 0, seq: 0 };
     cards.set(person.id, entry);
-    const token = ++entry.seq, before = JSON.stringify([entry.status, entry.record]);
+    const token = ++entry.seq, before = JSON.stringify([entry.status, entry.record, entry.counts]);
     try {
       const record = await call(`/people/${encodeURIComponent(person.id)}/filter`);
       if (mine !== epoch || token !== entry.seq) return 'same';
@@ -94,7 +117,12 @@ export function createContentFilter({ session, people }) {
       else if (entry.status === 'ready' || entry.status === 'unset') return 'failed'; // a failed read never replaces a card that is showing
       else entry.status = 'error';
     }
-    return JSON.stringify([entry.status, entry.record]) === before ? 'same' : 'changed';
+    if ((entry.status === 'ready' || entry.status === 'unset') && !countsOff) {
+      // The counts block is optional: any failure just leaves it out. Only the route being absent (feature off) is remembered for the session.
+      try { const counts = await call(`/people/${encodeURIComponent(person.id)}/filter/counts`); if (mine === epoch && token === entry.seq) entry.counts = counts; }
+      catch (error) { if (mine === epoch && token === entry.seq) { entry.counts = null; if (error.status === 404 && error.code === 'route_not_found') countsOff = true; } }
+    }
+    return JSON.stringify([entry.status, entry.record, entry.counts]) === before ? 'same' : 'changed';
   }
   const REFRESH_MS = 10000;
   async function loadAll() {
@@ -203,6 +231,23 @@ export function createContentFilter({ session, people }) {
     draw(person.id, at === document.body || at === null || here?.contains(at) || !list.contains(at) ? 'save' : undefined);
   }
 
+  // "Last 7 days": per child, collapsed. Every string is fixed copy, a class label from the table above, or a number; nothing from the answer is put in as markup.
+  function countsBlock(entry) {
+    if (!entry.counts || countsOff) return [];
+    const sum = summarize(entry.counts);
+    if (!sum.rows.length) return [];
+    const stateWord = (row) => (row.state === 'ok' ? `${row.blocked} blocked` : DAY_WORDS[row.state]);
+    const headline = `${sum.filterTotal} lookups blocked by this filter (${sum.counted} of ${sum.rows.length} days counted)`;
+    const details = el('details', { class: 'filter-counts', 'data-filter-counts': '', open: entry.countsOpen === true }, el('summary', { textContent: 'Last 7 days' }),
+      el('p', { 'data-filter-counts-headline': '', textContent: headline }),
+      ...(sum.filter.length ? [el('ul', { 'aria-label': 'Blocked lookups by kind' }, ...sum.filter.map(([code, n]) => el('li', { textContent: `${labelOf(code)}: ${n}` })))] : []),
+      el('p', { class: 'fine-print', textContent: `Also blocked in the background: ${sum.ads} ads and trackers, ${sum.security} security protections.` }),
+      el('ul', { 'aria-label': 'Day by day', 'data-filter-counts-days': '' }, ...sum.rows.map((row) => el('li', { 'data-counts-state': row.state }, el('strong', { textContent: row.text }), ` ${stateWord(row)}`))),
+      el('p', { class: 'fine-print', textContent: COUNTS_NOTE }));
+    details.addEventListener('toggle', () => { entry.countsOpen = details.open; }); // a redraw keeps it as the parent left it
+    return [details];
+  }
+
   function card(person, entry) {
     const title = `filter-${person.id}`;
     const body = [];
@@ -218,6 +263,7 @@ export function createContentFilter({ session, people }) {
         const info = stateOf(entry.record?.state);
         body.push(el('p', { 'data-filter-state': entry.record?.state ?? '' }, el('strong', { textContent: info.text }), ` — ${info.note} This is unverified on this router.`));
       }
+      body.push(...countsBlock(entry));
       body.push(
         el('fieldset', {}, el('legend', { textContent: 'Blocked categories' }), ...CATEGORIES.map(([id, label]) => checkbox(entry, 'categories', id, label)), ...extras(entry, 'categories', CATEGORIES)),
         el('fieldset', {}, el('legend', { textContent: 'Blocked apps and sites' }), ...SERVICES.map(([id, label]) => checkbox(entry, 'services', id, label)), ...extras(entry, 'services', SERVICES)),
