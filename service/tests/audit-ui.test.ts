@@ -63,7 +63,7 @@ test('HTTP: the audit page script and the service worker (cache name bumped, aud
         assert.equal(script.status, 200);
         assert.match(script.text, /createAuditLog/);
         const sw = await s.get('/sw.js');
-        assert.match(sw.text, /cf-shell-integration-[^']*-v8'/);
+        assert.match(sw.text, /cf-shell-integration-[^']*-v9'/);
         assert.match(sw.text, /'\/audit\.js'/);
     } finally { await s.close(); w.f.cleanup(); }
 });

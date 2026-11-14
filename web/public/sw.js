@@ -1,8 +1,11 @@
 // Only public, same-origin shell assets. No auth/API cache and no queued writes.
-const SHELL = 'cf-shell-v9';
-const ASSETS = ['/', '/styles.css', '/app.js', '/auth-client.js', '/status-cache.js', '/operational-alerts.js', '/parent-alerts.js', '/activity.js', '/schedule-editor.js', '/schedule-editor.css', '/time-requests.js', '/reward-time.js', '/audit.js', '/content-filter.js', '/accounts.js', '/children.js', '/install-readiness.js', '/tabs.js', '/manifest.webmanifest', '/icon.svg'];
+const SHELL = 'cf-shell-v10';
+const ASSETS = ['/', '/styles.css', '/app.js', '/auth-client.js', '/status-cache.js', '/operational-alerts.js', '/parent-alerts.js', '/activity.js', '/schedule-editor.js', '/schedule-editor.css', '/time-requests.js', '/reward-time.js', '/audit.js', '/content-filter.js', '/accounts.js', '/children.js', '/install-readiness.js', '/tabs.js', '/pwa-update.js', '/manifest.webmanifest', '/icon.svg'];
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(SHELL).then((cache) => cache.addAll(ASSETS)));
+});
+self.addEventListener('message', (event) => {
+  if (event.data === 'skipWaiting') self.skipWaiting();
 });
 self.addEventListener('activate', (event) => {
   event.waitUntil(caches.keys().then(async (names) => {
