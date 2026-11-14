@@ -38,7 +38,7 @@ export function el(tag, props = {}, ...children) {
 export function createChildren({ session, revisionToken, refresh, version, replaced = () => new Set(), wizard = { enabled: () => false, open: () => {} } }) {
   const root = document.querySelector('#children-panel');
   // prefill = the open add form's draft: { id, label, mac, warn }. confirm = the open confirm sentence: { kind: 'remove' | 'move' | 'child_remove', id }.
-  let key = '', data = null, notice = '', busy = false, lastVersion = null, prefill = null, focusPrefill = false, confirm = null, focus = '', drawn = '', skipped = false;
+  let key = '', data = null, notice = '', loadError = false, approved = [], busy = false, lastVersion = null, prefill = null, focusPrefill = false, confirm = null, focus = '', drawn = '', skipped = false;
   const moveChoice = new Map(); // device id -> chosen target child, kept across redraws
   const labels = new Map(); // scope request id -> the name typed in this session (the service holds only what the router reported)
   const enabled = () => document.documentElement.dataset.source === 'real-router-integration' && session()?.actor.role === 'admin';
@@ -55,8 +55,17 @@ export function createChildren({ session, revisionToken, refresh, version, repla
   }
   async function load() {
     if (!enabled()) { data = null; draw(); return; }
-    try { data = await call('/admin/children'); } catch (error) { if (error.status === 401 || error.status === 403) data = null; else notice = error.message; }
+    try {
+      const next = await call('/admin/children');
+      approved = settleApproved(next); data = next; loadError = false;
+    } catch (error) { if (error.status === 401 || error.status === 403) data = null; else loadError = true; } // old rows stay; never the raw server message
     draw();
+  }
+  // A waiting request that is gone from the list was taken in by the router (or timed out): tell the person it can be added now, until they dismiss it or the child shows a new device.
+  function settleApproved(next) {
+    const gone = (data?.pendingScope ?? []).filter((r) => !next.pendingScope?.some((n) => n.id === r.id) && next.children.some((c) => c.id === r.childId))
+      .map((r) => ({ id: r.id, childId: r.childId, name: labels.get(r.id) ?? r.name ?? 'Unnamed device', devices: next.children.find((c) => c.id === r.childId).devices.length }));
+    return [...approved, ...gone].filter((a) => (next.children.find((c) => c.id === a.childId)?.devices.length ?? Infinity) <= a.devices);
   }
   async function confirmed(action, target, params, path, done) {
     if (busy) return;
@@ -70,12 +79,14 @@ export function createChildren({ session, revisionToken, refresh, version, repla
         // Not an error: the request is recorded by the service and listed from there (it survives a reload). Only the typed name is kept here.
         if (error.requestId) labels.set(error.requestId, params.label);
         notice = '';
-      } else notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : error.message;
+      } else notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : friendly(error);
     }
     busy = false;
     await load();
     refresh();
   }
+  // A busy or broken service is said in plain words; the service's own message is shown only for a refusal it chose to explain (4xx other than 429).
+  const friendly = (error) => (error.status === 429 ? 'Too many changes at once. Wait a minute and try again.' : !error.status || error.status >= 500 ? "Couldn't reach Couvre-feu. Check the list before trying again." : error.message);
   const queued = (result) => result.operation ? `Sent to the router (${result.operation.state}). The device list updates once the router confirms.` : null;
   function rejection(last) {
     if (!last) return [];
@@ -120,10 +131,11 @@ export function createChildren({ session, revisionToken, refresh, version, repla
     onChoose: (kind, subject) => { confirm = { kind, id: subject.id }; notice = ''; focus = `[data-entry] [data-confirm] [data-confirm-text]`; draw(); },
     onCancel: () => { const was = confirm; closeSentence(was?.kind === 'child_remove' ? `[data-remove-child="${CSS.escape(was.id)}"]` : `[data-fk="menu-${CSS.escape(was?.id ?? '')}"]`); },
     onMove: move, onRemove: remove, onRemoveChild: removeChild,
+    onDismissApproved: (id) => { approved = approved.filter((a) => a.id !== id); draw(); },
     onMenuClosed: () => { if (skipped) { skipped = false; draw(); } },
   };
   function card(entry) {
-    return childCard({ entry, h: handlers, busy, confirm, prefill, moveChoice, labels, replaced: replaced(),
+    return childCard({ entry, h: handlers, busy, confirm, prefill, moveChoice, labels, replaced: replaced(), approved: approved.filter((a) => a.childId === entry.id),
       others: data.children.filter((c) => c.id !== entry.id), pending: (data.pendingScope ?? []).filter((request) => request.childId === entry.id) });
   }
   function createForm() {
@@ -144,18 +156,20 @@ export function createChildren({ session, revisionToken, refresh, version, repla
     if (!enabled() || !data) { drawn = ''; root.hidden = true; root.replaceChildren(); return; }
     // Never rebuild while typing, choosing in a list, or with a ⋯ menu open: it would drop the keyboard's place. The menu's close redraws.
     const active = document.activeElement;
-    if (root.contains(active) && active.matches('input, select')) return;
+    if (root.contains(active) && (active.matches('input') || (active.matches('select') && !active.closest('.confirm-sentence')))) return; // a move list is redrawn from fresh data
     if (root.querySelector('.row-menu-list')) { skipped = true; return; }
     const open = prefill && root.querySelector(`[data-add-device="${CSS.escape(prefill.id)}"]`);
     if (open && !focusPrefill) prefill = { ...prefill, label: open.elements.label.value, mac: open.elements.mac.value }; // keep what the parent typed over the original prefill
-    const signature = JSON.stringify([data, notice, busy, confirm, prefill, [...replaced()], [...labels]]);
+    if (confirm && !(confirm.kind === 'child_remove' ? data.children.some((c) => c.id === confirm.id) : data.children.some((c) => c.devices.some((d) => d.id === confirm.id)))) confirm = null; // the row is gone: no sentence about it
+    const signature = JSON.stringify([data, notice, loadError, approved, busy, confirm, prefill, [...replaced()], [...labels]]);
     if (signature === drawn && !focus && !focusPrefill) return; // nothing changed: keep focus where it is
     drawn = signature; skipped = false;
     const kept = root.contains(active) ? active.dataset?.fk : null;
     root.replaceChildren(
       el('h2', { id: 'children-title' }, 'Children and device groups'),
       el('p', { class: 'fine-print' }, `Adults' protected devices can never be added. The router holds at most ${data.limits.children} entries, ${data.limits.devicesPerChild} devices each and ${data.limits.devices} in total; every device must be in its installed allow list. Each change needs your passkey and a router confirmation.`),
-      el('p', { class: 'notice', role: 'status', hidden: !notice }, notice),
+      el('p', { class: 'notice', role: 'status', hidden: !notice && !loadError }, loadError ? "Couldn't refresh the list. Showing the last list. Retry." : notice),
+      ...(loadError ? [el('button', { class: 'button secondary', type: 'button', onclick: () => void load() }, 'Retry')] : []),
       ...pendingNotice(),
       ...rejection(data.lastRejection),
       el('ul', { class: 'account-list', 'aria-label': 'Children and device groups' }, ...data.children.map(card)),
@@ -181,7 +195,7 @@ export function createChildren({ session, revisionToken, refresh, version, repla
   const entries = () => (data?.children ?? []).map((c) => ({ id: c.id, name: c.name }));
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
-    if (next !== key) { key = next; data = null; notice = ''; labels.clear(); prefill = null; confirm = null; focus = ''; moveChoice.clear(); draw(); if (next) void load(); return; }
+    if (next !== key) { key = next; data = null; notice = ''; loadError = false; approved = []; labels.clear(); prefill = null; confirm = null; focus = ''; moveChoice.clear(); draw(); if (next) void load(); return; }
     // Router observations settle queued device changes; reload when the status snapshot moves.
     const seen = version();
     if (next && seen !== lastVersion) { lastVersion = seen; void load(); }

@@ -18,11 +18,13 @@ export function ageText(seconds) {
 }
 /**
  * Addresses of enrolled devices that may have been replaced: the router's list shows that device quiet, and exactly one active,
- * private-address, not-yet-assigned row has the same (non-generic) name. A guess for a "Replaced?" chip, never an action.
+ * private-address, not-yet-assigned row has the same (non-generic) name and first appeared after the old one went quiet. A guess for a "Replaced?" chip, never an action.
  */
 export function replacedMacs(devices) {
   const key = (d) => (d.hostname ?? '').toLowerCase();
   const fresh = devices.filter((d) => d.flags?.unassigned && d.flags?.private && ['online', 'lease_only'].includes(d.presence) && d.hostname && !GENERIC.test(d.hostname));
   const quiet = devices.filter((d) => !d.flags?.unassigned && d.personName && d.presence === 'quiet' && d.hostname);
-  return new Set(quiet.filter((d) => fresh.filter((n) => key(n) === key(d)).length === 1 && quiet.filter((q) => key(q) === key(d)).length === 1).map((d) => d.mac));
+  // The new row must first appear after the old one went quiet: a device that was there all along is not its replacement.
+  const successors = (d) => fresh.filter((n) => key(n) === key(d) && Number.isFinite(n.firstSeen) && Number.isFinite(d.lastSeen) && n.firstSeen >= d.lastSeen);
+  return new Set(quiet.filter((d) => successors(d).length === 1 && quiet.filter((q) => key(q) === key(d)).length === 1).map((d) => d.mac));
 }

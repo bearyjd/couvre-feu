@@ -16,12 +16,17 @@ function rowMenu(device, locked, h) {
     'aria-label': `Actions for ${device.label}`, 'aria-haspopup': 'menu', 'aria-expanded': 'false' }, '⋯');
   let menu = null;
   const items = () => [...menu.querySelectorAll('[role="menuitem"]')];
-  function close(restore) {
+  // Safari/iOS do not focus a tapped button, so focus leaving the menu says nothing about the person's intent. Only a press outside it, or Escape, closes it.
+  const outside = (event) => { if (!wrap.isConnected) stop(); else if (menu && !wrap.contains(event.target)) { close(false, true); } };
+  const escape = (event) => { if (event.key === 'Escape' && menu) { event.preventDefault(); close(true); } };
+  function stop() { document.removeEventListener('pointerdown', outside, true); document.removeEventListener('keydown', escape, true); }
+  function close(restore, later = false) {
     if (!menu) return;
-    const gone = menu; menu = null; gone.remove();
+    const gone = menu; menu = null; gone.remove(); stop();
     trigger.setAttribute('aria-expanded', 'false');
     if (restore) trigger.focus();
-    h.onMenuClosed();
+    if (later) setTimeout(h.onMenuClosed, 400); // a pending redraw must not land between a press and its click
+    else h.onMenuClosed();
   }
   function open(last) {
     if (menu) return;
@@ -29,22 +34,20 @@ function rowMenu(device, locked, h) {
       ...MENU.map(([kind, verb, text]) => el('li', { role: 'none' },
         el('button', { class: 'button secondary', type: 'button', role: 'menuitem', 'aria-label': `${verb} ${device.label}`, onclick: () => { close(false); h.onChoose(kind, device); } }, text))));
     wrap.append(menu); trigger.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true); document.addEventListener('keydown', escape, true);
     const list = items(); list[last ? list.length - 1 : 0].focus();
   }
   trigger.addEventListener('click', () => (menu ? close(true) : open(false)));
   trigger.addEventListener('keydown', (event) => {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); open(event.key === 'ArrowUp'); }
-    else if (event.key === 'Escape' && menu) { event.preventDefault(); close(true); }
   });
   wrap.addEventListener('keydown', (event) => {
     if (!menu || !menu.contains(event.target)) return;
     const list = items(), at = list.indexOf(document.activeElement), step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
     if (step) { event.preventDefault(); list[(at + step + list.length) % list.length].focus(); }
     else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); list[event.key === 'Home' ? 0 : list.length - 1].focus(); }
-    else if (event.key === 'Escape') { event.preventDefault(); close(true); }
     else if (event.key === 'Tab') close(false); // focus then moves on naturally
   });
-  wrap.addEventListener('focusout', (event) => { if (menu && !wrap.contains(event.relatedTarget)) close(false); });
   wrap.append(trigger);
   return wrap;
 }
@@ -59,18 +62,19 @@ function sentence({ kind, name, text, extra = [], yes, h }) {
 }
 function moveSentence(ctx, device) {
   const { entry, others, moveChoice, busy, h } = ctx;
-  const select = el('select', { 'aria-label': `Move ${device.label} to`, disabled: busy,
-    onchange: () => { moveChoice.set(device.id, select.value); built.yesButton.disabled = busy || !select.value; } },
+  const idle = !busy && device.state === 'active'; // the server refuses a change on a device that is mid-change; so does the button
+  const select = el('select', { 'aria-label': `Move ${device.label} to`, disabled: busy, 'data-fk': `move-select-${device.id}`,
+    onchange: () => { moveChoice.set(device.id, select.value); built.yesButton.disabled = !idle || !select.value; } },
     el('option', { value: '' }, 'Choose…'), ...others.map((c) => el('option', { value: c.id }, c.name)));
   select.value = others.some((c) => c.id === moveChoice.get(device.id)) ? moveChoice.get(device.id) : '';
   const built = sentence({ kind: 'move', name: device.id, h, extra: [select], text: `Move ${device.label} from ${entry.name} to another child? Your passkey is asked next.`,
-    yes: { label: 'Yes, move it', disabled: busy || !select.value, onclick: () => h.onMove(entry, device, select.value) } });
+    yes: { label: 'Yes, move it', disabled: !idle || !select.value, onclick: () => h.onMove(entry, device, select.value) } });
   return built.group;
 }
 function removeSentence(ctx, device) {
   const { entry, busy, h } = ctx;
   return sentence({ kind: 'remove', name: device.id, h, text: `Remove ${device.label} from ${entry.name}? The router stops managing it. Your passkey is asked next.`,
-    yes: { label: 'Yes, remove it', disabled: busy, onclick: () => h.onRemove(device) } }).group;
+    yes: { label: 'Yes, remove it', disabled: busy || device.state !== 'active', onclick: () => h.onRemove(device) } }).group;
 }
 
 function deviceRow(ctx, device) {
@@ -80,15 +84,23 @@ function deviceRow(ctx, device) {
     el('div', { class: 'device-line' }, el('span', { class: 'device-name', 'data-name': '', dir: 'auto' }, device.label), rowMenu(device, locked, ctx.h)),
     el('div', { class: 'device-meta' },
       ...(device.vendor ? [el('span', { class: 'fine-print', 'data-vendor': '' }, device.vendor)] : []),
-      chip(status), ...(status === 'on_router' && ctx.replaced.has(device.mac) ? [chip('replaced')] : []),
+      chip(status), ...(status === 'on_router' && ctx.replaced.has(device.mac) ? [chip('replaced'), el('span', { class: 'fine-print', 'data-replaced-note': '' }, 'Check the old device before removing it.')] : []),
       ...(word ? [el('span', { class: 'fine-print' }, word)] : [])),
     ...(open === 'remove' ? [removeSentence(ctx, device)] : open === 'move' ? [moveSentence(ctx, device)] : []));
 }
 /** A request the router's administrator has not approved yet. It comes from the service, so it is still here after a reload. */
 function waitingRow(ctx, request) {
+  const typed = ctx.labels.get(request.id);
   return el('li', { class: 'device-row', 'data-pending-scope': request.id },
-    el('div', { class: 'device-line' }, el('span', { class: 'device-name', 'data-name': '', dir: 'auto' }, ctx.labels.get(request.id) ?? request.name ?? 'New device')),
-    el('div', { class: 'device-meta' }, chip('waiting'), el('span', { class: 'fine-print' }, `Asked ${ageText(request.ageSeconds)}`)));
+    el('div', { class: 'device-line' }, el('span', { class: 'device-name', 'data-name': '', dir: 'auto' }, typed ?? request.name ?? 'Unnamed device')),
+    el('div', { class: 'device-meta' }, chip('waiting'), el('span', { class: 'fine-print' }, `Asked ${ageText(request.ageSeconds)}`),
+      ...(typed === undefined && request.name ? [el('span', { class: 'fine-print', 'data-reported': '' }, 'Name reported by the device')] : [])));
+}
+/** The router took the device's address in: it can be added now. Kept until dismissed or the child shows a new device. */
+function approvedNote(ctx, item) {
+  return el('div', { class: 'notice', role: 'status', 'data-approved': item.id },
+    el('strong', { dir: 'auto' }, 'Approved: add it now'), el('p', { dir: 'auto' }, `${item.name}: the router now knows this device. Use Add device to finish.`),
+    el('button', { class: 'button secondary', type: 'button', 'data-fk': `dismiss-${item.id}`, onclick: () => ctx.h.onDismissApproved(item.id) }, 'Dismiss'));
 }
 function addForm(ctx) {
   const { entry, prefill, h } = ctx;
@@ -113,12 +125,13 @@ function removeChild(ctx) {
   return el('button', { class: 'button secondary', type: 'button', disabled: busy, 'data-remove-child': entry.id, 'data-fk': `remove-child-${entry.id}`, 'aria-label': `Remove ${entry.name}`,
     onclick: () => h.onChoose('child_remove', entry) }, `Remove ${kind}`);
 }
-/** `ctx` = { entry, pending, replaced:Set, labels:Map, confirm, prefill, moveChoice, others, busy, h }. */
+/** `ctx` = { entry, pending, approved, replaced:Set, labels:Map, confirm, prefill, moveChoice, others, busy, h }. */
 export function childCard(ctx) {
   const { entry, h } = ctx, kind = KIND_LABEL[entry.kind] ?? 'Child';
   const adding = ctx.prefill?.id === entry.id;
   return el('li', { class: 'account-card', 'data-entry': entry.id },
     el('strong', {}, entry.name), el('span', { class: 'fine-print' }, `${kind} · ${entry.devices.length} device${entry.devices.length === 1 ? '' : 's'}`),
+    ...ctx.approved.map((item) => approvedNote(ctx, item)),
     el('ul', { class: 'passkey-list device-rows', 'aria-label': `Devices of ${entry.name}` }, ...entry.devices.map((device) => deviceRow(ctx, device)), ...ctx.pending.map((request) => waitingRow(ctx, request))),
     ...(adding ? [addForm(ctx)] : [el('button', { class: 'button primary add-device', type: 'button', disabled: ctx.busy, 'data-add-device-open': entry.id, 'data-fk': `add-${entry.id}`,
       'data-restore-focus': `#children-panel [data-add-device-open="${entry.id}"]`, 'aria-label': `Add device to ${entry.name}`, onclick: (event) => h.onAdd(entry, event.currentTarget) }, 'Add device')]),

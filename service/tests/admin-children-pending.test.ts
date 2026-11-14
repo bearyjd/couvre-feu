@@ -90,3 +90,16 @@ test('pendingScope is bounded however many rows exist', () => {
         assert.ok(pendingScope.length > 0 && pendingScope.length <= 64);
     } finally { f.cleanup(); }
 });
+
+test('with two children and an admin who sees one, only the visible child\'s waiting request is returned', () => {
+    const f = fixture();
+    try {
+        f.store.run("INSERT INTO people(id,name,kind,active,created_at) VALUES('hidden','Hidden kid','child',1,?)", f.now());
+        const mine = f.tracker.request(operatorActor, 'pilot', ASKED).id;
+        f.tracker.request(operatorActor, 'hidden', SECOND);
+        const {pendingScope} = f.admin.list(operatorActor) as unknown as {pendingScope: {id: string; childId: string}[]};
+        assert.deepEqual(pendingScope.map(r => [r.id, r.childId]), [[mine, 'pilot']]);
+        const all = f.admin.list({...operatorActor, personIds: ['pilot', 'hidden']}) as unknown as {pendingScope: unknown[]};
+        assert.equal(all.pendingScope.length, 2);
+    } finally { f.cleanup(); }
+});
