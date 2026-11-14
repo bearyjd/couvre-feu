@@ -1,6 +1,6 @@
 <!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~229 -->
 # Data (SQLite, STRICT tables; db.ts `Store`, migrations in service/migrations)
-Main DB migrations 001..013 (`PRAGMA user_version`; integration mode runs 001, 002, 005..013, db.ts:9). The integration DB adds integration-001..007 (integration-db.ts).
+Main DB migrations 001..015 (`PRAGMA user_version`; integration mode runs 001, 002, 005..015, so its version is 13; db.ts:9). The integration DB adds integration-001..007 (integration-db.ts).
 
 | Migration | Adds |
 |---|---|
@@ -15,6 +15,8 @@ Main DB migrations 001..013 (`PRAGMA user_version`; integration mode runs 001, 0
 | 009 | time_requests.apply_via (resume/allowance), grant_operation_id |
 | 010 | parent_audit (ids and closed enums only; no free text, domains, MACs or addresses; pruned after 90 days) |
 | 011, 012, 013 | parent_audit rebuilt to admit action `reward_add` (011), `focus_start` (012) and `owner_guard_refused` (013); ids and AUTOINCREMENT counter carried over |
+| 014 | content_filter_desired; parent_audit rebuilt to admit `content_filter_set`, `content_filter_loosened` |
+| 015 | inventory_decisions (parent roles/labels/links/stable checks, keyed by generation + mac, FK to inventory_devices ON DELETE CASCADE); parent_audit rebuilt to admit the five `inventory_*` actions. One-way: snapshot first |
 | integration-001 | integration_state (singleton, generation, dispatch_epoch, dispatch_stopped), operation_rpc (phase queued/claimed/uncertain/resolved; delivery), dispatch_batches, dispatch_steps |
 | integration-002 | dispatch_steps rebuilt (single ordinal, kinds observe/apply/receipt/activity, states consumed/resolved/uncertain/revoked); index dispatch_live_claims |
 | integration-003 | operations.action admits device enrollment (`enroll`) |
