@@ -824,3 +824,55 @@ test('a refused enrol keeps the adult decision; the list builds again with the d
         assert.ok(!view.children.some(c => c.devices.some(d => d.label === 'Private device 1')));
     } finally { f.cleanup(); }
 });
+
+/** Queue one enrol for mac(1) with an adult decision; returns the operation id and helpers over the shared state. */
+async function queuedAdultEnrol(f: ReturnType<typeof world>) {
+    f.config.inventoryUi = {triage: true, wizard: false, installReadiness: true};
+    const who = await f.signIn(); await f.observe(); f.ready([mac(1)]);
+    f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+    const stepUp = await f.proof(who, [add(1)]);
+    assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+    const readiness = new InstallReadiness(f.auth, f.inventory);
+    return {id: f.store.get<{id: string}>('SELECT id FROM operations')!.id, view: () => readiness.get(who.session(), '/admin/install-readiness')!.body as {children: {devices: {label: string}[]}[]; adults: {label: string}[]},
+        settle: (id: string, state: string) => (f.worker as any).updateOperation(id, state, null),
+        decision: () => f.store.get<{role: string}>('SELECT role FROM inventory_decisions WHERE mac=?', mac(1))?.role,
+        device: () => f.store.get<{state: string}>('SELECT state FROM devices WHERE identifier=?', mac(1))?.state};
+}
+
+test('a conflict with the router holding the device settles it active and clears the adult decision', async () => {
+    const f = world();
+    try {
+        const q = await queuedAdultEnrol(f);
+        await f.dispatch(q.id);
+        f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE identifier=?", q.id, mac(1));
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+        f.store.run("UPDATE operations SET state='pending' WHERE id=?", q.id);
+        q.settle(q.id, 'conflict');
+        assert.equal(q.device(), 'active'); assert.equal(q.decision(), undefined);
+    } finally { f.cleanup(); }
+});
+
+test('a conflict with no stored observation leaves the enrol unsettled: the decision stays and the list refuses with an explained overlap, not a pending enrol', async () => {
+    const f = world();
+    try {
+        const q = await queuedAdultEnrol(f);
+        f.store.run('UPDATE service_state SET observation_json=NULL,observed_at=NULL WHERE singleton=1');
+        q.settle(q.id, 'conflict');
+        assert.equal(q.device(), 'enrolling'); assert.equal(q.decision(), 'adult');
+        assert.throws(() => q.view(), (e: any) => e.status === 409 && e.code === 'install_list_overlap' && /ended without being settled/.test(e.message));
+    } finally { f.cleanup(); }
+});
+
+test('an adult decision for an already enrolled device is dropped at startup; a pending enrol keeps its decision', async () => {
+    const f = world();
+    try {
+        const q = await queuedAdultEnrol(f);
+        new InventoryStore(f.store, {raise() { /* none */ }} as never);
+        assert.equal(q.decision(), 'adult');
+        await f.dispatch(q.id);
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+        assert.equal(q.device(), 'active');
+        new InventoryStore(f.store, {raise() { /* none */ }} as never);
+        assert.equal(q.decision(), undefined);
+    } finally { f.cleanup(); }
+});

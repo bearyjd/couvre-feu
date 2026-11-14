@@ -106,7 +106,7 @@ export class InventoryStore {
         this.store = store; this.alerts = alerts; this.now = now; this.retentionDays = retentionDays;
         this.policy = new IntegrationPolicy(store, now);
         this.scope = new ScopeTracker(store, alerts, now);
-        this.atomic(() => this.purgeProtected());
+        this.atomic(() => { this.purgeProtected(); this.dropOwnedAdultDecisions(); });
     }
     /** A protected management MAC is never listed, so a stored row for one (an older manifest, a hand edit) is removed. */
     private purgeProtected(): void {
@@ -273,6 +273,10 @@ export class InventoryStore {
         this.sweepDecisions();
     }
 
+    /** Decisions from before an enrolment cleared them: a device a child owns is a kid, so an adult decision for an ACTIVE device is dead (a pending enrol keeps its decision until the router settles it). */
+    private dropOwnedAdultDecisions(): void {
+        this.store.run("DELETE FROM inventory_decisions WHERE role='adult' AND generation=? AND mac IN (SELECT identifier FROM devices WHERE identifier_kind='mac' AND state='active')", this.store.config.router.generation);
+    }
     /** The child that owns each MAC through the children admin (devices) or, failing that, the desired policy. A corrupt policy only costs the fallback. */
     private owners(): Map<string, string> {
         const owners = new Map<string, string>();
