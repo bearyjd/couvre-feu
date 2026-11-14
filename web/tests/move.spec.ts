@@ -8,7 +8,7 @@ const menuOf = (row: Locator) => row.getByRole('button', { name: /^Actions for /
 /** Opens the row's ⋯ menu and its Move panel. */
 async function openMove(row: Locator, label: string) {
   await menuOf(row).click();
-  await row.getByRole('menuitem', { name: `Move ${label}` }).click();
+  await row.getByRole('menuitem', { name: `Move ${label}`, exact: true }).click();
   return row.locator('[data-confirm="move"]');
 }
 

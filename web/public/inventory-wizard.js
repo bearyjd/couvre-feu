@@ -21,7 +21,7 @@ const FRESH = {
 
 /**
  * `source` = { data(), load(signal) -> Promise<boolean>, refresh(signal), stable(id, value), now(), children: { entries(), startAdd(id, values), showKids() } }.
- * Returns { button(), close(), isOpen() }.
+ * Returns { button(), openFor(childId, opener), close(), isOpen() }.
  */
 export function createWizard(source) {
   let s = FRESH, overlay = null, opener = null, runId = 0, pollTimer = null, waitTimer = null, painted = '', abort = null, loading = false, pageOverflow = null;
@@ -219,9 +219,10 @@ export function createWizard(source) {
   const keepFocus = (event) => { if (overlay && !overlay.contains(event.target)) overlay.querySelector('#wizard-title').focus({ preventScroll: true }); };
   const onHash = () => close({ restore: false });
 
-  function open(from) {
+  // `child` (from the Kids tab's Add device) skips step 1: the sheet starts at "How do we find it?" with that child chosen.
+  function open(from, child) {
     if (overlay) return;
-    opener = from; s = { ...FRESH }; painted = '';
+    opener = from; s = child ? { ...FRESH, step: 2, child } : { ...FRESH }; painted = '';
     overlay = el('div', { class: 'wizard-backdrop' }, el('div', { class: 'wizard-sheet', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'wizard-title' }));
     overlay.addEventListener('keydown', onKey);
     document.addEventListener('focusin', keepFocus);
@@ -236,7 +237,7 @@ export function createWizard(source) {
     overlay.removeEventListener('keydown', onKey); document.removeEventListener('focusin', keepFocus); window.removeEventListener('hashchange', onHash);
     document.documentElement.style.overflow = pageOverflow ?? '';
     overlay.remove(); overlay = null; s = FRESH; painted = '';
-    const target = document.querySelector('[data-wizard-open]') ?? opener;
+    const target = opener?.dataset?.restoreFocus ? document.querySelector(opener.dataset.restoreFocus) : document.querySelector('[data-wizard-open]') ?? opener; // a redrawn opener is found again by its selector
     opener = null;
     if (restore) target?.focus();
   }
@@ -244,6 +245,6 @@ export function createWizard(source) {
   return {
     button: () => el('div', { class: 'wizard-open-bar' },
       el('button', { class: 'button primary', type: 'button', 'data-wizard-open': '', onclick: (event) => open(event.currentTarget) }, "Find a kid's device")),
-    close, isOpen: () => overlay !== null,
+    openFor: (child, from) => open(from, child), close, isOpen: () => overlay !== null,
   };
 }

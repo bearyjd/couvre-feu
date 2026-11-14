@@ -11,6 +11,7 @@ import { createInstallReadiness } from './install-readiness.js';
 import { createAccounts } from './accounts.js';
 import { createTabs } from './tabs.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
+import { replacedMacs } from './kids-model.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -33,11 +34,12 @@ const installReadiness = createInstallReadiness({ session: () => state.session, 
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const tabs = createTabs();
-const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
+const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null,
+  replaced: () => replacedMacs(inventory.devices()), wizard: { enabled: () => inventory.wizardEnabled(), open: (id, from) => inventory.openWizard(id, from) } }); // `inventory` is created just below; both are only called later
 // The add form lives on the Kids tab: opening it from a Devices row must show that tab first, or the form could not take focus.
 const childrenFromDevices = { ...children, startAdd: (id, values) => { tabs.show('kids'); return children.startAdd(id, values); }, showKids: () => tabs.show('kids') };
 const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children: childrenFromDevices,
-  version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
+  version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null, onList: () => children.redraw() });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
   session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine, serviceDown: null,

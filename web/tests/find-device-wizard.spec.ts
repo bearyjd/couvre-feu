@@ -345,8 +345,7 @@ test('Kids tab, flag on: Add device opens the sheet at step 2 with that child ch
   await expect(sheet(page)).toHaveAttribute('data-step', '2');
   await expect(page.locator('#children-panel form[data-add-device]')).toHaveCount(0);
   await sheet(page).getByRole('button', { name: 'Pick from the list' }).click();
-  await sheet(page).getByRole('button', { name: 'Back' }).click();
-  await sheet(page).getByRole('button', { name: 'Back' }).click(); // step 1 is still reachable, but the child stays chosen
+  await sheet(page).getByRole('button', { name: 'Back' }).click(); // step 1 is still reachable, and the child stays chosen
   await expect(sheet(page).getByRole('button', { name: 'Kid kid2' })).toHaveAttribute('aria-pressed', 'true');
   await page.keyboard.press('Escape');
   await expect(sheet(page)).toHaveCount(0);
