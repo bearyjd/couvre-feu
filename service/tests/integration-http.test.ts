@@ -7,10 +7,11 @@ import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, digest } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
 import { TestAuthenticator } from './authenticator.ts';
+import { freePort } from './free-port.ts';
 import { AutomaticDispatch } from '../src/integration-automatic.ts';
 
 for (const enabled of [false, true]) test(`real integration HTTP preserves authentication and cached reads with ${enabled ? 'enabled automatic dispatch over private HTTPS' : 'default exact permits'}`, async () => {
-    const f = integrationFixture(), port = 35000 + process.pid % 10000, internal = `http://localhost:${port}`, origin = enabled ? 'https://parent.example.test:8443' : internal, host = new URL(origin).host;
+    const f = integrationFixture(), port = await freePort(), internal = `http://localhost:${port}`, origin = enabled ? 'https://parent.example.test:8443' : internal, host = new URL(origin).host;
     if (enabled) f.config.dispatch = {enabled: true, pollSeconds: 2, maxBackoffSeconds: 8};
     const automatic = enabled ? new AutomaticDispatch(f.worker) : null;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
@@ -41,7 +42,7 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
     try {
         const html = await (await proxyFetch('/')).text(); assert.match(html, /data-source="real-router-integration"/); assert.match(html, /Private router integration/); assert.doesNotMatch(html, /fictional account|Synthetic demo/);
         assert.match(html, new RegExp(`data-automatic-dispatch="${enabled}"`));
-        assert.match(await (await proxyFetch('/sw.js')).text(), /cf-shell-integration-dddd[^']*-v11'/);
+        assert.match(await (await proxyFetch('/sw.js')).text(), /cf-shell-integration-dddd[^']*-v13'/);
         assert.equal((await request('/people', undefined, {Host: 'untrusted.example.test'})).status, 403);
         assert.equal((await request('/people', undefined, {Origin: 'https://untrusted.example.test'})).status, 403);
         assert.equal(auth.rpID, enabled ? 'parent.example.test' : 'localhost');

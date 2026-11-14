@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
@@ -19,7 +20,7 @@ test('S1: the integration entry point serves /alerts (ParentAlerts wired, no sch
 });
 
 test('S1: an admin sees the router_scope_change alert over HTTP, a parent does not', async () => {
-    const f = integrationFixture(), port = 25000 + process.pid % 10000, origin = `http://localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     (f.config as {routerScope?: string[]}).routerScope = [SEED];
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`}, new ParentAlerts(f.store, null, f.now));

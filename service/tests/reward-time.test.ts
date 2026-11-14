@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
@@ -241,7 +242,7 @@ const insertAudit = (db: DatabaseSync, at: number, action: string, op: string | 
 test('migration 011 on a seeded pre-011 database keeps rows and ids, the three indexes, STRICT and the CHECKs, and admits reward_add', () => {
     const m = preEleven(db => { insertAudit(db, 1, 'pause', 'op_one'); insertAudit(db, 2, 'grant_approve', null); insertAudit(db, 3, 'resume', 'op_three'); });
     try {
-        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 15, 'opened by the current Store, so 012 to 015 have run too');
+        assert.equal(m.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16, 'opened by the current Store, so 012 to 016 have run too');
         assert.deepEqual(m.store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), [
             {id: 1, at: 1, actor_id: 'parent', action: 'pause', person_id: 'pilot', operation_id: 'op_one', result: 'applied'},
             {id: 2, at: 2, actor_id: 'parent', action: 'grant_approve', person_id: 'pilot', operation_id: null, result: 'applied'},
@@ -302,11 +303,10 @@ async function serve(r: Awaited<ReturnType<typeof rewardWorld>>, port: number) {
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     return {o, close: async () => { server.close(); await once(server, 'close'); }};
 }
-let ports = 28000 + process.pid % 5000;
 
 test('HTTP: POST /people/:id/reward queues one allowance (202 + Location), is idempotent and audited once; GET, query strings, extra fields and bad CSRF are refused', async () => {
     const r = await rewardWorld(); r.w.f.config.timeRequests = {mode: 'parents'};
-    const s = await serve(r, ports++);
+    const s = await serve(r, await freePort());
     try {
         const who = await session(r.w.f, s.o, 'operator'), pre = await who.token();
         const first = await who.post('/people/pilot/reward', {minutes: 15}, KEY, pre);
@@ -337,7 +337,7 @@ test('HTTP: flag off, time requests off, out-of-scope child and the owner-mode g
         const r = await rewardWorld({}, {reward: c.reward, audit: true});
         if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
         if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
-        const s = await serve(r, ports++);
+        const s = await serve(r, await freePort());
         try {
             const who = await session(r.w.f, s.o, c.account);
             const out = await who.post(`/people/${c.person}/reward`, {minutes: 15});
@@ -360,7 +360,7 @@ test('HTTP: GET /people carries a read-only rewardTime boolean only when the rew
         const r = await rewardWorld({}, {reward: c.reward, audit: true});
         if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
         if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
-        const s = await serve(r, ports++);
+        const s = await serve(r, await freePort());
         try {
             const who = await session(r.w.f, s.o, c.account);
             const people = await who.send('GET', '/people');

@@ -20,10 +20,16 @@ jobs:
           sh tests/run.sh --list-preflight-suites | sort > "$RUNNER_TEMP/suites-run-sh.txt"
           sed -n "s/^ *- suites: '\(.*\)'$/\1/p" .github/workflows/ci.yml | tr ' ' '\n' | sort -u > "$RUNNER_TEMP/suites-matrix.txt"
           diff -u "$RUNNER_TEMP/suites-run-sh.txt" "$RUNNER_TEMP/suites-matrix.txt"
-          # A sharded suite repeats once per partition; every i/N must be present exactly once.
-          sed -n "s/^ *partition: '\(.*\)'$/\1/p" .github/workflows/ci.yml | sort > "$RUNNER_TEMP/partitions-matrix.txt"
-          printf '%s\n' 1/4 2/4 3/4 4/4 | diff -u - "$RUNNER_TEMP/partitions-matrix.txt"
-          test "$(grep -c "^ *- suites: 'test-platform-integration.py'$" .github/workflows/ci.yml)" = 4
+          # A sharded suite repeats once per partition; every i/N must be present exactly once per suite.
+          awk -v q="'" '/^ *- suites: / { suite = $3; gsub(q, "", suite) } $1 == "partition:" && substr($2, 1, 1) == q { part = $2; gsub(q, "", part); print suite, part }' .github/workflows/ci.yml | sort > "$RUNNER_TEMP/partitions-matrix.txt"
+          : > "$RUNNER_TEMP/partitions-expected.txt"
+          for cells in test-platform-integration.py:4 test-install.py:3 test-os-trust.py:3; do
+            suite=${cells%:*}; count=${cells#*:}
+            test "$(grep -c "^ *- suites: '$suite'$" .github/workflows/ci.yml)" = "$count"
+            i=1; while [ "$i" -le "$count" ]; do echo "$suite $i/$count" >> "$RUNNER_TEMP/partitions-expected.txt"; i=$((i + 1)); done
+          done
+          sort -o "$RUNNER_TEMP/partitions-expected.txt" "$RUNNER_TEMP/partitions-expected.txt"
+          diff -u "$RUNNER_TEMP/partitions-expected.txt" "$RUNNER_TEMP/partitions-matrix.txt"
       - name: Static checks and acceptance preflight
         env:
           CF_TEST_SHELL: busybox ash
@@ -50,6 +56,14 @@ jobs:
       matrix:
         include:
           - suites: 'test-install.py'
+            partition: '1/3'
+            timeout: 30
+          - suites: 'test-install.py'
+            partition: '2/3'
+            timeout: 30
+          - suites: 'test-install.py'
+            partition: '3/3'
+            timeout: 30
           - suites: 'test-install-recovery.py'
           - suites: 'test-platform-integration.py'
             partition: '1/4'
@@ -64,6 +78,14 @@ jobs:
             partition: '4/4'
             timeout: 30
           - suites: 'test-os-trust.py'
+            partition: '1/3'
+            timeout: 30
+          - suites: 'test-os-trust.py'
+            partition: '2/3'
+            timeout: 30
+          - suites: 'test-os-trust.py'
+            partition: '3/3'
+            timeout: 30
           - suites: 'test-permanent-install.py'
           - suites: 'test-install-recovery-primitives.py test-pinned-helper-security.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py test-heartbeat.py test-platform-integration-partitions.py'
     steps:

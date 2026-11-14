@@ -260,9 +260,9 @@ getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<
 
 - Hourly tick (unref'd timers; first tick a few minutes after start; same `running` guard as the watch).
 - **Which days:** for each child in `contentFilter.profiles` (not the default profile), each local day `D` from
-  `today-6` to `yesterday` whose row is missing or `unavailable`, and only once local time is past **03:00 on D+1**
+  `today-7` to `today-1` (seven days: the digest's Sunday-to-Saturday window read at Sunday 18:00) whose row is missing or `unavailable`, and only once local time is past **03:00 on D+1**
   (settling margin for NextDNS aggregation lag; lag UNVERIFIED, measured in C0). Today's partial day is never
-  stored. Days older than `today-6` are not attempted (presumed beyond the one-week retention).
+  stored. Days older than `today-7` are not attempted (presumed beyond the one-week retention).
 - **Range:** `from` = epoch of local midnight starting `D`, `to` = epoch of local midnight starting `D+1`, computed by a
   DST-safe helper factored out of `digest.ts` (`zoned`/`local` become an exported `localDayBounds(day)`), so 23 h and
   25 h days are exact. Unix seconds avoid any time-zone parsing on NextDNS's side.
@@ -319,11 +319,11 @@ identical 404s; no NextDNS call is ever made by a request):
 | F6 | Logs turned off on the profile | `logs_off`, no analytics call | "Logging is off for this profile in NextDNS, so there are no counts" |
 | F7 | Free-plan 300k limit hit (filtering and logging stop per NextDNS staff) | `total` ≈ 0 while the child was online → `suspect_zero` (when activity is on); otherwise `ok` with zeros | "NextDNS saw no lookups while the device was online. Filtering may be off (plan limit, outage, or the device is not using it)." Recommend a paid plan (O7) |
 | F8 | Analytics retention shorter than 7 days or analytics lag | Days missed while down are re-tried only within the window; lag margin 03:00 | Honest gaps; C0 measures both |
-| F9 | Service down over a weekend | Backfills up to 6 days back on start | Gap only for days older than that |
+| F9 | Service down over a weekend | Backfills up to 7 days back on start | Gap only for days older than that |
 | F10 | Phase B not live (devices not using the profile) | Counts are real but cover only what reached the profile | Card copy: "Counts cover only lookups that reached this child's NextDNS profile" |
 | F11 | Store failure (disk full) | Pass ends; nothing logged with data | Missing days |
 | F12 | Digest due while some days unavailable | Digest sums ok days only and says so | "N blocked lookups (5 of 7 days)" |
-| F13 | Flag turned off then on | Rows kept until pruned; backfill again up to 6 days | Older gaps stay gaps |
+| F13 | Flag turned off then on | Rows kept until pruned; backfill again up to 7 days | Older gaps stay gaps |
 
 Nothing in this feature changes enforcement, pauses, or filters. A total outage of the feature is cosmetic.
 
@@ -460,7 +460,7 @@ only to the parents the mode allows and are not pushed.
   `main.ts` starts/stops it next to the watch.
 - Tests (`content-filter-counts.test.ts`): flag off → zero requests, no timer, no rows; first pass backfills 7 days in
   order; today never stored; not before 03:00 local next day; ok row never overwritten by a later failure;
-  `unavailable` retried and becomes ok; day older than 6 days not attempted; `logs_off` path makes no analytics call;
+  `unavailable` retried and becomes ok; day older than 7 days not attempted; `logs_off` path makes no analytics call;
   `suspect_zero` with and without activity; budget stop and resume; one child failing does not stop others; the
   default profile never requested; prune at 56 days; concurrent tick guard; no stdout/stderr on any path; G7 haystack.
 

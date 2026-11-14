@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { once } from 'node:events';
@@ -14,7 +15,7 @@ import { PolicyService } from '../src/policy.ts';
 import { appServer } from '../src/http.ts';
 import { demoConfig } from '../src/config.ts';
 test('genuine authenticated HTTP controls enforce Host, identity, scope, CSRF, origin, expiry and revocation', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-http-')), port = 45000 + process.pid % 10000, origin = `http://localhost:${port}`;
+    const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-http-')), port = await freePort(), origin = `http://localhost:${port}`;
     const store = new Store(join(dir, 'service.sqlite'));
     seedAccounts(store);
     let now = 1791691200;

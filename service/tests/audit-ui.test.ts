@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { world } from './fixtures/grant-world.ts';
@@ -8,11 +9,10 @@ import { auditFor } from '../src/parent-audit.ts';
 import { appServer } from '../src/http.ts';
 
 type W = Awaited<ReturnType<typeof world>>;
-let ports = 31000 + process.pid % 5000;
 
 /** Serves the app with the config as it is now (the gates are read from it at startup) and signs one account in. */
 async function serve(w: W, account: string) {
-    const port = ports++, o = `http://localhost:${port}`, f = w.f;
+    const port = await freePort(), o = `http://localhost:${port}`, f = w.f;
     const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -63,7 +63,7 @@ test('HTTP: the audit page script and the service worker (cache name bumped, aud
         assert.equal(script.status, 200);
         assert.match(script.text, /createAuditLog/);
         const sw = await s.get('/sw.js');
-        assert.match(sw.text, /cf-shell-integration-[^']*-v11'/);
+        assert.match(sw.text, /cf-shell-integration-[^']*-v13'/);
         assert.match(sw.text, /'\/audit\.js'/);
     } finally { await s.close(); w.f.cleanup(); }
 });
