@@ -9,6 +9,7 @@ const WHAT = {
   grant_approve: 'Approved extra time', grant_decline: 'Declined a request', grant_end: 'Ended extra time',
   reward_add: 'Added reward time', focus_start: 'Started a focus window',
   content_filter_set: 'Changed the content filter', content_filter_loosened: 'Relaxed the content filter',
+  inventory_classify: 'Sorted a device', inventory_undo: 'Undid sorting a device', inventory_link: 'Linked two devices as the same', inventory_unlink: 'Unlinked two devices', inventory_stable: 'Changed a device address check',
 };
 const GENERIC_WHAT = 'Changed a setting';
 const EVERYONE = new Set(['pause_all', 'resume_all']);

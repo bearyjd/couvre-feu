@@ -22,7 +22,7 @@ import { TimeRequestService } from './time-requests.ts';
 import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
 import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
-import { inventoryGet, inventoryPost } from './inventory-http.ts';
+import { INVENTORY_LINK_PATH, inventoryDelete, inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
 import type { InstallReadiness } from './install-readiness.ts';
 import { auditFor } from './parent-audit.ts';
@@ -39,7 +39,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/inventory-triage.js': ['inventory-triage.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -188,7 +188,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v9'", `'cf-shell-integration-${provenance.integrationScope}-v8'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v11'", `'cf-shell-integration-${provenance.integrationScope}-v8'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
@@ -328,6 +328,18 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const written = await contentFilter.put(session, path, payload);
                 if (!written) throw new AppError(405, 'method_not_allowed');
                 send(response, written.status, {...provenance, ...written.body as object});
+                return;
+            }
+            if (request.method === 'DELETE' && inventory && INVENTORY_LINK_PATH.test(path)) {
+                // Session and CSRF first, so an anonymous caller learns nothing about the flag; then without inventoryUi.triage this is any other DELETE (405).
+                // No body is read: the row id in the path is the whole request.
+                if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
+                request.resume();
+                const session = auth.session(sessionToken, jar.cf_browser);
+                auth.csrf(session, request.headers['x-csrf-token']);
+                const removed = inventoryDelete(inventory, session, path);
+                if (!removed) throw new AppError(405, 'method_not_allowed');
+                send(response, removed.status, {...provenance, ...removed.body as object});
                 return;
             }
             if (request.method !== 'GET') {

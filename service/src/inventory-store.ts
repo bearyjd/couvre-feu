@@ -3,7 +3,8 @@ import { isPrivateAddress } from '../../shared/src/router-inventory.ts';
 import type { InventorySource, RouterInventory } from '../../shared/src/router-inventory.ts';
 import { INVENTORY_POLL_SECONDS, kindHint, presenceOf, suggestReplacements } from '../../shared/src/inventory-hints.ts';
 import { lookupVendor } from '../../shared/src/oui.ts';
-import type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
+import { INVENTORY_ROLES } from '../../shared/src/admin-inventory.ts';
+import type { InventoryDeviceDTO, InventoryDTO, InventoryRole } from '../../shared/src/admin-inventory.ts';
 export type { InventoryDeviceDTO, InventoryDTO } from '../../shared/src/admin-inventory.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
 import { ScopeTracker } from './integration-scope.ts';
@@ -11,6 +12,8 @@ import type { Actor } from '../../shared/src/contracts.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
+import { auditFor } from './parent-audit.ts';
+import type { AuditAction } from './parent-audit.ts';
 
 /** One accepted refresh request per this many seconds, across all admins. */
 export const REFRESH_MIN_SECONDS = 10;
@@ -25,6 +28,12 @@ export const STALL_ALERT_INTERVAL_SECONDS = 6 * 3600;
 export const BENIGN_ROUTER_ERRORS: readonly string[] = ['invalid_clock', 'inventory_row_dropped'];
 export const DEFAULT_INVENTORY_RETENTION_DAYS = 30;
 export const MAX_INVENTORY_RETENTION_DAYS = 90;
+/** A parent's free-text name for a device ("Kitchen TV"); plain text, never stored outside the decision row. */
+export const DECISION_LABEL_MAX = 40;
+/** A guest quiet for this long is left out of the default admin list (reversible: any sighting brings it back). */
+export const GUEST_HIDE_SECONDS = 14 * 86400;
+/** Decisions are cheap and reversible, but one admin session still cannot spin the table. */
+export const DECISIONS_PER_MINUTE = 60;
 const DAY = 86400;
 const CANONICAL_MAC = /^[0-9a-f][02468ace](?::[0-9a-f]{2}){5}$/;
 
@@ -48,6 +57,25 @@ interface StateRow {
     refresh_requested_at: number | null; refresh_pending: number; alert_day_start: number | null; alert_day_count: number; last_alert_at: number | null;
     incomplete_since: number | null; last_stall_alert_at: number | null;
 }
+/** A stored decision. It is bound to (generation, mac); `row_id` and `linked_from_row` are the inventory row ids those resolve to right now (never stored). */
+interface DecisionRow {
+    generation: string; mac: string; role: InventoryRole; label: string | null; previous_role: InventoryRole | null; linked_from_mac: string | null; stable_confirmed: number; stable_at: number | null; decided_by: string; decided_at: number;
+    row_id: number; linked_from_row: number | null;
+}
+type DecisionFields = Pick<DecisionRow, 'role' | 'label' | 'previous_role' | 'linked_from_mac' | 'stable_confirmed' | 'stable_at'>;
+const NEW_DECISION: DecisionFields = {role: 'new', label: null, previous_role: null, linked_from_mac: null, stable_confirmed: 0, stable_at: null};
+/** Decisions with the row ids their natural keys resolve to. A decision whose row is gone is not returned, so a renumbered rowid can never attach one to another device. */
+const DECISIONS = `SELECT d.*, r.rowid row_id, o.rowid linked_from_row FROM inventory_decisions d JOIN inventory_devices r ON r.generation=d.generation AND r.mac=d.mac
+    LEFT JOIN inventory_devices o ON o.generation=d.generation AND o.mac=d.linked_from_mac`;
+const ASSIGNABLE_ROLES: readonly string[] = INVENTORY_ROLES.filter(r => r !== 'new');
+const DEVICE_COLUMNS = 'rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at';
+/** Plain text only: no control, format, separator or private-use characters and no angle brackets; trimmed, 1 to DECISION_LABEL_MAX characters. null clears. */
+function parseLabel(value: unknown): string | null {
+    if (value === null) return null;
+    const text = typeof value === 'string' ? value.normalize('NFC').trim() : '';
+    if (text.length === 0 || Array.from(text).length > DECISION_LABEL_MAX || /[\p{C}\p{Zl}\p{Zp}<>]/u.test(text)) throw new AppError(400, 'invalid_label');
+    return text;
+}
 interface DeviceRow {
     id: number; mac: string; ipv4_json: string; hostname: string | null; source: InventorySource; first_seen: number; last_seen: number; acknowledged_at: number | null;
 }
@@ -65,6 +93,7 @@ export class InventoryStore {
     readonly retentionDays: number;
     readonly policy: IntegrationPolicy;
     readonly scope: ScopeTracker;
+    private readonly decisionTimes = new Map<string, number[]>();
     constructor(store: IntegrationStore, alerts: Pick<ParentAlerts, 'raise'>, now = () => Math.floor(Date.now() / 1000), retentionDays = DEFAULT_INVENTORY_RETENTION_DAYS) {
         if (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > MAX_INVENTORY_RETENTION_DAYS) throw new Error('invalid_inventory_retention_days');
         this.store = store; this.alerts = alerts; this.now = now; this.retentionDays = retentionDays;
@@ -75,7 +104,13 @@ export class InventoryStore {
     /** A protected management MAC is never listed, so a stored row for one (an older manifest, a hand edit) is removed. */
     private purgeProtected(): void {
         const macs = this.store.config.protectedMacs;
-        if (macs.length > 0) this.store.run(`DELETE FROM inventory_devices WHERE mac IN (${macs.map(() => '?').join(',')})`, ...macs);
+        if (macs.length > 0) { this.store.run(`DELETE FROM inventory_devices WHERE mac IN (${macs.map(() => '?').join(',')})`, ...macs); this.sweepDecisions(); }
+    }
+    private sweepDecisions(): void {
+        // The foreign key cascades a deleted row's decision; this also covers a connection or rebuild that ran with foreign keys off.
+        this.store.run('DELETE FROM inventory_decisions WHERE NOT EXISTS (SELECT 1 FROM inventory_devices r WHERE r.generation=inventory_decisions.generation AND r.mac=inventory_decisions.mac)');
+        this.store.run('UPDATE inventory_decisions SET linked_from_mac=NULL WHERE linked_from_mac IS NOT NULL AND NOT EXISTS (SELECT 1 FROM inventory_devices r WHERE r.generation=inventory_decisions.generation AND r.mac=inventory_decisions.linked_from_mac)');
+        this.store.run("DELETE FROM inventory_decisions WHERE role='new' AND label IS NULL AND linked_from_mac IS NULL AND stable_confirmed=0");
     }
     private get generation(): string { return this.store.config.router.generation; }
     /** All-or-nothing, whether or not the caller already holds a transaction (the worker settles its step in the same one). */
@@ -95,6 +130,8 @@ export class InventoryStore {
         return row;
     }
     private requireAdmin(actor: Actor): void { if (actor.role !== 'admin') throw new AppError(403, 'admin_required'); }
+    /** Whether the manifest's inventoryUi.triage is on (read per call, like the other flags). Off: the decision routes and DTO fields do not exist. */
+    get triage(): boolean { return this.store.config.inventoryUi?.triage === true; }
 
     /** A poll is due every 60 s, or at once when an admin asked for a refresh. Reads only; opens nothing. */
     due(at = this.now()): boolean {
@@ -181,18 +218,20 @@ export class InventoryStore {
             JSON.stringify(d.ipv4), d.hostname, d.source, ...(presence(d.source) ? [at] : []), g, d.mac);
     }
     /**
-     * Keeps the per-generation row cap. Only the longest-unseen rows that this reply does not list, that nobody acknowledged and that are not a
+     * Keeps the per-generation row cap. Only the longest-unseen rows that this reply does not list, that nobody acknowledged or decided on and that are not a
      * New device still waiting for its alert may go. Returns how many new rows fit: at the cap with nothing evictable it is 0 (never a flood
      * pushing out the evidence).
      */
     private makeRoom(g: string, known: number, wanted: number, listed: Set<string>, baseline: number): number {
         let excess = known + wanted - INVENTORY_ROW_CAP, held = known;
         if (excess > 0) {
-            for (const row of this.store.all<{mac: string; acknowledged_at: number | null; alerted_at: number | null; first_seen: number}>('SELECT mac,acknowledged_at,alerted_at,first_seen FROM inventory_devices WHERE generation=? ORDER BY last_seen ASC, first_seen ASC, mac ASC', g)) {
+            const decided = new Set(this.store.all<{mac: string}>('SELECT mac FROM inventory_decisions WHERE generation=?', g).map(d => d.mac));
+            for (const row of this.store.all<{id: number; mac: string; acknowledged_at: number | null; alerted_at: number | null; first_seen: number}>('SELECT rowid id,mac,acknowledged_at,alerted_at,first_seen FROM inventory_devices WHERE generation=? ORDER BY last_seen ASC, first_seen ASC, mac ASC', g)) {
                 if (excess <= 0) break;
-                if (listed.has(row.mac) || row.acknowledged_at !== null || (row.alerted_at === null && row.first_seen > baseline)) continue;
+                if (listed.has(row.mac) || row.acknowledged_at !== null || decided.has(row.mac) || (row.alerted_at === null && row.first_seen > baseline)) continue;
                 this.store.run('DELETE FROM inventory_devices WHERE generation=? AND mac=?', g, row.mac); excess--; held--;
             }
+            if (held < known) this.sweepDecisions(); // a link to an evicted row must not outlive it (a new row could reuse the id)
         }
         return Math.max(0, Math.min(wanted, INVENTORY_ROW_CAP - held));
     }
@@ -202,7 +241,7 @@ export class InventoryStore {
      */
     private alertNew(g: string, at: number): number {
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')!;
-        const fresh = this.store.all<{mac: string}>('SELECT mac FROM inventory_devices WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ?', g, s.baseline_at!);
+        const fresh = this.store.all<{mac: string}>('SELECT mac FROM inventory_devices WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ? AND (generation,mac) NOT IN (SELECT generation,mac FROM inventory_decisions WHERE role<>\'new\')', g, s.baseline_at!);
         if (fresh.length === 0) return 0;
         const newDay = s.alert_day_start === null || at - s.alert_day_start >= DAY || at < s.alert_day_start;
         const used = newDay ? 0 : s.alert_day_count;
@@ -216,12 +255,16 @@ export class InventoryStore {
             this.alerts.raise({kind: 'new_device', personId: null, severity: 'warning', details: {count: fresh.length}});
             this.store.run('UPDATE inventory_state SET alert_day_start=?,alert_day_count=? WHERE singleton=1', newDay ? at : s.alert_day_start, used + 1);
         }
-        this.store.run('UPDATE inventory_devices SET alerted_at=? WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ?', at, g, s.baseline_at!);
+        this.store.run('UPDATE inventory_devices SET alerted_at=? WHERE generation=? AND acknowledged_at IS NULL AND alerted_at IS NULL AND first_seen > ? AND (generation,mac) NOT IN (SELECT generation,mac FROM inventory_decisions WHERE role<>\'new\')', at, g, s.baseline_at!);
         this.store.run('UPDATE inventory_state SET last_alert_at=? WHERE singleton=1', at);
         return fresh.length;
     }
     prune(): void { this.atomic(() => this.pruneAt(this.now())); }
-    private pruneAt(at: number): void { this.store.run('DELETE FROM inventory_devices WHERE last_seen < ?', at - this.retentionDays * DAY); }
+    /** A row a parent decided on outlives the retention window (up to the maximum), so a quiet NAS does not come back as New. */
+    private pruneAt(at: number): void {
+        this.store.run("DELETE FROM inventory_devices WHERE last_seen < ? AND (last_seen < ? OR (generation,mac) NOT IN (SELECT generation,mac FROM inventory_decisions WHERE role<>'new'))", at - this.retentionDays * DAY, at - MAX_INVENTORY_RETENTION_DAYS * DAY);
+        this.sweepDecisions();
+    }
 
     /** The child that owns each MAC through the children admin (devices) or, failing that, the desired policy. A corrupt policy only costs the fallback. */
     private owners(): Map<string, string> {
@@ -238,17 +281,20 @@ export class InventoryStore {
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1');
         return s?.generation === this.generation ? s.last_ok_at : null;
     }
-    list(actor: Actor): InventoryDTO {
+    /** `includeHidden` is the "show hidden" filter: it keeps guests that went quiet for GUEST_HIDE_SECONDS in the list. */
+    list(actor: Actor, opts: {includeHidden?: boolean} = {}): InventoryDTO {
         this.requireAdmin(actor);
         const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1'), current = s?.generation === this.generation ? s : undefined;
         const lookup = this.lookup(), baseline = current?.baseline_at ?? null, hidden = new Set(this.store.config.protectedMacs);
-        const rows = this.store.all<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? ORDER BY last_seen DESC, mac ASC LIMIT ?', this.generation, INVENTORY_ROW_CAP);
+        const rows = this.store.all<DeviceRow>(`SELECT ${DEVICE_COLUMNS} FROM inventory_devices WHERE generation=? ORDER BY last_seen DESC, mac ASC LIMIT ?`, this.generation, INVENTORY_ROW_CAP);
         const now = this.now(), shown = rows.filter(r => !hidden.has(r.mac)), replaces = this.replacements(rows, hidden, lookup.owners, now);
-        return {
-            status: {baselineAt: baseline, lastOkAt: current?.last_ok_at ?? null, lastAttemptAt: current?.last_attempt_at ?? null, lastError: current?.last_error ?? null,
-                refreshRequestedAt: current?.refresh_requested_at ?? null, pollSeconds: INVENTORY_POLL_SECONDS, retentionDays: this.retentionDays},
-            devices: shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id)))
-        };
+        const status = {baselineAt: baseline, lastOkAt: current?.last_ok_at ?? null, lastAttemptAt: current?.last_attempt_at ?? null, lastError: current?.last_error ?? null,
+            refreshRequestedAt: current?.refresh_requested_at ?? null, pollSeconds: INVENTORY_POLL_SECONDS, retentionDays: this.retentionDays};
+        if (!this.triage) return {status, devices: shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id)))};
+        const decisions = new Map(this.store.all<DecisionRow>(`${DECISIONS} WHERE d.generation=?`, this.generation).map(d => [d.row_id, d])), replaced = new Set([...decisions.values()].flatMap(d => d.linked_from_row === null ? [] : [d.linked_from_row]));
+        const devices = shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id), {decision: decisions.get(r.id), replaced: replaced.has(r.id)}));
+        const quiet = (d: InventoryDeviceDTO) => d.role === 'guest' && now - d.lastSeen >= GUEST_HIDE_SECONDS;
+        return {status, devices: opts.includeHidden ? devices : devices.filter(d => !quiet(d)), newCount: devices.filter(d => d.flags.new).length, hiddenCount: devices.filter(quiet).length};
     }
     /** Enrolled or scoped child devices (any owner) and protected MACs are never linked by a hint, on either side. */
     private replacements(rows: DeviceRow[], hidden: Set<string>, owners: Map<string, string>, now: number): Map<number, number> {
@@ -258,32 +304,120 @@ export class InventoryStore {
         return {owners: this.owners(), names: new Map(this.store.all<{id: string; name: string}>('SELECT id,name FROM people WHERE active=1').map(p => [p.id, p.name]))};
     }
     /** The owner is named only to a viewer who manages that child; for anyone else it is null (the device still counts as assigned). */
-    private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor, now: number, replaces?: number): InventoryDeviceDTO {
+    private dto(r: DeviceRow, baseline: number | null, lookup: {owners: Map<string, string>; names: Map<string, string>}, viewer: Actor, now: number, replaces?: number, triage?: {decision?: DecisionRow; replaced: boolean}): InventoryDeviceDTO {
         const owner = lookup.owners.get(r.mac), visible = owner !== undefined && viewer.personIds.includes(owner) && lookup.names.has(owner);
         const vendor = lookupVendor(r.mac);
-        return {id: r.id, ...(vendor ? {vendor} : {}), kind: kindHint({hostname: r.hostname, vendor}), presence: presenceOf({source: r.source, lastSeen: r.last_seen, now}),
+        // A device a child owns is a kid (enrolled) whatever was decided before; otherwise the parent's decision, else still new.
+        const role: InventoryRole = owner !== undefined ? 'kid' : triage?.decision?.role ?? 'new';
+        const decided = triage ? {role, ...(triage.decision?.label ? {label: triage.decision.label} : {}), ...(triage.decision?.linked_from_row ? {linkedFrom: triage.decision.linked_from_row} : {}), stableConfirmed: triage.decision?.stable_confirmed === 1} : {};
+        return {...decided, id: r.id, ...(vendor ? {vendor} : {}), kind: kindHint({hostname: r.hostname, vendor}), presence: presenceOf({source: r.source, lastSeen: r.last_seen, now}),
             ...(replaces === undefined ? {} : {suggestedReplaces: replaces}),
             mac: r.mac, inScope: this.scope.inRouterScope(r.mac, this.policy), ipv4: JSON.parse(r.ipv4_json) as string[], hostname: r.hostname, reportedByDevice: true, source: r.source, firstSeen: r.first_seen, lastSeen: r.last_seen, acknowledgedAt: r.acknowledged_at,
             personId: visible ? owner : null, personName: visible ? lookup.names.get(owner)! : null,
-            flags: {new: baseline !== null && r.acknowledged_at === null && r.first_seen > baseline, private: isPrivateAddress(r.mac), unassigned: owner === undefined}};
+            flags: {new: baseline !== null && r.acknowledged_at === null && r.first_seen > baseline && (!triage || (role === 'new' && !triage.replaced)), private: isPrivateAddress(r.mac), unassigned: owner === undefined}};
+    }
+    /** One row's DTO, read fresh. Only rows sharing its hostname can matter to its replacement suggestion. */
+    private view(actor: Actor, row: DeviceRow): InventoryDeviceDTO {
+        const lookup = this.lookup(), now = this.now(), hidden = new Set(this.store.config.protectedMacs);
+        const group = this.store.all<DeviceRow>(`SELECT ${DEVICE_COLUMNS} FROM inventory_devices WHERE generation=? AND (mac=? OR (hostname IS NOT NULL AND lower(hostname)=lower(?)))`, this.generation, row.mac, row.hostname);
+        const fresh = group.find(r => r.mac === row.mac)!, baseline = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')?.baseline_at ?? null;
+        const triage = this.triage ? {decision: this.decision(fresh.id), replaced: this.store.get('SELECT 1 FROM inventory_decisions WHERE generation=? AND linked_from_mac=?', this.generation, fresh.mac) !== undefined} : undefined;
+        return this.dto(fresh, baseline, lookup, actor, now, this.replacements(group, hidden, lookup.owners, now).get(fresh.id), triage);
     }
     /** Acknowledging records who looked; it never changes identity, assignment or policy. Repeating it keeps the first acknowledgement. */
     acknowledge(actor: Actor, mac: unknown): InventoryDeviceDTO {
         this.requireAdmin(actor);
         if (typeof mac !== 'string' || !CANONICAL_MAC.test(mac)) throw new AppError(400, 'invalid_mac');
         return this.atomic(() => {
-            const g = this.generation, row = this.store.get<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND mac=?', g, mac);
+            const g = this.generation, row = this.store.get<DeviceRow>(`SELECT ${DEVICE_COLUMNS} FROM inventory_devices WHERE generation=? AND mac=?`, g, mac);
             if (!row || this.store.config.protectedMacs.includes(mac)) throw new AppError(404, 'inventory_device_not_found');
             if (row.acknowledged_at === null) {
                 this.store.run('UPDATE inventory_devices SET acknowledged_at=?,acknowledged_by=? WHERE generation=? AND mac=?', this.now(), actor.id, g, mac);
                 // The row id, never the MAC: the audit trail must not become a second device list.
                 this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, 'inventory_acknowledge', this.now(), `inventory_row:${row.id}`);
             }
-            const lookup = this.lookup(), now = this.now(), hidden = new Set(this.store.config.protectedMacs);
-            // Only rows sharing this hostname can matter to its suggestion.
-            const group = this.store.all<DeviceRow>('SELECT rowid id,mac,ipv4_json,hostname,source,first_seen,last_seen,acknowledged_at FROM inventory_devices WHERE generation=? AND (mac=? OR (hostname IS NOT NULL AND lower(hostname)=lower(?)))', g, mac, row.hostname);
-            const fresh = group.find(r => r.mac === mac)!;
-            return this.dto(fresh, this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1')?.baseline_at ?? null, lookup, actor, now, this.replacements(group, hidden, lookup.owners, now).get(fresh.id));
+            return this.view(actor, row);
         });
+    }
+
+    // Parent decisions (UI plan D). Admin only, behind inventoryUi.triage, atomic with their audit rows, and every row that is unknown, from another
+    // generation or protected answers the same 404 so the ids reveal nothing.
+    private decision(rowId: number): DecisionRow | undefined { return this.store.get<DecisionRow>(`${DECISIONS} WHERE r.rowid=? AND r.generation=?`, rowId, this.generation); }
+    private requireDecider(actor: Actor): void {
+        this.requireAdmin(actor);
+        if (!this.triage) throw new AppError(404, 'route_not_found');
+        const now = this.now(), recent = (this.decisionTimes.get(actor.id) ?? []).filter(at => at > now - 60);
+        if (recent.length >= DECISIONS_PER_MINUTE) throw new AppError(429, 'inventory_decision_rate_limited');
+        this.decisionTimes.set(actor.id, [...recent, now]);
+    }
+    private target(rowId: unknown): DeviceRow {
+        const row = Number.isSafeInteger(rowId) ? this.store.get<DeviceRow>(`SELECT ${DEVICE_COLUMNS} FROM inventory_devices WHERE rowid=? AND generation=?`, rowId as number, this.generation) : undefined;
+        if (!row || this.store.config.protectedMacs.includes(row.mac)) throw new AppError(404, 'inventory_device_not_found');
+        return row;
+    }
+    /** A device a child owns is a kid (enrolled): only the child admin flows change that. */
+    private requireUnowned(row: DeviceRow): void { if (this.owners().has(row.mac)) throw new AppError(409, 'inventory_device_enrolled'); }
+    /**
+     * Runs one decision change. `change` returns the new decision fields, or null when nothing would change (idempotent: no write, no audit row).
+     * A decision with nothing left in it is removed. The legacy audit row and the parent audit row hold the action type, the actor and the row id only.
+     */
+    private decide(actor: Actor, rowId: unknown, action: AuditAction, change: (row: DeviceRow, current: DecisionRow | undefined) => DecisionFields | null): InventoryDeviceDTO {
+        return this.atomic(() => {
+            const row = this.target(rowId), next = change(row, this.decision(row.id));
+            if (next !== null) {
+                const empty = next.role === 'new' && next.label === null && next.linked_from_mac === null && next.stable_confirmed === 0;
+                if (empty) this.store.run('DELETE FROM inventory_decisions WHERE generation=? AND mac=?', this.generation, row.mac);
+                else this.store.run('INSERT OR REPLACE INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    this.generation, row.mac, next.role, next.label, next.previous_role, next.linked_from_mac, next.stable_confirmed, next.stable_at, actor.id, this.now());
+                this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', actor.id, action, this.now(), `inventory_row:${row.id}`);
+                auditFor(this.store).recordOrThrow({actor: actor.id, action, people: [], operationId: `inventory_row:${row.id}`, result: 'applied'});
+            }
+            return this.view(actor, row);
+        });
+    }
+    /** Sorts a device into a role (never `new`: that is undo). `label` undefined keeps the current one, null clears it. A kid device a child owns cannot be reclassified here. */
+    classify(actor: Actor, rowId: unknown, role: unknown, label?: unknown): InventoryDeviceDTO {
+        this.requireDecider(actor);
+        if (typeof role !== 'string' || !ASSIGNABLE_ROLES.includes(role)) throw new AppError(400, 'invalid_role');
+        const text = label === undefined ? undefined : parseLabel(label);
+        return this.decide(actor, rowId, 'inventory_classify', (row, cur) => {
+            this.requireUnowned(row);
+            const was = cur?.role ?? 'new', nextLabel = text === undefined ? cur?.label ?? null : text;
+            if (was === role && nextLabel === (cur?.label ?? null)) return null;
+            return {...(cur ?? NEW_DECISION), role: role as InventoryRole, label: nextLabel, previous_role: was === role ? cur?.previous_role ?? null : was};
+        });
+    }
+    /** Goes back one step to the role before the last change; with nothing to undo it changes nothing. */
+    undo(actor: Actor, rowId: unknown): InventoryDeviceDTO {
+        this.requireDecider(actor);
+        return this.decide(actor, rowId, 'inventory_undo', (row, cur) => {
+            this.requireUnowned(row);
+            if (!cur || cur.previous_role === null) return null;
+            return {...cur, role: cur.previous_role, label: cur.previous_role === 'new' ? null : cur.label, previous_role: null};
+        });
+    }
+    /** "This is the same device as that older row" (a private address rotated). Rows only: no MAC is compared, stored or audited. Both must be unowned, visible and distinct, and links never loop. */
+    link(actor: Actor, rowId: unknown, replacesRowId: unknown): InventoryDeviceDTO {
+        this.requireDecider(actor);
+        return this.decide(actor, rowId, 'inventory_link', (row, cur) => {
+            this.requireUnowned(row);
+            if (replacesRowId === row.id) throw new AppError(400, 'invalid_link');
+            const old = this.target(replacesRowId);
+            this.requireUnowned(old);
+            for (let at: number | null | undefined = old.id, hops = 0; at != null; at = this.decision(at)?.linked_from_row, hops++) {
+                if (at === row.id || hops > INVENTORY_ROW_CAP) throw new AppError(409, 'inventory_link_cycle');
+            }
+            return cur?.linked_from_mac === old.mac ? null : {...(cur ?? NEW_DECISION), linked_from_mac: old.mac};
+        });
+    }
+    unlink(actor: Actor, rowId: unknown): InventoryDeviceDTO {
+        this.requireDecider(actor);
+        return this.decide(actor, rowId, 'inventory_unlink', (_row, cur) => cur && cur.linked_from_mac !== null ? {...cur, linked_from_mac: null} : null);
+    }
+    /** The parent's tick for "Private Wi-Fi Address is off on this device". Allowed for a child's enrolled device too. */
+    confirmStable(actor: Actor, rowId: unknown, value: unknown): InventoryDeviceDTO {
+        this.requireDecider(actor);
+        if (typeof value !== 'boolean') throw new AppError(400, 'invalid_value');
+        return this.decide(actor, rowId, 'inventory_stable', (_row, cur) => (cur?.stable_confirmed === 1) === value ? null : {...(cur ?? NEW_DECISION), stable_confirmed: value ? 1 : 0, stable_at: value ? this.now() : null});
     }
 }

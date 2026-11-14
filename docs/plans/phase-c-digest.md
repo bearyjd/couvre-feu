@@ -233,8 +233,8 @@ export class ContentFilterCountsStore {
 Two methods, nothing else:
 
 ```ts
-getAnalyticsStatus(profile, range: {from: number; to: number}, call?): Promise<readonly {status: string; queries: number}[]>;
-getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<readonly {id: string; queries: number}[]>;
+getAnalyticsStatus(profile, range: {from: number; to: number}, call?): Promise<{total: number; blocked: number}>;
+getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<readonly {class: ClassCode; queries: number}[]>;
 ```
 
 - Paths are built only from a frozen table `{status: '/analytics/status', reasons: '/analytics/reasons'}` behind
@@ -251,16 +251,18 @@ getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<
   - Unknown keys → `bad_response` (the beta-API rule the client already follows).
 - Errors are the client's closed codes only (`rate_limited`, `unauthorized`, `bad_response`, ...). No server text.
 - `GET` is retried by the client on 429/5xx/transport with backoff and Retry-After, inside its deadline.
-- The reason id leaves the client only to be passed straight into `classOf`; the fetcher never stores, logs or
-  compares it outside that call. (It is in memory for one call, the same as a profile read today.)
+- As built (C1): `getAnalyticsStatus` returns integers `{total, blocked}` (`blocked` = status `blocked`, `total` = all statuses);
+  `getAnalyticsReasons` maps each id through `classOf` inside the client and returns per-class sums `{class, queries}`
+  (stable `CLASS_CODES` order, zero classes omitted). The raw reason id and `name` never leave the client. The range must be a
+  finished period: `to` not after the client clock (equality allowed); a non-finite clock fails closed (`invalid_request`).
 
 ### 5.2 Fetcher (`ContentFilterCounts`, scheduled like `ContentFilterWatch`)
 
 - Hourly tick (unref'd timers; first tick a few minutes after start; same `running` guard as the watch).
 - **Which days:** for each child in `contentFilter.profiles` (not the default profile), each local day `D` from
-  `today-6` to `yesterday` whose row is missing or `unavailable`, and only once local time is past **03:00 on D+1**
+  `today-7` to `today-1` (seven days: the digest's Sunday-to-Saturday window read at Sunday 18:00) whose row is missing or `unavailable`, and only once local time is past **03:00 on D+1**
   (settling margin for NextDNS aggregation lag; lag UNVERIFIED, measured in C0). Today's partial day is never
-  stored. Days older than `today-6` are not attempted (presumed beyond the one-week retention).
+  stored. Days older than `today-7` are not attempted (presumed beyond the one-week retention).
 - **Range:** `from` = epoch of local midnight starting `D`, `to` = epoch of local midnight starting `D+1`, computed by a
   DST-safe helper factored out of `digest.ts` (`zoned`/`local` become an exported `localDayBounds(day)`), so 23 h and
   25 h days are exact. Unix seconds avoid any time-zone parsing on NextDNS's side.
@@ -317,11 +319,11 @@ identical 404s; no NextDNS call is ever made by a request):
 | F6 | Logs turned off on the profile | `logs_off`, no analytics call | "Logging is off for this profile in NextDNS, so there are no counts" |
 | F7 | Free-plan 300k limit hit (filtering and logging stop per NextDNS staff) | `total` ≈ 0 while the child was online → `suspect_zero` (when activity is on); otherwise `ok` with zeros | "NextDNS saw no lookups while the device was online. Filtering may be off (plan limit, outage, or the device is not using it)." Recommend a paid plan (O7) |
 | F8 | Analytics retention shorter than 7 days or analytics lag | Days missed while down are re-tried only within the window; lag margin 03:00 | Honest gaps; C0 measures both |
-| F9 | Service down over a weekend | Backfills up to 6 days back on start | Gap only for days older than that |
+| F9 | Service down over a weekend | Backfills up to 7 days back on start | Gap only for days older than that |
 | F10 | Phase B not live (devices not using the profile) | Counts are real but cover only what reached the profile | Card copy: "Counts cover only lookups that reached this child's NextDNS profile" |
 | F11 | Store failure (disk full) | Pass ends; nothing logged with data | Missing days |
 | F12 | Digest due while some days unavailable | Digest sums ok days only and says so | "N blocked lookups (5 of 7 days)" |
-| F13 | Flag turned off then on | Rows kept until pruned; backfill again up to 6 days | Older gaps stay gaps |
+| F13 | Flag turned off then on | Rows kept until pruned; backfill again up to 7 days | Older gaps stay gaps |
 
 Nothing in this feature changes enforcement, pauses, or filters. A total outage of the feature is cosmetic.
 
@@ -392,7 +394,7 @@ household identities in logs, alerts, digests.
 |---|---|---|---|---|
 | P1 | A domain via the logs API | DB, logs | No client method or path for `/logs*`, `/analytics/domains`; path table frozen | T-client-surface: enumerate methods/paths; fake server fails the test on any request outside the two allowed paths |
 | P2 | A domain inside a reason id (`denylist:<domain>` is possible) | DB, logs, UI | Ids never stored; `classOf` maps to a code; denylist prefix discarded | T-classof: fuzz ids including `denylist:secret-domain.test`, `blocklist:secret-domain.test`, unicode, 256-char; assert output ∈ enum; G7 haystack has no `secret-domain` |
-| P3 | Vendor free text (`name`) | DB, UI | Dropped in the parser; never in the returned type | T-parse: returned objects have exactly `{id, queries}`; G7 haystack check for a sentinel placed in `name` |
+| P3 | Vendor free text (`name`) | DB, UI | Dropped in the parser; never in the returned type | T-parse: returned objects are exactly `{total, blocked}` and `{class, queries}` (every returned string is a class code); G7 haystack check for a sentinel placed in `name` |
 | P4 | Device names / client IPs | DB | No `device` param, no devices/ips endpoints; status/reasons items with extra keys are refused | T-parse: an item carrying `device`/`clientIp` → `bad_response`; sentinel not in haystack |
 | P5 | Profile id (household identifier at NextDNS) | DB, logs, route, errors | No profile column; errors are closed codes; route answers have no profile | G7: `PROFILE_ID` sentinel absent from stdout/stderr/route bodies/DB dump of the two new tables |
 | P6 | API key | logs, errors | Existing getter + closed codes | Existing snapshot test extended to counts fetcher paths (401, unsafe file) |
@@ -458,7 +460,7 @@ only to the parents the mode allows and are not pushed.
   `main.ts` starts/stops it next to the watch.
 - Tests (`content-filter-counts.test.ts`): flag off → zero requests, no timer, no rows; first pass backfills 7 days in
   order; today never stored; not before 03:00 local next day; ok row never overwritten by a later failure;
-  `unavailable` retried and becomes ok; day older than 6 days not attempted; `logs_off` path makes no analytics call;
+  `unavailable` retried and becomes ok; day older than 7 days not attempted; `logs_off` path makes no analytics call;
   `suspect_zero` with and without activity; budget stop and resume; one child failing does not stop others; the
   default profile never requested; prune at 56 days; concurrent tick guard; no stdout/stderr on any path; G7 haystack.
 

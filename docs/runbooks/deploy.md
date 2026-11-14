@@ -21,7 +21,7 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
 
 ## Common prerequisites
 
-1. Node **26.13.1** and npm **11.19.0** (`package.json` `engines`). Install from the official tarball after verifying it, or use the pinned image below:
+1. Node **26.13.1** and npm **11.21.2** (`package.json` `engines`). Install from the official tarball after verifying it, or use the pinned image below:
 
    ```sh
    V=26.13.1; T=node-v$V-linux-x64.tar.xz     # use the -linux-arm64 tarball on arm64
@@ -41,7 +41,7 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
    **The service's private SSH key is not stored in either directory.** Both are readable by the service uid (and `/etc/couvrefeu` is mounted into the container), so a compromised service could copy an encrypted key and brute-force its passphrase. Keep the key in a root-only directory (`install -d -o root -g root -m 0700 /root/couvrefeu-key`, key file `0600 root:root`) and only ever hand it to the agent (below). Only the public key (`/etc/couvrefeu/service_key.pub`) and `known_hosts` live in `/etc/couvrefeu`.
 4. `openssh-client` (the router transport runs `ssh` with `PATH=/usr/bin:/bin`).
 5. A private manifest built from [integration-004](../integration-004.md) and [http-behind-proxy](http-behind-proxy.md): `listen.host` is `<APP_IP>`, `trustedProxies` lists exactly the address the service sees for the proxy, `publicOrigin` is `https://cf.example.invalid`, `router.agentSocket` is `/run/couvrefeu/agent.sock`.
-6. Backups: install the daily backup timer (see [Backups](#backups)) before the first enrollment. Before any upgrade also stop the service and take a fresh copy with `node /opt/couvrefeu/deploy/backup.mjs` (or copy `integration.sqlite`, `integration.sqlite-wal` and `integration.sqlite-shm` together). Database migrations are not reversible; in particular migration 014 (content filtering) rebuilds `parent_audit` and raises the schema version, so rolling back the code requires restoring the pre-upgrade backup.
+6. Backups: install the daily backup timer (see [Backups](#backups)) before the first enrollment. Before any upgrade also stop the service and take a fresh copy with `node /opt/couvrefeu/deploy/backup.mjs` (or copy `integration.sqlite`, `integration.sqlite-wal` and `integration.sqlite-shm` together). Database migrations are not reversible; in particular migrations 014 (content filtering) and 015 (inventory decisions) rebuild `parent_audit` and raise the schema version, and 016 (daily NextDNS counts tables, empty unless `contentFilter.counts` is on) raises `user_version` to 16, so rolling back the code requires restoring the pre-upgrade backup.
 
 ## Option 1: systemd (LXC, VM or bare metal)
 

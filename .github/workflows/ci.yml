@@ -1,6 +1,7 @@
 name: isolated-project-checks
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -17,8 +18,12 @@ jobs:
       - name: Require every preflight suite in the preflight_suites matrix
         run: |
           sh tests/run.sh --list-preflight-suites | sort > "$RUNNER_TEMP/suites-run-sh.txt"
-          sed -n "s/^ *- suites: '\(.*\)'$/\1/p" .github/workflows/ci.yml | tr ' ' '\n' | sort > "$RUNNER_TEMP/suites-matrix.txt"
+          sed -n "s/^ *- suites: '\(.*\)'$/\1/p" .github/workflows/ci.yml | tr ' ' '\n' | sort -u > "$RUNNER_TEMP/suites-matrix.txt"
           diff -u "$RUNNER_TEMP/suites-run-sh.txt" "$RUNNER_TEMP/suites-matrix.txt"
+          # A sharded suite repeats once per partition; every i/N must be present exactly once.
+          sed -n "s/^ *partition: '\(.*\)'$/\1/p" .github/workflows/ci.yml | sort > "$RUNNER_TEMP/partitions-matrix.txt"
+          printf '%s\n' 1/4 2/4 3/4 4/4 | diff -u - "$RUNNER_TEMP/partitions-matrix.txt"
+          test "$(grep -c "^ *- suites: 'test-platform-integration.py'$" .github/workflows/ci.yml)" = 4
       - name: Static checks and acceptance preflight
         env:
           CF_TEST_SHELL: busybox ash
@@ -39,7 +44,7 @@ jobs:
           if-no-files-found: error
   preflight_suites:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.timeout || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,9 +52,20 @@ jobs:
           - suites: 'test-install.py'
           - suites: 'test-install-recovery.py'
           - suites: 'test-platform-integration.py'
+            partition: '1/4'
+            timeout: 30
+          - suites: 'test-platform-integration.py'
+            partition: '2/4'
+            timeout: 30
+          - suites: 'test-platform-integration.py'
+            partition: '3/4'
+            timeout: 30
+          - suites: 'test-platform-integration.py'
+            partition: '4/4'
+            timeout: 30
           - suites: 'test-os-trust.py'
           - suites: 'test-permanent-install.py'
-          - suites: 'test-install-recovery-primitives.py test-pinned-helper-security.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py test-heartbeat.py'
+          - suites: 'test-install-recovery-primitives.py test-pinned-helper-security.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py test-heartbeat.py test-platform-integration-partitions.py'
     steps:
       - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
@@ -61,6 +77,7 @@ jobs:
           CF_TEST_SHELL: busybox ash
           CF_TEST_AWK: busybox awk
           CF_TEST_TIMEOUT: busybox timeout
+          CF_TEST_PARTITION: ${{ matrix.partition }}
         run: |
           busybox 2>&1 | awk 'NR == 1 { print }'
           sh tests/run.sh --preflight-suite ${{ matrix.suites }}
