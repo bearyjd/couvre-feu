@@ -219,7 +219,7 @@ test('MOCK: Last 7 days at 390px shows classes, plain-language states, fixed cop
   await expect(strip.nth(1)).toContainText('No lookups recorded: the phone may have been off or not using this network.');
   await expect(strip.nth(1)).not.toContainText(/clean|all clear|nothing/i);
   await expect(strip.nth(2)).toContainText('Logging was off at NextDNS');
-  await expect(strip.nth(3)).toContainText('Not counted yet');
+  await expect(strip.nth(3)).toContainText('Not counted (NextDNS did not answer).');
   await expect(block).toContainText('Counts only. Couvre-feu does not see or keep which sites.');
   await expect(block).toContainText('Unverified on this router');
   await expect(block).not.toContainText(/monitor|catch/i);
@@ -236,4 +236,17 @@ test('MOCK: the counts route absent (feature off) or failing leaves the filter c
   await expect(card(page).locator('[data-filter-counts]')).toHaveCount(0);
   await page.waitForTimeout(500);
   expect(asked.length).toBe(1);
+});
+
+test('MOCK: with no counted day the headline is hidden and only the not-counted states show', async ({ page, demo }) => {
+  await page.setViewportSize({ width: 390, height: 800 });
+  await mock(page, { get: alexOnly });
+  await mockCounts(page, (route) => route.fulfill({ json: week(SEVEN.map((d) => ({ day: d.day, state: 'gap' }))) }));
+  await enroll(page, demo);
+  const block = card(page).locator('[data-filter-counts]');
+  await block.locator('summary').click();
+  await expect(block.locator('[data-filter-counts-headline]')).toHaveCount(0);
+  await expect(block.locator('[data-filter-counts-days] li')).toHaveCount(7);
+  await expect(block).toContainText('Not counted (NextDNS did not answer).');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

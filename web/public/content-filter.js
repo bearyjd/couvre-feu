@@ -21,7 +21,7 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 const DAY_WORDS = {
   logs_off: 'Logging was off at NextDNS, so nothing was counted.',
   suspect_zero: 'No lookups recorded: the phone may have been off or not using this network.',
-  gap: 'Not counted yet.',
+  gap: 'Not counted (NextDNS did not answer).',
 };
 const COUNTS_NOTE = 'Counts only. Couvre-feu does not see or keep which sites. Blocked lookups also come from ads, app prefetching and accidental taps; a number is a reason to talk, not proof. To see sites, open the NextDNS Logs tab (kept one week). Unverified on this router.';
 const HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
@@ -239,7 +239,7 @@ export function createContentFilter({ session, people }) {
     const stateWord = (row) => (row.state === 'ok' ? `${row.blocked} blocked` : DAY_WORDS[row.state]);
     const headline = `${sum.filterTotal} lookups blocked by this filter (${sum.counted} of ${sum.rows.length} days counted)`;
     const details = el('details', { class: 'filter-counts', 'data-filter-counts': '', open: entry.countsOpen === true }, el('summary', { textContent: 'Last 7 days' }),
-      el('p', { 'data-filter-counts-headline': '', textContent: headline }),
+      ...(sum.counted ? [el('p', { 'data-filter-counts-headline': '', textContent: headline })] : []),
       ...(sum.filter.length ? [el('ul', { 'aria-label': 'Blocked lookups by kind' }, ...sum.filter.map(([code, n]) => el('li', { textContent: `${labelOf(code)}: ${n}` })))] : []),
       el('p', { class: 'fine-print', textContent: `Also blocked in the background: ${sum.ads} ads and trackers, ${sum.security} security protections.` }),
       el('ul', { 'aria-label': 'Day by day', 'data-filter-counts-days': '' }, ...sum.rows.map((row) => el('li', { 'data-counts-state': row.state }, el('strong', { textContent: row.text }), ` ${stateWord(row)}`))),
