@@ -58,6 +58,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.auditLog, undefined, 'the audit log is off unless explicitly enabled');
         for (const enabled of [true, false]) { save({...manifest, auditLog: {enabled}}); assert.deepEqual(integrationConfig(path).auditLog, {enabled}); }
         for (const auditLog of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, auditLog}); assert.throws(() => integrationConfig(path)); }
+        // installReadiness (UI plan I): absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.installReadiness, undefined);
+        for (const enabled of [true, false]) { save({...manifest, installReadiness: {enabled}}); assert.deepEqual(integrationConfig(path).installReadiness, {enabled}); }
+        for (const installReadiness of [{enabled: 'true'}, {}, {enabled: true, extra: 1}, true, null]) { save({...manifest, installReadiness}); assert.throws(() => integrationConfig(path)); }
         // push and digest (B7): absent is OFF; strict {enabled: boolean}; the digest is delivered by push, so it needs push on.
         assert.equal(c.push, undefined); assert.equal(c.digest, undefined);
         for (const enabled of [true, false]) { save({...manifest, push: {enabled}}); assert.deepEqual(integrationConfig(path).push, {enabled}); }
