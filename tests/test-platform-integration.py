@@ -991,5 +991,52 @@ vp_classify
         self.assertIn(b'REFUSE=unknown_nonroot_gid0', result.stderr)
 
 
+def flatten_ids(suite):
+    for case in suite:
+        if isinstance(case, unittest.TestSuite):
+            yield from flatten_ids(case)
+        else:
+            yield case.id()
+
+
+def parse_partition(text):
+    """'i/N' (1-based) -> (i, N); anything else is refused so a typo cannot run a subset silently."""
+    index, _, count = text.partition('/')
+    if not (index.isdigit() and count.isdigit() and 1 <= int(index) <= int(count)):
+        raise SystemExit(f'invalid partition {text!r}: expected i/N with 1 <= i <= N')
+    return int(index), int(count)
+
+
+def select_partition(ids, index, count):
+    """Round-robin over the sorted ids: deterministic, disjoint, and covering.
+
+    Sorted order groups tests by class, so striding mixes the heavy install and
+    recovery cases evenly across partitions without a per-test timing table.
+    """
+    return sorted(ids)[index - 1::count]
+
+
+def main(argv):
+    """Run all tests, or one partition via --partition i/N or CF_TEST_PARTITION=i/N; --list only prints ids."""
+    argv = list(argv)
+    text = os.environ.get('CF_TEST_PARTITION', '')
+    if '--partition' in argv:
+        position = argv.index('--partition')
+        text = argv[position + 1] if position + 1 < len(argv) else ''
+        del argv[position:position + 2]
+    listing = '--list' in argv
+    if listing:
+        argv.remove('--list')
+    names = sorted(flatten_ids(unittest.defaultTestLoader.loadTestsFromModule(sys.modules['__main__'])))
+    if text:
+        names = select_partition(names, *parse_partition(text))
+        if not names:
+            raise SystemExit(f'partition {text} selected no tests')
+    if listing:
+        print('\n'.join(names))
+        return
+    unittest.main(argv=argv + names, module=None)
+
+
 if __name__ == '__main__':
-    unittest.main()
+    main(sys.argv)
