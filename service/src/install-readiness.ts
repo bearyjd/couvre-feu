@@ -107,7 +107,11 @@ export class InstallReadiness {
             .map(d => ({...this.device(d, false, seen, facts, now), source: d.source})).sort(byText(d => d.mac));
         // A device is protected or allowed, never both: refuse a list that would do both.
         const adultMacs = new Set(adults.map(a => a.mac));
-        if (children.some(c => c.devices.some(d => adultMacs.has(d.mac)))) throw new AppError(409, 'install_list_overlap');
+        if (children.some(c => c.devices.some(d => adultMacs.has(d.mac)))) {
+            // An enrol still on its way to the router (its decision is cleared only on confirmation) resolves itself once it settles; anything else is a real overlap.
+            const pending = new Set(store.all<{identifier: string}>("SELECT identifier FROM devices WHERE state='enrolling'").map(d => d.identifier));
+            throw new AppError(409, children.some(c => c.devices.some(d => adultMacs.has(d.mac) && pending.has(d.mac))) ? 'install_list_pending_enrol' : 'install_list_overlap');
+        }
         const sum = readinessDigest({children, adults});
         const reviewed = store.get<{at: number | null}>("SELECT MAX(timestamp) at FROM audit WHERE action='install_list_reviewed' AND outcome=?", `digest:${sum}`);
         return {children, adults, adultsAvailable: baseline.size > 0, adultsSource: ADULTS_SOURCE, warnings: this.warnings(children.map(c => ({child: c.name, devices: c.devices})), adults, seen, now), digest: sum, reviewedAt: reviewed?.at ?? null};

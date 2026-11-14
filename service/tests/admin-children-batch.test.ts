@@ -777,11 +777,14 @@ test('enrolling a device clears a stale adult decision on the batch and single p
         // batch path
         const stepUp = await f.proof(who, [add(1)]);
         assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+        // Pending: the decision is kept until the router confirms, and the list refuses (never lists the device twice).
+        assert.ok(decisionFor(mac(1))); assert.ok(decisionFor(mac(2)));
+        assert.throws(() => list(), (e: any) => e.status === 409 && e.code === 'install_list_pending_enrol');
+        await f.dispatch(f.store.get<{id: string}>('SELECT id FROM operations')!.id);
         assert.equal(decisionFor(mac(1)), undefined); assert.ok(decisionFor(mac(2)));
         let view = list();
         assert.deepEqual(view.adults.map(a => a.label).sort(), ['Bryn', 'Protected device']);
         assert.ok(view.children.some(c => c.devices.some(d => d.label === 'Private device 1')));
-        await f.dispatch(f.store.get<{id: string}>('SELECT id FROM operations')!.id);
         // single path, with a hand-typed upper-case, dashed address that normalises to the stored lower-case one
         const typed = mac(2).toUpperCase().replaceAll(':', '-');
         assert.equal(macInput(typed), mac(2));
@@ -789,9 +792,35 @@ test('enrolling a device clears a stale adult decision on the batch and single p
         const o = await single.stepUpOptions(who.session(), {action: 'device_add', target: 'pilot', params});
         const done = await single.perform(who.session(), 'device_add', 'pilot', {...params, stepUp: {challengeId: o.challengeId, response: who.key.login(o.options, origin)}});
         assert.equal(done.status, 202, JSON.stringify(done.body));
+        assert.ok(decisionFor(mac(2)));
+        assert.throws(() => list(), (e: any) => e.status === 409 && e.code === 'install_list_pending_enrol');
+        await f.dispatch(f.store.get<{id: string}>("SELECT id FROM operations WHERE state<>'confirmed' ORDER BY rowid DESC")!.id);
         assert.equal(decisionFor(mac(2)), undefined);
         view = list();
         assert.deepEqual(view.adults.map(a => a.label), ['Protected device']);
         assert.ok(view.children.some(c => c.devices.some(d => d.label === 'Private device 2')));
+    } finally { f.cleanup(); }
+});
+
+test('a refused enrol keeps the adult decision; the list builds again with the device under the adults only', async () => {
+    const f = world();
+    try {
+        f.config.inventoryUi = {triage: true, wizard: false, installReadiness: true};
+        const who = await f.signIn(); await f.observe(); f.ready([mac(1)]);
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+        const readiness = new InstallReadiness(f.auth, f.inventory);
+        const list = () => (readiness.get(who.session(), '/admin/install-readiness')!.body as {children: {devices: {label: string}[]}[]; adults: {label: string}[]});
+        const stepUp = await f.proof(who, [add(1)]);
+        assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+        assert.throws(() => list(), (e: any) => e.code === 'install_list_pending_enrol');
+        f.router.reject = 'incomplete_address_coverage';
+        const id = f.store.get<{id: string}>('SELECT id FROM operations')!.id;
+        await f.dispatch(id);
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM operations WHERE id=?', id)!.state, 'failed');
+        assert.equal(f.store.get('SELECT 1 FROM devices WHERE identifier=?', mac(1)), undefined);
+        assert.equal(f.store.get<{role: string}>('SELECT role FROM inventory_decisions WHERE mac=?', mac(1))?.role, 'adult');
+        const view = list();
+        assert.deepEqual(view.adults.map(a => a.label).sort(), ['Bryn', 'Protected device']);
+        assert.ok(!view.children.some(c => c.devices.some(d => d.label === 'Private device 1')));
     } finally { f.cleanup(); }
 });

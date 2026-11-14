@@ -305,6 +305,9 @@ test('L2: a child device whose address is also an adult or protected address ref
         t.classify(DAY_ROLE_MAC, 'adult');
         w.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d8','pilot','Dup2','mac',?, 'active',1)", DAY_ROLE_MAC);
         err(await admin.get(), 409, 'install_list_overlap');
+        // The same overlap while the enrol is still on its way to the router is a distinct, self-resolving refusal.
+        w.store.run("UPDATE devices SET state='enrolling' WHERE id='d8'");
+        for (const r of [await admin.get(), await admin.exportList(ok.body.digest)]) err(r, 409, 'install_list_pending_enrol');
         assert.equal(w.audit().length, 0);
     } finally { await w.cleanup(); }
 });

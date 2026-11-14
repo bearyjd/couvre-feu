@@ -64,7 +64,7 @@ interface DecisionRow {
 }
 /**
  * A device a child now owns is a kid by enrolment, so a parent's earlier decision for that address (adult, guest, ...) must not outlive it:
- * called in the enrol transaction. Silent: the enrolment's own audit row records the change, and nothing here names an address.
+ * called when the router CONFIRMS the enrolment (integration-worker settleDevices), never at queue time: a refused enrol must keep the decision. Silent: the enrolment's own audit row records the change, and nothing here names an address.
  */
 export function dropDecisionOnEnrol(store: IntegrationStore, mac: string): void {
     store.run('DELETE FROM inventory_decisions WHERE generation=? AND mac=?', store.config.router.generation, mac);

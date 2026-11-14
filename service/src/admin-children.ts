@@ -13,7 +13,6 @@ import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
 import { audited, auditFor } from './parent-audit.ts';
 import type { AuditAction } from './parent-audit.ts';
-import { dropDecisionOnEnrol } from './inventory-store.ts';
 import { ChildBatchAdmin } from './admin-children-batch.ts';
 
 /** Child/device-group and device changes. Admin-only; every one needs a fresh step-up bound to the exact change. */
@@ -180,10 +179,7 @@ export class ChildAdmin {
             const device = id('d');
             const op = this.policy.queue(actor, target, 'enroll', request({label: params.label, mac}), id('enroll'), params.precondition as string,
                 base => withDevice(base, config, target, mac),
-                operation => {
-                    this.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES(?,?,?,'mac',?,'enrolling',?,?)", device, target, params.label as string, mac, operation, now);
-                    dropDecisionOnEnrol(this.store, mac);
-                });
+                operation => this.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES(?,?,?,'mac',?,'enrolling',?,?)", device, target, params.label as string, mac, operation, now));
             return {op, audit: device};
         }
         const row = this.store.get<DeviceRow>('SELECT * FROM devices WHERE id=?', target);
