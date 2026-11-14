@@ -5,6 +5,7 @@ import { getPasskey } from './auth-client.js';
 
 const WARNING = {
   private_address_unconfirmed: (w) => `${w.device} uses a private (changing) address that has not been confirmed as fixed.`,
+  adult_private_address: (w) => `${w.device} (protected) uses a private (changing) address that has not been confirmed as fixed.`,
   device_quiet: (w) => `${w.device} has not been seen for more than 7 days.`,
   device_unseen: (w) => `${w.device} has not been seen.`,
   child_no_device: (w) => `${w.child} has no device on the list.`,
