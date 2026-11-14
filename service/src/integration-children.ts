@@ -40,7 +40,12 @@ export const devicesOf = (store: Store, person: string): DeviceRow[] => store.al
 /** MACs the router should hold for this child right now (pending additions excluded, pending removals included). */
 /** An enrol the router has not answered yet. An `enrolling` row whose operation has ended (a conflict with no stored observation) is no longer in flight: it is configured, and only its removal can leave that state. */
 export const enrolInFlight = (store: Store, d: DeviceRow): boolean => d.state === 'enrolling' && Boolean(store.get("SELECT 1 FROM operations WHERE id=? AND state IN ('pending','unknown')", d.operation_id));
-export const configuredMacs = (store: Store, person: string): string[] => devicesOf(store, person).filter(d => !enrolInFlight(store, d)).map(d => d.identifier).sort();
+/**
+ * The child's configured addresses. An `enrolling` row counts only once the router is KNOWN to hold it (`heldByRouter`: the addresses a FRESH observation
+ * shows for this child, none otherwise): an unsettled row the router does not hold must not make the whole household look unenrolled and hide the revision token.
+ */
+export const configuredMacs = (store: Store, person: string, heldByRouter: readonly string[] = []): string[] =>
+    devicesOf(store, person).filter(d => d.state !== 'enrolling' || (!enrolInFlight(store, d) && heldByRouter.includes(d.identifier))).map(d => d.identifier).sort();
 
 /**
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a

@@ -182,7 +182,7 @@ export class IntegrationPolicy {
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
     private enrolled(o: RPCObservation | null, child: string): boolean {
         if (o === null) return false;
-        const configured = configuredMacs(this.store, child), routed = o.acceptedPolicy.people.find(p => p.id === child)?.macs ?? [];
+        const routed = o.acceptedPolicy.people.find(p => p.id === child)?.macs ?? [], configured = configuredMacs(this.store, child, this.fresh() ? routed : []);
         return configured.length === routed.length && configured.every(m => routed.includes(m));
     }
     people(actor: Actor): PeopleDTO {
@@ -192,7 +192,7 @@ export class IntegrationPolicy {
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
         let allEnrolled = true;
         const people = children.map(child => {
-            const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id);
+            const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id, this.fresh() ? o?.acceptedPolicy.people.find(p => p.id === child.id)?.macs ?? [] : []);
             const validUntil = Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, allowance = allowanceView(o, healthy, child.id);
             if (!enrolled) allEnrolled = false;
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
