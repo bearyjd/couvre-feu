@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { integrationFixture } from './fixtures/integration.ts';
@@ -10,10 +11,9 @@ import { ParentAlerts } from '../src/parent-alerts.ts';
 import { actor } from './fixtures/integration.ts';
 
 const child = (name = 'Private batch child') => ({action: 'child_create', target: '', params: {name, kind: 'child'}, key: 'http_batch_item_0001'});
-let nextPort = 39000 + process.pid % 10000;
 async function world() {
     const f = integrationFixture();
-    const port = nextPort++, origin = `http://localhost:${port}`;
+    const port = await freePort(), origin = `http://localhost:${port}`;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');

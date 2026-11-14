@@ -1,7 +1,7 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { createServer } from 'node:http';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
@@ -15,12 +15,6 @@ const STABLE_MAC = '00:00:5e:00:00:10';
 const dev = (mac: string, hostname: string | null, n: number, source: InventoryDevice['source'] = 'both'): InventoryDevice => ({mac, ipv4: [`192.0.2.${n}`], hostname, source});
 const MAC_ANYWHERE = /[0-9a-f]{2}(:[0-9a-f]{2}){5}/i;
 
-async function freePort(): Promise<number> {
-    const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
-    const port = (probe.address() as {port: number}).port;
-    await new Promise<void>(resolve => probe.close(() => resolve()));
-    return port;
-}
 async function world(options: {enabled?: boolean} = {}) {
     const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});

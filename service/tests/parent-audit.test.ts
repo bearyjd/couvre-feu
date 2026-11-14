@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
@@ -190,7 +191,7 @@ test('nothing but ids and enums is stored: no reason text, MAC, address, hostnam
 });
 
 test('flag off (absent): nothing is written and GET /audit is 404', async () => {
-    const f = world(false), port = 26000 + process.pid % 10000, o = `http://localhost:${port}`;
+    const f = world(false), port = await freePort(), o = `http://localhost:${port}`;
     const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -223,7 +224,7 @@ async function http(f: ReturnType<typeof world>, _auth: Auth, o: string, account
 }
 
 test('GET /audit admins see every row (incl. no-child rows); non-admin parents only their own children; no children is an empty list', async () => {
-    const f = world(), port = 27000 + process.pid % 10000, o = `http://localhost:${port}`;
+    const f = world(), port = await freePort(), o = `http://localhost:${port}`;
     const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -276,7 +277,7 @@ test('retention: rows older than 90 days are pruned in bounded batches on startu
 });
 
 test('pagination: newest first, default page, hard cap, cursor, and no unbounded query', async () => {
-    const f = world(), port = 28000 + process.pid % 10000, o = `http://localhost:${port}`;
+    const f = world(), port = await freePort(), o = `http://localhost:${port}`;
     const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -387,7 +388,7 @@ test('flag off: a child-admin action does not read the device owner for the audi
 });
 
 test('the before cursor is at most 15 digits; limit takes 1 to 4 digits (clamped to 100), longer segments are 404', async () => {
-    const f = world(), port = 29000 + process.pid % 10000, o = `http://localhost:${port}`;
+    const f = world(), port = await freePort(), o = `http://localhost:${port}`;
     const auth = new Auth(f.store, o, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: o, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');

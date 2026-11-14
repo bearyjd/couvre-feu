@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -409,7 +410,7 @@ test('integration-005 rebuilds devices in place: rows, FKs and uniqueness surviv
 });
 
 test('HTTP: bulk and move routes are CSRF/Origin-checked and step-up gated; step-up options route by action', async () => {
-    const f = world(), port = 36000 + process.pid % 9000, base = `http://localhost:${port}`;
+    const f = world(), port = await freePort(), base = `http://localhost:${port}`;
     const auth = new Auth(f.store, base, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: base, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
