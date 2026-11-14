@@ -78,3 +78,17 @@ test('an admin sees new_device and inventory_stalled alerts with titles and coun
   await expect(page.locator('#alert-badge')).toHaveText('3');
   expect(errors).toEqual([]);
 });
+
+test('MOCK: filter_drift alerts show a title and a cause-only summary, never a category or a site', async ({ page, demo }) => {
+  const alert = (id: number, cause: string) => ({ id, personId: 'alex', kind: 'filter_drift', severity: 'warning', createdAt: nowSeconds(), firstSeen: nowSeconds(), lastSeen: nowSeconds(), count: 1,
+    state: 'open', acknowledgedAt: null, resolvedAt: null, details: { cause, domain: 'must-not-show.example' } });
+  await page.route('**/alerts', (route) => route.fulfill({ json: { alerts: [alert(2, 'unreachable'), alert(1, 'changed')], nextBefore: null, openCount: 2 } }));
+  await enroll(page, demo, 'jd');
+  await openTab(page, 'alerts');
+  const feed = page.locator('#parent-alert-feed');
+  await expect(feed.locator('.parent-alert')).toHaveCount(2);
+  await expect(feed).toContainText('Content filter needs a look');
+  await expect(feed).toContainText('could not check');
+  await expect(feed).toContainText('no longer matched what you set here');
+  expect(await feed.innerText()).not.toContain('must-not-show');
+});

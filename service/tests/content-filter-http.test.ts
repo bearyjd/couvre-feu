@@ -6,6 +6,7 @@ import { AppError } from '../../shared/src/errors.ts';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import { appServer } from '../src/http.ts';
+import { ParentAlerts } from '../src/parent-alerts.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { ContentFilterReconciler } from '../src/content-filter-reconcile.ts';
 import { ContentFilterRoutes, PUTS_PER_MINUTE } from '../src/content-filter-http.ts';
@@ -25,7 +26,7 @@ class RacyStore extends ContentFilterStore {
     script: (FilterRecord | undefined)[] = [];
     override get(person: string) { return this.script.length ? this.script.shift() : super.get(person); }
 }
-interface Options { mode?: ContentFilterMode; profiles?: Record<string, string>; wrap?: (next: Transport) => Transport; audit?: boolean; service?: boolean; authorize?: (actor: unknown, person: string) => void }
+interface Options { mode?: ContentFilterMode; profiles?: Record<string, string>; wrap?: (next: Transport) => Transport; audit?: boolean; alerts?: boolean; service?: boolean; authorize?: (actor: unknown, person: string) => void }
 async function world(options: Options = {}) {
     const f = integrationFixture(), fake = fakeWorld(options.wrap);
     f.config.ownerAccountId = 'operator';
@@ -34,7 +35,7 @@ async function world(options: Options = {}) {
     const port = await freePort(), origin = `http://localhost:${port}`, auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
     const filters = new RacyStore(f.store, f.now), reconciler = new ContentFilterReconciler({client: fake.client, profiles: options.profiles ?? {pilot: PROFILE_ID, other: PROFILE_ID, ghost: PROFILE_ID}, store: filters});
     const routes = new ContentFilterRoutes({auth, filters, reconciler, mode: options.mode ?? 'owner', ownerAccountId: 'operator', authorize: (actor, person) => { options.authorize?.(actor, person); f.policy.authorized(actor, person); }});
-    const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`}, undefined, undefined, undefined, undefined, options.service === false ? undefined : routes);
+    const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`}, options.alerts ? new ParentAlerts(f.store, null, f.now) : undefined, undefined, undefined, undefined, options.service === false ? undefined : routes);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     function client() {
         const jar = new Map<string, string>(); let csrf = '';
@@ -380,4 +381,21 @@ test('PUT is rate limited per actor', async () => {
         w.advance(61);
         assert.equal((await c.put('pilot', grow(PUTS_PER_MINUTE))).status, 200);
     } finally { await w.cleanup(); }
+});
+
+test('filter_drift alerts follow the filter mode: the owner sees them in owner mode, another parent does not, and parents mode shows them to assigned parents', async () => {
+    for (const [mode, account, sees] of [['owner', 'operator', true], ['owner', 'parent', false], ['parents', 'parent', true], ['off', 'operator', false]] as const) {
+        const w = await world({mode, alerts: true});
+        try {
+            w.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot','filter_drift','warning',1,1,1,1,'open','{\"cause\":\"changed\"}')");
+            const c = w.client(); await c.signIn(account);
+            const list = await c.call('GET', '/alerts');
+            assert.equal(list.status, 200, list.text);
+            const kinds = (list.body.alerts as {kind: string}[]).map(a => a.kind);
+            assert.equal(kinds.includes('filter_drift'), sees, `${mode}/${account}`);
+            const id = w.store.get<{id: number}>("SELECT id FROM parent_alerts WHERE kind='filter_drift'")!.id;
+            const ack = await c.call('POST', `/alerts/${id}/acknowledge`, {});
+            assert.equal(ack.status === 200, sees, `${mode}/${account} acknowledge: ${ack.status}`);
+        } finally { await w.cleanup(); }
+    }
 });

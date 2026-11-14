@@ -6,6 +6,8 @@ import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
 import { createRewardTime } from './reward-time.js';
 import { createAuditLog } from './audit.js';
+import { createContentFilter } from './content-filter.js';
+import { createInstallReadiness } from './install-readiness.js';
 import { createAccounts } from './accounts.js';
 import { createTabs } from './tabs.js';
 import { composeAbort, createUpdatePrompt, createSessionGrace } from './pwa-update.js';
@@ -26,7 +28,9 @@ const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.s
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
 const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
+const contentFilter = createContentFilter({ session: () => state.session, people: () => state.people?.people ?? [] });
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
+const installReadiness = createInstallReadiness({ session: () => state.session, people: () => state.people, offline: () => state.offline });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const updatePrompt = createUpdatePrompt({ banner: $('#update-banner'), reloadButton: $('#update-reload') });
 const sessionGrace = createSessionGrace({ root: $('#session-grace'), text: $('#session-grace-text'), dismiss: $('#session-grace-dismiss') });
@@ -548,7 +552,9 @@ function render() {
   bulk.update();
   children.update();
   inventory.update();
+  contentFilter.update();
   auditLog.update();
+  installReadiness.update();
 }
 
 function tick() {

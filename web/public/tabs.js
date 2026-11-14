@@ -11,7 +11,7 @@ const TABS = [
 const SUBS = {
   home: { requests: '#time-requests', bulk: '#bulk-panel' },
   alerts: { parent: '#parent-alerts', browser: '#operational-alerts' },
-  more: { schedules: '#schedule-editor', activity: '#activity-panel', audit: '#audit-panel', accounts: '#accounts-panel', about: '#about-panel' },
+  more: { schedules: '#schedule-editor', activity: '#activity-panel', audit: '#audit-panel', accounts: '#accounts-panel', install: '#install-readiness-panel', about: '#about-panel' },
 };
 const ROUTE = /^#(home|kids|devices|alerts|more)(?:\/([a-z-]+))?$/;
 const SUB_SECONDS = 6; // a sub-hash target that loads late is scrolled to once, but only soon after the link was opened

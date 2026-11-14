@@ -26,8 +26,8 @@ test('a newer service version shows an update banner and Reload brings the new b
 test('the service worker accepts a skipWaiting message and the shell cache is renamed', async ({ page, demo }) => {
   const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
   expect(sw).toContain("'skipWaiting'");
-  expect(sw).toContain("'cf-shell-v9'");
-  expect(sw).not.toContain('cf-shell-v8');
+  expect(sw).toContain("'cf-shell-v10'");
+  expect(sw).not.toContain('cf-shell-v9');
   expect(sw).toContain('/pwa-update.js');
 });
 

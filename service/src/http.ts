@@ -24,6 +24,7 @@ import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
 import { inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
+import type { InstallReadiness } from './install-readiness.ts';
 import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
@@ -38,7 +39,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
     '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'], '/pwa-update.js': ['pwa-update.js', 'text/javascript; charset=utf-8'],
@@ -103,14 +104,14 @@ export function remoteIPv4(address: string | undefined): string | undefined {
 /** The Idempotency-Key header, dropped when it uses the `tr-` prefix reserved for the time-request service (the route then reports the key as missing). */
 const clientKey = (value: string | string[] | undefined): string | undefined => typeof value === 'string' && !value.startsWith('tr-') ? value : undefined;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore, contentFilter?: ContentFilterRoutes) {
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore, contentFilter?: ContentFilterRoutes, installReadiness?: InstallReadiness) {
     // Demo: always on. Real-router integration: per the private manifest's timeRequests mode (default off); child routes and the timer run in any mode but off.
     const gated = timeRequests === undefined && auth.provenance.source === 'real-router-integration';
     const mode = timeRequestMode((config as {timeRequests?: unknown}).timeRequests), ownerAccountId = (config as {ownerAccountId?: string}).ownerAccountId;
     const timeRequestsEnabled = !gated || mode !== 'off';
     // Who may see and decide requests (parent routes) and read their alert: everyone unless the manifest narrows it to the owner account.
     const mayDecide = (actor: Actor) => !gated || mode === 'parents' || (mode === 'owner' && actor.id === ownerAccountId);
-    const hiddenAlerts = (actor: Actor): readonly string[] => mayDecide(actor) ? [] : ['time_request_pending'];
+    const hiddenAlerts = (actor: Actor): readonly string[] => [...(mayDecide(actor) ? [] : ['time_request_pending']), ...(contentFilter?.visibleTo(actor) === true ? [] : ['filter_drift'])];
     const clock = (policy as {now?: () => number}).now ?? auth.now;
     // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
     const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
@@ -188,7 +189,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v9'", `'cf-shell-integration-${provenance.integrationScope}-v6'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v10'", `'cf-shell-integration-${provenance.integrationScope}-v9'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
@@ -256,6 +257,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const inventoryWrite = inventoryPost(inventory ?? null, session, path, payload);
                 if (inventoryWrite) {
                     send(response, inventoryWrite.status, {...provenance, ...inventoryWrite.body as object});
+                    return;
+                }
+                const readinessWrite = await installReadiness?.post(session, path, payload);
+                if (readinessWrite) {
+                    send(response, readinessWrite.status, {...provenance, ...readinessWrite.body as object});
                     return;
                 }
                 const filterStepUp = await contentFilter?.post(session, path, payload);
@@ -335,7 +341,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 // rewardTime: one viewer-level boolean, present only when the reward route would answer for this viewer (never per child).
-                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(auditOn() ? {auditLog: true} : {})});
+                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(auditOn() ? {auditLog: true} : {}), ...(installReadiness && session.dto.actor.role === 'admin' ? {installReadiness: true} : {})});
                 return;
             }
             const childRead = childrenGet(children, session, path);
@@ -346,6 +352,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const inventoryRead = inventoryGet(inventory ?? null, session, path);
             if (inventoryRead) {
                 send(response, inventoryRead.status, {...provenance, ...inventoryRead.body as object});
+                return;
+            }
+            const readinessRead = installReadiness?.get(session, path);
+            if (readinessRead) {
+                send(response, readinessRead.status, {...provenance, ...readinessRead.body as object});
                 return;
             }
             const filterRead = contentFilter?.get(session, path);

@@ -21,3 +21,4 @@
 
 Rules: dynamic text via textContent; nothing sensitive in browser storage.
 Tests: web/tests/*.spec.ts (Playwright, chromium; browser-fixture.ts); `npm run test:web`.
+| content-filter.js | parent: "Content filter" card on Home (`GET/PUT /people/:id/filter`); a 404 `route_not_found` hides it for the session; loosening retries with a passkey step-up only after a 403 `step_up_required`; flagged off |

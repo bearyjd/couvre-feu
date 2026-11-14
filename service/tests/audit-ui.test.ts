@@ -63,7 +63,7 @@ test('HTTP: the audit page script and the service worker (cache name bumped, aud
         assert.equal(script.status, 200);
         assert.match(script.text, /createAuditLog/);
         const sw = await s.get('/sw.js');
-        assert.match(sw.text, /cf-shell-integration-[^']*-v6'/);
+        assert.match(sw.text, /cf-shell-integration-[^']*-v9'/);
         assert.match(sw.text, /'\/audit\.js'/);
     } finally { await s.close(); w.f.cleanup(); }
 });
@@ -84,4 +84,14 @@ test('HTTP: audit availability is independent of timeRequests and owner mode, an
             } finally { await s.close(); w.f.cleanup(); }
         }
     }
+});
+
+test('HTTP: the content filter page script is served and cached by the service worker', async () => {
+    const w = await world(), s = await serve(w, 'operator');
+    try {
+        const script = await s.get('/content-filter.js');
+        assert.equal(script.status, 200);
+        assert.match(script.text, /createContentFilter/);
+        assert.match((await s.get('/sw.js')).text, /'\/content-filter\.js'/);
+    } finally { await s.close(); w.f.cleanup(); }
 });

@@ -64,6 +64,8 @@ export class IntegrationStore extends Store {
         this.runMigration('integration-006.sql', 'dispatch_steps', "'inventory'");
         // integration-007 (ask-for-time): operations.action admits 'allow'. Marker: the action CHECK.
         this.runMigration('integration-007.sql', 'operations', "'allow'");
+        // integration-008 (content filtering A5): parent_alerts admits `filter_drift`. Marker: the kind CHECK.
+        this.runMigration('integration-008.sql', 'parent_alerts', "'filter_drift'");
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));

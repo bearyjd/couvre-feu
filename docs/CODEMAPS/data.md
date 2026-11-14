@@ -22,6 +22,7 @@ Main DB migrations 001..013 (`PRAGMA user_version`; integration mode runs 001, 0
 | integration-005 | devices state `moving` (move_to) |
 | integration-006 | network inventory tables, `inventory` step kind, `new_device` alert kind |
 | integration-007 | operations.action admits `allow` (router allowance for ask-for-time grants and Reward Time; a focus window is a labelled timed pause, not a new kind) |
+| integration-008 | parent_alerts.kind admits `filter_drift` (content filter drift check, PRP-006 A5) |
 
 Also referenced: automatic_read_summary (created in integration-db.ts). `notify_state` (key/value: last pushed alert id, last sent digest slot) is created by push-runtime.ts only when `push.enabled`.
 `admin-batches.sql` is additive and does not advance user_version: `admin_batches` stores actor/client_key uniqueness, canonical digest, stored success/refusal response, operation id and creation time (90-day retry retention); `admin_batch_setup` preserves setup completion independently of retry retention; `inventory_coverage` is the latest complete poll's generation/MAC/address-coverage timestamp, separate from historical inventory last_seen. No parent_audit rebuild, action or batch_id column is added. Legacy audit carries one child id/device-count row per touched child; parent audit reuses device_assign per child, inside the batch transaction.
