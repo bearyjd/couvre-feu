@@ -16,6 +16,7 @@ test('admin reviews the list at phone width: children, warnings, digest, no hori
   f.store.run("DELETE FROM devices WHERE person_id='kid3'");
   await page.setViewportSize({ width: 390, height: 800 });
   await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
   await expect(panel(page).getByRole('heading', { name: 'Review for the router install' })).toBeVisible();
   await expect(panel(page).locator('h3').filter({ hasText: NAMES.kid2 })).toBeVisible();
   await expect(panel(page).locator('[data-device]').filter({ hasText: 'Device kid2' })).toContainText(K2);
@@ -39,6 +40,7 @@ test('approve with a passkey records the review; download gives the JSON for the
 
 async function approveAndDownload(page: import('@playwright/test').Page, f: World) {
   await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
   const digest = await panel(page).locator('[data-digest]').innerText();
   await panel(page).getByRole('button', { name: 'Approve this list (passkey)' }).click();
   await expect(panel(page).locator('[data-reviewed]')).toContainText('Approved');
@@ -58,6 +60,7 @@ async function approveAndDownload(page: import('@playwright/test').Page, f: Worl
 test('adults are a count from the protected set, never raw MACs in the page', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
   await expect(panel(page).locator('[data-adults] h3')).toHaveText('Protected devices (existing protected set)');
   await expect(panel(page).locator('[data-adult-count]')).toHaveText('1 protected device');
   await expect(panel(page).locator('[data-adults-notice]')).toHaveCount(0);
@@ -69,6 +72,7 @@ test('with no protected set the review says so and Approve is disabled', async (
   seed(f);
   f.config.protectedMacs = [];
   await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
   await expect(panel(page).locator('[data-adults-notice]')).toHaveText('Adult devices are not included in this review yet.');
   await expect(panel(page).getByRole('button', { name: 'Approve this list (passkey)' })).toBeDisabled();
   await expect(panel(page).getByRole('button', { name: 'Download' })).toBeEnabled();
@@ -80,6 +84,7 @@ test('a hostile device label stays inert text', async ({ page, integration: f })
   seed(f);
   f.store.run("UPDATE devices SET label=? WHERE id='d_kid2'", HOSTILE);
   await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
   await expect(panel(page).locator('[data-name]').filter({ hasText: HOSTILE })).toBeVisible();
   expect(await panel(page).locator('img').count()).toBe(0);
   expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
@@ -87,6 +92,7 @@ test('a hostile device label stays inert text', async ({ page, integration: f })
 
 test('a parent never sees the review', async ({ page, integration: f }) => {
   await signIn(page, f, 'parent');
+  await page.locator('#tab-more').click();
   await expect(page.locator('#status-view')).toBeVisible();
   await expect(panel(page)).toBeHidden();
 });
@@ -95,6 +101,7 @@ test('without a hostile name the whole page has no horizontal scroll at 390px', 
   seed(f);
   await page.setViewportSize({ width: 390, height: 800 });
   await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
   await expect(panel(page).locator('[data-digest]')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
