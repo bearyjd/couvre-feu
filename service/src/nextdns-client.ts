@@ -1,3 +1,7 @@
+import { classOf } from './content-filter-classes.ts';
+import { CLASS_CODES } from '../../shared/src/content-filter-classes.ts';
+import type { ClassCode } from '../../shared/src/content-filter-classes.ts';
+
 /**
  * Thin, strict client for the NextDNS configuration API (PRP-006 4.1). It touches no router.
  * Read https://nextdns.github.io/api on 2026-11-08. CONFIRMED there: base https://api.nextdns.io, header X-Api-Key,
@@ -12,6 +16,9 @@
  * Retry-After behaviour, idempotency of any write, the status and body of write answers, bare-JSON write bodies, id
  * alphabets and lengths
  * (including hex-encoded service ids), page size limits, and the units and values of settings.logs.retention/location.
+ * Analytics (phase-c-digest plan 5.1): CONFIRMED in the doc: GET analytics endpoints take from (inclusive) and to (exclusive) as Unix seconds,
+ * limit 1-500, cursor; items are {status, queries} and {id, name, queries}. UNVERIFIED: 429 behaviour, whether reasons paginates at
+ * limit=500, how long analytics are retained, and the exact reason id spellings (see content-filter-classes.ts).
  * Errors carry a closed code and never any server text, response body, URL or key. The key arrives through a getter on
  * every request.
  */
@@ -43,6 +50,9 @@ const MAX_PAGE_ITEMS = 1000;
 export const PROFILE_ID = /^[A-Za-z0-9]{4,32}$/;
 export const SERVICE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 export const DOMAIN = /^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]{0,251}[a-z0-9_])?$/;
+const REASON_ID = /^[\x21-\x7e]{1,256}$/;
+const STATUS_NAME = /^[a-z_]{1,32}$/;
+const MAX_ANALYTICS_SPAN_S = 90_000; // 25 h: the longest local day (DST fall back)
 const CURSOR = /^[A-Za-z0-9_.=-]{1,128}$/;
 const API_KEY = /^[\x21-\x7e]{8,256}$/;
 const PROFILE_NAME = /^[^\u0000-\u001f\u007f]{0,100}$/u;
@@ -67,6 +77,13 @@ const LISTS = { services: 'parentalControl/services', categories: 'parentalContr
 export type ListName = keyof typeof LISTS;
 const ENTRY_ID: Record<ListName, RegExp> = { services: SERVICE_ID, categories: SERVICE_ID, denylist: DOMAIN,
     allowlist: DOMAIN };
+
+/** Integers only: `total` is every lookup of the period, `blocked` those with status `blocked`. */
+export interface AnalyticsStatus { readonly total: number; readonly blocked: number }
+/** One finished period as Unix seconds, `from` inclusive and `to` exclusive. */
+export interface AnalyticsRange { readonly from: number; readonly to: number }
+/** The raw reason id never leaves the client: only a closed class code and a count. */
+export interface ClassCount { readonly class: ClassCode; readonly queries: number }
 
 export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
 export interface NextDnsClientOptions {
@@ -97,6 +114,9 @@ export interface NextDnsClient {
     getList(profile: string, list: ListName, call?: CallOptions): Promise<readonly ListEntry[]>;
     setList(profile: string, list: ListName, entries: readonly ListEntry[], call?: CallOptions): Promise<void>;
     getSettings(profile: string, call?: CallOptions): Promise<ProfileSettings>;
+    /** Aggregate counts for one finished period (plan 5.1). Nothing else of the analytics or logs families is reachable. */
+    getAnalyticsStatus(profile: string, range: AnalyticsRange, call?: CallOptions): Promise<AnalyticsStatus>;
+    getAnalyticsReasons(profile: string, range: AnalyticsRange, call?: CallOptions): Promise<readonly ClassCount[]>;
 }
 
 /** Thrown by assertSafeNextDnsEnvironment. The message is a fixed reason code; no environment value is ever echoed. */
@@ -173,6 +193,29 @@ const parseProfile = (v: unknown): ProfileSummary => {
     const o = obj(v, ['id', 'name']);
     return Object.freeze({ id: str(o.id, PROFILE_ID), name: str(o.name, PROFILE_NAME) });
 };
+
+const count = (v: unknown): number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : fail();
+const parseStatusItem = (v: unknown): { readonly status: string; readonly queries: number } => {
+    const o = obj(v, ['status', 'queries']);
+    return { status: str(o.status, STATUS_NAME), queries: count(o.queries) };
+};
+// `name` is vendor free text: type-checked here and dropped, so it can never reach a caller, a database or a log.
+const parseReasonItem = (v: unknown): { readonly id: string; readonly queries: number } => {
+    const o = obj(v, ['id', 'name', 'queries']);
+    if (typeof o.name !== 'string' || o.name.length > 200) fail();
+    return { id: str(o.id, REASON_ID), queries: count(o.queries) };
+};
+const addSafe = (a: number, b: number): number => Number.isSafeInteger(a + b) ? a + b : fail();
+function toStatus(items: readonly { readonly status: string; readonly queries: number }[]): AnalyticsStatus {
+    return Object.freeze({ total: items.reduce((n, i) => addSafe(n, i.queries), 0),
+        // No overflow check needed: blocked is a subset of total, which was just checked (object literal evaluates in order).
+        blocked: items.filter(i => i.status === 'blocked').reduce((n, i) => n + i.queries, 0) });
+}
+function toClassCounts(items: readonly { readonly id: string; readonly queries: number }[]): readonly ClassCount[] {
+    const sums = new Map<ClassCode, number>();
+    for (const i of items) { const c = classOf(i.id); sums.set(c, addSafe(sums.get(c) ?? 0, i.queries)); }
+    return Object.freeze(CLASS_CODES.filter(c => sums.has(c)).map(c => Object.freeze({ class: c, queries: sums.get(c)! })));
+}
 
 function parseJson(text: string): unknown {
     try { return JSON.parse(text); } catch { return fail(); }
@@ -295,7 +338,7 @@ const num = (v: number | undefined, fallback: number): number => typeof v === 'n
 function resolveConfig(o: NextDnsClientOptions): Config {
     return {
         apiKey: o.apiKey, transport: o.transport ?? createFetchTransport(), sleep: o.sleep ?? abortableSleep,
-            now: o.now ?? Date.now, random: o.random ?? Math.random,
+            now: typeof o.now === 'function' ? o.now : Date.now, random: o.random ?? Math.random,
         // Non-finite or negative numbers fall back to the default: NaN/Infinity must not disable a bound.
         maxAttempts: Math.max(1, Math.floor(num(o.maxAttempts, 4))), maxPages: Math.max(1, Math.floor(num(o.maxPages, 20))),
             baseDelay: num(o.baseDelayMs, 500), maxDelay: num(o.maxDelayMs, 10_000),
@@ -417,7 +460,8 @@ async function readAll<T>(ctx: Ctx, path: string, item: (x: unknown) => T): Prom
     const out: T[] = [], seen = new Set<string>();
     let cursor: string | null = null;
     for (let page = 0; page < ctx.cfg.maxPages; page++) {
-        const res = await request(ctx, 'GET', cursor === null ? path : `${path}?cursor=${encodeURIComponent(cursor)}`);
+        const res = await request(ctx, 'GET', cursor === null ? path
+            : `${path}${path.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`);
         const env = parseEnvelope(res.body);
         out.push(...arr(env.data, MAX_PAGE_ITEMS, item));
         if (out.length > MAX_ITEMS) return fail();
@@ -433,6 +477,16 @@ const listPath = (profile: string, list: ListName, domainLists: boolean): string
     if (!Object.hasOwn(LISTS, list) || (!domainLists && (list === 'denylist' || list === 'allowlist'))) return fail();
     return profilePath(profile, `/${LISTS[list]}`);
 };
+/** The only analytics paths: a frozen table, so `domains`, `devices`, `ips`, `destinations` and `logs` cannot be built. */
+const ANALYTICS = Object.freeze({ status: '/analytics/status', reasons: '/analytics/reasons' } as const);
+/** Only finished periods: integer seconds, from < to, at most 25 h, and `to` not in the future. */
+function analyticsPath(profile: string, which: keyof typeof ANALYTICS, range: AnalyticsRange, nowMs: number): string {
+    const o = obj(range, ['from', 'to']);
+    const from = count(o.from), to = count(o.to);
+    if (from >= to || to - from > MAX_ANALYTICS_SPAN_S || !Number.isFinite(nowMs)
+        || to * 1000 > nowMs) fail(); // a broken clock fails closed
+    return `${profilePath(profile, ANALYTICS[which])}?from=${from}&to=${to}${which === 'reasons' ? '&limit=500' : ''}`;
+}
 /**
  * Caller input is validated before any request. Every failure here, whatever the validator threw, is the caller's bad
  * input, so it
@@ -466,6 +520,14 @@ export function createNextDnsClient(options: NextDnsClientOptions): NextDnsClien
         async getList(profile: string, list: ListName, call: CallOptions = {}) {
             const path = checked(() => listPath(profile, list, cfg.domainLists));
             return readAll(newCtx(cfg, call), path, entryOf(ENTRY_ID[list]));
+        },
+        async getAnalyticsStatus(profile: string, range: AnalyticsRange, call: CallOptions = {}) {
+            const path = checked(() => analyticsPath(profile, 'status', range, cfg.now()));
+            return toStatus(await readAll(newCtx(cfg, call), path, parseStatusItem));
+        },
+        async getAnalyticsReasons(profile: string, range: AnalyticsRange, call: CallOptions = {}) {
+            const path = checked(() => analyticsPath(profile, 'reasons', range, cfg.now()));
+            return toClassCounts(await readAll(newCtx(cfg, call), path, parseReasonItem));
         },
         /** A rejected write is not proof the write did not happen (a timeout may still have applied): callers must read back before trusting state. */
         async setParentalControl(profile: string, flags: ParentalFlags, call: CallOptions = {}): Promise<void> {

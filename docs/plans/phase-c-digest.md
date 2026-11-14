@@ -233,8 +233,8 @@ export class ContentFilterCountsStore {
 Two methods, nothing else:
 
 ```ts
-getAnalyticsStatus(profile, range: {from: number; to: number}, call?): Promise<readonly {status: string; queries: number}[]>;
-getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<readonly {id: string; queries: number}[]>;
+getAnalyticsStatus(profile, range: {from: number; to: number}, call?): Promise<{total: number; blocked: number}>;
+getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<readonly {class: ClassCode; queries: number}[]>;
 ```
 
 - Paths are built only from a frozen table `{status: '/analytics/status', reasons: '/analytics/reasons'}` behind
@@ -251,8 +251,10 @@ getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<
   - Unknown keys → `bad_response` (the beta-API rule the client already follows).
 - Errors are the client's closed codes only (`rate_limited`, `unauthorized`, `bad_response`, ...). No server text.
 - `GET` is retried by the client on 429/5xx/transport with backoff and Retry-After, inside its deadline.
-- The reason id leaves the client only to be passed straight into `classOf`; the fetcher never stores, logs or
-  compares it outside that call. (It is in memory for one call, the same as a profile read today.)
+- As built (C1): `getAnalyticsStatus` returns integers `{total, blocked}` (`blocked` = status `blocked`, `total` = all statuses);
+  `getAnalyticsReasons` maps each id through `classOf` inside the client and returns per-class sums `{class, queries}`
+  (stable `CLASS_CODES` order, zero classes omitted). The raw reason id and `name` never leave the client. The range must be a
+  finished period: `to` not after the client clock (equality allowed); a non-finite clock fails closed (`invalid_request`).
 
 ### 5.2 Fetcher (`ContentFilterCounts`, scheduled like `ContentFilterWatch`)
 
@@ -392,7 +394,7 @@ household identities in logs, alerts, digests.
 |---|---|---|---|---|
 | P1 | A domain via the logs API | DB, logs | No client method or path for `/logs*`, `/analytics/domains`; path table frozen | T-client-surface: enumerate methods/paths; fake server fails the test on any request outside the two allowed paths |
 | P2 | A domain inside a reason id (`denylist:<domain>` is possible) | DB, logs, UI | Ids never stored; `classOf` maps to a code; denylist prefix discarded | T-classof: fuzz ids including `denylist:secret-domain.test`, `blocklist:secret-domain.test`, unicode, 256-char; assert output ∈ enum; G7 haystack has no `secret-domain` |
-| P3 | Vendor free text (`name`) | DB, UI | Dropped in the parser; never in the returned type | T-parse: returned objects have exactly `{id, queries}`; G7 haystack check for a sentinel placed in `name` |
+| P3 | Vendor free text (`name`) | DB, UI | Dropped in the parser; never in the returned type | T-parse: returned objects are exactly `{total, blocked}` and `{class, queries}` (every returned string is a class code); G7 haystack check for a sentinel placed in `name` |
 | P4 | Device names / client IPs | DB | No `device` param, no devices/ips endpoints; status/reasons items with extra keys are refused | T-parse: an item carrying `device`/`clientIp` → `bad_response`; sentinel not in haystack |
 | P5 | Profile id (household identifier at NextDNS) | DB, logs, route, errors | No profile column; errors are closed codes; route answers have no profile | G7: `PROFILE_ID` sentinel absent from stdout/stderr/route bodies/DB dump of the two new tables |
 | P6 | API key | logs, errors | Existing getter + closed codes | Existing snapshot test extended to counts fetcher paths (401, unsafe file) |
