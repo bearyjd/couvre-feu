@@ -23,6 +23,30 @@ test('a newer service version shows an update banner and Reload brings the new b
   await expect(page.locator('#update-banner')).toBeHidden(); // The reloaded page treats the answered version as its own.
 });
 
+test('Reload with a waiting worker posts skipWaiting and reloads on controllerchange, not on the fallback timer', async ({ page, demo }) => {
+  await page.addInitScript(() => {
+    if (sessionStorage.getItem('stubbed-done')) return;
+    // A waiting registration stub: postMessage is recorded, and the worker "takes over" 1 s later.
+    const worker = { postMessage: (message: unknown) => {
+      sessionStorage.setItem('posted', String(message));
+      setTimeout(() => navigator.serviceWorker.dispatchEvent(new Event('controllerchange')), 1000);
+    } };
+    navigator.serviceWorker.getRegistration = (async () => ({ waiting: worker })) as unknown as typeof navigator.serviceWorker.getRegistration;
+  });
+  await enroll(page, demo);
+  await page.locator('#refresh').click();
+  await rewriteSession(page, (body) => ({ ...body, version: 'next-build' }));
+  await page.locator('#refresh').click();
+  await expect(page.locator('#update-banner')).toBeVisible();
+  await page.evaluate(() => sessionStorage.setItem('stubbed-done', '1')); // The reloaded page uses the real registration.
+  const started = Date.now();
+  await Promise.all([page.waitForEvent('load'), page.locator('#update-banner').getByRole('button', { name: 'Reload' }).click()]);
+  const elapsed = Date.now() - started;
+  expect(await page.evaluate(() => sessionStorage.getItem('posted'))).toBe('skipWaiting');
+  expect(elapsed).toBeGreaterThanOrEqual(900); // Waited for controllerchange rather than reloading at once.
+  expect(elapsed).toBeLessThan(2800); // And did not need the 3 s fallback.
+});
+
 test('the service worker accepts a skipWaiting message and the shell cache is renamed', async ({ page, demo }) => {
   const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
   expect(sw).toContain("'skipWaiting'");
