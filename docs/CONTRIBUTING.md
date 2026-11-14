@@ -7,7 +7,7 @@ Couvre-feu is a router enforcement layer (POSIX ash under `router/`), a TypeScri
 <!-- AUTO-GENERATED -->
 | Tool | Version | Needed for |
 |---|---|---|
-| Node.js | `26.8.1` (pinned in `package.json` `engines` and CI) | Service, shared, demo router, Playwright. Node runs `.ts` directly |
+| Node.js | `26.13.1` (pinned in `package.json` `engines` and CI) | Service, shared, demo router, Playwright. Node runs `.ts` directly |
 | npm | `11.19.0` (pinned) | `npm ci` from the lockfile |
 | Python 3 | any recent 3.x | Router fixtures under `tests/`, `tools/freeze-router-release.py`, `tools/live/*` |
 | BusyBox | with `ash`, `awk`, `timeout` applets | Router fixtures. CI runs them under BusyBox, not the host `sh` |

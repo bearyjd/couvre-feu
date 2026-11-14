@@ -25,7 +25,7 @@ AGPL-3.0; see [LICENSE](LICENSE). The original [PRP-001](docs/prp/PRP-001-enforc
 
 ## Run the local parent demo
 
-Use Node 26.8.1 and npm 11.19.0. Install locked dependencies with `npm ci`, then run these in separate terminals from the repository:
+Use Node 26.13.1 and npm 11.19.0. Install locked dependencies with `npm ci`, then run these in separate terminals from the repository:
 
 ```sh
 npm run demo:router
