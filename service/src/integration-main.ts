@@ -16,7 +16,7 @@ function refuseStart<T>(start: () => T): T {
 }
 const config = refuseStart(() => integrationConfig(process.argv[2])), store = refuseStart(() => new IntegrationStore(config));
 // SSH is disabled unless the private manifest explicitly enables a new owner epoch.
-const {worker, prune, app, startWatch} = refuseStart(() => wireIntegration(config, store, new SSHRouter(config)));
+const {worker, prune, app, startWatch, startCounts} = refuseStart(() => wireIntegration(config, store, new SSHRouter(config)));
 const automatic = config.dispatch?.enabled ? new AutomaticDispatch(worker) : null;
 if (!automatic) store.stopDispatch();
 const auth = new Auth(store, config.origin, undefined, {provenance: config.provenance, rpName: 'Couvre-feu private integration'});
@@ -24,6 +24,7 @@ refuseStart(() => checkOwnerAccount(config, store));
 prune();
 const pruneTimer = setInterval(prune, 3600000);
 const stopWatch = startWatch();
+const stopCounts = startCounts();
 // Off unless push.enabled; a bad ntfy setting or any init failure is logged and leaves notifications off, and no later failure reaches request handling.
 const notifications = startNotifications(config, store);
 const server = app(auth, config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config);
@@ -37,6 +38,7 @@ async function stop() {
     if (stopping) return; stopping = true;
     clearInterval(pruneTimer);
     stopWatch?.();
+    stopCounts?.();
     // Notifications abort their sends and are waited for at most two seconds, in parallel with the listener closing.
     const quiet = notifications?.stop();
     const closed = new Promise<void>(resolve => server.close(() => resolve()));

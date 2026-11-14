@@ -13,6 +13,8 @@ export type ContentFilterMode = 'off' | 'owner' | 'parents';
  */
 export interface ContentFilterConfig {
     mode: ContentFilterMode; apiKeyFile?: string; defaultProfile?: string; profiles?: Readonly<Record<string, string>>;
+    /** PRP-006 phase C: daily blocked-lookup counts from NextDNS analytics. Absent is off; ignored when mode is off. */
+    counts?: Readonly<{enabled: boolean}>;
 }
 /**
  * The NextDNS profile id rule. content-filter-state.test.ts asserts this equals the NextDNS client's own pattern.
@@ -47,17 +49,24 @@ function profileMap(value: unknown): Record<string, string> {
     // Null prototype and frozen: a lookup of 'constructor' or 'toString' finds nothing unless that person is configured. Use Object.hasOwn.
     try { return Object.freeze(Object.assign(Object.create(null) as Record<string, string>, Object.fromEntries(entries.map(([person, profile]) => [id(person), profileId(profile)])))); } catch { return bad(); }
 }
+function countsSetting(value: unknown): Readonly<{enabled: boolean}> {
+    let settings: Record<string, unknown>;
+    try { settings = object(value, ['enabled']); } catch { return bad(); }
+    if (typeof settings.enabled !== 'boolean') bad();
+    return Object.freeze({enabled: settings.enabled as boolean});
+}
 export function parseContentFilter(value: unknown): ContentFilterConfig | undefined {
     if (value === undefined) return undefined;
     let settings: Record<string, unknown>;
-    try { settings = object(value, ['mode'], ['apiKeyFile', 'defaultProfile', 'profiles']); } catch { return bad(); }
+    try { settings = object(value, ['mode'], ['apiKeyFile', 'defaultProfile', 'profiles', 'counts']); } catch { return bad(); }
     if (!['off', 'owner', 'parents'].includes(settings.mode as string)) bad();
     const mode = settings.mode as ContentFilterMode;
     const apiKeyFile = settings.apiKeyFile === undefined ? undefined : keyFilePath(settings.apiKeyFile);
     const defaultProfile = settings.defaultProfile === undefined ? undefined : profileId(settings.defaultProfile);
     const profiles = settings.profiles === undefined ? undefined : profileMap(settings.profiles);
+    const counts = settings.counts === undefined ? undefined : countsSetting(settings.counts);
     if (mode !== 'off' && (apiKeyFile === undefined || defaultProfile === undefined || profiles === undefined || Object.keys(profiles).length === 0)) bad();
-    return Object.freeze({mode, ...(apiKeyFile !== undefined ? {apiKeyFile} : {}), ...(defaultProfile !== undefined ? {defaultProfile} : {}), ...(profiles !== undefined ? {profiles} : {})});
+    return Object.freeze({mode, ...(apiKeyFile !== undefined ? {apiKeyFile} : {}), ...(defaultProfile !== undefined ? {defaultProfile} : {}), ...(profiles !== undefined ? {profiles} : {}), ...(counts !== undefined ? {counts} : {})});
 }
 
 export type ContentFilterKeyErrorCode = 'key_file_missing' | 'key_file_unsafe' | 'key_file_invalid';
