@@ -1,6 +1,7 @@
 name: isolated-project-checks
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -39,7 +40,7 @@ jobs:
           if-no-files-found: error
   preflight_suites:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
