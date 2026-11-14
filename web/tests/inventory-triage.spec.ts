@@ -20,11 +20,15 @@ const triageOn = (f: World) => { f.config.inventoryUi = { triage: true, wizard: 
 const panel = (page: Page) => page.locator('#inventory-panel');
 const chip = (page: Page, label: string) => panel(page).locator('[data-filter]').filter({ hasText: label });
 const rows = (page: Page) => panel(page).locator('li.inventory-row');
+async function openDevices(page: Page, f: World) {
+  await signIn(page, f, 'operator');
+  await page.locator('#tab-devices').click();
+}
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' }); });
 
 test('flag off: the current panel is unchanged (no filter chips, no role chips)', async ({ page, integration: f }) => {
   seed45(f);
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   await expect(panel(page).getByRole('heading', { name: 'Devices on the network' })).toBeVisible();
   await expect(panel(page).locator('[data-filter]')).toHaveCount(0);
   await expect(panel(page).locator('[data-role]')).toHaveCount(0);
@@ -32,7 +36,7 @@ test('flag off: the current panel is unchanged (no filter chips, no role chips)'
 
 test('45-device seed: To sort is the default and shrinks on tap; Undo brings it back; Hidden shows hidden devices', async ({ page, integration: f }) => {
   triageOn(f); seed45(f);
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   await expect(chip(page, 'To sort')).toContainText('44');
   await expect(chip(page, 'To sort')).toHaveAttribute('aria-pressed', 'true');
   await expect(chip(page, 'Kids')).toContainText('1');
@@ -65,7 +69,7 @@ test('45-device seed: To sort is the default and shrinks on tap; Undo brings it 
 
 test('rows are compact: 44 px tap targets, three lines at most, vendor and kind hints, no sideways scroll at 390 px', async ({ page, integration: f }) => {
   triageOn(f); seed45(f);
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   const first = rows(page).first();
   for (const b of await first.locator('button').all()) expect((await b.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   for (const b of await panel(page).locator('[data-filter]').all()) expect((await b.boundingBox())!.height).toBeGreaterThanOrEqual(44);
@@ -77,7 +81,7 @@ test('rows are compact: 44 px tap targets, three lines at most, vendor and kind 
 
 test('a child chip opens the existing prefilled add form; the address is only in the form', async ({ page, integration: f }) => {
   triageOn(f); seed45(f);
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   await rows(page).first().locator('[data-child]').first().click();
   await expect(page.locator('#children-panel').getByRole('textbox').first()).toBeVisible();
   expect(await panel(page).innerText()).not.toMatch(MAC_PATTERN);
@@ -90,7 +94,7 @@ test('502 on reload shows plain copy with Retry, and Retry recovers', async ({ p
     if (fail) await route.fulfill({ status: 502, contentType: 'text/html', body: '<html>Bad gateway</html>' });
     else await route.continue();
   });
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   await expect(rows(page)).toHaveCount(44);
   fail = true;
   await panel(page).getByRole('button', { name: 'Refresh' }).click();
@@ -106,7 +110,7 @@ test('502 on reload shows plain copy with Retry, and Retry recovers', async ({ p
 test('stalled scan says how long and who to tell; never an all-clear', async ({ page, integration: f }) => {
   triageOn(f); seed45(f);
   f.store.run('UPDATE inventory_state SET last_error=NULL, last_ok_at=?', f.now() - 48 * 60);
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   await expect(panel(page).locator('[data-inventory-status]')).toContainText('Scan stalled 48 min. Tell JD.');
   await expect(panel(page)).not.toContainText(/check the router|no new devices/i);
 });
@@ -118,7 +122,7 @@ test('link suggestion: "Same device" links the new row to the one that went quie
   poll(f, [kid, dev(oldMac, 'Penns-iPhone', 40)], t - 7200);
   poll(f, [kid], t - 3600);
   poll(f, [kid, dev(newMac, 'Penns-iPhone', 41)], t);
-  await signIn(page, f, 'operator');
+  await openDevices(page, f);
   const suggestion = panel(page).locator('[data-suggestion]');
   await expect(suggestion).toContainText('Penns-iPhone');
   await suggestion.getByRole('button', { name: 'Same device' }).click();
