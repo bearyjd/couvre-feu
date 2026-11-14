@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
@@ -378,11 +379,10 @@ async function serve(r: Awaited<ReturnType<typeof focusWorld>>, port: number) {
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     return {o, close: async () => { server.close(); await once(server, 'close'); }};
 }
-let ports = 28000 + process.pid % 5000;
 
 test('HTTP: POST /people/:id/focus queues one timed pause (202 + Location), is idempotent and audited once; GET, query strings, extra fields and bad CSRF are refused', async () => {
     const r = await focusWorld(); r.w.f.config.timeRequests = {mode: 'parents'};
-    const s = await serve(r, ports++);
+    const s = await serve(r, await freePort());
     try {
         const who = await session(r.w.f, s.o, 'operator'), pre = await who.token();
         const first = await who.post('/people/pilot/focus', {minutes: 45}, KEY, pre);
@@ -414,7 +414,7 @@ test('HTTP: flag off, time requests off, out-of-scope child and the owner-mode g
         const r = await focusWorld({}, {focus: c.focus, audit: true});
         if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
         if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
-        const s = await serve(r, ports++);
+        const s = await serve(r, await freePort());
         try {
             const who = await session(r.w.f, s.o, c.account);
             const out = await who.post(`/people/${c.person}/focus`, {minutes: 30});

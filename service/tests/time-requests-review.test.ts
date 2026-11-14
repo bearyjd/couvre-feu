@@ -1,7 +1,7 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { createServer } from 'node:net';
 import { actor } from './fixtures/integration.ts';
 import { world, bedtime } from './fixtures/grant-world.ts';
 import { Auth } from '../src/auth.ts';
@@ -130,12 +130,6 @@ test('scheduleWithAllowance keeps an unknown schedule claim unknown', () => {
     assert.equal(scheduleWithAllowance({...base, scheduleBlocked: false}, {until: 500}, 400).scheduleBlocked, false);
 });
 
-async function freePort(): Promise<number> {
-    const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
-    const port = (probe.address() as {port: number}).port;
-    await new Promise<void>(resolve => probe.close(() => resolve()));
-    return port;
-}
 
 test('flag off with grants wired: time-request routes 404 while the drain still follows an in-flight grant', async () => {
     const w = await world(bedtime);

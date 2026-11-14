@@ -1,7 +1,7 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { createServer } from 'node:http';
 import { AppError } from '../../shared/src/errors.ts';
 import { integrationFixture } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
@@ -16,12 +16,6 @@ import type { ContentFilterMode } from '../src/content-filter-config.ts';
 import type { Transport } from '../src/nextdns-client.ts';
 import { API_KEY, DESIRED, PROFILE_ID, SECRET_ALLOWED, SECRET_DOMAIN, fakeWorld, input, json } from './fixtures/content-filter.ts';
 
-async function freePort(): Promise<number> {
-    const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
-    const port = (probe.address() as {port: number}).port;
-    await new Promise<void>(resolve => probe.close(() => resolve()));
-    return port;
-}
 class RacyStore extends ContentFilterStore {
     script: (FilterRecord | undefined)[] = [];
     override get(person: string) { return this.script.length ? this.script.shift() : super.get(person); }

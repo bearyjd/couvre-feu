@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
@@ -8,7 +9,7 @@ import { appServer } from '../src/http.ts';
 import { TestAuthenticator } from './authenticator.ts';
 
 test('account and passkey routes over HTTP: admin-only, CSRF and Origin enforced, step-up required, pending enrollment issues no session', async () => {
-    const f = integrationFixture(), port = 36000 + process.pid % 10000, origin = `http://localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance});
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
