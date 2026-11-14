@@ -406,3 +406,30 @@ for (const scenario of ['manifest-only', 'fresh', 'remembered', 'stale', 'wrong-
         } finally { f.cleanup(); }
     });
 }
+
+test('an enrolling row whose operation has ended is removed through the normal path; one still in flight is refused', async () => {
+    const f = fixture();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const id = (await f.act(op, 'device_add', 'pilot', {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id as string;
+        await f.dispatch(id); f.advance(1); await f.observe();
+        const tablet = f.store.get<{id: string}>('SELECT id FROM devices WHERE identifier=?', TABLET)!.id;
+        const stick = (state: string) => { f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE id=?", id, tablet); f.store.run('UPDATE operations SET state=? WHERE id=?', state, id); };
+        for (const state of ['pending', 'unknown']) { stick(state); await assert.rejects(f.act(op, 'device_remove', tablet, {precondition: f.token()}), code('device_change_in_progress'), state); }
+        // Final operation, router holds it: the removal is queued on the router, and the row goes when that settles.
+        stick('conflict');
+        const removed = await f.act(op, 'device_remove', tablet, {precondition: f.token()});
+        assert.equal(removed.body.operation.action, 'unenroll');
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM devices WHERE id=?', tablet)!.state, 'removing');
+        await f.dispatch(removed.body.operation.id);
+        assert.equal(f.store.get('SELECT id FROM devices WHERE id=?', tablet), undefined);
+        assert.deepEqual(f.router.policy.people, [{id: 'pilot', macs: [SEED]}]);
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken, 'the list is healthy again once the stuck row is gone');
+        // Final operation, router does not hold it: no router change.
+        f.advance(1); await f.observe();
+        f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES('d_stuck','pilot','Stuck','mac',?,'enrolling',?,1)", LAPTOP, id);
+        stick('failed'); f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE id='d_stuck'", id); f.store.run("DELETE FROM devices WHERE id=?", tablet);
+        assert.deepEqual((await f.act(op, 'device_remove', 'd_stuck', {precondition: null})).body, {removed: 'd_stuck', routerChange: false});
+    } finally { f.cleanup(); }
+});

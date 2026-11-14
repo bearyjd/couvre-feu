@@ -62,7 +62,7 @@ interface SeenRow { mac: string; source: InventorySource; last_seen: number }
  * digest and an action type, never a MAC.
  */
 const PENDING_ENROL_TEXT = 'An enrolment is still pending for a device you marked as an adult; wait for it to finish or remove that device.';
-const STUCK_ENROL_TEXT = 'An enrolment for a device you marked as an adult ended without being settled; remove that device, then classify it again.';
+const STUCK_ENROL_TEXT = 'An enrolment for a device you marked as an adult ended without being settled; remove that device from the child\'s device list, then enrol it again.';
 const OVERLAP_TEXT = 'A device is on both the protect list and the allow list; remove it from one.';
 export class InstallReadiness {
     readonly auth: Auth;

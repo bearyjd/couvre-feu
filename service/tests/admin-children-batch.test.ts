@@ -872,7 +872,14 @@ test('an adult decision for an already enrolled device is dropped at startup; a 
         await f.dispatch(q.id);
         f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
         assert.equal(q.device(), 'active');
+        // An old-generation decision for the same active device is not this router's: it survives.
+        f.store.run("INSERT INTO inventory_devices(generation,mac,ipv4_json,hostname,source,first_seen,last_seen) VALUES(?,?,'[]',NULL,'lease',1,1)", 'f'.repeat(64), mac(1));
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Old',NULL,NULL,0,NULL,'operator',1)", 'f'.repeat(64), mac(1));
         new InventoryStore(f.store, {raise() { /* none */ }} as never);
-        assert.equal(q.decision(), undefined);
+        assert.equal(f.store.get('SELECT 1 FROM inventory_decisions WHERE generation=? AND mac=?', f.config.router.generation, mac(1)), undefined);
+        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM inventory_decisions WHERE generation=?", 'f'.repeat(64))!.n, 1);
+        // One count-only audit row, no address.
+        const rows = f.store.all<{outcome: string}>("SELECT outcome FROM audit WHERE action='inventory_adult_decisions_dropped'");
+        assert.deepEqual(rows.map(r => r.outcome), ['count:1']);
     } finally { f.cleanup(); }
 });

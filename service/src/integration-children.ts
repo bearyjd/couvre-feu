@@ -38,7 +38,9 @@ export function seedChildren(store: Store, config: Pick<IntegrationManifest, 'pe
 export const activeChildren = (store: Store): ChildRow[] => store.all<ChildRow>('SELECT * FROM people WHERE active=1 ORDER BY created_at,id');
 export const devicesOf = (store: Store, person: string): DeviceRow[] => store.all<DeviceRow>('SELECT * FROM devices WHERE person_id=? ORDER BY created_at,id', person);
 /** MACs the router should hold for this child right now (pending additions excluded, pending removals included). */
-export const configuredMacs = (store: Store, person: string): string[] => devicesOf(store, person).filter(d => d.state !== 'enrolling').map(d => d.identifier).sort();
+/** An enrol the router has not answered yet. An `enrolling` row whose operation has ended (a conflict with no stored observation) is no longer in flight: it is configured, and only its removal can leave that state. */
+export const enrolInFlight = (store: Store, d: DeviceRow): boolean => d.state === 'enrolling' && Boolean(store.get("SELECT 1 FROM operations WHERE id=? AND state IN ('pending','unknown')", d.operation_id));
+export const configuredMacs = (store: Store, person: string): string[] => devicesOf(store, person).filter(d => !enrolInFlight(store, d)).map(d => d.identifier).sort();
 
 /**
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a

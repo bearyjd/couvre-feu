@@ -275,7 +275,9 @@ export class InventoryStore {
 
     /** Decisions from before an enrolment cleared them: a device a child owns is a kid, so an adult decision for an ACTIVE device is dead (a pending enrol keeps its decision until the router settles it). */
     private dropOwnedAdultDecisions(): void {
-        this.store.run("DELETE FROM inventory_decisions WHERE role='adult' AND generation=? AND mac IN (SELECT identifier FROM devices WHERE identifier_kind='mac' AND state='active')", this.store.config.router.generation);
+        const dropped = this.store.run("DELETE FROM inventory_decisions WHERE role='adult' AND generation=? AND mac IN (SELECT identifier FROM devices WHERE identifier_kind='mac' AND state='active')", this.store.config.router.generation).changes;
+        // The count only: no address, no row id.
+        if (dropped > 0) this.store.run("INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES('system','inventory_adult_decisions_dropped',?,?)", this.now(), `count:${dropped}`);
     }
     /** The child that owns each MAC through the children admin (devices) or, failing that, the desired policy. A corrupt policy only costs the fallback. */
     private owners(): Map<string, string> {
