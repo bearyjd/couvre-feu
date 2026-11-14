@@ -1,6 +1,8 @@
 import { HEADLINE_CLASSES } from '../../shared/src/content-filter-classes.ts';
 import { addDays, dayRange, localDay } from './content-filter-day.ts';
-import type { ContentFilterCountsStore } from './content-filter-counts.ts';
+import { ContentFilterCountsStore } from './content-filter-counts.ts';
+import type { IntegrationConfig } from './integration-config.ts';
+import type { Store } from './db.ts';
 
 /** The weekly digest's only counts-derived data: one household integer and how many of the seven days it covers. No child, class or day is kept. */
 export interface BlockedWeek { readonly count: number; readonly daysCounted: number }
@@ -23,4 +25,10 @@ export function householdWeek(store: Pick<ContentFilterCountsStore, 'days'>, peo
         for (const row of rows) for (const [code, queries] of Object.entries(row!.classes)) if (HEADLINE.includes(code)) count += queries!;
     }
     return Object.freeze({count, daysCounted});
+}
+
+/** The reader the digest gets: the children are exactly the keys of contentFilter.profiles (a child without a profile is never counted; no profiles, no line). */
+export function digestBlockedReader(config: Pick<IntegrationConfig, 'contentFilter'>, store: Store): (slot: number) => BlockedWeek {
+    const counts = new ContentFilterCountsStore(store), people = Object.keys(config.contentFilter?.profiles ?? {});
+    return slot => householdWeek(counts, people, slot);
 }

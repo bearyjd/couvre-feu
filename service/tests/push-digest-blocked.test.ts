@@ -8,7 +8,7 @@ import { CLASS_CODES } from '../../shared/src/content-filter-classes.ts';
 import { dayRange } from '../src/content-filter-day.ts';
 import { ContentFilterCountsStore } from '../src/content-filter-counts.ts';
 import type { DayCounts } from '../src/content-filter-counts.ts';
-import { householdWeek } from '../src/digest-blocked.ts';
+import { digestBlockedReader, householdWeek } from '../src/digest-blocked.ts';
 import { digestTick } from '../src/digest.ts';
 import { pushText } from '../src/push-sender.ts';
 import { startNotifications, weeklyCounts } from '../src/push-runtime.ts';
@@ -216,4 +216,65 @@ test('the exact payload that leaves the host: fixed headers, one integer line, n
         // not the per-child numbers (4+1)*7=35 and 2*7=14 as separate figures either
         assert.ok(!/\b35\b|\b14\b/.test(seen!.body));
     } finally { ntfy.close(); w.cleanup(); }
+});
+
+test('L1: a throwing counts read logs only the fixed tag, nothing from the error, no names or counts', async () => {
+    const w = world(), logged: string[] = [], ntfy = await fakeNtfy();
+    try {
+        let clock = utc(2026, 11, 8, 22);
+        const n = startNotifications({...w.config, push: {enabled: true}, digest: {enabled: true}, contentFilter: filter(true)}, w.store,
+            {env: ntfy.env, now: () => clock, blocked: () => { throw new Error(`boom ${HOSTILE_A} 12345 SECRET`); }, options: {sleep: async () => undefined, log: line => logged.push(line)}})!;
+        await n.tick(); clock = SLOT; await n.tick(); await n.stop();
+        assert.deepEqual(ntfy.seen.map(s => s.body), [BASE], 'the digest still goes out, without the line');
+        assert.deepEqual(logged, ['digest_blocked_failed\n']);
+    } finally { ntfy.close(); w.cleanup(); }
+});
+
+const reader = (w: ReturnType<typeof world>, profiles?: Record<string, string>) =>
+    digestBlockedReader({contentFilter: {mode: 'owner', counts: {enabled: true}, ...(profiles ? {profiles} : {})}}, w.store);
+
+test('L3a wiring: the children are exactly the profile keys (empty drops the line; a child without a profile is never counted)', () => {
+    const w = world();
+    try {
+        w.fill(WEEK);
+        w.fill(WEEK, day => okDay(day, {adult: 1000}), ['unprofiled-child']);
+        assert.deepEqual(reader(w, {[HOSTILE_A]: 'abcd0001', [HOSTILE_B]: 'abcd0002'})(SLOT), {count: 42, daysCounted: 7});
+        // a child with rows but no profile entry does not add numbers, and is not required for a day to count
+        assert.deepEqual(reader(w, {[HOSTILE_A]: 'abcd0001'})(SLOT), {count: 21, daysCounted: 7});
+    } finally { w.cleanup(); }
+});
+
+test('L3b single configured child: N is that child\'s count', () => {
+    const w = world();
+    try {
+        w.fill(WEEK, okDay, [HOSTILE_A]);
+        assert.deepEqual(reader(w, {[HOSTILE_A]: 'abcd0001'})(SLOT), {count: 21, daysCounted: 7});
+    } finally { w.cleanup(); }
+});
+
+test('L3c a child added mid-week: days before their first row are not counted', () => {
+    const w = world();
+    try {
+        w.fill(WEEK, okDay, [HOSTILE_A]); w.fill(WEEK.slice(4), okDay, [HOSTILE_B]);
+        assert.deepEqual(reader(w, {[HOSTILE_A]: 'abcd0001', [HOSTILE_B]: 'abcd0002'})(SLOT), {count: 3 * 2 * 3, daysCounted: 3});
+    } finally { w.cleanup(); }
+});
+
+test('L3d a child removed from profiles mid-week is left out, their stored rows are ignored', () => {
+    const w = world();
+    try {
+        w.fill(WEEK, okDay, [HOSTILE_A]); w.fill(WEEK.slice(0, 3), okDay, [HOSTILE_B]);
+        assert.deepEqual(reader(w, {[HOSTILE_A]: 'abcd0001'})(SLOT), {count: 21, daysCounted: 7});
+    } finally { w.cleanup(); }
+});
+
+test('L3e counts.enabled without contentFilter.profiles: no children, so no line', () => {
+    const w = world();
+    try {
+        w.fill(WEEK);
+        const week = reader(w)(SLOT);
+        assert.deepEqual(week, {count: 0, daysCounted: 0});
+        assert.equal(text(week).body, BASE);
+        assert.equal(digestBlockedReader({}, w.store)(SLOT).daysCounted, 0);
+    } finally { w.cleanup(); }
 });

@@ -19,18 +19,18 @@ function stateStore(db: Db, key: string): DigestStateStore & {exists(): boolean}
 }
 
 /** Numbers only: requests made, grants approved and pause operations in the window. No ids, names or text are selected. */
-export function weeklyCounts(db: Pick<IntegrationStore, 'get'>, from: number, to: number, blocked?: (slot: number) => BlockedWeek): DigestCounts {
+export function weeklyCounts(db: Pick<IntegrationStore, 'get'>, from: number, to: number, blocked?: (slot: number) => BlockedWeek, log?: (line: string) => unknown): DigestCounts {
     const n = (sql: string) => db.get<{n: number}>(sql, from, to)!.n;
     return {
         requests: n('SELECT count(*) n FROM time_requests WHERE created_at > ? AND created_at <= ?'),
         grants: n("SELECT count(*) n FROM time_requests WHERE state='approved' AND decided_at > ? AND decided_at <= ?"),
         pauses: n("SELECT count(*) n FROM operations WHERE action IN ('pause','pause_all') AND state IN ('pending','confirmed','unknown') AND created_at > ? AND created_at <= ?"),
-        ...blockedPart(blocked, to)};
+        ...blockedPart(blocked, to, log)};
 }
 /** Counts failing or unreadable must never cost the digest: the line is simply left out. */
-function blockedPart(blocked: ((slot: number) => BlockedWeek) | undefined, slot: number): {blocked?: BlockedWeek} {
+function blockedPart(blocked: ((slot: number) => BlockedWeek) | undefined, slot: number, log?: (line: string) => unknown): {blocked?: BlockedWeek} {
     if (!blocked) return {};
-    try { return {blocked: blocked(slot)}; } catch { return {}; }
+    try { return {blocked: blocked(slot)}; } catch { log?.('digest_blocked_failed\n'); return {}; }
 }
 
 export interface Notifications { tick(): Promise<void>; stop(): Promise<void> }
@@ -73,7 +73,7 @@ function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log
     const shutdown = new AbortController();
     const pass = async () => {
         try { await alertPass(); } catch { log('push_alert_pass_failed\n'); }
-        try { if (digest && !shutdown.signal.aborted) await digestTick({now, slot: slotOf, counts: (from, to) => weeklyCounts(store, from, to, blockedOn ? deps.blocked : undefined), send: m => push.send(m, shutdown.signal), state: digest, log, deferralLogged}); } catch { log('digest_pass_failed\n'); }
+        try { if (digest && !shutdown.signal.aborted) await digestTick({now, slot: slotOf, counts: (from, to) => weeklyCounts(store, from, to, blockedOn ? deps.blocked : undefined, log), send: m => push.send(m, shutdown.signal), state: digest, log, deferralLogged}); } catch { log('digest_pass_failed\n'); }
     };
     const tick = (): Promise<void> => {
         if (flight) return flight;
