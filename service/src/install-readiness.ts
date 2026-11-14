@@ -61,6 +61,9 @@ interface SeenRow { mac: string; source: InventorySource; last_seen: number }
  * Off (the manifest default) is a set of routes that does not exist. Approval is a step-up bound to the exact digest; audit rows carry the
  * digest and an action type, never a MAC.
  */
+const PENDING_ENROL_TEXT = 'An enrolment is still pending for a device you marked as an adult; wait for it to finish or remove that device.';
+const STUCK_ENROL_TEXT = 'An enrolment for a device you marked as an adult ended without being settled; remove that device from the child\'s device list, then enrol it again.';
+const OVERLAP_TEXT = 'A device is on both the protect list and the allow list; remove it from one.';
 export class InstallReadiness {
     readonly auth: Auth;
     readonly inventory: InventoryStore;
@@ -107,7 +110,15 @@ export class InstallReadiness {
             .map(d => ({...this.device(d, false, seen, facts, now), source: d.source})).sort(byText(d => d.mac));
         // A device is protected or allowed, never both: refuse a list that would do both.
         const adultMacs = new Set(adults.map(a => a.mac));
-        if (children.some(c => c.devices.some(d => adultMacs.has(d.mac)))) throw new AppError(409, 'install_list_overlap');
+        const overlapping = children.flatMap(c => c.devices).filter(d => adultMacs.has(d.mac)).map(d => d.mac);
+        if (overlapping.length > 0) {
+            // An enrol still on its way to the router (its decision is cleared only on confirmation) resolves itself once it settles. One whose operation already ended without
+            // the device being settled (a conflict with no stored observation) never will, so it is a real overlap, as is any device that is already enrolled.
+            const pending = new Set(store.all<{identifier: string}>("SELECT d.identifier FROM devices d JOIN operations o ON o.id=d.operation_id WHERE d.state='enrolling' AND o.state IN ('pending','unknown')").map(d => d.identifier));
+            if (overlapping.every(mac => pending.has(mac))) throw new AppError(409, 'install_list_pending_enrol', PENDING_ENROL_TEXT);
+            const stuck = new Set(store.all<{identifier: string}>("SELECT identifier FROM devices WHERE state='enrolling'").map(d => d.identifier));
+            throw new AppError(409, 'install_list_overlap', overlapping.some(mac => stuck.has(mac) && !pending.has(mac)) ? STUCK_ENROL_TEXT : OVERLAP_TEXT);
+        }
         const sum = readinessDigest({children, adults});
         const reviewed = store.get<{at: number | null}>("SELECT MAX(timestamp) at FROM audit WHERE action='install_list_reviewed' AND outcome=?", `digest:${sum}`);
         return {children, adults, adultsAvailable: baseline.size > 0, adultsSource: ADULTS_SOURCE, warnings: this.warnings(children.map(c => ({child: c.name, devices: c.devices})), adults, seen, now), digest: sum, reviewedAt: reviewed?.at ?? null};
