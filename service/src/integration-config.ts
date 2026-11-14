@@ -47,6 +47,8 @@ export interface IntegrationManifest {
     contentFilter?: ContentFilterConfig;
     /** Admin inventory UI switches (device decisions, wizard, install readiness); absent is all off. Only `triage` is used so far. */
     inventoryUi?: InventoryUiConfig;
+    /** Install readiness review and export (UI plan I): admin routes that list what the permanent install will protect and allow; absent is off. Never touches the router. */
+    installReadiness?: {enabled: boolean};
     /** The account that decides time requests in 'owner' mode; must be one of `accounts`. */
     ownerAccountId?: string;
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
@@ -115,7 +117,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'rewardTime', 'focus', 'dnsHardening', 'contentFilter', 'inventoryUi', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'rewardTime', 'focus', 'dnsHardening', 'contentFilter', 'inventoryUi', 'installReadiness', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -164,6 +166,12 @@ export function integrationConfig(path: string): IntegrationConfig {
         if (typeof settings.enabled !== 'boolean') bad('invalid_audit_log');
         auditLog = {enabled: settings.enabled as boolean};
     }
+    let installReadiness: IntegrationManifest['installReadiness'];
+    if (m.installReadiness !== undefined) {
+        const settings = object(m.installReadiness, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_install_readiness');
+        installReadiness = {enabled: settings.enabled as boolean};
+    }
     let push: IntegrationManifest['push'];
     if (m.push !== undefined) {
         const settings = object(m.push, ['enabled']);
@@ -201,7 +209,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
     if ((timeRequests?.mode === 'owner' || contentFilter?.mode === 'owner') && ownerAccountId === undefined) bad('owner_account_required');
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(inventoryUi ? {inventoryUi} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(inventoryUi ? {inventoryUi} : {}), ...(installReadiness ? {installReadiness} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));
