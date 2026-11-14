@@ -293,7 +293,7 @@ identical 404s; no NextDNS call is ever made by a request):
   "days": [
     {"day": "2026-11-08", "state": "ok", "total": 4210, "blocked": 63,
      "classes": {"adult": 2, "social": 11, "apps": 9, "bypass": 1, "ads_trackers": 40}},
-    {"day": "2026-11-09", "state": "unavailable"},
+    {"day": "2026-11-09", "state": "gap"},
     {"day": "2026-11-10", "state": "logs_off"},
     {"day": "2026-11-11", "state": "suspect_zero", "total": 0, "blocked": 0}
   ],
@@ -301,6 +301,7 @@ identical 404s; no NextDNS call is ever made by a request):
 }
 ```
 
+- `gap` is the wire word for both a stored `unavailable` day and a day with no row yet.
 - Always the last 7 complete local days (no query parameters in the first version; nothing to validate or abuse).
 - `classes` keys are class codes; values integers; zero classes omitted.
 - `week.filterBlocked` sums only headline classes (§4.1) over `ok` days; `background` sums `ads_trackers`+`security`.
@@ -524,6 +525,7 @@ Stop rule: any sentinel/domain/child name seen in a push, alert or log → flag 
 | O8 | Show total lookups (`total`) in the app | yes / no | **Yes, small print**: makes "0 blocked" meaningful and exposes F7; it is a count, not browsing data |
 | O9 | Digest window | Sun–Sat local days / slot-to-slot via live query | **Sun–Sat days** (survives one-week retention and quiet-hours deferral) |
 | O10 | Tell the children what is counted | yes / no | **Yes** (consistent with D4's "tell the children what is logged") |
+| O11 | Who sees per-child counts when contentFilter.mode is parents? | parents in scope (as built, same gate as the filter card) / admins only (one line: `actor.role==="admin"` at the top of the counts branch in `ContentFilterRoutes.get`) | **As built** (both parents are admins today); revisit if a non-admin parent account is ever added |
 
 ---
 
