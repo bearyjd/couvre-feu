@@ -346,37 +346,40 @@ export function createInventory({ session, gate, offline, time, children, versio
   // Scan age is measured on the SERVER's clock. Unknown (an older service) counts as stalled: never an all-clear on a guess.
   const nowSeconds = () => (serverNow === null ? Number.POSITIVE_INFINITY : serverNow + Math.floor((performance.now() - loadedPerf) / 1000));
   const closed = () => busy || Boolean(gate());
-  const wizard = createWizard({ data: () => data, load: () => load(), now: () => nowSeconds(), call: (path, body) => call(path, body), children }); // hoisted: call and load are declared below
+  const wizard = createWizard({ data: () => data, load: (signal) => load({ signal }), now: () => nowSeconds(), children,
+    refresh: (signal) => call('/admin/inventory/refresh', {}, signal), stable: (id, value) => call(`/admin/inventory/${id}/stable`, { value }) }); // hoisted: call and load are declared below
   const sorted = (list) => [...list].sort((a, b) => b.firstSeen - a.firstSeen || b.lastSeen - a.lastSeen);
   function setNote(text) {
     refreshNote = text; clearTimeout(noteTimer);
     noteTimer = setTimeout(() => { refreshNote = ''; draw(); }, NOTE_SECONDS * 1000);
   }
 
-  async function call(path, body) {
+  async function call(path, body, abort) {
     const response = await fetch(path, {
       method: body === undefined ? 'GET' : 'POST', credentials: 'same-origin', cache: 'no-store',
       headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'X-CSRF-Token': session().csrfToken },
-      body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000),
+      body: body === undefined ? undefined : JSON.stringify(body), signal: abort ? AbortSignal.any([AbortSignal.timeout(20000), abort]) : AbortSignal.timeout(20000),
     });
     const result = await readJson(response);
     if (!response.ok || result === null) { const error = new Error(result?.error?.message ?? 'The request could not be completed.'); error.status = response.status; error.code = result?.error?.code; throw error; }
     return result;
   }
-  async function load() {
-    if (!enabled()) { data = null; swallowed = false; draw(); return; }
-    if (offline()) { swallowed = false; draw(); return; } // keep the saved list; it is labelled as saved
+  /** Resolves true when a fresh list arrived, false when it did not (offline, failed or aborted); `signal` lets the wizard cancel its own reads. */
+  async function load({ signal } = {}) {
+    if (!enabled()) { data = null; swallowed = false; draw(); return false; }
+    if (offline()) { swallowed = false; draw(); return false; } // keep the saved list; it is labelled as saved
     const mine = key;
     fetched = true; inFlight = true;
-    let retry = false;
+    let retry = false, ok = false;
     try {
-      const result = await call('/admin/inventory');
-      if (mine !== key) return;
+      const result = await call('/admin/inventory', undefined, signal);
+      if (mine !== key) return false;
       data = result.inventory; loadFailed = false; swallowed = false;
       serverNow = Number.isFinite(result.now) ? result.now : null; loadedPerf = performance.now(); loadedAt = serverNow ?? Math.floor(Date.now() / 1000);
       refreshNote = ''; clearTimeout(noteTimer); // a request note is stale once a newer list has arrived
+      ok = true;
     } catch (error) {
-      if (mine !== key) return;
+      if (mine !== key || signal?.aborted) return false; // an aborted wizard read is not a failed load
       if (error.status === 401 || error.status === 403) { data = null; swallowed = false; }
       else {
         loadFailed = true;
@@ -385,6 +388,7 @@ export function createInventory({ session, gate, offline, time, children, versio
     } finally { if (mine === key) inFlight = false; }
     draw();
     if (retry) void load();
+    return ok;
   }
   async function acknowledge(device) {
     if (closed()) { draw(); return; }

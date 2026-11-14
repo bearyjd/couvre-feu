@@ -68,15 +68,17 @@ test('flag on: a sticky 44 px button opens the sheet; Esc closes it and focus re
   await expect(opener(page)).toBeFocused();
 });
 
-test('focus stays inside the sheet while Tab and Shift+Tab cycle', async ({ page, integration: f }) => {
+test('focus trap: Tab from the last control wraps to the first, Shift+Tab from the first wraps to the last', async ({ page, integration: f }) => {
   wizardOn(f); seed(f);
   await openSheet(page, f);
+  const last = sheet(page).locator('button').last(), first = sheet(page).getByRole('button', { name: "Close Find a kid's device" });
+  await last.focus();
+  await page.keyboard.press('Tab');
+  await expect(first).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(last).toBeFocused();
   for (let i = 0; i < 12; i++) {
     await page.keyboard.press('Tab');
-    expect(await page.evaluate(() => Boolean(document.activeElement?.closest('[role="dialog"]')))).toBe(true);
-  }
-  for (let i = 0; i < 12; i++) {
-    await page.keyboard.press('Shift+Tab');
     expect(await page.evaluate(() => Boolean(document.activeElement?.closest('[role="dialog"]')))).toBe(true);
   }
 });
@@ -97,8 +99,8 @@ test('toggle test: a device that goes quiet and comes back is highlighted, in th
   wizardOn(f); seed(f);
   await toggleStart(page, f);
   await expect(sheet(page).locator('[data-wizard-device]')).toHaveCount(0);
-  // Wi-Fi off: the Pixel stops being listed for two minutes; the others keep being seen.
-  f.advance(130);
+  // Wi-Fi off: one scan (60 s later) lists the others but not the Pixel. Its age still reads "online"; the unmoved last-seen time says it went quiet.
+  f.advance(60);
   poll(f, [kid, b, a], f.now());
   await page.clock.runFor(15000);
   const row = sheet(page).locator('[data-wizard-device]');
@@ -178,6 +180,7 @@ test('confirm: OS wording, the private warning once, the stable check is recorde
   await expect(sheet(page)).toHaveAttribute('data-step', '4');
   expect(f.store.all('SELECT * FROM inventory_decisions WHERE stable_confirmed=1')).toHaveLength(1);
   await expect(sheet(page).locator('[data-private-warning]')).toHaveCount(0);
+  await expect(sheet(page).locator('[data-wizard-find-again]')).toContainText('may show up again with a new address');
   await expect(sheet(page)).toContainText('Sent to the router, not confirmed yet');
   expect(await sheet(page).innerText()).not.toMatch(MAC_PATTERN);
   // Back to Confirm: the check is already recorded, so the warning is not repeated.
@@ -185,11 +188,13 @@ test('confirm: OS wording, the private warning once, the stable check is recorde
   await expect(sheet(page)).toHaveAttribute('data-step', '3');
   await expect(sheet(page).locator('[data-private-warning]')).toHaveCount(0);
   await sheet(page).getByRole('button', { name: 'Next' }).click();
+  await expect(sheet(page).locator('[data-private-warning]')).toHaveCount(0);
   await sheet(page).getByRole('button', { name: 'Open the add form' }).click();
   await expect(sheet(page)).toHaveCount(0);
   const form = page.locator('#children-panel form[data-add-device]').filter({ hasText: 'Kid kid2' });
   await expect(form.locator('input[name="mac"]')).toHaveValue(P);
-  await expect(form.locator('input[name="label"]')).toHaveValue('Pixel-7-Pro');
+  await expect(form.locator('input[name="label"]')).toHaveValue("Kid kid2's Pixel");
+  await expect(form.locator('input[name="label"]')).toBeFocused(); // the sheet is gone first, so nothing pulls focus back
 });
 
 test('"It has no such setting" on a fixed (not private) address records the check', async ({ page, integration: f }) => {
@@ -215,4 +220,110 @@ test('pick from the list and the Add a child path; 390 px without sideways scrol
   await sheet(page).getByRole('button', { name: 'Add a child' }).click();
   await expect(sheet(page)).toHaveCount(0);
   await expect(page.locator('#new-entry-name')).toBeVisible();
+});
+
+test('private address OFF: Find it again goes back to step 2 and the stale address is not the default', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  await toStep2(page, f);
+  await sheet(page).getByRole('button', { name: 'It just connected' }).click();
+  await sheet(page).locator('[data-wizard-device]').filter({ hasText: 'Pixel-7-Pro' }).getByRole('button').click();
+  await sheet(page).getByRole('button', { name: 'It has no such setting' }).click(); // private + no setting: nothing recorded
+  await expect(sheet(page)).toHaveAttribute('data-step', '4');
+  expect(f.store.all('SELECT * FROM inventory_decisions WHERE stable_confirmed=1')).toHaveLength(0);
+  await sheet(page).getByRole('button', { name: 'Back' }).click();
+  await expect(sheet(page).locator('[data-private-warning]')).toHaveCount(0); // seen once already on this path
+  await sheet(page).getByRole('button', { name: 'I turned it off' }).click();
+  await expect(sheet(page).getByRole('button', { name: 'Find it again' })).toHaveClass(/primary/);
+  await expect(sheet(page).getByRole('button', { name: 'Open the add form' })).not.toHaveClass(/primary/);
+  await sheet(page).getByRole('button', { name: 'Find it again' }).click();
+  await expect(sheet(page)).toHaveAttribute('data-step', '2');
+});
+
+test('Stop ends the wait: no more requests and no time-up message later', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  let gets = 0;
+  await page.route('**/admin/inventory', async (route) => { if (route.request().method() === 'GET') gets += 1; await route.continue(); });
+  await toggleStart(page, f);
+  await sheet(page).getByRole('button', { name: 'Stop' }).click();
+  await expect(sheet(page).locator('[data-wizard-waiting]')).toHaveCount(0);
+  await page.waitForTimeout(300);
+  const stopped = gets;
+  await page.clock.runFor(200000);
+  await page.waitForTimeout(300);
+  expect(gets).toBe(stopped);
+  await expect(sheet(page).locator('[data-wizard-timeup]')).toHaveCount(0);
+});
+
+test('a 502 mid-poll says so, keeps polling, and never blames the phone', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  let fail = false;
+  await page.route('**/admin/inventory', async (route) => {
+    if (route.request().method() === 'GET' && fail) await route.fulfill({ status: 502, contentType: 'text/html', body: '<html>Bad gateway</html>' });
+    else await route.continue();
+  });
+  await toggleStart(page, f);
+  fail = true;
+  await page.clock.runFor(15000);
+  await expect(sheet(page).locator('[data-wizard-poll-error]')).toContainText("Couldn't refresh the list. Check your connection.");
+  fail = false;
+  f.advance(60);
+  poll(f, [kid, b, a], f.now());
+  await page.clock.runFor(15000);
+  await expect(sheet(page).locator('[data-wizard-poll-error]')).toHaveCount(0);
+  await expect(sheet(page).locator('[data-wizard-device]')).toHaveAttribute('data-wiz-state', 'quiet');
+  fail = true; // run out the clock while failing: the time-up words must not blame the phone
+  for (let i = 0; i < 12; i++) { await page.clock.runFor(15000); await page.waitForTimeout(60); }
+  await expect(sheet(page).locator('[data-wizard-timeup]')).not.toContainText('Check the phone');
+});
+
+test('a device that appears mid-run is "New device", not "Came back"', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  await toggleStart(page, f);
+  f.advance(20);
+  poll(f, [kid, p, b, a, dev('00:00:5e:00:02:09', 'late-comer', 40)], f.now());
+  await page.clock.runFor(15000);
+  const row = sheet(page).locator('[data-wizard-device]');
+  await expect(row).toHaveCount(1);
+  await expect(row).toContainText('New device');
+  await expect(row).not.toContainText('Came back');
+});
+
+test('a hostile hostname is inert text', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  const hostile = '<img src=x onerror="window.__pwned=1">';
+  await page.route('**/admin/inventory', async (route) => {
+    if (route.request().method() !== 'GET') { await route.continue(); return; }
+    const response = await route.fetch(), body = await response.json();
+    body.inventory.devices = body.inventory.devices.map((d: { hostname: string | null }) => (d.hostname === 'tablet-b' ? { ...d, hostname: hostile } : d));
+    await route.fulfill({ response, json: body });
+  });
+  await toStep2(page, f);
+  await sheet(page).getByRole('button', { name: 'It just connected' }).click();
+  await expect(sheet(page)).toContainText(hostile);
+  await expect(sheet(page).locator('img')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
+});
+
+test('a TV gets the generic wording, not the phone settings', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  poll(f, [kid, p, b, a, dev('00:00:5e:00:02:0b', 'Living-room-TV', 42)], f.now());
+  await toStep2(page, f);
+  await sheet(page).getByRole('button', { name: 'It just connected' }).click();
+  await sheet(page).locator('[data-wizard-device]').filter({ hasText: 'Living-room-TV' }).getByRole('button').click();
+  await expect(sheet(page)).toContainText('Turn off any private or random address option');
+  await expect(sheet(page)).not.toContainText('Use device MAC');
+});
+
+test('signing out while waiting closes the sheet and stops every request', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  let gets = 0;
+  await page.route('**/admin/inventory', async (route) => { if (route.request().method() === 'GET') gets += 1; await route.continue(); });
+  await toggleStart(page, f);
+  await page.evaluate(() => (document.querySelector('#logout') as HTMLButtonElement).click());
+  await expect(sheet(page)).toHaveCount(0);
+  await page.waitForTimeout(300);
+  const done = gets;
+  await page.clock.runFor(60000);
+  await page.waitForTimeout(300);
+  expect(gets).toBe(done);
 });
