@@ -1016,26 +1016,44 @@ def select_partition(ids, index, count):
     return sorted(ids)[index - 1::count]
 
 
-def main(argv):
-    """Run all tests, or one partition via --partition i/N or CF_TEST_PARTITION=i/N; --list only prints ids."""
+def requested_partition(argv, environ):
+    """Return (argv without --partition, 'i/N' or ''); a missing value or a conflict between flag and env is refused."""
     argv = list(argv)
-    text = os.environ.get('CF_TEST_PARTITION', '')
+    text = environ.get('CF_TEST_PARTITION', '')
     if '--partition' in argv:
         position = argv.index('--partition')
-        text = argv[position + 1] if position + 1 < len(argv) else ''
+        if position + 1 >= len(argv):
+            raise SystemExit('--partition requires a value i/N')
+        flag = argv[position + 1]
         del argv[position:position + 2]
+        if text and text != flag:
+            raise SystemExit(f'--partition {flag} conflicts with CF_TEST_PARTITION={text}')
+        text = flag
+    return argv, text
+
+
+def main(argv):
+    """Run all tests, or one partition via --partition i/N or CF_TEST_PARTITION=i/N; --list only prints ids.
+
+    Positional test names or flags such as -k given on the command line select tests themselves
+    and are never overridden by a partition.
+    """
+    argv, text = requested_partition(argv, os.environ)
     listing = '--list' in argv
     if listing:
         argv.remove('--list')
     names = sorted(flatten_ids(unittest.defaultTestLoader.loadTestsFromModule(sys.modules['__main__'])))
+    total = len(names)
     if text:
         names = select_partition(names, *parse_partition(text))
         if not names:
             raise SystemExit(f'partition {text} selected no tests')
+        print(f'partition {text}: {len(names)} of {total} tests', file=sys.stderr)
     if listing:
         print('\n'.join(names))
         return
-    unittest.main(argv=argv + names, module=None)
+    targeted = any(not arg.startswith('-') for arg in argv[1:])
+    unittest.main(argv=argv if targeted or not text else argv + names, module=None)
 
 
 if __name__ == '__main__':
