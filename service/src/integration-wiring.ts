@@ -12,6 +12,7 @@ import { ParentAlerts } from './parent-alerts.ts';
 import { auditFor } from './parent-audit.ts';
 import { InstallReadiness } from './install-readiness.ts';
 import { wireContentFilter } from './content-filter-wiring.ts';
+import { ContentFilterWatch, startContentFilterWatch } from './content-filter-watch.ts';
 import type { AsyncRouter } from './router-transport.ts';
 
 /**
@@ -35,7 +36,10 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
         const policy = new IntegrationPolicy(store);
         return appServer(auth, policy, serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory, filter?.routes(auth, policy), config.installReadiness?.enabled ? new InstallReadiness(auth, worker.inventory) : undefined);
     };
-    return {worker, activity, prune, app};
+    // Hourly read-only check of each child's NextDNS profile (PRP-006 A5); nothing exists unless content filtering is on.
+    const watch = filter ? new ContentFilterWatch(filter.reconciler, new ParentAlerts(store, null)) : null;
+    const startWatch = (): (() => void) | null => watch ? startContentFilterWatch(watch) : null;
+    return {worker, activity, prune, app, startWatch};
 }
 
 /** Owner mode fails closed when the owner account is missing, inactive or has no active passkey (nobody can decide requests); say so once at startup. Never throws, never logs ids. */
