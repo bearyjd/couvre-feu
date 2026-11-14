@@ -113,15 +113,20 @@ test('offline shell is timestamped read-only, has no auth cache and reconnect re
   expect(cachedURLs).toContain('/');
   expect(cachedURLs.some((path) => /^\/(auth|people|operations)(\/|$)/.test(path))).toBe(false);
   let writes = 0; page.on('request', (request) => { if (request.method() === 'POST' && /\/people\//.test(request.url())) writes++; });
-  await context.setOffline(true);
+  // Chromium 159 (Playwright 1.65) keeps navigator.onLine true in a document loaded after context.setOffline(true);
+  // CDP emulation reports a truly offline browser to the reloaded page, as a real phone would.
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Network.enable');
+  await cdp.send('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
   await page.reload();
+  await page.waitForFunction(() => navigator.onLine === false);
   await expect(page.locator('#connection')).toContainText('Offline · read-only snapshot');
   await expect(page.locator('#connection')).toContainText('cached');
   await expect(page.getByRole('button', { name: 'Pause Alex (fictional)', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Pause Alex (fictional)', exact: true }).click({ force: true });
   expect(writes).toBe(0);
   demo.router.localAdvance();
-  await context.setOffline(false);
+  await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
   await expect(page.locator('#connection')).toContainText('Connected');
   await expect(page.getByRole('button', { name: 'Pause Alex (fictional)', exact: true })).toBeEnabled();
   expect(writes).toBe(0);
