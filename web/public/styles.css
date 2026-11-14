@@ -996,6 +996,19 @@ footer {
 .inventory-flag.flag-new { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
 .inventory-flag.flag-private { border-style: dashed; }
 
+/* Devices triage list (UI plan F): compact rows, chips as 44 px tap targets, wrapping instead of sideways scroll. */
+.triage-head-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; justify-content: space-between; min-width: 0; }
+.triage-head-row .notice { flex: 1 1 12rem; margin: 0; }
+.triage-filters { margin: .5rem 0; }
+#inventory-panel .chip { min-width: 44px; border-radius: 99px; padding-inline: .9rem; }
+#inventory-panel .chip[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: transparent; }
+.triage-row { gap: .25rem; }
+.triage-line { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; min-width: 0; overflow-wrap: anywhere; }
+.triage-head .inventory-name { flex: 1 1 8rem; }
+.presence-dot { color: var(--green); }
+.presence-dot[data-presence="quiet"] { color: var(--muted); }
+.triage-suggestion { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; padding: .4rem .6rem; border: 1px dashed var(--line); border-radius: var(--radius); min-width: 0; }
+
 /* Activity log: rows reuse the stacked-card language; names are untrusted text and must wrap, never widen the page. */
 #audit-panel .button { min-height: 44px; }
 .audit-list { list-style: none; padding: 0; margin: 12px 0; }
