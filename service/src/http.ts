@@ -27,6 +27,8 @@ import type { InventoryStore } from './inventory-store.ts';
 import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
+import { Health } from './health.ts';
+import type { SessionDTO, SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -36,7 +38,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
 };
@@ -87,6 +89,10 @@ function send(response: ServerResponse, status: number, value: unknown) {
     });
     response.end(JSON.stringify(value));
 }
+function healthSend(response: ServerResponse, request: IncomingMessage, status: number, value: object) {
+    response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8'});
+    response.end(request.method === 'HEAD' ? undefined : JSON.stringify(value));
+}
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
 type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'> & Partial<Pick<ParentAlerts, 'reconcile'>>;
 /** Node reports IPv4 peers on dual-stack sockets as ::ffff:a.b.c.d; compare the plain IPv4 literal. */
@@ -103,7 +109,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const timeRequestsEnabled = !gated || mode !== 'off';
     // Who may see and decide requests (parent routes) and read their alert: everyone unless the manifest narrows it to the owner account.
     const mayDecide = (actor: Actor) => !gated || mode === 'parents' || (mode === 'owner' && actor.id === ownerAccountId);
-    const hiddenAlerts = (actor: Actor): readonly string[] => mayDecide(actor) ? [] : ['time_request_pending'];
+    const hiddenAlerts = (actor: Actor): readonly string[] => [...(mayDecide(actor) ? [] : ['time_request_pending']), ...(contentFilter?.visibleTo(actor) === true ? [] : ['filter_drift'])];
     const clock = (policy as {now?: () => number}).now ?? auth.now;
     // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
     const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
@@ -129,6 +135,10 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
     const trusted = config.trustedProxies;
     const untrusted = (address: string | undefined) => trusted !== undefined && !trusted.includes(remoteIPv4(address) ?? '');
+    // Unauthenticated and content-free by design; see service/src/health.ts for the only fields it may carry.
+    const health = new Health(auth.store, () => inventory?.lastOkAt() ?? null, clock);
+    // Build identity for every signed-in caller; the exact inventory age only for admins.
+    const sessionInfo = (dto: SessionDTO): SessionInfoDTO => ({...dto, version: health.version, schemaVersion: health.schemaVersion(), ...(dto.actor.role === 'admin' ? {lastInventoryOkAgeSeconds: health.inventoryAge()} : {})});
     const handler = async (request: IncomingMessage, response: ServerResponse) => {
         if (untrusted(request.socket.remoteAddress)) {
             request.socket.destroy();
@@ -157,6 +167,17 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             if (path.includes('?') || path.includes('%') || path.includes('#')) {
                 throw new AppError(400, 'invalid_path');
             }
+            if (path === '/health') {
+                if (request.method !== 'GET' && request.method !== 'HEAD') {
+                    response.setHeader('Allow', 'GET, HEAD');
+                    healthSend(response, request, 405, {ok: false});
+                    return;
+                }
+                if (health.limited()) { healthSend(response, request, 429, {ok: false}); return; }
+                const answer = health.answer();
+                healthSend(response, request, answer ? 200 : 503, answer ?? {ok: false});
+                return;
+            }
             if (!requests && ['/request.html', '/request.js'].includes(path)) {
                 throw new AppError(404, 'route_not_found');
             }
@@ -166,7 +187,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v6'", `'cf-shell-integration-${provenance.integrationScope}-v5'`));
+                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v8'", `'cf-shell-integration-${provenance.integrationScope}-v7'`));
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);
@@ -206,7 +227,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                             return;
                         }
                         response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`]);
-                        send(response, 200, result.dto);
+                        send(response, 200, sessionInfo(result.dto));
                         return;
                     }
                 }
@@ -320,7 +341,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             const session = auth.session(sessionToken, jar.cf_browser);
             if (path === '/auth/session') {
-                send(response, 200, session.dto);
+                send(response, 200, sessionInfo(session.dto));
                 return;
             }
             if (path === '/people') {

@@ -30,7 +30,7 @@ test('local alert feed survives reload, witnesses one recovery and keeps recurre
     const fixture = await alertFixture(page.context(), demo.origin);
     const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
     await page.clock.install({time: new Date((fixture.at - 1) * 1000)}); await page.clock.pauseAt(new Date(fixture.at * 1000));
-    await page.goto(demo.origin);
+    await page.goto(`${demo.origin}/#alerts`);
     await expect(page.getByRole('heading', {name: 'Recent alerts in this browser'})).toBeVisible();
     await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
     await expect(page.locator('#alert-feed')).toContainText('Current verification warning');
@@ -68,8 +68,8 @@ test('local alert feed survives reload, witnesses one recovery and keeps recurre
 
 test('tabs share scoped episodes and preference; revocation clears alert DOM, memory and storage', async ({page, demo}) => {
     const fixture = await alertFixture(page.context(), demo.origin);
-    await page.goto(demo.origin); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
-    const other = await page.context().newPage(); await other.goto(demo.origin); await expect(other.locator('#alert-feed .alert-row')).toHaveCount(1);
+    await page.goto(`${demo.origin}/#alerts`); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
+    const other = await page.context().newPage(); await other.goto(`${demo.origin}/#alerts`); await expect(other.locator('#alert-feed .alert-row')).toHaveCount(1);
     await page.getByLabel('Hide recovery history').check(); await expect(other.getByLabel('Hide recovery history')).toBeChecked();
     fixture.actor.permissionVersion = '2'; fixture.actor.personIds = [];
     await page.getByRole('button', {name: 'Refresh status'}).click();
@@ -89,9 +89,9 @@ test('tabs share scoped episodes and preference; revocation clears alert DOM, me
 test('an offline stale tab cannot reopen recovery; a later evaluated read error can recur without a newer source timestamp', async ({page, demo}) => {
     const fixture = await alertFixture(page.context(), demo.origin);
     await page.clock.install({time: new Date((fixture.at - 1) * 1000)}); await page.clock.pauseAt(new Date(fixture.at * 1000));
-    await page.goto(demo.origin); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
+    await page.goto(`${demo.origin}/#alerts`); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(1);
     const staleTab = await page.context().newPage();
-    await staleTab.goto(demo.origin); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
+    await staleTab.goto(`${demo.origin}/#alerts`); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(1);
     await staleTab.evaluate(() => window.dispatchEvent(new Event('offline')));
     await page.clock.fastForward(2000);
     fixture.healthy(fixture.at + 2); await page.getByRole('button', {name: 'Refresh status'}).click();
@@ -113,9 +113,9 @@ test('an offline stale tab cannot reopen recovery; a later evaluated read error 
 test('healthy observations with no prior incident keep old offline snapshots from fabricating stale alerts', async ({page, demo}) => {
     const fixture = await alertFixture(page.context(), demo.origin); fixture.healthy(fixture.at + 2);
     await page.clock.install({time: new Date((fixture.at + 1) * 1000)}); await page.clock.pauseAt(new Date((fixture.at + 2) * 1000));
-    await page.goto(demo.origin); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(0);
+    await page.goto(`${demo.origin}/#alerts`); await expect(page.locator('#alert-feed .alert-row')).toHaveCount(0);
     const staleTab = await page.context().newPage();
-    await staleTab.goto(demo.origin); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(0);
+    await staleTab.goto(`${demo.origin}/#alerts`); await expect(staleTab.locator('#alert-feed .alert-row')).toHaveCount(0);
     await staleTab.evaluate(() => window.dispatchEvent(new Event('offline')));
     fixture.healthy(fixture.at + 20); await page.clock.fastForward(18000);
     await page.getByRole('button', {name: 'Refresh status'}).click();

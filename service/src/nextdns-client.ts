@@ -82,8 +82,8 @@ export interface NextDnsClientOptions {
     /** Overall per-call deadline covering retries and pagination (default 60 s). Expiry is `timeout`. */
     readonly deadlineMs?: number;
     /**
-     * PRP-006 sections 2 and 4.1: Couvre-feu does not manage parent-entered domains in Phase A. denylist/allowlist calls are refused
-     * (`invalid_request`) unless this is true, so the privacy rule does not rest on caller discipline alone. Tests only for now.
+     * PRP-006 decision D8: parent-entered deny/allow domains are the one owner-approved domain data in Couvre-feu. denylist/allowlist calls are
+     * refused (`invalid_request`) unless this is true, so the exception is explicit: only the content-filter wiring sets it.
      */
     readonly allowDomainLists?: boolean;
     /** Aborts every call of this client. Caller aborts surface as `transport`, deadline expiry as `timeout`. */

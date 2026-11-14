@@ -6,7 +6,9 @@ import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
 import { createRewardTime } from './reward-time.js';
 import { createAuditLog } from './audit.js';
+import { createContentFilter } from './content-filter.js';
 import { createAccounts } from './accounts.js';
+import { createTabs } from './tabs.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
@@ -16,6 +18,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
 const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 const FRESH_SECONDS = 30;
+const WELCOME_SECONDS = 6;
 let alertStorage;
 try { alertStorage = localStorage; } catch { alertStorage = null; }
 const alertJournal = createAlertJournal(alertStorage);
@@ -23,11 +26,15 @@ const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.s
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
 const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
+const contentFilter = createContentFilter({ session: () => state.session, people: () => state.people?.people ?? [] });
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
+const tabs = createTabs();
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
-const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children,
+// The add form lives on the Kids tab: opening it from a Devices row must show that tab first, or the form could not take focus.
+const childrenFromDevices = { ...children, startAdd: (id, values) => { tabs.show('kids'); return children.startAdd(id, values); } };
+const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children: childrenFromDevices,
   version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
@@ -235,7 +242,12 @@ async function authenticate(kind, token) {
     acceptSession(session);
     state.busy = false;
     await refresh({ quiet: true });
-    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
+    if (state.people) {
+      const welcome = `Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`;
+      announce(welcome);
+      // Said once, then out of the way: it would otherwise sit above every tab for the whole session.
+      setTimeout(() => { if ($('#notice').textContent === welcome) announce(''); }, WELCOME_SECONDS * 1000);
+    }
   } catch (error) {
     if (generation !== state.generation) return;
     const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.'
@@ -404,7 +416,7 @@ function renderControlState() {
   for (const button of document.querySelectorAll('[data-control], [data-quick-pause], [data-reward-minutes]:not([data-reward-busy])')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   bulk.update();
-  $('#refresh').disabled = state.busy || state.refreshing || state.offline;
+  for (const button of document.querySelectorAll('[data-refresh]')) button.disabled = state.busy || state.refreshing || state.offline;
   scheduleEditor.render();
 }
 
@@ -507,6 +519,8 @@ function render() {
     $('#account-actions').innerHTML = account ? `<div class="account-actions"><span class="account-name">${escape(account.displayName)} · ${escape(account.role)}</span><button id="logout" class="button secondary" type="button">Sign out</button></div>` : '';
     $('#logout')?.addEventListener('click', () => void logout());
   }
+  const build = hasStatus && state.session?.version ? `${String(state.session.version).slice(0, 64)} · schema ${Number(state.session.schemaVersion)}` : '';
+  $('#build-info').textContent = build;
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
     renderConnection(); renderPeople(); renderControlState(); rewardTime.afterRender();
@@ -519,6 +533,7 @@ function render() {
     state.renderKey = '';
     scheduleEditor.render();
   }
+  tabs.update({ signedIn: hasStatus, infrastructure: hasStatus && isReal() && account.role === 'admin' });
   renderAuthControls();
   renderAlerts();
   parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
@@ -527,6 +542,7 @@ function render() {
   bulk.update();
   children.update();
   inventory.update();
+  contentFilter.update();
   auditLog.update();
 }
 
@@ -570,7 +586,8 @@ $('#enroll-form').addEventListener('submit', (event) => {
   $('#enrollment-token').value = '';
   if (token) void authenticate('register', token);
 });
-$('#refresh').addEventListener('click', () => void refresh());
+// One Refresh status button per tab heading (Home keeps #refresh), so the "refresh" advice on any tab has a button to act on.
+document.addEventListener('click', (event) => { if (event.target.closest('[data-refresh]')) void refresh(); });
 $('#hide-recovery').addEventListener('change', event => { alertJournal.setHideRecovery(event.target.checked, now()); renderAlerts(); });
 $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);

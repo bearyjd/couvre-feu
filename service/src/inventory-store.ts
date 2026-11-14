@@ -276,6 +276,11 @@ export class InventoryStore {
         } catch { /* devices alone decide */ }
         return owners;
     }
+    /** Time of the last successful poll in the current generation, or null. Read-only, for the content-free /health. */
+    lastOkAt(): number | null {
+        const s = this.store.get<StateRow>('SELECT * FROM inventory_state WHERE singleton=1');
+        return s?.generation === this.generation ? s.last_ok_at : null;
+    }
     /** `includeHidden` is the "show hidden" filter: it keeps guests that went quiet for GUEST_HIDE_SECONDS in the list. */
     list(actor: Actor, opts: {includeHidden?: boolean} = {}): InventoryDTO {
         this.requireAdmin(actor);
