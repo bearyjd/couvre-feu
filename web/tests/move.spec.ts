@@ -141,3 +141,16 @@ test('touch targets: the menu button, its items and the move sentence controls a
     await expect.poll(() => control.evaluate((el: HTMLElement) => el.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
   }
 });
+
+test('a quiet device whose name just appeared on a new private address is marked "Replaced?" next to its status, and nothing is offered to do', async ({ page, integration: f }) => {
+  const poll = (devices: { mac: string; ipv4: string[]; hostname: string; source: 'both' }[], at: number) => f.worker.inventory.ingest({ inventory_version: 1, generation: f.config.router.generation, routerTime: at, devices, truncated: false, errors: [] }, at);
+  const t = f.now();
+  poll([{ mac: K2, ipv4: ['192.0.2.20'], hostname: 'jack-pixel', source: 'both' }], t - 3000);
+  poll([{ mac: '02:aa:bb:cc:dd:10', ipv4: ['192.0.2.33'], hostname: 'jack-pixel', source: 'both' }], t);
+  await signIn(page, f, 'operator');
+  await openTab(page, 'kids');
+  const row = page.locator('#children-panel [data-entry="kid2"] [data-device="d_kid2"]');
+  await expect(row.locator('[data-status="on_router"]')).toHaveText('On the router');
+  await expect(row.locator('[data-status="replaced"]')).toHaveText('Replaced?');
+  await expect(page.locator('#children-panel [data-entry="kid3"] [data-status="replaced"]')).toHaveCount(0);
+});

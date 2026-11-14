@@ -249,12 +249,13 @@ test('Add to a child opens the existing add form prefilled; the waiting notice n
   await expect(form.getByLabel('New device name for Explicit test person')).toHaveValue('outside-box');
   await expect(form.getByLabel('Wi-Fi address (MAC) for Explicit test person')).toHaveValue(OUTSIDE);
   await expect(form).toContainText("Confirm the address in the device's own Wi-Fi settings before approving");
-  expect(await children.locator('[data-add-device="kid2"]').getByLabel(/Wi-Fi address/).inputValue()).toBe('');
+  await expect(children.locator('[data-add-device="kid2"]')).toHaveCount(0); // only the chosen child's form is open
   await form.getByRole('button', { name: 'Add device' }).click();
-  const waiting = children.locator('[data-pending-approval]');
+  const waiting = children.locator('[data-pending-approval]'), waitingRow = children.locator('[data-pending-scope]');
   await expect(waiting).toContainText('Waiting for router approval');
-  await expect(waiting).toContainText('outside-box');
+  await expect(waitingRow).toContainText('outside-box');
   expect(await waiting.innerText()).not.toMatch(MAC_PATTERN);
+  expect(await waitingRow.innerText()).not.toMatch(MAC_PATTERN);
   expect((await page.locator('body').innerText()).toLowerCase()).not.toContain(OUTSIDE); // only the form field holds it
 
   // In-scope address: the same flow queues the change like a typed-in device.
@@ -267,7 +268,8 @@ test('Add to a child opens the existing add form prefilled; the waiting notice n
   await expect(children.locator('.notice[role="status"]').first()).toContainText('Sent to the router');
   await dispatchPending(f);
   await page.getByRole('button', { name: 'Refresh status' }).click();
-  await expect(children.locator('[data-entry="pilot"]')).toContainText(`${NEW_PHONE} · on the router`);
+  await expect(children.locator('[data-entry="pilot"] [data-device] [data-status="on_router"]')).toHaveCount(2); // the new device is on the router; the address is only ever in the form
+  expect(await children.locator('[data-entry="pilot"]').innerText()).not.toMatch(MAC_PATTERN);
 });
 
 test('offline or stale: the last list stays readable with its time, and every button is disabled with the reason', async ({ page, integration: f }) => {
@@ -445,20 +447,17 @@ test('L1: a label edited after the prefill survives a redraw, and Cancel drops a
   await expect(label).toHaveValue('outside-box');
   await label.fill('edited label');
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); // focus leaves the form, so a redraw is allowed
-  await form.evaluate((n) => { (window as unknown as { __form: Element }).__form = n; });
   await page.route('**/people', async (route) => { // a new snapshot version makes the children panel reload and redraw
     const response = await route.fetch(); const body = await response.json(); body.observedAt -= 1;
     await route.fulfill({ response, json: body });
   });
+  const reloaded = page.waitForResponse((r) => new URL(r.url()).pathname === '/admin/children');
   await page.getByRole('button', { name: 'Refresh status' }).click();
-  // wait until the children panel has really been rebuilt (a new form node), then the typed text must still be there
-  await expect.poll(() => page.evaluate(() => {
-    const n = document.querySelector<HTMLFormElement>('#children-panel [data-add-device="pilot"]');
-    return n && n !== (window as unknown as { __form: Element }).__form ? n.elements.namedItem('label') && (n.elements.namedItem('label') as HTMLInputElement).value : 'NOT-REDRAWN';
-  })).toBe('edited label');
+  await reloaded; // the children list was read again; whether or not the panel was rebuilt, the typed text must still be there
+  await expect(label).toHaveValue('edited label');
 
   await openTab(page, 'devices'); // the prefill moved the page to the Kids tab
   await row(page, 'new-tv').getByRole('button', { name: /^Add to a child/ }).click();
   await row(page, 'new-tv').getByRole('button', { name: 'Cancel' }).click();
-  await expect(label).toHaveValue('');
+  await expect(form).toHaveCount(0); // Cancel on the picker closes the stale prefill
 });
