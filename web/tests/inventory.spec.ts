@@ -1,5 +1,6 @@
 import { test, expect, signIn, noHorizontalScroll, dispatchPending, K2, OUTSIDE } from './bulk-fixture.ts';
 import type { World } from './bulk-fixture.ts';
+import { openTab } from './browser-fixture.ts';
 import type { Page } from '@playwright/test';
 import { actor } from '../../service/tests/fixtures/integration.ts';
 
@@ -30,6 +31,7 @@ const markAllAcknowledged = (f: World) => f.store.run("UPDATE inventory_devices 
 test('admin sees the devices newest first with the right flags, names labelled as device-reported, at phone width', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).getByRole('heading', { name: 'Devices on the network' })).toBeVisible();
   const names = await panel(page).locator('li.inventory-row [data-name]').allTextContents();
   expect(names.slice(0, 3)).toEqual(['new-phone', 'outside-box', 'new-tv']);
@@ -69,6 +71,7 @@ test('hostile device names (markup, scripts, very long, right-to-left) render as
   });
   const errors: string[] = []; page.on('pageerror', (e) => errors.push(e.message));
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
   const text = await panel(page).innerText();
   expect(text).toContain(HOSTILE);
@@ -89,6 +92,7 @@ test('sign-in loads the inventory list exactly once', async ({ page, integration
   seed(f);
   const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
   await page.waitForTimeout(500); // a duplicate load followed ~25 ms after the first
   expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(1);
@@ -103,6 +107,7 @@ test('a failed first inventory load is retried by the next version bump', async 
     await route.continue();
   });
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
   expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
 });
@@ -121,6 +126,7 @@ test('a first inventory load that fails after the version bump landed mid-flight
     await route.continue();
   });
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
   await page.waitForTimeout(500);
   expect(requests.filter((p) => p === '/admin/inventory')).toHaveLength(2);
@@ -137,6 +143,7 @@ test('a later load that fails after a successful first load is not retried immed
   });
   await page.route('**/people', async (route) => { await firstLoaded; await new Promise((resolve) => setTimeout(resolve, 100)); await route.continue(); }); // the bump lands after the first load settled
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
   await row(page, 'new-tv').getByRole('button', { name: /^Acknowledge/ }).click(); // the reload after the acknowledge is the failing second load
   await expect.poll(() => requests.filter((p) => p === '/admin/inventory').length).toBe(2);
@@ -148,6 +155,8 @@ test('a parent sees no inventory panel and the endpoint answers 403', async ({ p
   seed(f);
   const requests: string[] = []; page.on('request', (r) => requests.push(new URL(r.url()).pathname));
   await signIn(page, f, 'parent');
+  await expect(page.locator('#tab-devices')).toBeHidden(); // no tab for a parent, and the panel itself is off, not just out of view
+  await expect(panel(page)).toHaveJSProperty('hidden', true);
   await expect(panel(page)).toBeHidden();
   await expect(panel(page)).toBeEmpty();
   expect(requests).not.toContain('/admin/inventory');
@@ -161,6 +170,7 @@ test('acknowledge removes the New badge once, and the server accepts it again', 
   seed(f);
   const posts: string[] = []; page.on('request', (r) => { if (r.method() === 'POST') posts.push(new URL(r.url()).pathname); });
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(flags(page, 'new-tv').first()).toHaveText('New');
   await row(page, 'new-tv').getByRole('button', { name: /^Acknowledge/ }).click();
   await expect(flags(page, 'new-tv')).toHaveText(['Unassigned']);
@@ -174,6 +184,7 @@ test('acknowledge removes the New badge once, and the server accepts it again', 
 test('refresh: 409 while dispatch is off, 202 when accepted, 429 when repeated at once', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   const message = panel(page).locator('[data-refresh-status]');
   await panel(page).getByRole('button', { name: 'Refresh now' }).click();
   await expect(message).toHaveText('Inventory polling is off until router dispatch is enabled');
@@ -197,6 +208,7 @@ for (const [name, lastError, age, wording] of BAD) {
     seed(f); markAllAcknowledged(f); // nothing is New, so only the status can say anything about the future
     f.store.run('UPDATE inventory_state SET last_error=?, last_ok_at=?', lastError, age === null ? null : age === 0 ? f.now() : f.now() + age);
     await signIn(page, f, 'operator');
+    await openTab(page, 'devices');
     await expect(status(page)).toContainText(wording);
     if (age !== null) await expect(status(page)).toContainText('Showing the last complete scan from');
     await expect(panel(page)).not.toContainText(/no new devices/i);
@@ -207,6 +219,7 @@ for (const [name, lastError, age, wording] of BAD) {
 test('a healthy complete scan with nothing New says so, with the scan time', async ({ page, integration: f }) => {
   seed(f); markAllAcknowledged(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(status(page)).toContainText('No new devices');
   await expect(status(page)).toContainText('Last complete scan');
   await expect(panel(page).locator('[data-all-clear]')).toHaveCount(1);
@@ -214,6 +227,7 @@ test('a healthy complete scan with nothing New says so, with the scan time', asy
 
 test('before the first complete scan nothing is claimed either', async ({ page, integration: f }) => {
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(status(page)).toContainText('No complete scan yet');
   await expect(panel(page)).not.toContainText(/no new devices/i);
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(0);
@@ -222,6 +236,7 @@ test('before the first complete scan nothing is claimed either', async ({ page, 
 test('Add to a child opens the existing add form prefilled; the waiting notice never shows the address', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(row(page, 'old-laptop').getByRole('button', { name: /^Add to a child/ })).toBeVisible();
   await expect(row(page, 'kid2-phone').getByRole('button', { name: /^Add to a child/ })).toHaveCount(0); // already assigned
 
@@ -243,6 +258,7 @@ test('Add to a child opens the existing add form prefilled; the waiting notice n
   expect((await page.locator('body').innerText()).toLowerCase()).not.toContain(OUTSIDE); // only the form field holds it
 
   // In-scope address: the same flow queues the change like a typed-in device.
+  await openTab(page, 'devices'); // the first prefill moved the page to the Kids tab
   await row(page, 'new-phone').getByRole('button', { name: /^Add to a child/ }).click();
   await row(page, 'new-phone').getByLabel(/^Child for/).selectOption({ label: 'Explicit test person' });
   await row(page, 'new-phone').getByRole('button', { name: 'Continue' }).click();
@@ -257,6 +273,7 @@ test('Add to a child opens the existing add form prefilled; the waiting notice n
 test('offline or stale: the last list stays readable with its time, and every button is disabled with the reason', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(row(page, 'new-tv')).toBeVisible();
   await page.context().setOffline(true);
   await page.evaluate(() => window.dispatchEvent(new Event('offline')));
@@ -273,6 +290,7 @@ test('a stale status snapshot disables the buttons with a refresh hint', async (
     await route.fulfill({ response, json: body });
   });
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('[data-inventory-reason]')).toHaveText('Status is out of date — refresh');
   for (const button of await panel(page).getByRole('button').all()) await expect(button).toBeDisabled();
   await expect(row(page, 'new-tv')).toBeVisible();
@@ -281,6 +299,7 @@ test('a stale status snapshot disables the buttons with a refresh hint', async (
 test('touch targets are at least 44px and nothing scrolls sideways at 390px', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await row(page, 'new-tv').getByRole('button', { name: /^Add to a child/ }).click();
   const buttons = await panel(page).getByRole('button').all();
   expect(buttons.length).toBeGreaterThan(4);
@@ -299,6 +318,7 @@ const enableDispatch = (f: World) => {
 test('M1: no Wi-Fi address in markup, aria/title/data attributes, storage or caches (picker open)', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await row(page, 'new-tv').getByRole('button', { name: /^Add to a child/ }).click();
   await expect(row(page, 'new-tv').getByLabel(/^Child for/)).toBeVisible();
   await expect(panel(page).locator('li.inventory-row')).toHaveCount(5);
@@ -336,6 +356,7 @@ test('M2: stall detection follows the server clock, not a phone clock that is ho
   f.store.run('UPDATE inventory_state SET last_error=NULL, last_ok_at=?', f.now() - 7200); // stale by the SERVER clock
   await page.addInitScript(() => { const real = Date.now.bind(Date); Date.now = () => real() - 3 * 3600 * 1000; }); // phone is 3 hours slow
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(status(page)).toContainText('Inventory is stalled — check the router');
   await expect(panel(page)).not.toContainText(/no new devices/i);
 });
@@ -344,6 +365,7 @@ test('M3: a router-clock warning never comes with an all-clear sentence', async 
   seed(f); markAllAcknowledged(f);
   f.store.run("UPDATE inventory_state SET last_error='inventory_warning:invalid_clock', last_ok_at=?", f.now());
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(status(page)).toContainText('router clock looks wrong');
   await expect(panel(page)).not.toContainText(/no new devices/i);
   await expect(panel(page).locator('[data-all-clear]')).toHaveCount(0);
@@ -352,6 +374,7 @@ test('M3: a router-clock warning never comes with an all-clear sentence', async 
 test('M4: results go to one persistent polite live region and focus stays inside the panel after Acknowledge', async ({ page, integration: f }) => {
   seed(f); enableDispatch(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(row(page, 'new-tv')).toBeVisible();
   await expect(panel(page).locator('[role="status"]')).toHaveCount(1);
   const live = panel(page).locator('[data-live]');
@@ -376,6 +399,7 @@ for (const code of ['constructor', '__proto__', 'toString']) {
     seed(f);
     await page.route('**/admin/inventory/refresh', (route) => route.fulfill({ status: 400, json: { error: { code, message: 'Refused for test' } } }));
     await signIn(page, f, 'operator');
+    await openTab(page, 'devices');
     await panel(page).getByRole('button', { name: 'Refresh now' }).click();
     await expect(panel(page).locator('[data-refresh-status]')).toHaveText('Refused for test');
   });
@@ -384,6 +408,7 @@ for (const code of ['constructor', '__proto__', 'toString']) {
 test('L3: the "Refresh requested" note goes away after the next successful load', async ({ page, integration: f }) => {
   seed(f); enableDispatch(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   const message = panel(page).locator('[data-refresh-status]');
   await panel(page).getByRole('button', { name: 'Refresh now' }).click();
   await expect(message).toContainText('Refresh requested');
@@ -398,6 +423,7 @@ test('L6: a button forced enabled still refuses to act while the gate is closed'
   });
   const posts: string[] = []; page.on('request', (r) => { if (r.method() === 'POST') posts.push(new URL(r.url()).pathname); });
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   await expect(panel(page).locator('[data-inventory-reason]')).toHaveText('Status is out of date — refresh');
   await page.evaluate(() => {
     for (const b of Array.from(document.querySelectorAll<HTMLButtonElement>('#inventory-panel button'))) { b.disabled = false; b.click(); }
@@ -409,6 +435,7 @@ test('L6: a button forced enabled still refuses to act while the gate is closed'
 test('L1: a label edited after the prefill survives a redraw, and Cancel drops a stale prefill', async ({ page, integration: f }) => {
   seed(f);
   await signIn(page, f, 'operator');
+  await openTab(page, 'devices');
   const children = page.locator('#children-panel');
   const form = children.locator('[data-add-device="pilot"]');
   await row(page, 'outside-box').getByRole('button', { name: /^Add to a child/ }).click();
@@ -430,6 +457,7 @@ test('L1: a label edited after the prefill survives a redraw, and Cancel drops a
     return n && n !== (window as unknown as { __form: Element }).__form ? n.elements.namedItem('label') && (n.elements.namedItem('label') as HTMLInputElement).value : 'NOT-REDRAWN';
   })).toBe('edited label');
 
+  await openTab(page, 'devices'); // the prefill moved the page to the Kids tab
   await row(page, 'new-tv').getByRole('button', { name: /^Add to a child/ }).click();
   await row(page, 'new-tv').getByRole('button', { name: 'Cancel' }).click();
   await expect(label).toHaveValue('');

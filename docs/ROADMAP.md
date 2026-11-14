@@ -108,7 +108,7 @@ Also avoid OpenAppFilter code (GPL-2.0, not combinable with this AGPL-3.0 projec
 
 Every PR in Phases 1-5 and PRP-006 phases A-C states in its description how it meets these; reviewers block on a miss.
 
-- No domains, URLs, page titles, search terms or content anywhere: database, logs, alerts, pushes, digests.
+- No domains, URLs, page titles, search terms or content anywhere: database, logs, alerts, pushes, digests. One owner-approved exception (PRP-006 D8, 2026-11-09): parent-entered content-filter deny/allow domains live in the `content_filter_desired` table only, never in audit, logs, alerts, pushes, digests or errors. Browsing data of any kind is still never stored.
 - Counts and action types only. Alert `details` keep the existing rule: at most 1024 bytes; counts, windows, operation ids; never MACs, addresses, domains or router diagnostics.
 - Push payload: content-free (for example "Couvre-feu: new alert"). The app fetches the details over the signed-in session when tapped. No child names, no reason text, no device names in the payload.
 - Digest: per child, counts for the week (pauses, grants and minutes granted, schedule nights enforced, requests, new devices, alerts by kind). No timelines, no per-device detail, no domains. Sent only to the recipients the owner picks.

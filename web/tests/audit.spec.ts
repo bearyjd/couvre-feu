@@ -1,4 +1,4 @@
-import { test, expect, enroll } from './browser-fixture.ts';
+import { test, expect, enroll, openTab } from './browser-fixture.ts';
 import type { Page, Route } from '@playwright/test';
 
 // The parent Activity log (item 6, web). The demo has no audit log (it is real-router-integration only), so every state is driven by
@@ -49,6 +49,7 @@ test('MOCK: rows are newest first with friendly verbs, a child name, local date 
   ];
   await mockAudit(page, { answer: page1(rows) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(panel(page).getByRole('heading', { name: 'Activity log' })).toBeVisible();
   await expect(items(page)).toHaveCount(9);
   const verbs = await items(page).locator('[data-what]').allTextContents();
@@ -74,6 +75,7 @@ test('MOCK: rows are newest first with friendly verbs, a child name, local date 
 test('MOCK: heading, list semantics, polite live status, and 44px buttons', async ({ page, demo }) => {
   await mockAudit(page, { answer: page1([row(2), row(1)], 1) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(items(page)).toHaveCount(2);
   await expect(panel(page).getByRole('list', { name: 'Activity log entries' }).getByRole('listitem')).toHaveCount(2);
   await expect(panel(page).locator('[data-audit-status]')).toHaveAttribute('aria-live', 'polite');
@@ -86,6 +88,7 @@ test('MOCK: the first page asks for 50 rows; Show older follows nextBefore, appe
   const second = Array.from({ length: 3 }, (_, i) => row(50 - i, { action: 'resume' }));
   const mock = await mockAudit(page, { answer: (route, path) => (path.endsWith('/before/51') ? page1(second, null)(route, path) : page1(first, 51)(route, path)) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(items(page)).toHaveCount(50);
   expect(mock.paths).toEqual(['/audit/limit/50']);
   await older(page).focus();
@@ -104,6 +107,7 @@ test('MOCK: a double click on Show older sends one request', async ({ page, demo
     if (path.includes('/before/')) { await held; await page1([row(1, { action: 'resume' })])(route, path); } else await page1([row(3), row(2)], 2)(route, path);
   } });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(items(page)).toHaveCount(2);
   await older(page).dblclick();
   await expect.poll(() => mock.paths.filter((p) => p.includes('/before/')).length).toBe(1);
@@ -116,6 +120,7 @@ test('MOCK: a double click on Show older sends one request', async ({ page, demo
 test('MOCK: an empty log says so', async ({ page, demo }) => {
   await mockAudit(page, { answer: page1([]) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(panel(page)).toContainText('No activity recorded yet.');
   await expect(items(page)).toHaveCount(0);
   await expect(older(page)).toHaveCount(0);
@@ -125,6 +130,7 @@ test('MOCK: a failed load says Couldn\'t load the log, shows no raw text, and Tr
   let fail = true;
   await mockAudit(page, { answer: (route, path) => (fail ? refuse(500, 'internal_error')(route, path) : page1([row(1)])(route, path)) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(panel(page).locator('[data-audit-status]')).toHaveText("Couldn't load the log.");
   await expect(panel(page)).not.toContainText(/raw message|internal_error/);
   fail = false;
@@ -137,6 +143,7 @@ test('MOCK: a failed Show older keeps the rows already shown and offers a retry'
   let fail = true;
   await mockAudit(page, { answer: (route, path) => (path.includes('/before/') ? (fail ? refuse(500, 'x')(route, path) : page1([row(1)])(route, path)) : page1([row(2)], 2)(route, path)) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await older(page).click();
   await expect(panel(page).locator('[data-audit-status]')).toHaveText("Couldn't load the log.");
   await expect(items(page)).toHaveCount(1);
@@ -148,9 +155,10 @@ test('MOCK: a failed Show older keeps the rows already shown and offers a retry'
 test('MOCK: a 404 from the log hides the panel (feature off) and is not retried', async ({ page, demo }) => {
   const mock = await mockAudit(page, { answer: refuse(404, 'route_not_found') });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect.poll(() => mock.paths.length).toBe(1);
   await expect(panel(page)).toBeHidden();
-  await page.locator('#refresh').click();
+  await page.getByRole('button', { name: 'Refresh status' }).click();
   await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 400)));
   expect(mock.paths).toHaveLength(1);
   await expect(panel(page)).toBeHidden();
@@ -160,6 +168,7 @@ test('MOCK: a 404 from the log hides the panel (feature off) and is not retried'
 test('MOCK: without the per-viewer auditLog signal the panel is hidden and /audit is never requested', async ({ page, demo }) => {
   const mock = await mockAudit(page, { feature: false, answer: page1([row(1)]) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 400)));
   await expect(panel(page)).toBeHidden();
   expect(mock.paths).toEqual([]);
@@ -169,8 +178,9 @@ test('MOCK: hostile names stay inert text', async ({ page, demo }) => {
   let hostile = false; // the child is renamed only after sign-in, which waits for the real name
   await mockAudit(page, { answer: page1([row(1, { actorName: HOSTILE }), row(2, { actorName: null, actorId: HOSTILE })]) }, () => (hostile ? HOSTILE : null));
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   hostile = true;
-  await page.locator('#refresh').click();
+  await page.getByRole('button', { name: 'Refresh status' }).click();
   await expect(items(page)).toHaveCount(2);
   await expect(items(page).nth(0).locator('[data-who]')).toHaveText(HOSTILE);
   await expect(items(page).nth(1).locator('[data-who]')).toHaveText(HOSTILE);
@@ -182,6 +192,7 @@ test('MOCK: hostile names stay inert text', async ({ page, demo }) => {
 test('MOCK: signing out clears the log from the page', async ({ page, demo }) => {
   await mockAudit(page, { answer: page1([row(1)]) });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(items(page)).toHaveCount(1);
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.locator('#status-view')).toBeHidden();
@@ -199,6 +210,7 @@ test('MOCK: a second parent never sees the first parent\'s rows, and a held resp
     if (calls === 1) { await held; await page1([row(1, { actorName: 'FIRST-PARENT-ROW' })])(route, path); finished(); } else await page1([row(2, { actorName: 'SECOND-PARENT-ROW' })])(route, path);
   } });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect.poll(() => calls).toBe(1);
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.locator('#status-view')).toBeHidden();
@@ -218,6 +230,7 @@ test('MOCK: a 404 for one session does not hide the log for the next parent who 
   let calls = 0;
   await mockAudit(page, { answer: (route, path) => { calls += 1; return calls === 1 ? refuse(404, 'route_not_found')(route, path) : page1([row(1)])(route, path); } });
   await enroll(page, demo, 'bryn');
+  await openTab(page, 'more');
   await expect(panel(page)).toBeHidden();
   await page.getByRole('button', { name: 'Sign out' }).click();
   await page.getByLabel('One-use enrollment token').fill(demo.token('jd'));

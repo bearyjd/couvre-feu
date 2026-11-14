@@ -10,6 +10,8 @@ export interface FakeProfile {
     id: string; name: string;
     parentalControl: { services: FakeEntry[]; categories: FakeEntry[]; safeSearch: boolean; youtubeRestrictedMode: boolean; blockBypass: boolean };
     denylist: FakeEntry[]; allowlist: FakeEntry[]; settings: unknown;
+    /** Raw `data` arrays for GET /analytics/status and /analytics/reasons. Shapes follow the API doc; UNVERIFIED beyond that. */
+    analytics?: { status: unknown[]; reasons: unknown[] };
 }
 /** One scripted answer consumed by the next request, whatever it is. */
 export type FakeStep = HttpResponse | { throw: 'timeout' | 'network' };
@@ -31,6 +33,7 @@ const badRequest = (pointer: string) => json(400, { errors: [{ code: 'invalid', 
 const LISTS: Record<string, (p: FakeProfile) => FakeEntry[]> = {
     denylist: p => p.denylist, allowlist: p => p.allowlist, 'parentalControl/services': p => p.parentalControl.services, 'parentalControl/categories': p => p.parentalControl.categories,
 };
+const ANALYTICS_PARAMS = ['from', 'to', 'limit', 'cursor'];
 const FLAGS = ['safeSearch', 'youtubeRestrictedMode', 'blockBypass'];
 
 export function createFakeNextDns(options: FakeOptions): FakeNextDns {
@@ -58,6 +61,11 @@ export function createFakeNextDns(options: FakeOptions): FakeNextDns {
         if (sub === 'settings' && req.method === 'GET') return json(200, { data: p.settings });
         if (sub === 'parentalControl' && req.method === 'GET') return json(200, { data: p.parentalControl });
         if (sub === 'parentalControl' && req.method === 'PATCH') return patchFlags(p, body);
+        if ((sub === 'analytics/status' || sub === 'analytics/reasons') && req.method === 'GET') {
+            const q = url.searchParams, int = (k: string) => /^\d{1,12}$/.test(q.get(k) ?? '');
+            if (!p.analytics || [...q.keys()].some(k => !ANALYTICS_PARAMS.includes(k)) || !int('from') || !int('to')) return badRequest('/from');
+            return page(sub === 'analytics/status' ? p.analytics.status : p.analytics.reasons, cursor);
+        }
         const list = LISTS[sub];
         if (list && req.method === 'GET') return page(list(p), cursor);
         if (list && req.method === 'PUT') {

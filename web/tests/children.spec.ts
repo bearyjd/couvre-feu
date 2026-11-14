@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { issueOperatorBootstrap, Auth } from '../../service/src/auth.ts';
 import { appServer } from '../../service/src/http.ts';
 import { integrationFixture } from '../../service/tests/fixtures/integration.ts';
-import { virtualAuthenticator } from './browser-fixture.ts';
+import { virtualAuthenticator, openTab } from './browser-fixture.ts';
 
 // Placeholder, locally administered MACs only. The router is the in-process test transport; the test drives dispatch.
 const TABLET = '02:10:20:30:40:52', TV = '02:10:20:30:40:53';
@@ -39,6 +39,7 @@ test('admin adds a device group and devices with passkey step-up through the rou
   await page.getByLabel('One-use enrollment token').fill(issueOperatorBootstrap(f.store, 'operator', f.now()));
   await page.getByRole('button', { name: 'Create a passkey' }).click();
   await expect(page.locator('#status-view')).toBeVisible();
+  await openTab(page, 'kids');
   const panel = page.locator('#children-panel');
   await expect(panel.getByRole('heading', { name: 'Children and device groups' })).toBeVisible();
   await expect(panel.locator('[data-entry="pilot"]')).toContainText('Child · 1 device');
@@ -53,7 +54,9 @@ test('admin adds a device group and devices with passkey step-up through the rou
   await dispatchPending(f);
   await page.getByRole('button', { name: 'Refresh status' }).click();
   await expect(child).toContainText(`${TABLET} · on the router`);
+  await openTab(page, 'home');
   await expect(page.locator('[data-person="pilot"]')).toContainText('2 assigned devices');
+  await openTab(page, 'kids');
 
   // A non-child entry (e.g. a TV) is labelled as a device group, never as a child.
   await panel.getByLabel('New name').fill('Living-room TV');
@@ -68,8 +71,10 @@ test('admin adds a device group and devices with passkey step-up through the rou
   await dispatchPending(f);
   await page.getByRole('button', { name: 'Refresh status' }).click();
   await expect(group).toContainText(`${TV} · on the router`);
+  await openTab(page, 'home');
   const card = page.locator('article.person').filter({ hasText: 'Living-room TV' });
   await expect(card.locator('.person-id')).toHaveText(/^Device group · 1 assigned device$/);
+  await openTab(page, 'kids');
 
   // A refused MAC shows the server's explanation and changes nothing.
   await child.getByLabel('New device name for Explicit test person').fill('Unknown');
@@ -97,6 +102,8 @@ test('parents never see the child admin panel or device addresses', async ({ pag
   await page.getByRole('button', { name: 'Create a passkey' }).click();
   await expect(page.locator('#status-view')).toBeVisible();
   await expect(page.locator('#children-panel')).toBeHidden();
+  await expect(page.locator('#children-panel')).toHaveJSProperty('hidden', true); // the panel itself is off, not just its tab
+  await expect(page.locator('#tab-kids')).toBeHidden();
   expect(await page.content()).not.toContain('02:10:20:30:40:50');
   const status = await page.evaluate(async () => (await fetch('/admin/children')).status);
   expect(status).toBe(403);

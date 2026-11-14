@@ -35,6 +35,8 @@ export class ContentFilterRoutes {
     private readonly options: ContentFilterRoutesOptions;
     private readonly puts = new Map<string, number[]>();
     constructor(options: ContentFilterRoutesOptions) { this.options = options; }
+    /** Whether this account may see content-filter routes and their alerts (the manifest mode, and the owner account in owner mode). */
+    visibleTo(actor: Actor): boolean { return this.visible(actor); }
     private visible(actor: Actor): boolean {
         const {mode, ownerAccountId} = this.options;
         return mode === 'parents' || (mode === 'owner' && ownerAccountId !== undefined && actor.id === ownerAccountId);

@@ -238,3 +238,15 @@ test('seed-only manifest inventory distinguishes scope from assignment without a
         assert.equal(f.inv.acknowledge(actor, m(2)).inScope, false);
     } finally { f.cleanup(); }
 });
+test('lastOkAt (read by the content-free /health) follows the last successful poll and ignores refused ones', () => {
+    const f = world();
+    try {
+        assert.equal(f.inv.lastOkAt(), null);
+        f.poll([dev(1)]); const ok = f.now();
+        assert.equal(f.inv.lastOkAt(), ok);
+        f.advance(60); f.poll([], {errors: ['inventory_refused']});
+        assert.equal(f.inv.lastOkAt(), ok);
+        f.store.run("UPDATE inventory_state SET generation='another-router' WHERE singleton=1");
+        assert.equal(f.inv.lastOkAt(), null, 'a previous router generation never counts');
+    } finally { f.cleanup(); }
+});

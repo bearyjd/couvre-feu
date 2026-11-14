@@ -5,6 +5,7 @@ import { issueOperatorBootstrap, Auth } from '../../service/src/auth.ts';
 import { appServer } from '../../service/src/http.ts';
 import { integrationFixture } from '../../service/tests/fixtures/integration.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
+import { InstallReadiness } from '../../service/src/install-readiness.ts';
 import { virtualAuthenticator } from './browser-fixture.ts';
 
 // Placeholder, locally administered MACs only. Three children on the router; the operator manages all, the parent two.
@@ -12,8 +13,10 @@ export const SEED = '02:10:20:30:40:50', K2 = '02:10:20:30:40:62', K3 = '02:10:2
 export const NAMES = { pilot: 'Explicit test person', kid2: 'Kid kid2', kid3: 'Kid kid3' };
 export type World = ReturnType<typeof integrationFixture> & { origin: string };
 
-export const test = base.extend<{ integration: World }>({
-  integration: async ({}, use) => {
+export const test = base.extend<{ integration: World; readiness: boolean }>({
+  // UI plan I: the install readiness routes exist only for specs that ask (test.use({ readiness: true })), like the manifest flag.
+  readiness: [false, { option: true }],
+  integration: async ({ readiness }, use) => {
     const f = integrationFixture(), port = Number(process.env.CF_WEB_TEST_PORT ?? '4273'), origin = `http://localhost:${port}`;
     f.config.routerScope = [SEED, K2, K3, '02:10:20:30:40:52'];
     f.advance(Math.floor(Date.now() / 1000) - f.now()); // the browser checks session expiry against its own clock
@@ -26,7 +29,7 @@ export const test = base.extend<{ integration: World }>({
     f.store.run('UPDATE accounts SET person_ids=? WHERE id=?', JSON.stringify(['pilot', 'kid2']), 'parent');
     f.router.policy = normalizePolicy({ version: 1, revision: 1, people: [{ id: 'pilot', macs: [SEED] }, { id: 'kid2', macs: [K2] }, { id: 'kid3', macs: [K3] }], pauses: [], schedules: [] }, f.config.protectedMacs);
     const auth = new Auth(f.store, origin, f.now, { provenance: f.config.provenance, rpName: 'Private integration test' });
-    const server = appServer(auth, f.policy, { ...f.config, port, origin, host: `localhost:${port}` }, undefined, undefined, undefined, f.worker.inventory);
+    const server = appServer(auth, f.policy, { ...f.config, port, origin, host: `localhost:${port}` }, undefined, undefined, undefined, f.worker.inventory, undefined, readiness ? new InstallReadiness(auth, f.worker.inventory) : undefined);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     await f.observe();
     try { await use({ ...f, origin }); } finally {
