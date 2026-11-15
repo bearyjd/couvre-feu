@@ -47,11 +47,11 @@ test('Reload with a waiting worker posts skipWaiting and reloads on controllerch
   expect(elapsed).toBeLessThan(2800); // And did not need the 3 s fallback.
 });
 
-test('the service worker accepts a skipWaiting message and the shell cache is renamed', async ({ page, demo }) => {
+test('the service worker accepts a skipWaiting message and the shell cache name is a content hash', async ({ page, demo }) => {
   const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
   expect(sw).toContain("'skipWaiting'");
-  expect(sw).toContain("'cf-shell-v14'");
-  expect(sw).not.toContain('cf-shell-v13');
+  expect(sw).toMatch(/'cf-shell-[0-9a-f]{10}'/);
+  expect(sw).not.toContain('cf-shell-dev');
   expect(sw).toContain('/pwa-update.js');
 });
 

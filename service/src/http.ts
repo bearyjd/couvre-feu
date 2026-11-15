@@ -29,6 +29,7 @@ import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
 import { Health } from './health.ts';
+import { buildServiceWorker } from './sw-shell.ts';
 import type { SessionDTO, SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
@@ -124,6 +125,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const reconcileAlerts = alerts?.reconcile?.bind(alerts);
     const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
+    // Computed once at startup (a missing shipped asset fails here, not per request): the cache name follows the shipped bytes. The integration variant keeps a scope-specific name.
+    const serviceWorker = buildServiceWorker(fileURLToPath(new URL('../../web/public/', import.meta.url)), provenance.source === 'real-router-integration' ? `integration-${provenance.integrationScope}` : undefined);
     const accounts = new AccountAdmin(auth, gated && mode === 'owner' ? ownerAccountId : undefined);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
@@ -189,7 +192,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (name === 'index.html' && provenance.source === 'real-router-integration') {
                     data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
                 }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v14'", `'cf-shell-integration-${provenance.integrationScope}-v13'`));
+                if (name === 'sw.js') data = Buffer.from(serviceWorker.source);
                 if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
                 response.setHeader('Content-Type', type);
                 response.end(data);

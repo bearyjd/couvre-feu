@@ -56,14 +56,14 @@ test('HTTP: GET /people carries a read-only auditLog boolean exactly when GET /a
     }
 });
 
-test('HTTP: the audit page script and the service worker (cache name bumped, audit.js cached) are served', async () => {
+test('HTTP: the audit page script and the service worker (content-hash cache name, audit.js cached) are served', async () => {
     const w = await world(), s = await serve(w, 'operator');
     try {
         const script = await s.get('/audit.js');
         assert.equal(script.status, 200);
         assert.match(script.text, /createAuditLog/);
         const sw = await s.get('/sw.js');
-        assert.match(sw.text, /cf-shell-integration-[^']*-v13'/);
+        assert.match(sw.text, /'cf-shell-[0-9a-f]{10}-integration-[^']+'/);
         assert.match(sw.text, /'\/audit\.js'/);
     } finally { await s.close(); w.f.cleanup(); }
 });
