@@ -260,9 +260,9 @@ getAnalyticsReasons(profile, range: {from: number; to: number}, call?): Promise<
 
 - Hourly tick (unref'd timers; first tick a few minutes after start; same `running` guard as the watch).
 - **Which days:** for each child in `contentFilter.profiles` (not the default profile), each local day `D` from
-  `today-6` to `yesterday` whose row is missing or `unavailable`, and only once local time is past **03:00 on D+1**
+  `today-7` to `today-1` (seven days: the digest's Sunday-to-Saturday window read at Sunday 18:00) whose row is missing or `unavailable`, and only once local time is past **03:00 on D+1**
   (settling margin for NextDNS aggregation lag; lag UNVERIFIED, measured in C0). Today's partial day is never
-  stored. Days older than `today-6` are not attempted (presumed beyond the one-week retention).
+  stored. Days older than `today-7` are not attempted (presumed beyond the one-week retention).
 - **Range:** `from` = epoch of local midnight starting `D`, `to` = epoch of local midnight starting `D+1`, computed by a
   DST-safe helper factored out of `digest.ts` (`zoned`/`local` become an exported `localDayBounds(day)`), so 23 h and
   25 h days are exact. Unix seconds avoid any time-zone parsing on NextDNS's side.
@@ -293,7 +293,7 @@ identical 404s; no NextDNS call is ever made by a request):
   "days": [
     {"day": "2026-11-08", "state": "ok", "total": 4210, "blocked": 63,
      "classes": {"adult": 2, "social": 11, "apps": 9, "bypass": 1, "ads_trackers": 40}},
-    {"day": "2026-11-09", "state": "unavailable"},
+    {"day": "2026-11-09", "state": "gap"},
     {"day": "2026-11-10", "state": "logs_off"},
     {"day": "2026-11-11", "state": "suspect_zero", "total": 0, "blocked": 0}
   ],
@@ -301,6 +301,7 @@ identical 404s; no NextDNS call is ever made by a request):
 }
 ```
 
+- `gap` is the wire word for both a stored `unavailable` day and a day with no row yet.
 - Always the last 7 complete local days (no query parameters in the first version; nothing to validate or abuse).
 - `classes` keys are class codes; values integers; zero classes omitted.
 - `week.filterBlocked` sums only headline classes (§4.1) over `ok` days; `background` sums `ads_trackers`+`security`.
@@ -319,11 +320,11 @@ identical 404s; no NextDNS call is ever made by a request):
 | F6 | Logs turned off on the profile | `logs_off`, no analytics call | "Logging is off for this profile in NextDNS, so there are no counts" |
 | F7 | Free-plan 300k limit hit (filtering and logging stop per NextDNS staff) | `total` ≈ 0 while the child was online → `suspect_zero` (when activity is on); otherwise `ok` with zeros | "NextDNS saw no lookups while the device was online. Filtering may be off (plan limit, outage, or the device is not using it)." Recommend a paid plan (O7) |
 | F8 | Analytics retention shorter than 7 days or analytics lag | Days missed while down are re-tried only within the window; lag margin 03:00 | Honest gaps; C0 measures both |
-| F9 | Service down over a weekend | Backfills up to 6 days back on start | Gap only for days older than that |
+| F9 | Service down over a weekend | Backfills up to 7 days back on start | Gap only for days older than that |
 | F10 | Phase B not live (devices not using the profile) | Counts are real but cover only what reached the profile | Card copy: "Counts cover only lookups that reached this child's NextDNS profile" |
 | F11 | Store failure (disk full) | Pass ends; nothing logged with data | Missing days |
 | F12 | Digest due while some days unavailable | Digest sums ok days only and says so | "N blocked lookups (5 of 7 days)" |
-| F13 | Flag turned off then on | Rows kept until pruned; backfill again up to 6 days | Older gaps stay gaps |
+| F13 | Flag turned off then on | Rows kept until pruned; backfill again up to 7 days | Older gaps stay gaps |
 
 Nothing in this feature changes enforcement, pauses, or filters. A total outage of the feature is cosmetic.
 
@@ -351,6 +352,8 @@ Rules:
   Sunday is incomplete). Stated in the service contract; differs from the requests/grants window (slot to slot) by
   18 hours. Accepted; the alternative (ask NextDNS at send time) fails F8.
 - Numbers pass the existing `count()` coercion; text is constants + integers only.
+
+**As built (C4, deviations from the text above).** The number is on its own line: `N blocked lookups last week.`, or `N blocked lookups last week (x of 7 days counted).` when fewer than 7 days were counted. A week with zero counted days omits the line (not "blocked lookups unavailable"). A day counts only if every configured child (the keys of `contentFilter.profiles`) is `ok` for it; `suspect_zero`, `logs_off` and gaps do not count, so one child stuck in such a state means the line never appears (remedy: enable NextDNS logs for every profile, check the child's profile). A parent cannot tell "counts broken" from "counts off" from the push alone; the app card shows it. A failing read logs the fixed tag `digest_blocked_failed`. See `docs/service-contract.md`.
 
 ### 7.2 In-app (filter card, `web/public/content-filter.js`)
 
@@ -460,7 +463,7 @@ only to the parents the mode allows and are not pushed.
   `main.ts` starts/stops it next to the watch.
 - Tests (`content-filter-counts.test.ts`): flag off → zero requests, no timer, no rows; first pass backfills 7 days in
   order; today never stored; not before 03:00 local next day; ok row never overwritten by a later failure;
-  `unavailable` retried and becomes ok; day older than 6 days not attempted; `logs_off` path makes no analytics call;
+  `unavailable` retried and becomes ok; day older than 7 days not attempted; `logs_off` path makes no analytics call;
   `suspect_zero` with and without activity; budget stop and resume; one child failing does not stop others; the
   default profile never requested; prune at 56 days; concurrent tick guard; no stdout/stderr on any path; G7 haystack.
 
@@ -524,6 +527,7 @@ Stop rule: any sentinel/domain/child name seen in a push, alert or log → flag 
 | O8 | Show total lookups (`total`) in the app | yes / no | **Yes, small print**: makes "0 blocked" meaningful and exposes F7; it is a count, not browsing data |
 | O9 | Digest window | Sun–Sat local days / slot-to-slot via live query | **Sun–Sat days** (survives one-week retention and quiet-hours deferral) |
 | O10 | Tell the children what is counted | yes / no | **Yes** (consistent with D4's "tell the children what is logged") |
+| O11 | Who sees per-child counts when contentFilter.mode is parents? | parents in scope (as built, same gate as the filter card) / admins only (one line: `actor.role==="admin"` at the top of the counts branch in `ContentFilterRoutes.get`) | **As built** (both parents are admins today); revisit if a non-admin parent account is ever added |
 
 ---
 

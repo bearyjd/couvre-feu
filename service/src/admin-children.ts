@@ -9,7 +9,7 @@ import type { Auth, AuthSession } from './auth.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import type { IntegrationPolicy, IntegrationOperation } from './integration-policy.ts';
-import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, TOKEN, activeChildren, devicesOf, movePolicy, withDevice, withoutDevice } from './integration-children.ts';
+import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, TOKEN, activeChildren, devicesOf, enrolInFlight, movePolicy, withDevice, withoutDevice } from './integration-children.ts';
 import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
 import { audited, auditFor } from './parent-audit.ts';
@@ -201,7 +201,8 @@ export class ChildAdmin {
         const row = this.store.get<DeviceRow>('SELECT * FROM devices WHERE id=?', target);
         if (!row || !actor.personIds.includes(row.person_id) || !this.store.get('SELECT id FROM people WHERE id=? AND active=1', row.person_id)) throw new AppError(404, 'device_not_found');
         if (kind === 'device_move') return this.move(actor, row, params, request);
-        if (row.state !== 'active') throw new AppError(409, 'device_change_in_progress');
+        // An enrolling row whose operation has ended without settling it (a conflict with no stored observation) can only be left by this removal; one still in flight cannot.
+        if (row.state !== 'active' && (row.state !== 'enrolling' || enrolInFlight(this.store, row))) throw new AppError(409, 'device_change_in_progress');
         if (!this.policy.fresh()) throw new AppError(503, 'approved_router_observation_required');
         const o = this.store.observation().value!;
         if (!o.acceptedPolicy.people.some(p => p.id === row.person_id && p.macs.includes(row.identifier))) {

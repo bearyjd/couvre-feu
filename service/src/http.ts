@@ -29,6 +29,7 @@ import { auditFor } from './parent-audit.ts';
 import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
 import { Health } from './health.ts';
+import { buildServiceWorker } from './sw-shell.ts';
 import type { SessionDTO, SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
@@ -42,6 +43,7 @@ const STATIC: Record<string, [
     '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/kids-card.js': ['kids-card.js', 'text/javascript; charset=utf-8'], '/kids-model.js': ['kids-model.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/inventory-triage.js': ['inventory-triage.js', 'text/javascript; charset=utf-8'], '/inventory-wizard.js': ['inventory-wizard.js', 'text/javascript; charset=utf-8'], '/inventory-wizard-model.js': ['inventory-wizard-model.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
+    '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'], '/pwa-update.js': ['pwa-update.js', 'text/javascript; charset=utf-8'],
 };
 function cookies(request: IncomingMessage): Record<string, string> {
     const result: Record<string, string> = Object.create(null);
@@ -132,6 +134,16 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // The one gate for the audit routes and for the per-viewer auditLog signal on GET /people.
     const auditOn = () => audit?.enabled === true;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
+    // The bytes of index.html and the manifest as served (rewritten for the integration variant).
+    const integration = provenance.source === 'real-router-integration';
+    const servedBytes = (name: string, data: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
+        if (!integration) return data;
+        if (name === 'index.html') return Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
+        if (name === 'manifest.webmanifest') return Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
+        return data;
+    };
+    // Computed once at startup (a missing shipped asset fails here, not per request): the cache name follows the bytes actually served, so flipping automatic dispatch renames it too. The integration variant keeps a scope-specific name.
+    const serviceWorker = buildServiceWorker(fileURLToPath(new URL('../../web/public/', import.meta.url)), integration ? `integration-${provenance.integrationScope}` : undefined, servedBytes);
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
     const trusted = config.trustedProxies;
@@ -184,12 +196,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (request.method === 'GET' && STATIC[path]) {
                 const [name, type] = STATIC[path];
-                let data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
-                if (name === 'index.html' && provenance.source === 'real-router-integration') {
-                    data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
-                }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v13'", `'cf-shell-integration-${provenance.integrationScope}-v8'`));
-                if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
+                const file = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
+                const data = name === 'sw.js' ? Buffer.from(serviceWorker.source) : servedBytes(name, file);
                 response.setHeader('Content-Type', type);
                 response.end(data);
                 return;

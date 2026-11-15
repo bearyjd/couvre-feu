@@ -21,6 +21,8 @@ import time
 import unittest
 
 REPO=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(REPO/'tests/fixtures'))
+import partition
 spec=importlib.util.spec_from_file_location('platform_fixtures',REPO/'tests/test-platform-integration.py')
 platform=importlib.util.module_from_spec(spec);spec.loader.exec_module(platform)
 SHELL=platform.SHELL
@@ -638,4 +640,4 @@ class OperationalFlowTests(unittest.TestCase):
         finally:
             time.sleep(2.2);f.close()
 
-if __name__=='__main__':unittest.main()
+if __name__=='__main__':partition.main(sys.argv)

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import type { Actor, OperationDTO, PeopleDTO, PersonDTO } from '../../shared/src/contracts.ts';
@@ -197,7 +198,7 @@ test('a failing people source does not clear existing state alerts', () => {
 
 test('HTTP alert routes require an authenticated session and reject malformed ids', async () => {
     const store = new Store(':memory:'); seedAccounts(store);
-    const origin = 'http://localhost:45999', port = 45999;
+    const port = await freePort(), origin = `http://localhost:${port}`;
     const alerts = new ParentAlerts(store, null, () => now);
     const server = appServer(new Auth(store, origin), {} as never, {port, origin, host: `localhost:${port}`, dataDir: '.'}, alerts);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');

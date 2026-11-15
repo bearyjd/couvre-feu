@@ -7,11 +7,16 @@ import type { ContentFilterMode } from './content-filter-config.ts';
 import type { ContentFilterReconciler } from './content-filter-reconcile.ts';
 import { desiredSha256, isLoosening, parseDesired } from './content-filter-state.ts';
 import type { ContentFilterDesired, ContentFilterStore, FilterRecord, FilterState } from './content-filter-state.ts';
+import { COUNTS_WINDOW_DAYS } from './content-filter-counts.ts';
+import type { ContentFilterCountsStore, DayState } from './content-filter-counts.ts';
+import { addDays, dayRange, localDay } from './content-filter-day.ts';
+import type { ClassCode } from '../../shared/src/content-filter-classes.ts';
 import { auditFor } from './parent-audit.ts';
 import type { Routed } from './time-requests-http.ts';
 
 const PERSON_ID = '[a-z][a-z0-9_]{0,31}';
 export const FILTER_PATH = new RegExp(`^/people/(${PERSON_ID})/filter$`);
+export const COUNTS_PATH = new RegExp(`^/people/(${PERSON_ID})/filter/counts$`);
 const PERSON = new RegExp(`^${PERSON_ID}$`);
 /** Stated on every answer: nothing here is enforced or measured on the router. */
 export const FILTER_NOTE = 'unverified on this router';
@@ -21,7 +26,13 @@ export interface ContentFilterRoutesOptions {
     auth: Auth; filters: ContentFilterStore; reconciler: ContentFilterReconciler; mode: ContentFilterMode; ownerAccountId?: string;
     /** Throws AppError(404) unless the actor may manage this active child (the repo's person scoping). */
     authorize: (actor: Actor, person: string) => void;
+    /** Daily counts (phase C). Absent when contentFilter.counts is off: the counts route then does not exist. */
+    counts?: ContentFilterCountsStore;
 }
+/** What a day can say on the wire: a stored `unavailable` day and a day with no row are both a `gap`. */
+export type CountsDayState = Exclude<DayState, 'unavailable'> | 'gap';
+export interface CountsDayDTO { day: string; state: CountsDayState; total?: number; blocked?: number; classes?: Readonly<Partial<Record<ClassCode, number>>> }
+export interface CountsDTO { note: typeof FILTER_NOTE; days: CountsDayDTO[]; week: {filterBlocked: number; background: number; okDays: number; days: number} }
 /** The step-up commits to this child and this exact canonical filter. */
 export const filterBinding = (person: string, sha256: string): string => digest(JSON.stringify(['content_filter_set', person, sha256]));
 const unknownPerson = () => new AppError(404, 'person_not_found');
@@ -52,7 +63,24 @@ export class ContentFilterRoutes {
         if (recent.length >= PUTS_PER_MINUTE) throw new AppError(429, 'content_filter_rate_limited');
         this.puts.set(actorId, [...recent, now]);
     }
+    /** Reads the stored counts only (no NextDNS call): the last seven finished local days, integers and class codes, nothing else. */
+    private countsFor(person: string): CountsDTO {
+        const store = this.options.counts!, to = addDays(localDay(this.options.auth.now()), -1), from = addDays(to, 1 - COUNTS_WINDOW_DAYS);
+        const stored = new Map(store.days(person, from, to).map(day => [day.day, day]));
+        const days = dayRange(from, to).map((day): CountsDayDTO => {
+            const row = stored.get(day);
+            if (row === undefined || row.state === 'unavailable') return {day, state: 'gap'};
+            return row.state === 'logs_off' ? {day, state: 'logs_off'} : {day, state: row.state, total: row.total ?? 0, blocked: row.blocked ?? 0, classes: row.classes};
+        });
+        return {note: FILTER_NOTE, days, week: {...store.weekSums(person, from, to)}};
+    }
     get(session: AuthSession, path: string): Routed | null {
+        const counted = this.options.counts ? COUNTS_PATH.exec(path)?.[1] : undefined;
+        if (counted !== undefined) {
+            if (!this.visible(session.dto.actor)) return null;
+            this.scope(session.dto.actor, counted);
+            return {status: 200, body: this.countsFor(counted)};
+        }
         const person = FILTER_PATH.exec(path)?.[1];
         if (person === undefined) return null;
         if (!this.visible(session.dto.actor)) return null;

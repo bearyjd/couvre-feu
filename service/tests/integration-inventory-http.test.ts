@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { integrationFixture } from './fixtures/integration.ts';
@@ -14,7 +15,7 @@ const dev = (n: number, over: Partial<InventoryDevice> = {}): InventoryDevice =>
 
 let worlds = 0;
 async function world(opts: {automatic?: boolean} = {}) {
-    const f = integrationFixture(), port = 26000 + (process.pid + 7 * worlds++) % 9000, origin = `http://localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     if (opts.automatic) f.config.dispatch = {enabled: true, pollSeconds: 2, maxBackoffSeconds: 8};
     const automatic = opts.automatic ? new AutomaticDispatch(f.worker) : null;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
@@ -110,7 +111,7 @@ test('refresh: 409 when dispatch is off, otherwise 202 once per 10 s (429), and 
     } finally { await w.close(); }
 });
 test('the production wiring serves the inventory routes, applies the configured retention and prunes on its own schedule', async () => {
-    const f = integrationFixture(), port = 26000 + (process.pid + 7 * worlds++) % 9000, origin = `http://localhost:${port}`;
+    const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     const wired = wireIntegration(f.config, f.store, f.router, {CF_INVENTORY_RETENTION_DAYS: '7'});
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = wired.app(auth, {...f.config, port, origin, host: `localhost:${port}`});

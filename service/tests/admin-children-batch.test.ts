@@ -9,7 +9,8 @@ import { integrationFixture, actor } from './fixtures/integration.ts';
 import { Auth, digest, issueOperatorBootstrap } from '../src/auth.ts';
 import { ChildBatchAdmin } from '../src/admin-children-batch.ts';
 import { AppError } from '../../shared/src/errors.ts';
-import { ChildAdmin } from '../src/admin-children.ts';
+import { ChildAdmin, macInput } from '../src/admin-children.ts';
+import { InstallReadiness } from '../src/install-readiness.ts';
 import { BulkOps } from '../src/integration-bulk.ts';
 import { TestAuthenticator } from './authenticator.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
@@ -356,7 +357,7 @@ test('batch: first-run completion refuses later setup with confirmed nonseed dev
 test('batch: tables stay additive, but migration 014 raises the version so the pre-014 binary refuses the database', () => {
     const f = world();
     try {
-        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 13);
+        assert.equal(f.store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 14);
         assert.equal(f.count('people'), 1); assert.equal(f.count('devices'), 1);
         const sql = f.store.get<{sql: string}>("SELECT sql FROM sqlite_master WHERE name='admin_batches'")!.sql;
         assert.match(sql, /UNIQUE\s*\(actor_id,\s*client_key\)/i);
@@ -759,5 +760,126 @@ test('batch: refusal remains stored if parent audit insertion fails', async () =
         assert.equal(f.count('admin_batches'), 1);
         assert.equal(f.count('parent_audit'), 0);
         assert.equal(f.store.get<{outcome: string}>("SELECT outcome FROM audit WHERE outcome LIKE 'refused:%'")?.outcome, 'refused:device_not_ready:1');
+    } finally { f.cleanup(); }
+});
+
+test('enrolling a device clears a stale adult decision on the batch and single paths; readiness lists it under the child only', async () => {
+    const f = world();
+    try {
+        f.config.inventoryUi = {triage: true, wizard: false, installReadiness: true};
+        const who = await f.signIn(); await f.observe(); f.ready([mac(1), mac(2)]);
+        const decide = (m: string) => f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, m);
+        const decisionFor = (m: string) => f.store.get('SELECT 1 FROM inventory_decisions WHERE mac=?', m);
+        const readiness = new InstallReadiness(f.auth, f.inventory);
+        const list = () => (readiness.get(who.session(), '/admin/install-readiness')!.body as {children: {devices: {label: string}[]}[]; adults: {label: string}[]});
+        decide(mac(1)); decide(mac(2));
+        assert.equal(list().adults.length, 3);
+        // batch path
+        const stepUp = await f.proof(who, [add(1)]);
+        assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+        // Pending: the decision is kept until the router confirms, and the list refuses (never lists the device twice).
+        assert.ok(decisionFor(mac(1))); assert.ok(decisionFor(mac(2)));
+        assert.throws(() => list(), (e: any) => e.status === 409 && e.code === 'install_list_pending_enrol');
+        await f.dispatch(f.store.get<{id: string}>('SELECT id FROM operations')!.id);
+        assert.equal(decisionFor(mac(1)), undefined); assert.ok(decisionFor(mac(2)));
+        let view = list();
+        assert.deepEqual(view.adults.map(a => a.label).sort(), ['Bryn', 'Protected device']);
+        assert.ok(view.children.some(c => c.devices.some(d => d.label === 'Private device 1')));
+        // single path, with a hand-typed upper-case, dashed address that normalises to the stored lower-case one
+        const typed = mac(2).toUpperCase().replaceAll(':', '-');
+        assert.equal(macInput(typed), mac(2));
+        const single = new ChildAdmin(f.auth, f.policy), params = {label: 'Private device 2', mac: typed, precondition: f.token()};
+        const o = await single.stepUpOptions(who.session(), {action: 'device_add', target: 'pilot', params});
+        const done = await single.perform(who.session(), 'device_add', 'pilot', {...params, stepUp: {challengeId: o.challengeId, response: who.key.login(o.options, origin)}});
+        assert.equal(done.status, 202, JSON.stringify(done.body));
+        assert.ok(decisionFor(mac(2)));
+        assert.throws(() => list(), (e: any) => e.status === 409 && e.code === 'install_list_pending_enrol');
+        await f.dispatch(f.store.get<{id: string}>("SELECT id FROM operations WHERE state<>'confirmed' ORDER BY rowid DESC")!.id);
+        assert.equal(decisionFor(mac(2)), undefined);
+        view = list();
+        assert.deepEqual(view.adults.map(a => a.label), ['Protected device']);
+        assert.ok(view.children.some(c => c.devices.some(d => d.label === 'Private device 2')));
+    } finally { f.cleanup(); }
+});
+
+test('a refused enrol keeps the adult decision; the list builds again with the device under the adults only', async () => {
+    const f = world();
+    try {
+        f.config.inventoryUi = {triage: true, wizard: false, installReadiness: true};
+        const who = await f.signIn(); await f.observe(); f.ready([mac(1)]);
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+        const readiness = new InstallReadiness(f.auth, f.inventory);
+        const list = () => (readiness.get(who.session(), '/admin/install-readiness')!.body as {children: {devices: {label: string}[]}[]; adults: {label: string}[]});
+        const stepUp = await f.proof(who, [add(1)]);
+        assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+        assert.throws(() => list(), (e: any) => e.code === 'install_list_pending_enrol');
+        f.router.reject = 'incomplete_address_coverage';
+        const id = f.store.get<{id: string}>('SELECT id FROM operations')!.id;
+        await f.dispatch(id);
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM operations WHERE id=?', id)!.state, 'failed');
+        assert.equal(f.store.get('SELECT 1 FROM devices WHERE identifier=?', mac(1)), undefined);
+        assert.equal(f.store.get<{role: string}>('SELECT role FROM inventory_decisions WHERE mac=?', mac(1))?.role, 'adult');
+        const view = list();
+        assert.deepEqual(view.adults.map(a => a.label).sort(), ['Bryn', 'Protected device']);
+        assert.ok(!view.children.some(c => c.devices.some(d => d.label === 'Private device 1')));
+    } finally { f.cleanup(); }
+});
+
+/** Queue one enrol for mac(1) with an adult decision; returns the operation id and helpers over the shared state. */
+async function queuedAdultEnrol(f: ReturnType<typeof world>) {
+    f.config.inventoryUi = {triage: true, wizard: false, installReadiness: true};
+    const who = await f.signIn(); await f.observe(); f.ready([mac(1)]);
+    f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+    const stepUp = await f.proof(who, [add(1)]);
+    assert.equal((await f.batch.perform(who.session(), {items: [add(1)], precondition: f.token(), stepUp}, 'batch_client_key_0001')).status, 200);
+    const readiness = new InstallReadiness(f.auth, f.inventory);
+    return {id: f.store.get<{id: string}>('SELECT id FROM operations')!.id, view: () => readiness.get(who.session(), '/admin/install-readiness')!.body as {children: {devices: {label: string}[]}[]; adults: {label: string}[]},
+        settle: (id: string, state: string) => (f.worker as any).updateOperation(id, state, null),
+        decision: () => f.store.get<{role: string}>('SELECT role FROM inventory_decisions WHERE mac=?', mac(1))?.role,
+        device: () => f.store.get<{state: string}>('SELECT state FROM devices WHERE identifier=?', mac(1))?.state};
+}
+
+test('a conflict with the router holding the device settles it active and clears the adult decision', async () => {
+    const f = world();
+    try {
+        const q = await queuedAdultEnrol(f);
+        await f.dispatch(q.id);
+        f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE identifier=?", q.id, mac(1));
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+        f.store.run("UPDATE operations SET state='pending' WHERE id=?", q.id);
+        q.settle(q.id, 'conflict');
+        assert.equal(q.device(), 'active'); assert.equal(q.decision(), undefined);
+    } finally { f.cleanup(); }
+});
+
+test('a conflict with no stored observation leaves the enrol unsettled: the decision stays and the list refuses with an explained overlap, not a pending enrol', async () => {
+    const f = world();
+    try {
+        const q = await queuedAdultEnrol(f);
+        f.store.run('UPDATE service_state SET observation_json=NULL,observed_at=NULL WHERE singleton=1');
+        q.settle(q.id, 'conflict');
+        assert.equal(q.device(), 'enrolling'); assert.equal(q.decision(), 'adult');
+        assert.throws(() => q.view(), (e: any) => e.status === 409 && e.code === 'install_list_overlap' && /ended without being settled/.test(e.message));
+    } finally { f.cleanup(); }
+});
+
+test('an adult decision for an already enrolled device is dropped at startup; a pending enrol keeps its decision', async () => {
+    const f = world();
+    try {
+        const q = await queuedAdultEnrol(f);
+        new InventoryStore(f.store, {raise() { /* none */ }} as never);
+        assert.equal(q.decision(), 'adult');
+        await f.dispatch(q.id);
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Bryn',NULL,NULL,0,NULL,'operator',1)", f.config.router.generation, mac(1));
+        assert.equal(q.device(), 'active');
+        // An old-generation decision for the same active device is not this router's: it survives.
+        f.store.run("INSERT INTO inventory_devices(generation,mac,ipv4_json,hostname,source,first_seen,last_seen) VALUES(?,?,'[]',NULL,'lease',1,1)", 'f'.repeat(64), mac(1));
+        f.store.run("INSERT INTO inventory_decisions(generation,mac,role,label,previous_role,linked_from_mac,stable_confirmed,stable_at,decided_by,decided_at) VALUES(?,?,'adult','Old',NULL,NULL,0,NULL,'operator',1)", 'f'.repeat(64), mac(1));
+        new InventoryStore(f.store, {raise() { /* none */ }} as never);
+        assert.equal(f.store.get('SELECT 1 FROM inventory_decisions WHERE generation=? AND mac=?', f.config.router.generation, mac(1)), undefined);
+        assert.equal(f.store.get<{n: number}>("SELECT count(*) n FROM inventory_decisions WHERE generation=?", 'f'.repeat(64))!.n, 1);
+        // One count-only audit row, no address.
+        const rows = f.store.all<{outcome: string}>("SELECT outcome FROM audit WHERE action='inventory_adult_decisions_dropped'");
+        assert.deepEqual(rows.map(r => r.outcome), ['count:1']);
     } finally { f.cleanup(); }
 });

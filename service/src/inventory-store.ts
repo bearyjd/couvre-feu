@@ -62,6 +62,13 @@ interface DecisionRow {
     generation: string; mac: string; role: InventoryRole; label: string | null; previous_role: InventoryRole | null; linked_from_mac: string | null; stable_confirmed: number; stable_at: number | null; decided_by: string; decided_at: number;
     row_id: number; linked_from_row: number | null;
 }
+/**
+ * A device a child now owns is a kid by enrolment, so a parent's earlier decision for that address (adult, guest, ...) must not outlive it:
+ * called when the router CONFIRMS the enrolment (integration-worker settleDevices), never at queue time: a refused enrol must keep the decision. Silent: the enrolment's own audit row records the change, and nothing here names an address.
+ */
+export function dropDecisionOnEnrol(store: IntegrationStore, mac: string): void {
+    store.run('DELETE FROM inventory_decisions WHERE generation=? AND mac=?', store.config.router.generation, mac);
+}
 type DecisionFields = Pick<DecisionRow, 'role' | 'label' | 'previous_role' | 'linked_from_mac' | 'stable_confirmed' | 'stable_at'>;
 const NEW_DECISION: DecisionFields = {role: 'new', label: null, previous_role: null, linked_from_mac: null, stable_confirmed: 0, stable_at: null};
 /** Decisions with the row ids their natural keys resolve to. A decision whose row is gone is not returned, so a renumbered rowid can never attach one to another device. */
@@ -99,7 +106,7 @@ export class InventoryStore {
         this.store = store; this.alerts = alerts; this.now = now; this.retentionDays = retentionDays;
         this.policy = new IntegrationPolicy(store, now);
         this.scope = new ScopeTracker(store, alerts, now);
-        this.atomic(() => this.purgeProtected());
+        this.atomic(() => { this.purgeProtected(); this.dropOwnedAdultDecisions(); });
     }
     /** A protected management MAC is never listed, so a stored row for one (an older manifest, a hand edit) is removed. */
     private purgeProtected(): void {
@@ -268,6 +275,12 @@ export class InventoryStore {
         this.sweepDecisions();
     }
 
+    /** Decisions from before an enrolment cleared them: a device a child owns is a kid, so an adult decision for an ACTIVE device is dead (a pending enrol keeps its decision until the router settles it). */
+    private dropOwnedAdultDecisions(): void {
+        const dropped = this.store.run("DELETE FROM inventory_decisions WHERE role='adult' AND generation=? AND mac IN (SELECT identifier FROM devices WHERE identifier_kind='mac' AND state='active')", this.store.config.router.generation).changes;
+        // The count only: no address, no row id.
+        if (dropped > 0) this.store.run("INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES('system','inventory_adult_decisions_dropped',?,?)", this.now(), `count:${dropped}`);
+    }
     /** The child that owns each MAC through the children admin (devices) or, failing that, the desired policy. A corrupt policy only costs the fallback. */
     private owners(): Map<string, string> {
         const owners = new Map<string, string>();

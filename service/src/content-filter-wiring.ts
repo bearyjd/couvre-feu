@@ -1,4 +1,5 @@
 import type { Auth } from './auth.ts';
+import { ContentFilterCounts, ContentFilterCountsStore } from './content-filter-counts.ts';
 import { ContentFilterRoutes } from './content-filter-http.ts';
 import { ContentFilterReconciler, contentFilterApiKey } from './content-filter-reconcile.ts';
 import { ContentFilterStore } from './content-filter-state.ts';
@@ -18,13 +19,17 @@ export function wireContentFilter(config: IntegrationConfig, store: IntegrationS
     if (settings === undefined || settings.mode === 'off') return null;
     assertSafeNextDnsEnvironment(env);
     const filters = new ContentFilterStore(store, () => Math.floor(Date.now() / 1000));
+    const nextDns = client ?? createNextDnsClient({apiKey: testing.apiKey ?? contentFilterApiKey(settings.apiKeyFile!), allowDomainLists: true, ...(testing.transport ? {transport: testing.transport} : {})});
     const reconciler = new ContentFilterReconciler({
         // PRP-006 A3: parent-entered denylist/allowlist entries are managed (stored in the DB, sent to NextDNS), never written to audit/logs/alerts/errors;
         // owner decision D8, 2026-11-09 (client gate kept; this wiring opts in). This is the only place the opt-in is set. `testing` (transport, key source) is for tests; production uses the HTTPS default and the key file.
-        client: client ?? createNextDnsClient({apiKey: testing.apiKey ?? contentFilterApiKey(settings.apiKeyFile!), allowDomainLists: true, ...(testing.transport ? {transport: testing.transport} : {})}), profiles: settings.profiles!, store: filters,
+        client: nextDns, profiles: settings.profiles!, store: filters,
     });
-    return {filters, reconciler, routes: (auth: Auth, policy: IntegrationPolicy) => new ContentFilterRoutes({
-        auth, filters, reconciler, mode: settings.mode, ...(config.ownerAccountId !== undefined ? {ownerAccountId: config.ownerAccountId} : {}),
+    // PRP phase C: daily counts from NextDNS analytics exist only when the manifest says counts.enabled (absent = off); no flag, no fetcher, no call.
+    const countsStore = settings.counts?.enabled === true ? new ContentFilterCountsStore(store) : null;
+    const counts = countsStore ? new ContentFilterCounts({client: nextDns, profiles: settings.profiles!, store: countsStore}) : null;
+    return {filters, reconciler, counts, routes: (auth: Auth, policy: IntegrationPolicy) => new ContentFilterRoutes({
+        auth, filters, reconciler, mode: settings.mode, ...(countsStore ? {counts: countsStore} : {}), ...(config.ownerAccountId !== undefined ? {ownerAccountId: config.ownerAccountId} : {}),
         authorize: (actor, person) => { policy.authorized(actor, person); },
     })};
 }
