@@ -3197,17 +3197,30 @@ cfp_crond_count() { :; }
     def elapsed(self, done):
         return int(re.search(r'ELAPSED:([0-9]+)', done.stdout).group(1))
 
+    # The child stamps /proc/uptime when it starts and again when TERM reaches its trap, so the test measures the
+    # allowance-to-TERM delay itself rather than the driver's whole-second `date +%s` difference (which reads a real
+    # 2.1 s as 3 and made this test flake under CI load: the supervisor polls once a second, so TERM lands 1-2 s in).
+    TERM_TRAP_STAMPED = ('#!/bin/sh\ntrap \'read u _ < /proc/uptime; echo "$u" > "$H/term-at"; echo released > "$H/lock-released"; '
+                         'rmdir "$H/lock"; kill "$s" 2>/dev/null; exit 143\' TERM\n'
+                         'read u _ < /proc/uptime\necho "$u" > "$H/start-at"\n'
+                         'mkdir "$H/lock"\nsleep 60 >/dev/null 2>&1 &\ns=$!\nwait\n')
+
     def test_a_hung_cfctl_gets_term_first_and_releases_its_lock(self):
+        # Allowance 1, grace 20: TERM at the allowance arrives within a couple of poll ticks; TERM only after the
+        # grace (the bug this guards) arrives at 21 s or later. The 20 s margin absorbs any CI scheduling delay.
+        grace = 20
         for shell in ('sh', 'busybox ash'):
             if shell != 'sh' and not shutil.which('busybox'):
                 continue
             with self.subTest(shell=shell):
-                done = self.run_driver(self.term_driver('cfp_cfctl status --json > /dev/null; echo "RC:$?"', shell=shell),
-                                       files={'cfctl.sh': self.TERM_TRAP}, timeout=60)
+                done = self.run_driver(self.term_driver('cfp_cfctl status --json > /dev/null; echo "RC:$?"', grace=grace, shell=shell),
+                                       files={'cfctl.sh': self.TERM_TRAP_STAMPED}, timeout=120)
                 self.assertIn('RC:143', done.stdout, done.stdout + done.stderr)
                 self.assertEqual((done.home / 'lock-released').read_text().strip(), 'released')
                 self.assertFalse((done.home / 'lock').exists())
-                self.assertLess(self.elapsed(done), 3, 'TERM must come at the allowance, not after the grace')
+                start = float((done.home / 'start-at').read_text())
+                term = float((done.home / 'term-at').read_text())
+                self.assertLess(term - start, grace, 'TERM must come at the allowance, not after the grace')
 
     def test_term_reaches_the_child_when_the_session_ignores_term_as_the_teardown_does(self):
         done = self.run_driver(self.term_driver("trap '' INT TERM\ncfp_cfctl status --json > /dev/null; echo \"RC:$?\""),
