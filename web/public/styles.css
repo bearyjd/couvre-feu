@@ -985,6 +985,26 @@ footer {
 .bulk-confirm ul { margin: 0; padding-left: 1.25rem; }
 .move-controls select { min-width: 0; max-width: 100%; }
 
+/* Kids tab (UI plan H): one card per child, device rows with a status chip, a ⋯ menu per row. 44 px targets, wrapping instead of sideways scroll. */
+#children-panel .button, #children-panel select, #children-panel input:not([type="checkbox"]) { min-height: 44px; }
+.device-rows { margin-bottom: 0; }
+.device-row { display: grid; gap: .4rem; padding: .6rem .75rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); min-width: 0; overflow-wrap: anywhere; }
+.device-line { display: flex; gap: .5rem; align-items: center; justify-content: space-between; min-width: 0; }
+.device-name { font-weight: 650; min-width: 0; overflow-wrap: anywhere; word-break: break-word; unicode-bidi: plaintext; }
+.device-meta { display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; min-width: 0; }
+.status-chip { font-size: 12px; font-weight: 650; line-height: 1.4; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); background: var(--surface); }
+.status-chip.chip-on_router { background: var(--green-soft); color: var(--green); border-color: transparent; }
+.status-chip.chip-sent, .status-chip.chip-waiting, .status-chip.chip-replaced { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
+.status-chip.chip-missing { background: var(--red-soft); color: var(--red); border-color: transparent; }
+.row-menu { display: grid; justify-items: end; gap: .4rem; flex: none; }
+#children-panel .menu-trigger { min-width: 44px; padding-inline: .6rem; font-size: 1.25rem; line-height: 1; }
+.row-menu-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; }
+.row-menu-list .button { width: 100%; justify-content: center; }
+.confirm-sentence { display: grid; gap: .5rem; padding: .75rem; border: 1px solid var(--line); border-left: 4px solid var(--amber); border-radius: var(--radius); background: var(--surface); min-width: 0; overflow-wrap: anywhere; }
+.confirm-sentence p { margin: 0; }
+.confirm-sentence select { width: 100%; min-width: 0; }
+.add-device { justify-self: start; }
+
 /* Devices on the network (admins): rows reuse the stacked-card language; names are untrusted text and must wrap, never widen the page. */
 #inventory-panel .button, #inventory-panel select { min-height: 44px; }
 #inventory-panel [data-live]:empty { margin: 0; }

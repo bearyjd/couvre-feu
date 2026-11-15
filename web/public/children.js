@@ -3,10 +3,9 @@
 // All dynamic text is rendered with textContent. createBulk (same file, same helpers) is the Block all / Unblock all panel for admins and parents.
 import { getPasskey } from './auth-client.js';
 import { createWizard } from './inventory-wizard.js';
+import { childCard } from './kids-card.js';
 import { triageOn, triageView, triageStatus, groupCounts, roleWord, UNDO_SECONDS } from './inventory-triage.js';
 
-const KIND_LABEL = { child: 'Child', device_group: 'Device group' };
-const STATE_LABEL = { enrolling: 'Adding…', removing: 'Removing…', moving: 'Moving…' };
 const PENDING_COMMAND = 'cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>'; // a placeholder only; the address is never shown next to it
 
 // What a bulk operation means for the household right now. The server's `effect` decides the wording, never the bare state.
@@ -36,10 +35,12 @@ export function el(tag, props = {}, ...children) {
   return node;
 }
 
-export function createChildren({ session, revisionToken, refresh, version }) {
+export function createChildren({ session, revisionToken, refresh, version, replaced = () => new Set(), wizard = { enabled: () => false, open: () => {} } }) {
   const root = document.querySelector('#children-panel');
-  let key = '', data = null, notice = '', busy = false, lastVersion = null, pending = [], prefill = null, focusPrefill = false;
+  // prefill = the open add form's draft: { id, label, mac, warn }. confirm = the open confirm sentence: { kind: 'remove' | 'move' | 'child_remove', id }.
+  let key = '', data = null, notice = '', loadError = false, approved = [], busy = false, lastVersion = null, prefill = null, focusPrefill = false, confirm = null, focus = '', drawn = '', skipped = false;
   const moveChoice = new Map(); // device id -> chosen target child, kept across redraws
+  const labels = new Map(); // scope request id -> the name typed in this session (the service holds only what the router reported)
   const enabled = () => document.documentElement.dataset.source === 'real-router-integration' && session()?.actor.role === 'admin';
 
   async function call(path, body) {
@@ -49,13 +50,22 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(130000),
     });
     const result = await readJson(response);
-    if (!response.ok || result === null) { const error = new Error(result?.error?.message ?? 'The request could not be completed.'); error.status = response.status; error.code = result?.error?.code; throw error; }
+    if (!response.ok || result === null) { const error = new Error(result?.error?.message ?? 'The request could not be completed.'); error.status = response.status; error.code = result?.error?.code; error.requestId = result?.error?.requestId; throw error; }
     return result;
   }
   async function load() {
     if (!enabled()) { data = null; draw(); return; }
-    try { data = await call('/admin/children'); } catch (error) { if (error.status === 401 || error.status === 403) data = null; else notice = error.message; }
+    try {
+      const next = await call('/admin/children');
+      approved = settleApproved(next); data = next; loadError = false;
+    } catch (error) { if (error.status === 401 || error.status === 403) data = null; else loadError = true; } // old rows stay; never the raw server message
     draw();
+  }
+  // A waiting request that is gone from the list was taken in by the router (or timed out): tell the person it can be added now, until they dismiss it or the child shows a new device.
+  function settleApproved(next) {
+    const gone = (data?.pendingScope ?? []).filter((r) => !next.pendingScope?.some((n) => n.id === r.id) && next.children.some((c) => c.id === r.childId))
+      .map((r) => ({ id: r.id, childId: r.childId, name: labels.get(r.id) ?? r.name ?? 'Unnamed device', devices: next.children.find((c) => c.id === r.childId).devices.length }));
+    return [...approved, ...gone].filter((a) => (next.children.find((c) => c.id === a.childId)?.devices.length ?? Infinity) <= a.devices);
   }
   async function confirmed(action, target, params, path, done) {
     if (busy) return;
@@ -66,15 +76,17 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       notice = done(await call(path, { ...params, stepUp: { challengeId: start.challengeId, response } })) ?? '';
     } catch (error) {
       if (error.code === 'device_pending_router_scope') {
-        // Not an error: the request is recorded, the router administrator has a step to do. Held for this session only.
-        pending = [...pending, { label: params.label, child: data?.children.find((c) => c.id === target)?.name ?? '' }].slice(-5);
+        // Not an error: the request is recorded by the service and listed from there (it survives a reload). Only the typed name is kept here.
+        if (error.requestId) labels.set(error.requestId, params.label);
         notice = '';
-      } else notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : error.message;
+      } else notice = error.name === 'NotAllowedError' ? 'Passkey confirmation was cancelled. Nothing changed.' : friendly(error);
     }
     busy = false;
     await load();
     refresh();
   }
+  // A busy or broken service is said in plain words; the service's own message is shown only for a refusal it chose to explain (4xx other than 429).
+  const friendly = (error) => (error.status === 429 ? 'Too many changes at once. Wait a minute and try again.' : !error.status || error.status >= 500 ? "Couldn't reach Couvre-feu. Check the list before trying again." : error.message);
   const queued = (result) => result.operation ? `Sent to the router (${result.operation.state}). The device list updates once the router confirms.` : null;
   function rejection(last) {
     if (!last) return [];
@@ -84,64 +96,47 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       el('p', {}, `The router does not say which device. Check that these are on and connected, or remove one that is gone: ${devices || 'none in your scope'}${last.otherDevices ? ` and ${last.otherDevices} other device${last.otherDevices === 1 ? '' : 's'}` : ''}.`))];
   }
   function pendingNotice() {
-    if (!pending.length) return [];
-    const names = pending.map((p) => p.child ? `${p.label} (${p.child})` : p.label).join(', ');
+    const count = data.pendingScope?.length ?? 0;
+    if (!count) return [];
     return [el('div', { class: 'notice', role: 'status', 'data-pending-approval': '' },
       el('strong', {}, 'Waiting for router approval'),
-      el('p', {}, `${names}: the router does not know ${pending.length === 1 ? 'this device' : 'these devices'} yet, so nothing was added and nothing is blocked. A router administrator must approve the device's address first (${PENDING_COMMAND}).`),
-      el('p', {}, "Read the address from the device's own Wi-Fi settings, never from this page. Add the device here again once the router has approved it."),
-      el('button', { class: 'button secondary', type: 'button', onclick: () => { pending = []; draw(); } }, 'Dismiss'))];
-  }
-  function moveControls(entry, device) {
-    const others = data.children.filter((c) => c.id !== entry.id);
-    if (!others.length) return [];
-    const select = el('select', { 'aria-label': `Move ${device.label} to`, disabled: busy || device.state !== 'active',
-      onchange: () => { moveChoice.set(device.id, select.value); button.disabled = busy || !select.value; } },
-      el('option', { value: '' }, 'Move to…'), ...others.map((c) => el('option', { value: c.id }, c.name)));
-    select.value = others.some((c) => c.id === moveChoice.get(device.id)) ? moveChoice.get(device.id) : '';
-    const button = el('button', { class: 'button secondary', type: 'button', disabled: busy || device.state !== 'active' || !select.value, 'aria-label': `Move device ${device.label}`,
-      onclick: () => move(entry, device, select.value) }, 'Move');
-    return [el('div', { class: 'move-controls' }, select, button)];
+      el('p', {}, `The router does not know ${count === 1 ? 'one device' : `${count} devices`} yet, so nothing was added and nothing is blocked. A router administrator must approve the device's address first (${PENDING_COMMAND}).`),
+      el('p', {}, "Read the address from the device's own Wi-Fi settings, never from this page. Add the device here again once the router has approved it."))];
   }
   function move(entry, device, to) {
     if (!to) return;
-    if (to === entry.id) { notice = `${device.label} already belongs to ${entry.name}.`; draw(); return; }
+    confirm = null;
+    if (to === entry.id) { notice = `${device.label} already belongs to ${entry.name}.`; focus = `[data-row-menu][data-fk="menu-${device.id}"]`; draw(); return; }
     moveChoice.delete(device.id);
     void confirmed('device_move', device.id, { to, precondition: revisionToken() }, `/admin/devices/${device.id}/move`, queued);
   }
-  function deviceRow(entry, device) {
-    const where = STATE_LABEL[device.state] ?? (device.onRouter === null ? 'router state unknown' : device.onRouter ? 'on the router' : 'not on the router');
-    return el('li', { class: 'passkey-row', 'data-device': device.id },
-      el('span', {}, device.label), el('span', { class: 'fine-print' }, `${device.mac} · ${where}`),
-      el('button', { class: 'button secondary', type: 'button', disabled: busy || device.state !== 'active', 'aria-label': `Remove device ${device.label} from ${entry.name}`,
-        onclick: () => void confirmed('device_remove', device.id, { precondition: revisionToken() }, `/admin/devices/${device.id}/remove`, (result) => queued(result) ?? `Removed ${device.label}.`) }, 'Remove'),
-      ...moveControls(entry, device));
+  function remove(device) {
+    confirm = null;
+    void confirmed('device_remove', device.id, { precondition: revisionToken() }, `/admin/devices/${device.id}/remove`, (result) => queued(result) ?? `Removed ${device.label}.`);
   }
-  function addForm(entry) {
-    const filled = prefill?.id === entry.id ? prefill : null; // from the network list: the address lives only in this form field
-    const form = el('form', { class: 'account-form', 'data-add-device': entry.id },
-      ...(filled ? [el('p', { class: 'notice', role: 'note', 'data-prefill-warning': '' }, "Confirm the address in the device's own Wi-Fi settings before approving")] : []),
-      el('label', { for: `device-label-${entry.id}` }, `New device name for ${entry.name}`),
-      el('input', { id: `device-label-${entry.id}`, name: 'label', required: true, maxLength: 64, autocomplete: 'off', value: filled?.label ?? '' }),
-      el('label', { for: `device-mac-${entry.id}` }, `Wi-Fi address (MAC) for ${entry.name}`),
-      el('input', { id: `device-mac-${entry.id}`, name: 'mac', required: true, maxLength: 17, autocomplete: 'off', autocapitalize: 'none', spellcheck: false, placeholder: 'aa:bb:cc:dd:ee:ff', value: filled?.mac ?? '' }),
-      el('button', { class: 'button primary', type: 'submit', disabled: busy }, 'Add device'));
-    form.addEventListener('submit', (event) => {
-      event.preventDefault();
-      const params = { label: form.elements.label.value.trim(), mac: form.elements.mac.value.trim(), precondition: revisionToken() };
-      if (prefill?.id === entry.id) prefill = null;
-      void confirmed('device_add', entry.id, params, `/admin/children/${entry.id}/devices`, queued);
-    });
-    return form;
+  function removeChild(entry) {
+    confirm = null;
+    void confirmed('child_remove', entry.id, {}, `/admin/children/${entry.id}/remove`, () => `Removed ${entry.name}.`);
   }
+  function openForm(id) { confirm = null; prefill = { id, label: '', mac: '', warn: false }; notice = ''; focusPrefill = true; draw(); }
+  function submitAdd(entry, values) {
+    prefill = null;
+    void confirmed('device_add', entry.id, { ...values, precondition: revisionToken() }, `/admin/children/${entry.id}/devices`, queued);
+  }
+  const closeSentence = (selector) => { confirm = null; focus = selector; draw(); };
+  const handlers = {
+    onAdd: (entry, button) => { if (wizard.enabled()) wizard.open(entry.id, button); else openForm(entry.id); },
+    onCancelAdd: (entry) => { prefill = null; focus = `[data-add-device-open="${CSS.escape(entry.id)}"]`; draw(); },
+    onSubmitAdd: submitAdd,
+    onChoose: (kind, subject) => { confirm = { kind, id: subject.id }; notice = ''; focus = `[data-entry] [data-confirm] [data-confirm-text]`; draw(); },
+    onCancel: () => { const was = confirm; closeSentence(was?.kind === 'child_remove' ? `[data-remove-child="${CSS.escape(was.id)}"]` : `[data-fk="menu-${CSS.escape(was?.id ?? '')}"]`); },
+    onMove: move, onRemove: remove, onRemoveChild: removeChild,
+    onDismissApproved: (id) => { approved = approved.filter((a) => a.id !== id); draw(); },
+    onMenuClosed: () => { if (skipped) { skipped = false; draw(); } },
+  };
   function card(entry) {
-    const kind = KIND_LABEL[entry.kind] ?? 'Child';
-    return el('li', { class: 'account-card', 'data-entry': entry.id },
-      el('strong', {}, entry.name), el('span', { class: 'fine-print' }, `${kind} · ${entry.devices.length} device${entry.devices.length === 1 ? '' : 's'}`),
-      el('ul', { class: 'passkey-list', 'aria-label': `Devices of ${entry.name}` }, ...entry.devices.map((device) => deviceRow(entry, device))),
-      addForm(entry),
-      ...(entry.devices.length ? [] : [el('button', { class: 'button secondary', type: 'button', disabled: busy, 'aria-label': `Remove ${entry.name}`,
-        onclick: () => void confirmed('child_remove', entry.id, {}, `/admin/children/${entry.id}/remove`, () => `Removed ${entry.name}.`) }, `Remove ${kind.toLowerCase()}`)]));
+    return childCard({ entry, h: handlers, busy, confirm, prefill, moveChoice, labels, replaced: replaced(), approved: approved.filter((a) => a.childId === entry.id),
+      others: data.children.filter((c) => c.id !== entry.id), pending: (data.pendingScope ?? []).filter((request) => request.childId === entry.id) });
   }
   function createForm() {
     const form = el('form', { class: 'account-form' },
@@ -158,14 +153,23 @@ export function createChildren({ session, revisionToken, refresh, version }) {
     return form;
   }
   function draw() {
-    if (!enabled() || !data) { root.hidden = true; root.replaceChildren(); return; }
-    if (root.contains(document.activeElement) && document.activeElement.matches('input, select')) return; // never rebuild while typing
+    if (!enabled() || !data) { drawn = ''; root.hidden = true; root.replaceChildren(); return; }
+    // Never rebuild while typing, choosing in a list, or with a ⋯ menu open: it would drop the keyboard's place. The menu's close redraws.
+    const active = document.activeElement;
+    if (root.contains(active) && (active.matches('input') || (active.matches('select') && !active.closest('.confirm-sentence')))) return; // a move list is redrawn from fresh data
+    if (root.querySelector('.row-menu-list')) { skipped = true; return; }
     const open = prefill && root.querySelector(`[data-add-device="${CSS.escape(prefill.id)}"]`);
     if (open && !focusPrefill) prefill = { ...prefill, label: open.elements.label.value, mac: open.elements.mac.value }; // keep what the parent typed over the original prefill
+    if (confirm && !(confirm.kind === 'child_remove' ? data.children.some((c) => c.id === confirm.id) : data.children.some((c) => c.devices.some((d) => d.id === confirm.id)))) confirm = null; // the row is gone: no sentence about it
+    const signature = JSON.stringify([data, notice, loadError, approved, busy, confirm, prefill, [...replaced()], [...labels]]);
+    if (signature === drawn && !focus && !focusPrefill) return; // nothing changed: keep focus where it is
+    drawn = signature; skipped = false;
+    const kept = root.contains(active) ? active.dataset?.fk : null;
     root.replaceChildren(
       el('h2', { id: 'children-title' }, 'Children and device groups'),
       el('p', { class: 'fine-print' }, `Adults' protected devices can never be added. The router holds at most ${data.limits.children} entries, ${data.limits.devicesPerChild} devices each and ${data.limits.devices} in total; every device must be in its installed allow list. Each change needs your passkey and a router confirmation.`),
-      el('p', { class: 'notice', role: 'status', hidden: !notice }, notice),
+      el('p', { class: 'notice', role: 'status', hidden: !notice && !loadError }, loadError ? "Couldn't refresh the list. Showing the last list. Retry." : notice),
+      ...(loadError ? [el('button', { class: 'button secondary', type: 'button', onclick: () => void load() }, 'Retry')] : []),
       ...pendingNotice(),
       ...rejection(data.lastRejection),
       el('ul', { class: 'account-list', 'aria-label': 'Children and device groups' }, ...data.children.map(card)),
@@ -175,13 +179,14 @@ export function createChildren({ session, revisionToken, refresh, version }) {
       focusPrefill = false;
       const input = prefill && root.querySelector(`[data-add-device="${CSS.escape(prefill.id)}"] input[name="label"]`);
       input?.scrollIntoView({ block: 'center' }); input?.focus();
-    }
+    } else if (focus) { root.querySelector(focus)?.focus(); focus = ''; }
+    else if (kept) root.querySelector(`[data-fk="${CSS.escape(kept)}"]`)?.focus();
   }
-  // Used by the network list: open one child's add form with a name and address filled in. Nothing is sent from here.
+  // Used by the network list and the wizard: open one child's add form with a name and address filled in. Nothing is sent from here.
   function startAdd(id, values) {
     if (!enabled() || !data?.children.some((c) => c.id === id)) return false;
-    prefill = { id, label: String(values.label ?? '').slice(0, 64), mac: String(values.mac ?? '') };
-    notice = ''; focusPrefill = true;
+    prefill = { id, label: String(values.label ?? '').slice(0, 64), mac: String(values.mac ?? ''), warn: true };
+    confirm = null; notice = ''; focusPrefill = true;
     document.activeElement?.blur?.();
     draw();
     return true;
@@ -190,12 +195,12 @@ export function createChildren({ session, revisionToken, refresh, version }) {
   const entries = () => (data?.children ?? []).map((c) => ({ id: c.id, name: c.name }));
   function update() {
     const current = session(), next = current ? `${current.actor.id}:${current.actor.role}:${current.csrfToken}` : '';
-    if (next !== key) { key = next; data = null; notice = ''; pending = []; prefill = null; moveChoice.clear(); draw(); if (next) void load(); return; }
+    if (next !== key) { key = next; data = null; notice = ''; loadError = false; approved = []; labels.clear(); prefill = null; confirm = null; focus = ''; moveChoice.clear(); draw(); if (next) void load(); return; }
     // Router observations settle queued device changes; reload when the status snapshot moves.
     const seen = version();
     if (next && seen !== lastVersion) { lastVersion = seen; void load(); }
   }
-  return { update, load, startAdd, clearPrefill, entries };
+  return { update, load, startAdd, clearPrefill, entries, redraw: draw };
 }
 
 // "Block all kids" / "Unblock all": one router change for every child the signed-in account manages. Admins and parents alike.
@@ -335,7 +340,7 @@ export function inventoryStatus(status, nowSeconds, time) {
   return { kind: 'ok', clear: status.baselineAt !== null, text: `Last complete scan ${time(status.lastOkAt)}.` };
 }
 
-export function createInventory({ session, gate, offline, time, children, version }) {
+export function createInventory({ session, gate, offline, time, children, version, onList = () => {} }) {
   const root = document.querySelector('#inventory-panel');
   let key = '', data = null, loadedAt = null, loadFailed = false, notice = '', refreshNote = '', busy = false, picking = null, choice = '', lastVersion = null, drawn = '', timer = null, noteTimer = null, filter = 'new', undo = null, undoTimer = null;
   let serverNow = null, loadedPerf = 0, mounted = false, fetched = false, inFlight = false, swallowed = false; // swallowed: the first version bump was dropped as a duplicate of the in-flight first load, so a failure of that load must retry itself. fetched: a list request was issued for this session key. serverNow: the service clock at the last load, advanced by this page's own elapsed time
@@ -387,6 +392,7 @@ export function createInventory({ session, gate, offline, time, children, versio
       }
     } finally { if (mine === key) inFlight = false; }
     draw();
+    if (ok) onList(); // the Kids tab shows hints taken from this list
     if (retry) void load();
     return ok;
   }
@@ -536,5 +542,5 @@ export function createInventory({ session, gate, offline, time, children, versio
     }
     draw();
   }
-  return { update, load };
+  return { update, load, devices: () => data?.devices ?? [], wizardEnabled: () => data?.wizard === true && triageOn(data), openWizard: (child, from) => wizard.openFor(child, from) };
 }

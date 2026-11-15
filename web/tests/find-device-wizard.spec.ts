@@ -327,3 +327,52 @@ test('signing out while waiting closes the sheet and stops every request', async
   await page.waitForTimeout(300);
   expect(gets).toBe(done);
 });
+
+// UI plan H: the Kids tab's single Add device button per child opens this sheet at step 2 when the wizard flag is on.
+async function toKids(page: Page, f: World) {
+  await page.clock.install();
+  await signIn(page, f, 'operator');
+  await expect(page.locator('#inventory-panel [data-wizard-open]')).toBeAttached(); // the list (and its flag) has loaded
+  await page.locator('#tab-kids').click();
+}
+const addDevice = (page: Page, name = 'Kid kid2') => page.locator('#children-panel').getByRole('button', { name: `Add device to ${name}` });
+
+test('Kids tab, flag on: Add device opens the sheet at step 2 with that child chosen, and Close puts focus back on the button', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  await toKids(page, f);
+  await addDevice(page).click();
+  await expect(sheet(page)).toBeVisible();
+  await expect(sheet(page)).toHaveAttribute('data-step', '2');
+  await expect(page.locator('#children-panel form[data-add-device]')).toHaveCount(0);
+  await sheet(page).getByRole('button', { name: 'Pick from the list' }).click();
+  await sheet(page).getByRole('button', { name: 'Back' }).click(); // step 1 is still reachable, and the child stays chosen
+  await expect(sheet(page).getByRole('button', { name: 'Kid kid2' })).toHaveAttribute('aria-pressed', 'true');
+  await page.keyboard.press('Escape');
+  await expect(sheet(page)).toHaveCount(0);
+  await expect(addDevice(page)).toBeFocused();
+  expect(await noHorizontalScroll(page)).toBe(true);
+});
+
+test('Kids tab, flag on: finishing the sheet opens the add form inside that child card (passkey step-up unchanged)', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  await toKids(page, f);
+  await addDevice(page).click();
+  await sheet(page).getByRole('button', { name: 'It just connected' }).click();
+  await sheet(page).locator('[data-wizard-device]').filter({ hasText: 'tablet-b' }).getByRole('button').click();
+  await sheet(page).getByRole('button', { name: 'It has no such setting' }).click();
+  await sheet(page).getByRole('button', { name: 'Open the add form' }).click();
+  await expect(sheet(page)).toHaveCount(0);
+  const form = page.locator('#children-panel [data-entry="kid2"] form[data-add-device="kid2"]');
+  await expect(form.locator('input[name="mac"]')).toHaveValue(B);
+  await expect(form.locator('input[name="label"]')).toBeFocused();
+});
+
+test('Kids tab, flag off: Add device opens the add form and never the sheet', async ({ page, integration: f }) => {
+  wizardOn(f, false); seed(f);
+  await page.clock.install();
+  await signIn(page, f, 'operator');
+  await page.locator('#tab-kids').click();
+  await addDevice(page).click();
+  await expect(page.locator('#children-panel form[data-add-device="kid2"]')).toBeVisible();
+  await expect(sheet(page)).toHaveCount(0);
+});

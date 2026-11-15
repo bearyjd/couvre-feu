@@ -3,6 +3,7 @@ import type { Actor, EntryKind } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
 import { mac as canonicalMac } from '../../shared/src/router-schema.ts';
+import { lookupVendor } from '../../shared/src/oui.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
 import { ScopeTracker } from './integration-scope.ts';
@@ -24,8 +25,12 @@ const ID = /^[a-z][a-z0-9_]{0,31}$/;
 const KINDS: readonly EntryKind[] = ['child', 'device_group'];
 export interface ChildAdminDTO {
     id: string; name: string; kind: EntryKind;
-    devices: {id: string; label: string; mac: string; state: DeviceRow['state']; onRouter: boolean | null}[];
+    devices: {id: string; label: string; mac: string; vendor?: string; state: DeviceRow['state']; onRouter: boolean | null}[];
 }
+/** A device request still waiting for the router's own administrator. Ids, the child, the device-reported name and the age only: never the address, never who asked or the digests. */
+export interface PendingScopeDTO { id: string; childId: string; name: string | null; status: 'pending'; ageSeconds: number }
+/** More than the per-child cap allows across every child; a bound on the read, not a limit on requests. */
+export const PENDING_SCOPE_LIST_LIMIT = 64;
 export interface RejectionDTO { operationId: string; code: string; at: number; devices: {child: string; device: string}[]; otherDevices: number }
 
 export function label(value: unknown, code: string): string {
@@ -66,6 +71,7 @@ function normalize(kind: ChildAction, target: unknown, params: unknown): {target
 const bindingOf = (kind: ChildAction, target: string, params: Record<string, unknown>) => digest(JSON.stringify(['child_admin', kind, target, params]));
 /** A placeholder for a person to fill in at the router, never a command with a MAC or digest: the app must not hand out something paste-ready (design H2). */
 const PENDING_SCOPE_TEXT = 'The router has not approved this device yet. A router administrator runs: cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>. Read the address from the device\'s own Wi-Fi settings, never from this page.';
+const vendorOf = (mac: string): {vendor?: string} => { const vendor = lookupVendor(mac); return vendor ? {vendor} : {}; };
 const id = (prefix: string) => `${prefix}_${randomBytes(5).toString('hex')}`;
 
 export class ChildAdmin {
@@ -82,13 +88,23 @@ export class ChildAdmin {
     private allowed(actor: Actor): void { if (actor.role !== 'admin') throw new AppError(403, 'admin_required'); }
     static isAction(value: unknown): value is ChildAction { return CHILD_ACTIONS.includes(value as ChildAction); }
     /** In-scope entries with their device identifiers (admins type them in), router membership and the last refusal. */
-    list(actor: Actor): {children: ChildAdminDTO[]; canCreate: boolean; limits: {children: number; devicesPerChild: number; devices: number}; lastRejection: RejectionDTO | null} {
+    list(actor: Actor): {children: ChildAdminDTO[]; canCreate: boolean; limits: {children: number; devicesPerChild: number; devices: number}; lastRejection: RejectionDTO | null; pendingScope: PendingScopeDTO[]} {
         this.allowed(actor);
         const o = this.policy.fresh() ? this.store.observation().value : null;
         const children = activeChildren(this.store).filter(child => actor.personIds.includes(child.id)).map(child => ({id: child.id, name: child.name, kind: child.kind,
-            devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, mac: d.identifier, state: d.state,
+            devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, mac: d.identifier, ...vendorOf(d.identifier), state: d.state,
                 onRouter: o ? o.acceptedPolicy.people.some(p => p.id === child.id && p.macs.includes(d.identifier)) : null}))}));
-        return {children, canCreate: this.scopeAll(actor.id), limits: {children: CHILD_LIMIT, devicesPerChild: DEVICES_PER_CHILD, devices: DEVICE_LIMIT}, lastRejection: this.rejection(actor)};
+        return {children, canCreate: this.scopeAll(actor.id), limits: {children: CHILD_LIMIT, devicesPerChild: DEVICES_PER_CHILD, devices: DEVICE_LIMIT}, lastRejection: this.rejection(actor), pendingScope: this.pendingScope(children.map(c => c.id))};
+    }
+    /** Requests still waiting for router approval, from the service's own records so they survive a reload. Names come from the router's device list, never from the request. */
+    private pendingScope(visible: string[]): PendingScopeDTO[] {
+        if (!visible.length) return [];
+        const now = this.policy.now();
+        return this.store.all<{id: string; person_id: string; created_at: number; hostname: string | null}>(
+            `SELECT r.id,r.person_id,r.created_at,i.hostname FROM scope_requests r LEFT JOIN inventory_devices i ON i.generation=r.generation AND i.mac=r.mac
+             WHERE r.state='pending' AND r.generation=? AND r.expires_at>? AND r.person_id IN (${visible.map(() => '?').join(',')}) ORDER BY r.created_at,r.id LIMIT ?`,
+            this.store.config.router.generation, now, ...visible, PENDING_SCOPE_LIST_LIMIT)
+            .map(r => ({id: r.id, childId: r.person_id, name: r.hostname, status: 'pending' as const, ageSeconds: Math.max(0, now - r.created_at)}));
     }
     async stepUpOptions(session: AuthSession, input: unknown) {
         if ((input as {action?: unknown} | null)?.action === 'child_batch') return this.batch.stepUpOptions(session, input);

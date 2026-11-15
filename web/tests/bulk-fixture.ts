@@ -59,3 +59,22 @@ export async function signIn(page: Page, f: World, account: 'operator' | 'parent
 }
 
 export const noHorizontalScroll = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
+
+const bumped = new WeakMap<Page, { n: number }>();
+/** A new status snapshot version (the kids tab reloads and redraws), then waits for the children list to be read again. Repeatable. */
+export async function bumpVersion(page: Page) {
+  let state = bumped.get(page);
+  if (!state) {
+    const fresh = { n: 0 };
+    state = fresh; bumped.set(page, fresh);
+    await page.route('**/people', async (route) => {
+      try {
+        const response = await route.fetch(); const body = await response.json(); body.observedAt -= (fresh.n += 1);
+        await route.fulfill({ response, json: body });
+      } catch { /* the page is closing: nothing left to answer */ }
+    });
+  }
+  const read = page.waitForResponse((r) => new URL(r.url()).pathname === '/admin/children');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await read;
+}
