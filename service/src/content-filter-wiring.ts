@@ -26,9 +26,10 @@ export function wireContentFilter(config: IntegrationConfig, store: IntegrationS
         client: nextDns, profiles: settings.profiles!, store: filters,
     });
     // PRP phase C: daily counts from NextDNS analytics exist only when the manifest says counts.enabled (absent = off); no flag, no fetcher, no call.
-    const counts = settings.counts?.enabled === true ? new ContentFilterCounts({client: nextDns, profiles: settings.profiles!, store: new ContentFilterCountsStore(store)}) : null;
+    const countsStore = settings.counts?.enabled === true ? new ContentFilterCountsStore(store) : null;
+    const counts = countsStore ? new ContentFilterCounts({client: nextDns, profiles: settings.profiles!, store: countsStore}) : null;
     return {filters, reconciler, counts, routes: (auth: Auth, policy: IntegrationPolicy) => new ContentFilterRoutes({
-        auth, filters, reconciler, mode: settings.mode, ...(config.ownerAccountId !== undefined ? {ownerAccountId: config.ownerAccountId} : {}),
+        auth, filters, reconciler, mode: settings.mode, ...(countsStore ? {counts: countsStore} : {}), ...(config.ownerAccountId !== undefined ? {ownerAccountId: config.ownerAccountId} : {}),
         authorize: (actor, person) => { policy.authorized(actor, person); },
     })};
 }

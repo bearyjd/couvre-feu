@@ -1,3 +1,4 @@
+import { OBSERVATION_FRESH_SECONDS } from '../src/integration-policy.ts';
 import test from 'node:test';
 import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
@@ -407,3 +408,83 @@ for (const scenario of ['manifest-only', 'fresh', 'remembered', 'stale', 'wrong-
         } finally { f.cleanup(); }
     });
 }
+
+test('an enrolling row whose operation has ended is removed through the normal path; one still in flight is refused', async () => {
+    const f = fixture();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const id = (await f.act(op, 'device_add', 'pilot', {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id as string;
+        await f.dispatch(id); f.advance(1); await f.observe();
+        const tablet = f.store.get<{id: string}>('SELECT id FROM devices WHERE identifier=?', TABLET)!.id;
+        const stick = (state: string) => { f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE id=?", id, tablet); f.store.run('UPDATE operations SET state=? WHERE id=?', state, id); };
+        for (const state of ['pending', 'unknown']) { stick(state); await assert.rejects(f.act(op, 'device_remove', tablet, {precondition: f.token()}), code('device_change_in_progress'), state); }
+        // Final operation, router holds it: the removal is queued on the router, and the row goes when that settles.
+        stick('conflict');
+        const removed = await f.act(op, 'device_remove', tablet, {precondition: f.token()});
+        assert.equal(removed.body.operation.action, 'unenroll');
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM devices WHERE id=?', tablet)!.state, 'removing');
+        await f.dispatch(removed.body.operation.id);
+        assert.equal(f.store.get('SELECT id FROM devices WHERE id=?', tablet), undefined);
+        assert.deepEqual(f.router.policy.people, [{id: 'pilot', macs: [SEED]}]);
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken, 'the list is healthy again once the stuck row is gone');
+        // Final operation, router does not hold it: no router change.
+        f.advance(1); await f.observe();
+        f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES('d_stuck','pilot','Stuck','mac',?,'enrolling',?,1)", LAPTOP, id);
+        stick('failed'); f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE id='d_stuck'", id); f.store.run("DELETE FROM devices WHERE id=?", tablet);
+        assert.deepEqual((await f.act(op, 'device_remove', 'd_stuck', {precondition: null})).body, {removed: 'd_stuck', routerChange: false});
+    } finally { f.cleanup(); }
+});
+
+/** The real way to get an unsettled enrol: the operation ends in conflict while no observation is stored (worker settleDevices returns early). */
+async function stuckEnrol(f: ReturnType<typeof fixture>) {
+    const op = await f.signIn('operator'); await f.observe();
+    const id = (await f.act(op, 'device_add', 'pilot', {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id as string;
+    f.store.run('UPDATE service_state SET observation_json=NULL,observed_at=NULL WHERE singleton=1');
+    (f.worker as any).updateOperation(id, 'conflict', 'router_base_changed');
+    f.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+    assert.equal(f.store.get<{state: string}>('SELECT state FROM devices WHERE identifier=?', TABLET)!.state, 'enrolling');
+    return {op, id, tablet: f.store.get<{id: string}>('SELECT id FROM devices WHERE identifier=?', TABLET)!.id};
+}
+
+test('a stuck enrol the router does not hold neither hides the revision token nor blocks other changes; removing it is local', async () => {
+    const f = fixture();
+    try {
+        const s = await stuckEnrol(f);
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken);
+        await f.dispatch(f.pause(0, 'pause_while_stuck_1').result.operation.id);
+        f.advance(1); await f.observe();
+        assert.deepEqual((await f.act(s.op, 'device_remove', s.tablet, {precondition: null})).body, {removed: s.tablet, routerChange: false});
+    } finally { f.cleanup(); }
+});
+
+test('a stuck enrol the router holds counts as configured, so the list is healthy and the removal queues a router unenroll', async () => {
+    const f = fixture();
+    try {
+        const s = await stuckEnrol(f);
+        f.router.policy = {...f.router.policy, people: f.router.policy.people.map((p: any) => p.id === 'pilot' ? {...p, macs: [...p.macs, TABLET].sort()} : p)};
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken);
+        const removed = await f.act(s.op, 'device_remove', s.tablet, {precondition: f.token()});
+        assert.equal(removed.body.operation.action, 'unenroll');
+    } finally { f.cleanup(); }
+});
+
+test('a stuck enrol with no fresh observation is not counted, and its removal is refused 503 without touching anything', async () => {
+    const f = fixture();
+    try {
+        const s = await stuckEnrol(f);
+        const snapshot = () => JSON.stringify([f.store.all('SELECT * FROM devices'), f.store.all('SELECT id,state FROM operations'), f.store.get<{n: number}>('SELECT count(*) n FROM audit')]);
+        const before = snapshot();
+        await assert.rejects(f.act(s.op, 'device_remove', s.tablet, {precondition: null}), code('approved_router_observation_required'));
+        assert.equal(snapshot(), before);
+        // Even once an observation that holds the device exists, it stops counting when that observation goes stale.
+        f.router.policy = {...f.router.policy, people: f.router.policy.people.map((p: any) => p.id === 'pilot' ? {...p, macs: [...p.macs, TABLET].sort()} : p)};
+        f.advance(1); await f.observe();
+        assert.ok(!(f.policy.people(actor) as any).errors.includes('pilot_device_not_enrolled'));
+        f.advance(OBSERVATION_FRESH_SECONDS + 1);
+        assert.ok((f.policy.people(actor) as any).errors.includes('pilot_device_not_enrolled'));
+        assert.equal(f.policy.people(actor).revisionToken, null);
+    } finally { f.cleanup(); }
+});

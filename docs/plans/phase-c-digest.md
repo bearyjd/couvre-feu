@@ -293,7 +293,7 @@ identical 404s; no NextDNS call is ever made by a request):
   "days": [
     {"day": "2026-11-08", "state": "ok", "total": 4210, "blocked": 63,
      "classes": {"adult": 2, "social": 11, "apps": 9, "bypass": 1, "ads_trackers": 40}},
-    {"day": "2026-11-09", "state": "unavailable"},
+    {"day": "2026-11-09", "state": "gap"},
     {"day": "2026-11-10", "state": "logs_off"},
     {"day": "2026-11-11", "state": "suspect_zero", "total": 0, "blocked": 0}
   ],
@@ -301,6 +301,7 @@ identical 404s; no NextDNS call is ever made by a request):
 }
 ```
 
+- `gap` is the wire word for both a stored `unavailable` day and a day with no row yet.
 - Always the last 7 complete local days (no query parameters in the first version; nothing to validate or abuse).
 - `classes` keys are class codes; values integers; zero classes omitted.
 - `week.filterBlocked` sums only headline classes (§4.1) over `ok` days; `background` sums `ads_trackers`+`security`.
@@ -351,6 +352,8 @@ Rules:
   Sunday is incomplete). Stated in the service contract; differs from the requests/grants window (slot to slot) by
   18 hours. Accepted; the alternative (ask NextDNS at send time) fails F8.
 - Numbers pass the existing `count()` coercion; text is constants + integers only.
+
+**As built (C4, deviations from the text above).** The number is on its own line: `N blocked lookups last week.`, or `N blocked lookups last week (x of 7 days counted).` when fewer than 7 days were counted. A week with zero counted days omits the line (not "blocked lookups unavailable"). A day counts only if every configured child (the keys of `contentFilter.profiles`) is `ok` for it; `suspect_zero`, `logs_off` and gaps do not count, so one child stuck in such a state means the line never appears (remedy: enable NextDNS logs for every profile, check the child's profile). A parent cannot tell "counts broken" from "counts off" from the push alone; the app card shows it. A failing read logs the fixed tag `digest_blocked_failed`. See `docs/service-contract.md`.
 
 ### 7.2 In-app (filter card, `web/public/content-filter.js`)
 
@@ -524,6 +527,7 @@ Stop rule: any sentinel/domain/child name seen in a push, alert or log → flag 
 | O8 | Show total lookups (`total`) in the app | yes / no | **Yes, small print**: makes "0 blocked" meaningful and exposes F7; it is a count, not browsing data |
 | O9 | Digest window | Sun–Sat local days / slot-to-slot via live query | **Sun–Sat days** (survives one-week retention and quiet-hours deferral) |
 | O10 | Tell the children what is counted | yes / no | **Yes** (consistent with D4's "tell the children what is logged") |
+| O11 | Who sees per-child counts when contentFilter.mode is parents? | parents in scope (as built, same gate as the filter card) / admins only (one line: `actor.role==="admin"` at the top of the counts branch in `ContentFilterRoutes.get`) | **As built** (both parents are admins today); revisit if a non-admin parent account is ever added |
 
 ---
 

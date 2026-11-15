@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { integrationFixture } from './fixtures/integration.ts';
+import { integrationFixture, actor } from './fixtures/integration.ts';
 import { wireIntegration } from '../src/integration-wiring.ts';
 import { wireContentFilter } from '../src/content-filter-wiring.ts';
 import { NextDnsEnvironmentError } from '../src/nextdns-client.ts';
 import { createFakeNextDns, profile } from './fixtures/fake-nextdns.ts';
 import { API_KEY, DESIRED, PROFILE_ID, SECRET_ALLOWED, SECRET_DOMAIN, fakeWorld } from './fixtures/content-filter.ts';
+import { Auth } from '../src/auth.ts';
+import type { AuthSession } from '../src/auth.ts';
 import type { IntegrationConfig } from '../src/integration-config.ts';
 
 const setting = (mode: 'off' | 'owner' | 'parents'): NonNullable<IntegrationConfig['contentFilter']> =>
@@ -64,5 +66,24 @@ test('the real wiring path builds a client that reconciles a filter with denylis
         assert.equal((await wired.reconciler.reconcile('pilot'))!.state, 'applied');
         assert.deepEqual(fake.profile.allowlist, [{id: SECRET_ALLOWED, active: true}]);
         assert.deepEqual(fake.profile.denylist, [{id: SECRET_DOMAIN, active: true}]);
+    } finally { f.cleanup(); }
+});
+
+test('contentFilter.counts.enabled mounts the counts route on the real wiring; absent leaves it a missing route', () => {
+    const f = integrationFixture();
+    try {
+        const auth = new Auth(f.store, 'http://localhost:4273', f.now, {provenance: f.config.provenance});
+        const session = {dto: {actor}} as unknown as AuthSession;
+        const answer = (counts: {enabled: boolean} | undefined) => {
+            f.config.contentFilter = {mode: 'parents', apiKeyFile: '/nonexistent-dir/never-read.key', defaultProfile: 'dflt01', profiles: {pilot: PROFILE_ID}, ...(counts ? {counts} : {})};
+            const routes = wireContentFilter(f.config, f.store, {})!.routes(auth, f.policy);
+            try { return routes.get(session, '/people/pilot/filter/counts'); } catch (e) { return (e as {status?: number; code?: string}); }
+        };
+        const on = answer({enabled: true}) as {status: number; body: {days: unknown[]}};
+        assert.equal(on.status, 200); assert.equal(on.body.days.length, 7);
+        for (const off of [undefined, {enabled: false}]) {
+            const r = answer(off) as {status?: number; code?: string} | null;
+            assert.ok(r === null || (r.status === 404 && r.code === 'route_not_found'), JSON.stringify(r));
+        }
     } finally { f.cleanup(); }
 });

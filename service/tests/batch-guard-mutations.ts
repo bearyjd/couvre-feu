@@ -1,4 +1,4 @@
-/** Manual runner: pinned Node 26.8.1, private TMPDIR and local loopback bind permission are required. */
+/** Manual runner: pinned Node 26.13.1, private TMPDIR and local loopback bind permission are required. */
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -101,7 +101,7 @@ const selectedIds = new Set(process.argv.slice(2));
 const selected = selectedIds.size ? mutations.filter(m => selectedIds.has(m.id)) : mutations;
 for (const requested of selectedIds) if (!mutations.some(m => m.id === requested)) throw new Error(`Unknown guard: ${requested}`);
 const node = process.env.BATCH_NODE ?? process.execPath;
-if (spawnSync(node, ['--version'], {encoding: 'utf8'}).stdout.trim() !== 'v26.8.1') throw new Error('Use pinned Node 26.8.1 (or BATCH_NODE).');
+if (spawnSync(node, ['--version'], {encoding: 'utf8'}).stdout.trim() !== 'v26.13.1') throw new Error('Use pinned Node 26.13.1 (or BATCH_NODE).');
 const reportDir = resolve(process.env.BATCH_REPORT_DIR ?? join(tmpdir(), 'batch-guard-report'));
 mkdirSync(reportDir, {recursive: true, mode: 0o700});
 const workspace = process.env.TMPDIR ?? join(repo, '.omc', 'test-tmp');
@@ -158,7 +158,7 @@ for (const mutation of selected) {
     results.push({id: mutation.id, test: mutation.test, status, log, snapshot});
     process.stdout.write(`${mutation.id} -> ${mutation.test} -> ${status}\n`);
     // Persist after each result so an interrupted run still leaves usable evidence.
-    writeFileSync(join(reportDir, 'mutations.json'), JSON.stringify({node: '26.8.1', source: repo, snapshot, baseline: 'passed', defined: mutations.length, results}, null, 2) + '\n');
+    writeFileSync(join(reportDir, 'mutations.json'), JSON.stringify({node: '26.13.1', source: repo, snapshot, baseline: 'passed', defined: mutations.length, results}, null, 2) + '\n');
 }
 const killed = results.filter(result => result.status === 'killed').length;
 process.stdout.write(`Killed ${killed}/${results.length}; report ${join(reportDir, 'mutations.json')}\n`);

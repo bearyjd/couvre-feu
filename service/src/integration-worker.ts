@@ -11,7 +11,7 @@ import type { RouterActivity } from '../../shared/src/router-activity.ts';
 import { routerScopeOf } from './integration-config.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
-import { DEFAULT_INVENTORY_RETENTION_DAYS, InventoryStore, inventoryFailureLabel } from './inventory-store.ts';
+import { DEFAULT_INVENTORY_RETENTION_DAYS, InventoryStore, dropDecisionOnEnrol, inventoryFailureLabel } from './inventory-store.ts';
 import type { RouterInventory } from '../../shared/src/router-inventory.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-children.ts';
@@ -329,10 +329,12 @@ export class IntegrationWorker {
             for (const row of this.store.all<{id: string; person_id: string; identifier: string}>('SELECT id,person_id,identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) {
                 held = o.acceptedPolicy.people.some(p => p.id === row.person_id && p.macs.includes(row.identifier));
                 this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE id=?" : 'DELETE FROM devices WHERE id=?', row.id);
+                if (held && op.action === 'enroll') dropDecisionOnEnrol(this.store, row.identifier);
             }
             return null;
         }
         held = (state === 'confirmed') === (op.action === 'enroll');
+        if (held && op.action === 'enroll') for (const row of this.store.all<{identifier: string}>('SELECT identifier FROM devices WHERE operation_id=? AND state=?', op.id, pending)) dropDecisionOnEnrol(this.store, row.identifier);
         this.store.run(held ? "UPDATE devices SET state='active',operation_id=NULL WHERE operation_id=? AND state=?" : 'DELETE FROM devices WHERE operation_id=? AND state=?', op.id, pending);
         return null;
     }

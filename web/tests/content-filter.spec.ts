@@ -180,3 +180,73 @@ test('MOCK: a typed site survives a failed save and is sent on the next one', as
   await expect(card(page).locator('[data-filter-notice]')).toContainText('Saved here');
   expect((m.puts[1] as any).desired.allowlist).toEqual(['keep.example.org']);
 });
+
+// "Last 7 days" block (phase C3). The counts route is answered by the test (MOCK); the real route is covered by the service tests.
+const week = (days: unknown[]) => ({ note: 'unverified on this router', days, week: { filterBlocked: 0, background: 0, okDays: 0, days: 7 } });
+const SEVEN = [
+  { day: '2026-11-07', state: 'ok', total: 100, blocked: 3, classes: { adult: 2, social: 1 } },
+  { day: '2026-11-08', state: 'suspect_zero', total: 0, blocked: 0, classes: {} },
+  { day: '2026-11-09', state: 'logs_off' },
+  { day: '2026-11-10', state: 'gap' },
+  { day: '2026-11-11', state: 'ok', total: 900, blocked: 45, classes: { apps: 4, ads_trackers: 40, '<img src=x onerror=window.__pwn=1>': 1 } },
+  { day: '2026-11-12', state: 'ok', total: 5, blocked: 0, classes: {} },
+  { day: '2026-11-13', state: 'ok', total: 8, blocked: 0, classes: {} },
+];
+async function mockCounts(page: Page, answer: (route: Route) => Promise<void> | void) {
+  const asked: string[] = [];
+  await page.route((url) => /^\/people\/[a-z_0-9]+\/filter\/counts$/.test(url.pathname), async (route) => { asked.push(new URL(route.request().url()).pathname); await answer(route); });
+  return asked;
+}
+const alexOnly = (route: Route) => (new URL(route.request().url()).pathname.includes('/alex/') ? route.fulfill({ json: record('applied') }) : refuse(404, 'person_not_found')(route));
+
+test('MOCK: Last 7 days at 390px shows classes, plain-language states, fixed copy, no scroll, and treats markup as text', async ({ page, demo }) => {
+  await page.setViewportSize({ width: 390, height: 800 });
+  await mock(page, { get: alexOnly });
+  await mockCounts(page, (route) => route.fulfill({ json: week(SEVEN) }));
+  await enroll(page, demo);
+  const block = card(page).locator('[data-filter-counts]');
+  await expect(block).toBeVisible();
+  await expect(block).not.toHaveAttribute('open', '');
+  await block.locator('summary').click();
+  await expect(block.locator('[data-filter-counts-headline]')).toHaveText('7 lookups blocked by this filter (4 of 7 days counted)');
+  await expect(block).toContainText('Adult content: 2');
+  await expect(block).toContainText('Social networks: 1');
+  await expect(block).toContainText('Blocked apps and services: 4');
+  await expect(block).toContainText('Other: 1'); // the unknown (hostile) code
+  await expect(block).toContainText('40 ads and trackers');
+  const strip = block.locator('[data-filter-counts-days] li');
+  await expect(strip).toHaveCount(7);
+  await expect(strip.nth(1)).toContainText('No lookups recorded: the phone may have been off or not using this network.');
+  await expect(strip.nth(1)).not.toContainText(/clean|all clear|nothing/i);
+  await expect(strip.nth(2)).toContainText('Logging was off at NextDNS');
+  await expect(strip.nth(3)).toContainText('Not counted (NextDNS did not answer).');
+  await expect(block).toContainText('Counts only. Couvre-feu does not see or keep which sites.');
+  await expect(block).toContainText('Unverified on this router');
+  await expect(block).not.toContainText(/monitor|catch/i);
+  expect(await page.evaluate(() => (window as unknown as { __pwn?: number }).__pwn)).toBeUndefined();
+  expect(await block.locator('img').count()).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('MOCK: the counts route absent (feature off) or failing leaves the filter card alone, and absent is asked once', async ({ page, demo }) => {
+  await mock(page, { get: alexOnly });
+  const asked = await mockCounts(page, refuse(404, 'route_not_found'));
+  await enroll(page, demo);
+  await expect(card(page).locator('[data-filter-state]')).toBeVisible();
+  await expect(card(page).locator('[data-filter-counts]')).toHaveCount(0);
+  await page.waitForTimeout(500);
+  expect(asked.length).toBe(1);
+});
+
+test('MOCK: with no counted day the headline is hidden and only the not-counted states show', async ({ page, demo }) => {
+  await page.setViewportSize({ width: 390, height: 800 });
+  await mock(page, { get: alexOnly });
+  await mockCounts(page, (route) => route.fulfill({ json: week(SEVEN.map((d) => ({ day: d.day, state: 'gap' }))) }));
+  await enroll(page, demo);
+  const block = card(page).locator('[data-filter-counts]');
+  await block.locator('summary').click();
+  await expect(block.locator('[data-filter-counts-headline]')).toHaveCount(0);
+  await expect(block.locator('[data-filter-counts-days] li')).toHaveCount(7);
+  await expect(block).toContainText('Not counted (NextDNS did not answer).');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});

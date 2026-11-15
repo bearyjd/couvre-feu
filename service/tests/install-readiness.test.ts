@@ -299,6 +299,20 @@ test('L2: a child device whose address is also an adult or protected address ref
         t.classify(DAY_ROLE_MAC, 'adult');
         w.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d8','pilot','Dup2','mac',?, 'active',1)", DAY_ROLE_MAC);
         err(await admin.get(), 409, 'install_list_overlap');
+        // The same overlap while the enrol is still on its way to the router is a distinct, self-resolving refusal.
+        w.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at) SELECT 'op_p',id,'pilot','enroll',9999,'pending','{}','{}','{}','k',1,1 FROM accounts LIMIT 1");
+        w.store.run("UPDATE devices SET state='enrolling',operation_id='op_p' WHERE id='d8'");
+        for (const r of [await admin.get(), await admin.exportList(ok.body.digest)]) err(r, 409, 'install_list_pending_enrol');
+        // Another, real overlap alongside the pending one is reported as the overlap.
+        w.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d9','pilot','Dup3','mac',?, 'active',1)", w.config.protectedMacs[0]);
+        err(await admin.get(), 409, 'install_list_overlap');
+        w.store.run("DELETE FROM devices WHERE id='d9'");
+        // A pending enrol is not an approvable list either: approve and the passkey options refuse with the same code.
+        err(await admin.call('POST', '/step-up/options', {action: 'install_list_approve', digest: ok.body.digest}), 409, 'install_list_pending_enrol');
+        err(await admin.approve(ok.body.digest), 409, 'install_list_pending_enrol');
+        // Its operation ending without the device being settled turns the refusal into a permanent, explained overlap.
+        w.store.run("UPDATE operations SET state='conflict' WHERE id='op_p'");
+        err(await admin.get(), 409, 'install_list_overlap');
         assert.equal(w.audit().length, 0);
     } finally { await w.cleanup(); }
 });
