@@ -10,6 +10,7 @@ import { TestAuthenticator } from './authenticator.ts';
 import { freePort } from './free-port.ts';
 import { AutomaticDispatch } from '../src/integration-automatic.ts';
 
+const shellNames = new Map<boolean, string>();
 for (const enabled of [false, true]) test(`real integration HTTP preserves authentication and cached reads with ${enabled ? 'enabled automatic dispatch over private HTTPS' : 'default exact permits'}`, async () => {
     const f = integrationFixture(), port = await freePort(), internal = `http://localhost:${port}`, origin = enabled ? 'https://parent.example.test:8443' : internal, host = new URL(origin).host;
     if (enabled) f.config.dispatch = {enabled: true, pollSeconds: 2, maxBackoffSeconds: 8};
@@ -42,7 +43,9 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
     try {
         const html = await (await proxyFetch('/')).text(); assert.match(html, /data-source="real-router-integration"/); assert.match(html, /Private router integration/); assert.doesNotMatch(html, /fictional account|Synthetic demo/);
         assert.match(html, new RegExp(`data-automatic-dispatch="${enabled}"`));
-        assert.match(await (await proxyFetch('/sw.js')).text(), /cf-shell-integration-dddd[^']*-v15'/);
+        const swText = await (await proxyFetch('/sw.js')).text();
+        assert.match(swText, /'cf-shell-[0-9a-f]{10}-integration-dddd[^']*'/);
+        shellNames.set(enabled, /'(cf-shell-[^']+)'/.exec(swText)![1]);
         assert.equal((await request('/people', undefined, {Host: 'untrusted.example.test'})).status, 403);
         assert.equal((await request('/people', undefined, {Origin: 'https://untrusted.example.test'})).status, 403);
         assert.equal(auth.rpID, enabled ? 'parent.example.test' : 'localhost');
@@ -83,4 +86,9 @@ for (const enabled of [false, true]) test(`real integration HTTP preserves authe
         f.store.run("UPDATE accounts SET permission_version=permission_version+1 WHERE id='parent'"); assert.equal((await request('/people')).status, 401);
         assert.equal(f.router.calls.filter(c => c.kind !== 'inventory').length, enabled ? 3 : 1);
     } finally { await automatic?.stop(); server.close(); await once(server, 'close'); f.cleanup(); }
+});
+
+test('the offline shell cache name differs when automatic dispatch changes the served bytes', () => {
+    assert.equal(shellNames.size, 2);
+    assert.notEqual(shellNames.get(false), shellNames.get(true));
 });

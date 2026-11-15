@@ -47,11 +47,11 @@ test('Reload with a waiting worker posts skipWaiting and reloads on controllerch
   expect(elapsed).toBeLessThan(2800); // And did not need the 3 s fallback.
 });
 
-test('the service worker accepts a skipWaiting message and the shell cache is renamed', async ({ page, demo }) => {
+test('the service worker accepts a skipWaiting message and the shell cache name is a content hash', async ({ page, demo }) => {
   const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
   expect(sw).toContain("'skipWaiting'");
-  expect(sw).toContain("'cf-shell-v15'");
-  expect(sw).not.toContain('cf-shell-v14');
+  expect(sw).toMatch(/'cf-shell-[0-9a-f]{10}'/);
+  expect(sw).not.toContain('cf-shell-dev');
   expect(sw).toContain('/pwa-update.js');
 });
 
@@ -97,4 +97,17 @@ test('the notice gives way to the existing expiry message when the session ends'
   await expect(page.locator('#session-grace')).toBeVisible();
   await expect(page.locator('#notice')).toContainText('Your session expired', { timeout: 8000 });
   await expect(page.locator('#session-grace')).toBeHidden();
+  await page.unrouteAll({ behavior: 'ignoreErrors' }); // A background poll may still await route.fetch().
+});
+
+test('activating the new worker deletes the old cf-shell cache and keeps only the content-hash cache holding the shell', async ({ page, demo }) => {
+  await page.goto(demo.origin);
+  await page.evaluate(async () => { const old = await caches.open('cf-shell-v14'); await old.put('/old-marker', new Response('old')); });
+  await page.reload(); // The worker is registered by the first load; the reload installs it against the seeded cache.
+  await page.evaluate(async () => { await navigator.serviceWorker.ready; });
+  await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
+  const served = /'(cf-shell-[0-9a-f]{10})'/.exec(await (await page.request.get(demo.origin + '/sw.js')).text())![1];
+  await expect.poll(() => page.evaluate(() => caches.keys())).toEqual([served]);
+  expect(served).toMatch(/^cf-shell-[0-9a-f]{10}$/);
+  expect(await page.evaluate(async (name) => Boolean(await (await caches.open(name)).match('/app.js')), served)).toBe(true);
 });
