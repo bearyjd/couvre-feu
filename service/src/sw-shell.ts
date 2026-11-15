@@ -12,9 +12,9 @@ export interface BuiltServiceWorker {
 /**
  * Reads sw.js plus every file its ASSETS list names, hashes them, and returns sw.js with the placeholder cache name
  * replaced by `cf-shell-<hash>[-<variant>]`. Any changed shipped byte therefore renames the cache; PRs never bump it.
- * Throws (never hashes fewer files) when an asset is unreadable or sw.js has no placeholder or no ASSETS list.
+ * `served` maps each file's bytes to the bytes the server actually serves, so the hash covers those. Throws (never hashes fewer files) when an asset is unreadable or sw.js has no placeholder or no ASSETS list.
  */
-export function buildServiceWorker(publicDir: string, variant?: string): BuiltServiceWorker {
+export function buildServiceWorker(publicDir: string, variant?: string, served: (file: string, bytes: Buffer) => Buffer = (_file, bytes) => bytes): BuiltServiceWorker {
     const source = readFileSync(join(publicDir, 'sw.js'), 'utf8');
     if (source.split(PLACEHOLDER).length !== 2) {
         throw new Error(`sw.js must contain the cache-name placeholder ${PLACEHOLDER} exactly once`);
@@ -33,7 +33,7 @@ export function buildServiceWorker(publicDir: string, variant?: string): BuiltSe
         } catch (error) {
             throw new Error(`service worker asset ${asset} (web/public/${file}) is unreadable: ${(error as Error).message}`);
         }
-        hash.update(`\0${asset}\0`).update(bytes);
+        hash.update(`\0${asset}\0`).update(served(file, bytes));
     }
     const name = `cf-shell-${hash.digest('hex').slice(0, 10)}${variant ? `-${variant}` : ''}`;
     return {name, source: source.replace(PLACEHOLDER, `'${name}'`)};

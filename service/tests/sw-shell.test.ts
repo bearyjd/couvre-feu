@@ -63,3 +63,10 @@ test('a missing asset or a missing placeholder fails fast instead of hashing few
         assert.throws(() => buildServiceWorker(dir), /placeholder/);
     } finally { rmSync(dir, {recursive: true, force: true}); }
 });
+
+test('the hash covers the bytes actually served: a different rewrite renames the cache, the same one does not', () => {
+    const rewrite = (automatic: boolean) => (file: string, bytes: Buffer) => file === 'index.html' ? Buffer.concat([bytes, Buffer.from(`<!--${automatic}-->`)]) : bytes;
+    const off = buildServiceWorker(REAL, 'integration-dddd', rewrite(false)), on = buildServiceWorker(REAL, 'integration-dddd', rewrite(true));
+    assert.notEqual(off.name, on.name);
+    assert.equal(buildServiceWorker(REAL, 'integration-dddd', rewrite(true)).name, on.name);
+});

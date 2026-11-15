@@ -125,8 +125,6 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const reconcileAlerts = alerts?.reconcile?.bind(alerts);
     const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
-    // Computed once at startup (a missing shipped asset fails here, not per request): the cache name follows the shipped bytes. The integration variant keeps a scope-specific name.
-    const serviceWorker = buildServiceWorker(fileURLToPath(new URL('../../web/public/', import.meta.url)), provenance.source === 'real-router-integration' ? `integration-${provenance.integrationScope}` : undefined);
     const accounts = new AccountAdmin(auth, gated && mode === 'owner' ? ownerAccountId : undefined);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
@@ -136,6 +134,16 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // The one gate for the audit routes and for the per-viewer auditLog signal on GET /people.
     const auditOn = () => audit?.enabled === true;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
+    // The bytes of index.html and the manifest as served (rewritten for the integration variant).
+    const integration = provenance.source === 'real-router-integration';
+    const servedBytes = (name: string, data: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
+        if (!integration) return data;
+        if (name === 'index.html') return Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
+        if (name === 'manifest.webmanifest') return Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
+        return data;
+    };
+    // Computed once at startup (a missing shipped asset fails here, not per request): the cache name follows the bytes actually served, so flipping automatic dispatch renames it too. The integration variant keeps a scope-specific name.
+    const serviceWorker = buildServiceWorker(fileURLToPath(new URL('../../web/public/', import.meta.url)), integration ? `integration-${provenance.integrationScope}` : undefined, servedBytes);
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
     const trusted = config.trustedProxies;
@@ -188,12 +196,8 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (request.method === 'GET' && STATIC[path]) {
                 const [name, type] = STATIC[path];
-                let data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
-                if (name === 'index.html' && provenance.source === 'real-router-integration') {
-                    data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
-                }
-                if (name === 'sw.js') data = Buffer.from(serviceWorker.source);
-                if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
+                const file = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
+                const data = name === 'sw.js' ? Buffer.from(serviceWorker.source) : servedBytes(name, file);
                 response.setHeader('Content-Type', type);
                 response.end(data);
                 return;
