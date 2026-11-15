@@ -36,6 +36,20 @@ test('inventoryUi parses strictly; absent is all off', () => {
     }
 });
 
+test('the list carries wizard: true only with triage and wizard both on (the web reads it; absent = off)', () => {
+    const t = setup();
+    try {
+        t.seed();
+        assert.ok(!('wizard' in t.inv.list(actor)), 'wizard off by default');
+        t.f.config.inventoryUi = {triage: true, wizard: true, installReadiness: false};
+        assert.equal(t.inv.list(actor).wizard, true);
+        t.f.config.inventoryUi = {triage: false, wizard: true, installReadiness: false};
+        assert.ok(!('wizard' in t.inv.list(actor)), 'the wizard needs the decision routes, so triage off means no wizard');
+        t.f.config.inventoryUi = undefined;
+        assert.ok(!('wizard' in t.inv.list(actor)));
+    } finally { t.f.cleanup(); }
+});
+
 test('classify, relabel and undo: roles, previous role, newCount, flags.new', () => {
     const t = setup();
     try {

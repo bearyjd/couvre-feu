@@ -139,6 +139,8 @@ export class InventoryStore {
     private requireAdmin(actor: Actor): void { if (actor.role !== 'admin') throw new AppError(403, 'admin_required'); }
     /** Whether the manifest's inventoryUi.triage is on (read per call, like the other flags). Off: the decision routes and DTO fields do not exist. */
     get triage(): boolean { return this.store.config.inventoryUi?.triage === true; }
+    /** inventoryUi.wizard (UI plan G): the "find a kid's device" sheet. It uses the decision routes, so it needs triage as well. */
+    get wizard(): boolean { return this.triage && this.store.config.inventoryUi?.wizard === true; }
 
     /** A poll is due every 60 s, or at once when an admin asked for a refresh. Reads only; opens nothing. */
     due(at = this.now()): boolean {
@@ -307,7 +309,7 @@ export class InventoryStore {
         const decisions = new Map(this.store.all<DecisionRow>(`${DECISIONS} WHERE d.generation=?`, this.generation).map(d => [d.row_id, d])), replaced = new Set([...decisions.values()].flatMap(d => d.linked_from_row === null ? [] : [d.linked_from_row]));
         const devices = shown.map(r => this.dto(r, baseline, lookup, actor, now, replaces.get(r.id), {decision: decisions.get(r.id), replaced: replaced.has(r.id)}));
         const quiet = (d: InventoryDeviceDTO) => d.role === 'guest' && now - d.lastSeen >= GUEST_HIDE_SECONDS;
-        return {status, devices: opts.includeHidden ? devices : devices.filter(d => !quiet(d)), newCount: devices.filter(d => d.flags.new).length, hiddenCount: devices.filter(quiet).length};
+        return {status, devices: opts.includeHidden ? devices : devices.filter(d => !quiet(d)), newCount: devices.filter(d => d.flags.new).length, hiddenCount: devices.filter(quiet).length, ...(this.wizard ? {wizard: true} : {})};
     }
     /** Enrolled or scoped child devices (any owner) and protected MACs are never linked by a hint, on either side. */
     private replacements(rows: DeviceRow[], hidden: Set<string>, owners: Map<string, string>, now: number): Map<number, number> {

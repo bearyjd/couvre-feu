@@ -292,6 +292,17 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
 - **Who sees it.** The same accounts that see the filter routes: owner mode shows it to the owner account only, parents mode to assigned parents, off to nobody (`hiddenAlerts` in `http.ts`). Push uses the existing generic "New alert" text.
 - **Storage.** `integration-008.sql` widens `parent_alerts.kind` with `filter_drift` (same rebuild as integration-006; marker: the kind CHECK). The demo database never holds the kind.
 
+### NextDNS daily counts (PRP-006 phase C, off, unverified on this router)
+
+Operator guide: [content-filter-counts runbook](runbooks/content-filter-counts.md). Plan: [phase-c-digest.md](plans/phase-c-digest.md).
+
+- **Flag.** `"contentFilter": {..., "counts": {"enabled": true}}` (strict boolean; absent is off; accepted and ignored when `mode` is `off`: `service/src/content-filter-config.ts`). Off means no fetcher, no timer, no NextDNS analytics call, no counts route and no rows. Migration `016.sql` (two additive tables, `user_version` 16) exists either way; rolling the code back past it needs the pre-upgrade backup.
+- **Fetcher** (`service/src/content-filter-counts.ts`). Hourly (first pass five minutes after start), per child in `contentFilter.profiles` (the default profile is never read), for each finished local day (America/New_York) of the last seven that has no answer, a gap, or a `logs_off` stamp; never today, never before 03:00 local the next day. Stores integers only: total, blocked and a count per class from a closed set. Failures are quiet gaps (nothing logged, no alert). Rows older than 56 days are pruned.
+- **Day states.** `ok`, `suspect_zero` (zero lookups at all; unknown activity counts as suspect), `logs_off`, and `gap` (stored as `unavailable` or absent). Only `ok` days count toward totals and the digest.
+- **Route.** `GET /people/:id/filter/counts` answers `{note, days[7], week}` from the local store (never NextDNS), same gate and 404 parity as `GET /people/:id/filter`; with `counts` off it is `404 route_not_found`. The filter card shows it as "Last 7 days".
+- **Digest.** One household integer line, see [Push and weekly digest](#push-and-weekly-digest-b7-service-only-off).
+- **Not built.** The category-attempts alert (C5). Reason id forms, aggregation lag, pagination and 429 behaviour are UNVERIFIED until the owner-approved C0 live probe, which has not been run.
+
 ## Operating notes for the flagged features
 
 Everything below ships **OFF** and is **unverified on this router** until the Phase 0 live proof in the [roadmap](ROADMAP.md#live-proof). These notes were checked against the code on `main` (PR #92 to #95); the sections above give the detail.
@@ -300,10 +311,11 @@ Everything below ships **OFF** and is **unverified on this router** until the Ph
 |---|---|---|
 | Time requests (F1, F3) | `"timeRequests": {"mode": "off" \| "owner" \| "parents"}`; legacy `{"enabled": true}` reads as `parents`. Top-level `"ownerAccountId"` | Child request link and page, parent ask-for-time card, grants |
 | Audit log (F2) | `"auditLog": {"enabled": true}` | Writes to `parent_audit` and `GET /audit` |
-| Inventory decisions (UI plan D) | `"inventoryUi": {"triage": true, "wizard": false, "installReadiness": false}` | `triage` gates the device decision routes and the extra inventory DTO fields (see [Device decisions](#device-decisions-ui-plan-d)); `wizard` and `installReadiness` are parsed now and used by later changes |
+| Inventory decisions (UI plan D) | `"inventoryUi": {"triage": true, "wizard": false, "installReadiness": false}` | `triage` gates the device decision routes and the extra inventory DTO fields (see [Device decisions](#device-decisions-ui-plan-d)); `wizard` (needs `triage` too) adds `wizard: true` to `GET /admin/inventory` so the page shows the "Find a kid's device" sheet; `installReadiness` is parsed now and used by a later change |
 | Reward Time (F4) | `"rewardTime": {"enabled": true}` | `POST /people/:id/reward` |
 | Focus window (F5) | `"focus": {"enabled": true}` | `POST /people/:id/focus` (also needs `timeRequests` on) |
 | Content filter (PRP-006 A2, A3) | `"contentFilter": {"mode": "off" \| "owner" \| "parents", ...}`; see above | `GET`/`PUT /people/:id/filter` and the `content_filter_set` step-up; writes and reads back a NextDNS profile only, nothing on the router |
+| Content filter counts (PRP-006 C) | `"contentFilter": {"counts": {"enabled": true}}`; needs mode not `off`; see [runbook](runbooks/content-filter-counts.md) | Hourly NextDNS analytics counts per child per day (integers), `GET /people/:id/filter/counts`, filter-card block, digest line |
 | Push and digest (B7) | `"push": {"enabled": true}`, `"digest": {"enabled": true}` (needs push); ntfy settings in `COUVRE_NTFY_*` env | Content-free ntfy push and weekly counts-only digest; no route. See [Push and weekly digest](#push-and-weekly-digest-b7-service-only-off) |
 
 **Owner mode (F1).** `timeRequests.mode` `owner` needs a top-level `ownerAccountId` naming an entry in `accounts` (`owner_account_required` and `invalid_owner_account` refuse the manifest otherwise: `service/src/integration-config.ts:157-159`). Only that account sees or decides requests and the `time_request_pending` alert (`service/src/http.ts:103-104`). Reward Time follows the same gate. **It is not a security boundary against other admins**: it hides the feature, it does not stop another admin from using other routes (for example Pause, Resume or editing devices). Tracked follow-ups, not built: protect the owner account from other admins, and a startup check that the owner account exists and is active (today the check only confirms the id is listed in `accounts`).
