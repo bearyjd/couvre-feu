@@ -50,8 +50,8 @@ test('Reload with a waiting worker posts skipWaiting and reloads on controllerch
 test('the service worker accepts a skipWaiting message and the shell cache is renamed', async ({ page, demo }) => {
   const sw = await (await page.request.get(demo.origin + '/sw.js')).text();
   expect(sw).toContain("'skipWaiting'");
-  expect(sw).toContain("'cf-shell-v14'");
-  expect(sw).not.toContain('cf-shell-v13');
+  expect(sw).toContain("'cf-shell-v15'");
+  expect(sw).not.toContain('cf-shell-v14');
   expect(sw).toContain('/pwa-update.js');
 });
 

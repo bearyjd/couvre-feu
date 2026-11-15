@@ -38,7 +38,7 @@ const bulk = createBulk({ gate: () => controlBlock(), session: () => state.sessi
 const tabs = createTabs();
 const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 // The add form lives on the Kids tab: opening it from a Devices row must show that tab first, or the form could not take focus.
-const childrenFromDevices = { ...children, startAdd: (id, values) => { tabs.show('kids'); return children.startAdd(id, values); } };
+const childrenFromDevices = { ...children, startAdd: (id, values) => { tabs.show('kids'); return children.startAdd(id, values); }, showKids: () => tabs.show('kids') };
 const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children: childrenFromDevices,
   version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';

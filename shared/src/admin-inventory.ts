@@ -26,4 +26,6 @@ export interface InventoryDTO {
     devices: InventoryDeviceDTO[];
     /** Triage on only: rows still new (no decision, not acknowledged, not replaced by a link), and guests hidden after 14 quiet days. */
     newCount?: number; hiddenCount?: number;
+    /** Present (true) only while inventoryUi.wizard and triage are on: the page shows the "Find a kid's device" button. */
+    wizard?: true;
 }

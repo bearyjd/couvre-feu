@@ -311,7 +311,7 @@ Everything below ships **OFF** and is **unverified on this router** until the Ph
 |---|---|---|
 | Time requests (F1, F3) | `"timeRequests": {"mode": "off" \| "owner" \| "parents"}`; legacy `{"enabled": true}` reads as `parents`. Top-level `"ownerAccountId"` | Child request link and page, parent ask-for-time card, grants |
 | Audit log (F2) | `"auditLog": {"enabled": true}` | Writes to `parent_audit` and `GET /audit` |
-| Inventory decisions (UI plan D) | `"inventoryUi": {"triage": true, "wizard": false, "installReadiness": false}` | `triage` gates the device decision routes and the extra inventory DTO fields (see [Device decisions](#device-decisions-ui-plan-d)); `wizard` and `installReadiness` are parsed now and used by later changes |
+| Inventory decisions (UI plan D) | `"inventoryUi": {"triage": true, "wizard": false, "installReadiness": false}` | `triage` gates the device decision routes and the extra inventory DTO fields (see [Device decisions](#device-decisions-ui-plan-d)); `wizard` (needs `triage` too) adds `wizard: true` to `GET /admin/inventory` so the page shows the "Find a kid's device" sheet; `installReadiness` is parsed now and used by a later change |
 | Reward Time (F4) | `"rewardTime": {"enabled": true}` | `POST /people/:id/reward` |
 | Focus window (F5) | `"focus": {"enabled": true}` | `POST /people/:id/focus` (also needs `timeRequests` on) |
 | Content filter (PRP-006 A2, A3) | `"contentFilter": {"mode": "off" \| "owner" \| "parents", ...}`; see above | `GET`/`PUT /people/:id/filter` and the `content_filter_set` step-up; writes and reads back a NextDNS profile only, nothing on the router |
