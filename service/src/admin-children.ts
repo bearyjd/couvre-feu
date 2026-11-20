@@ -13,6 +13,7 @@ import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIM
 import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
 import { audited, auditFor } from './parent-audit.ts';
+import { hasObligation } from './time-request-obligations.ts';
 import type { AuditAction } from './parent-audit.ts';
 import { ChildBatchAdmin } from './admin-children-batch.ts';
 
@@ -147,7 +148,7 @@ export class ChildAdmin {
     }
     private scopeAll(account: string): boolean { return this.store.get<{scope_all: number}>('SELECT scope_all FROM accounts WHERE id=?', account)?.scope_all === 1; }
     private obligations(person: string): boolean {
-        return Boolean(this.store.get("SELECT id FROM time_requests WHERE person_id=? AND (state IN ('pending','approving') OR repause_state IN ('waiting','applying')) LIMIT 1", person));
+        return hasObligation(this.store, {person, includePending: true});
     }
     private apply(actor: Actor, kind: ChildAction, target: string, params: Record<string, unknown>): {status?: number; body?: unknown; op?: IntegrationOperation; audit: string} {
         const now = this.policy.now(), config = this.store.config;

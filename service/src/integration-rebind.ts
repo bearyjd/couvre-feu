@@ -4,6 +4,7 @@ import { routerScopeOf } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { hasObligation } from './time-request-obligations.ts';
 
 const refuse = (code: string): never => { throw new AppError(409, code); };
 /**
@@ -27,7 +28,7 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         if (state.dispatch_stopped !== 1 || store.get("SELECT enabled FROM automatic_dispatch WHERE singleton=1 AND enabled=1")) refuse('rebind_requires_dispatch_stopped');
         if (state.active_operation_id !== null || store.get("SELECT id FROM operations WHERE state IN ('pending','unknown') LIMIT 1")) refuse('rebind_operation_in_progress');
         if (store.get("SELECT operation_id FROM operation_rpc WHERE phase IN ('queued','claimed','uncertain') LIMIT 1") || store.get("SELECT batch_id FROM dispatch_steps WHERE state IN ('consumed','uncertain') LIMIT 1")) refuse('rebind_uncertain_claim');
-        if (store.get("SELECT id FROM time_requests WHERE state='approving' OR repause_state IN ('waiting','applying') LIMIT 1")) refuse('rebind_time_request_obligation');
+        if (hasObligation(store)) refuse('rebind_time_request_obligation');
         // A stored device the new router installation protects or does not allow would invalidate every observation and
         // block every change, including its own removal. Remove the device first, or list it in the new routerScope.
         const macs = store.all<{identifier: string}>("SELECT identifier FROM devices WHERE identifier_kind='mac'").map(d => d.identifier), scope = routerScopeOf(next);
