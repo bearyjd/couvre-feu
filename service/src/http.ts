@@ -30,6 +30,7 @@ import { FILTER_PATH } from './content-filter-http.ts';
 import type { ContentFilterRoutes } from './content-filter-http.ts';
 import { Health } from './health.ts';
 import { buildServiceWorker } from './sw-shell.ts';
+import { applyRewrites, integrationHTMLRewrites, integrationManifestRewrites } from './integration-copy.ts';
 import type { SessionDTO, SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
@@ -140,7 +141,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     const servedBytes = (name: string, data: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
         if (!integration) return data;
         if (name === 'index.html') return Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
-        if (name === 'manifest.webmanifest') return Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
+        if (name === 'manifest.webmanifest') return Buffer.from(applyRewrites(data.toString('utf8'), integrationManifestRewrites(automatic), name));
         return data;
     };
     // Computed once at startup (a missing shipped asset fails here, not per request): the cache name follows the bytes actually served, so flipping automatic dispatch renames it too. The integration variant keeps a scope-specific name.
@@ -465,15 +466,5 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
 }
 function integrationHTML(html: string, scope: string, automatic: boolean): string {
     if (!/^[a-f0-9]{64}$/.test(scope)) throw new Error('invalid_integration_scope');
-    return html.replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}" data-automatic-dispatch="${automatic}">`)
-        .replace('Fictional, local Couvre-feu parent-control prototype.', 'Private one-device Couvre-feu router integration.')
-        .replace('Couvre-feu · synthetic demo', 'Couvre-feu · private router integration')
-        .replace('<strong>Synthetic demo</strong><span>Fictional people · fake router · target compatibility unverified</span>', `<strong>Private router integration</strong><span>One test device · ${automatic ? 'owner-enabled automatic dispatch' : 'operator approval required'} · packet behavior unverified</span>`)
-        .replace('Local prototype / 002', 'Private one-device pilot')
-        .replace('This demo changes a fake router. It does not control a household connection.', automatic ? 'Authenticated requests dispatch automatically while the owner authorization is active. Unknown outcomes remain blocked for review.' : 'Requests wait for an operator-approved router invocation. Router observations and packet measurements are separate.')
-        .replace('Sign in to the fictional account bound to your passkey.', 'Sign in to the private account bound to your passkey.')
-        .replace('Use the token from the local demo bootstrap. It already identifies your fictional account.', 'Use the token from the private integration bootstrap. It fixes your account and permissions.')
-        .replace('Create a demo passkey', 'Create a passkey')
-        .replace('Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.', 'Source: real router integration. Accepted policy, current runtime health and packet acceptance are distinct. Packet cutoff and target compatibility remain unverified.')
-        .replace('Local, fictional prototype', 'Private one-device pilot');
+    return applyRewrites(html, integrationHTMLRewrites(scope, automatic), 'index.html');
 }
