@@ -447,9 +447,11 @@ select {
   appearance:none;
   -webkit-appearance:none;
   padding-right:38px;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 1.5 6 6l4.5-4.5' fill='none' stroke='%238e8e93' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  /* Chevron drawn with gradients: the CSP (img-src 'self') blocks data: SVG images. */
+  background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);
   background-repeat:no-repeat;
-  background-position:right 14px center
+  background-size:6px 6px,6px 6px;
+  background-position:right 20px center,right 14px center
 }
 
 #enrollment-token {
@@ -546,6 +548,12 @@ input[type="checkbox"],input[type="radio"] {
 
 .section-heading .eyebrow {
   margin-bottom:6px
+}
+
+.section-heading>.button {
+  flex:none;
+  white-space:nowrap;
+  overflow-wrap:normal
 }
 
 .section-heading p:last-child {
@@ -1445,7 +1453,7 @@ main :where(img,svg,video,canvas,input,select,textarea,button,table) { max-width
 /* Kids tab (UI plan H): one card per child, device rows with a status chip, a ⋯ menu per row. 44 px targets, wrapping instead of sideways scroll. */
 #children-panel .button, #children-panel select, #children-panel input:not([type="checkbox"]) { min-height: 44px; }
 .device-rows { margin-bottom: 0; }
-.device-row { display: grid; gap: .4rem; padding: .6rem .75rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); min-width: 0; overflow-wrap: anywhere; }
+.device-row { display: grid; gap: .4rem; padding: .6rem .75rem; border: 0; border-radius: var(--radius-sm); background: var(--fill); min-width: 0; overflow-wrap: anywhere; }
 .device-line { display: flex; gap: .5rem; align-items: center; justify-content: space-between; min-width: 0; }
 .device-name { font-weight: 650; min-width: 0; overflow-wrap: anywhere; word-break: break-word; unicode-bidi: plaintext; }
 .device-meta { display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; min-width: 0; }
