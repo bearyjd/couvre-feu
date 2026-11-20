@@ -159,10 +159,7 @@ export class IntegrationPolicy {
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
         const policy = this.withStaticDoh(build(o.acceptedPolicy)), id = randomUUID(), now = this.now();
         stage?.(id);
-        // Staged windows belong to a child this operation names: they settle with its receipt, so they must sit inside its scope.
-        const stagedChild = this.store.get<{person_id: string}>('SELECT person_id FROM schedule_staged WHERE operation_id=?', id)?.person_id;
-        if (stagedChild !== undefined && !affected.includes(stagedChild)) throw new AppError(409, 'schedule_staged_child_out_of_scope');
-        validateManagedPolicy(policy, this.store.config, this.store, false, id);
+        validateManagedPolicy(policy, this.store.config, this.store, false);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
         this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
         for (const child of new Set(affected)) this.store.run('INSERT INTO operation_people(operation_id,person_id) VALUES(?,?)', id, child);
@@ -223,14 +220,15 @@ export class IntegrationPolicy {
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
     }
     /**
-     * The router's schedules when it holds this child. With schedules.editable on, a child the observed policy does not hold (no observation,
-     * or its last device removed, which takes its schedules off the router) shows the committed windows and its enforcement stays unknown.
+     * Flag off: main's schedule view. Flag schedules.editable on (unverified on this router): always the committed windows, never the
+     * manifest or the observation; their state is known only while the router holds the child in a healthy observation (an unowned
+     * observation is never stored and sets observation_error, so it is never healthy).
      */
     private scheduleState(o: RPCObservation | null, enrolled: boolean, healthy: boolean, validUntil: number, child: string) {
         const config = this.store.config;
         if (!schedulesInDatabase(config)) return integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child);
-        const held = enrolled && o!.acceptedPolicy.people.some(p => p.id === child);
-        return integrationScheduleState(held ? o!.acceptedPolicy : {...config.enrollment, schedules: scheduleWindows(this.store)}, config, o?.routerTime ?? null, healthy && held, this.now(), validUntil, child);
+        const held = o?.acceptedPolicy.people.some(p => p.id === child) === true;
+        return integrationScheduleState({...config.enrollment, schedules: scheduleWindows(this.store)}, config, o?.routerTime ?? null, healthy && held, this.now(), validUntil, child);
     }
     /**
      * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the

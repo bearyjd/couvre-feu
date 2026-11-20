@@ -1,15 +1,30 @@
-import test from 'node:test';
+import base from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { integrationFixture, actor, testConfig, TestRouter } from './fixtures/integration.ts';
+import { integrationFixture, actor, storeDump, TestRouter } from './fixtures/integration.ts';
+import type { FixtureOptions } from './fixtures/integration.ts';
 import { IntegrationStore } from '../src/integration-db.ts';
 import { IntegrationWorker } from '../src/integration-worker.ts';
 import { RouterTransportError } from '../src/router-transport.ts';
 import { policyDigest, sha256 } from '../../shared/src/router-rpc.ts';
 
+// Schedule truth S1 parity (schedules.editable, unverified on this router): every scenario below runs with the manifest key absent,
+// {editable: false} and {editable: true} (rows seeded from, so equal to, the manifest), and must leave identical stores.
+const VARIANTS: readonly (readonly [string, FixtureOptions])[] = [['absent', {}], ['editable false', {schedules: {editable: false}}], ['editable true', {schedules: {editable: true}}]];
+let variant: FixtureOptions = {};
+const dumps = new Map<string, Map<string, string[]>>();
+const test = (name: string, fn: () => Promise<void> | void) => {
+    for (const [label, options] of VARIANTS) base(`${name} [schedules ${label}]`, async () => {
+        const seen: string[] = [];
+        variant = {...options, beforeClose: store => { seen.push(storeDump(store)); }};
+        try { await fn(); } finally { variant = {}; }
+        dumps.set(name, (dumps.get(name) ?? new Map()).set(label, seen));
+    });
+};
+
 test('integration defaults make no calls; HTTP facade only queues an exact durable intent', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         assert.equal(f.store.integrationState().dispatch_stopped, 1);
         for (let n = 0; n < 4; n++) { f.policy.people(actor); f.policy.devices(actor); f.policy.reconcile(); }
@@ -29,7 +44,7 @@ test('integration defaults make no calls; HTTP facade only queues an exact durab
     } finally { f.cleanup(); }
 });
 test('one exact approval dispatches once and 200 requires fresh exact current runtime', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const result = f.pause(), id = result.result.operation.id, plan = f.worker.prepare('apply', id);
         await assert.rejects(f.worker.execute(plan, '0'.repeat(64)), /exact_operator_approval_required/);
@@ -46,7 +61,7 @@ test('one exact approval dispatches once and 200 requires fresh exact current ru
     } finally { f.cleanup(); }
 });
 test('changed plan payload, target, timeout and script fail before transport', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         const plan = f.worker.prepare('observe');
         for (const changed of [ {...plan, targetDigest: '0'.repeat(64)}, {...plan, invocation: {...plan.invocation, stdin: '{}'}}, {...plan, invocation: {...plan.invocation, deadlineMs: 30000}}, {...plan, script: plan.script + '\n'} ]) await assert.rejects(f.worker.execute(changed, plan.scriptSha256));
@@ -55,7 +70,7 @@ test('changed plan payload, target, timeout and script fail before transport', a
     } finally { f.cleanup(); }
 });
 test('deferred I/O releases SQLite and competing processes cannot consume an invocation twice', async () => {
-    const f = integrationFixture(); let release!: () => void;
+    const f = integrationFixture(variant); let release!: () => void;
     const second = new IntegrationStore(f.config), competing = new IntegrationWorker(second, new TestRouter(second, f.now), f.now);
     try {
         await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id);
@@ -69,7 +84,7 @@ test('deferred I/O releases SQLite and competing processes cannot consume an inv
     } finally { second.close(); f.cleanup(); }
 });
 test('disconnect after acceptance persists unknown and exact receipt resolves without replay or renewed expiry', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const until = f.now() + 60, id = f.pause(until).result.operation.id, plan = f.worker.prepare('apply', id);
         f.router.afterApplyFailure = new RouterTransportError('test_lost_response');
@@ -86,7 +101,7 @@ test('disconnect after acceptance persists unknown and exact receipt resolves wi
     } finally { f.cleanup(); }
 });
 test('receipt absence and lease expiry cannot authorize reapply; late callbacks cannot replace newer observations', async () => {
-    const f = integrationFixture(); let release!: () => void;
+    const f = integrationFixture(variant); let release!: () => void;
     try {
         await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id);
         f.router.defer = new Promise<void>(resolve => {release = resolve;}); const work = f.worker.execute(plan, plan.scriptSha256);
@@ -102,7 +117,7 @@ test('receipt absence and lease expiry cannot authorize reapply; late callbacks 
     } finally { f.cleanup(); }
 });
 test('shutdown fences late replies and old permits without any autonomous transport', async () => {
-    const f = integrationFixture(); let release!: () => void;
+    const f = integrationFixture(variant); let release!: () => void;
     try {
         await f.observe(); const id = f.pause().result.operation.id, old = f.worker.prepare('apply', id);
         f.router.defer = new Promise<void>(resolve => {release = resolve;}); const work = f.worker.execute(old, old.scriptSha256);
@@ -113,7 +128,7 @@ test('shutdown fences late replies and old permits without any autonomous transp
     } finally { f.cleanup(); }
 });
 test('actual child crash after durable consumption remains unresolved across restart', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause(f.now() + 60).result.operation.id;
         const crash = spawnSync(process.execPath, ['service/tests/fixtures/integration-crash.ts', f.dir, id], {encoding: 'utf8'});
@@ -121,7 +136,7 @@ test('actual child crash after durable consumption remains unresolved across res
         const claim = f.store.get<{attempt_count: number; phase: string; delivery: string}>('SELECT * FROM operation_rpc WHERE operation_id=?', id)!;
         assert.equal(claim.attempt_count, 1); assert.equal(claim.delivery, 'possible'); assert.equal(claim.phase, 'claimed');
         f.advance(18);
-        const reopened = new IntegrationStore(testConfig(f.dir));
+        const reopened = new IntegrationStore(f.config);
         try {
             const w = new IntegrationWorker(reopened, new TestRouter(reopened, f.now), f.now), plan = w.prepare('apply', id);
             await assert.rejects(w.execute(plan, plan.scriptSha256), /operation_dispatch_not_eligible/);
@@ -132,7 +147,7 @@ test('actual child crash after durable consumption remains unresolved across res
 });
 test('missing runtime coverage, native, conntrack and IPv6 witnesses never confirm acceptance', async () => {
     for (const capability of ['addressCoverageComplete', 'nativeKernelConfirmed', 'conntrack', 'ipv6'] as const) {
-        const f = integrationFixture();
+        const f = integrationFixture(variant);
         try {
             await f.observe(); const id = f.pause().result.operation.id;
             f.router.transform = o => ({...o, status: {...o.status, capabilities: {...o.status.capabilities, [capability]: false}}});
@@ -143,7 +158,7 @@ test('missing runtime coverage, native, conntrack and IPv6 witnesses never confi
     }
 });
 test('never-delivered transport failure is explicit, with a new deliberate intent allowed at the same CAS revision', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id);
         f.router.failure = new RouterTransportError('test_spawn_failed', 'not_delivered'); await f.worker.execute(plan, plan.scriptSha256);
@@ -153,7 +168,7 @@ test('never-delivered transport failure is explicit, with a new deliberate inten
     } finally { f.cleanup(); }
 });
 test('queued same-revision changed policy conflicts before dispatch and invalid generation never overwrites cache', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id);
         f.router.policy = {...f.router.policy, doh: {ipv4: ['1.1.1.1'], ipv6: []}};
@@ -166,7 +181,7 @@ test('queued same-revision changed policy conflicts before dispatch and invalid 
     } finally { f.cleanup(); }
 });
 test('restart revokes old permits but preserves a never-dispatched queued identity and exact payload', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause(f.now() + 60).result.operation.id, old = f.worker.prepare('apply', id), envelope = JSON.stringify(f.policy.envelope(id));
         f.store.stopDispatch(f.now());
@@ -177,7 +192,7 @@ test('restart revokes old permits but preserves a never-dispatched queued identi
     } finally { f.cleanup(); }
 });
 test('a fresh superseding local policy makes historical confirmation conflict, and permits a new deliberate intent', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id); await f.worker.execute(plan, plan.scriptSha256);
         f.router.policy = {...f.router.policy, revision: 2, pauses: []}; f.advance(1); await f.observe();
@@ -187,7 +202,7 @@ test('a fresh superseding local policy makes historical confirmation conflict, a
     } finally { f.cleanup(); }
 });
 test('an empty installed policy can be observed but cannot falsely enable the configured device before enrollment', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         f.router.policy = {...f.router.policy, people: []}; await f.observe();
         const people = f.policy.people(actor); assert.equal(people.people[0].status, 'unknown'); assert.equal(people.revisionToken, null); assert.ok(people.errors.includes('pilot_device_not_enrolled'));
@@ -197,7 +212,7 @@ test('an empty installed policy can be observed but cannot falsely enable the co
 // current) fails a change; anything else stays unknown because the outcome cannot be proven.
 const PRE_WRITE = ['incomplete_address_coverage', 'incomplete_transition_address_coverage', 'rpc_scope_overlap', 'protected_mac_overlap'];
 async function refusedApply(reject: string, transform: ((o: any, id: string) => any) | null, before?: (f: ReturnType<typeof integrationFixture>) => void) {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause().result.operation.id, plan = f.worker.prepare('apply', id);
         before?.(f);
@@ -231,7 +246,7 @@ test('apply reply with a null receipt and a non-pre-write error is unknown, neve
     assert.equal(r.op.accepted, false); assert.equal(r.op.confirmedAt, null); assert.equal(r.active, r.id);
 });
 test('receipt poll returning null after eviction while policy moved on is unknown, not success', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         await f.observe(); const id = f.pause(f.now() + 60).result.operation.id, plan = f.worker.prepare('apply', id);
         f.router.afterApplyFailure = new RouterTransportError('test_lost_response');
@@ -247,7 +262,7 @@ test('receipt poll returning null after eviction while policy moved on is unknow
 });
 
 test('S3: an observation whose scope holds a protected MAC, or misses a floor MAC, is invalid and changes nothing', async () => {
-    const f = integrationFixture();
+    const f = integrationFixture(variant);
     try {
         const SEED = '02:10:20:30:40:50', PROTECTED = f.config.protectedMacs[0], OTHER = '02:10:20:30:40:52';
         (f.config as {routerScope?: string[]}).routerScope = [SEED];
@@ -262,4 +277,13 @@ test('S3: an observation whose scope holds a protected MAC, or misses a floor MA
             assert.equal(observedScope(), before);
         }
     } finally { f.cleanup(); }
+});
+
+base('schedules.editable parity: every scenario leaves the same store whether the flag is absent, false or true', () => {
+    assert.ok(dumps.size >= 18, String(dumps.size));
+    for (const [name, byVariant] of dumps) {
+        const reference = byVariant.get('absent');
+        assert.ok(reference && reference.length > 0, name);
+        for (const [label] of VARIANTS) assert.deepEqual(byVariant.get(label), reference, `${name} [${label}]`);
+    }
 });

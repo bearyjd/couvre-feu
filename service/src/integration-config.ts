@@ -8,6 +8,7 @@ import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import { hexDigest, sha256 } from '../../shared/src/router-rpc.ts';
 import type { Role, Provenance } from '../../shared/src/contracts.ts';
 import { scheduleClockReader } from './schedule-clock.ts';
+import { MAX_WINDOWS_PER_CHILD } from './integration-schedule-store.ts';
 import { loadTLS, privateIPv4, privateListenHost } from './tls.ts';
 import type { TLSFiles } from './tls.ts';
 import { ACCOUNT_LIMIT } from './account-limits.ts';
@@ -179,6 +180,8 @@ export function integrationConfig(path: string): IntegrationConfig {
         const settings = object(m.schedules, ['editable']);
         if (typeof settings.editable !== 'boolean') bad('invalid_schedules');
         schedules = {editable: settings.editable as boolean};
+        // The one-time seed copies the manifest schedules into schedule_windows, whose trigger caps each child at 8: refuse here, not at startup.
+        if (schedules.editable && enrollment.schedules.some(w => enrollment.schedules.filter(o => o.person === w.person).length > MAX_WINDOWS_PER_CHILD)) bad('invalid_schedules');
     }
     let push: IntegrationManifest['push'];
     if (m.push !== undefined) {

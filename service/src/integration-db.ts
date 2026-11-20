@@ -70,8 +70,8 @@ export class IntegrationStore extends Store {
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));
-        // integration-009 (schedules.editable, S1): additive schedule_windows table; idempotent, so no marker. Seeded once, only with the flag on.
-        if (!this.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedule_staged'")) this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/integration-009.sql', import.meta.url), 'utf8')));
+        // integration-009 (schedules.editable, S1): additive schedule_windows and schedule_seed tables; applied once (marker: the schedule_seed table). Seeded once, only with the flag on.
+        if (!this.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedule_seed'")) this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/integration-009.sql', import.meta.url), 'utf8')));
         this.transaction(() => seedScheduleWindows(this, config));
         // Separate additive state keeps existing manifest-bound databases readable.
         this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_dispatch (

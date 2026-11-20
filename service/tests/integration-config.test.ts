@@ -66,6 +66,11 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.schedules, undefined);
         for (const editable of [true, false]) { save({...manifest, schedules: {editable}}); assert.deepEqual(integrationConfig(path).schedules, {editable}); }
         for (const schedules of [{editable: 'true'}, {}, {editable: true, extra: 1}, true, null]) { save({...manifest, schedules}); assert.throws(() => integrationConfig(path)); }
+        // With the flag on, the one-time seed would hit the 8-per-child trigger at startup: a 9-window manifest is refused when loaded.
+        const windows = (n: number) => Array.from({length: n}, (_, i) => ({person: 'pilot', id: `w${i}`, weekdays: ['Sat'], start: '10:00', stop: '11:00'}));
+        const windowed = (n: number) => ({...manifest, schedules: {editable: true}, scheduleClock: {timezone: 'UTC'}, enrollment: {...manifest.enrollment, schedules: windows(n)}});
+        save(windowed(9)); assert.throws(() => integrationConfig(path), /invalid_schedules/);
+        save(windowed(8)); assert.equal(integrationConfig(path).enrollment.schedules.length, 8);
         // push and digest (B7): absent is OFF; strict {enabled: boolean}; the digest is delivered by push, so it needs push on.
         assert.equal(c.push, undefined); assert.equal(c.digest, undefined);
         for (const enabled of [true, false]) { save({...manifest, push: {enabled}}); assert.deepEqual(integrationConfig(path).push, {enabled}); }

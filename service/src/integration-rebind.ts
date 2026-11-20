@@ -1,9 +1,9 @@
 import { AppError } from '../../shared/src/errors.ts';
-import { policyJSON } from '../../shared/src/router-schema.ts';
+import { normalizePolicy, policyJSON } from '../../shared/src/router-schema.ts';
 import { routerScopeOf } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
-import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 
 const refuse = (code: string): never => { throw new AppError(409, code); };
 /**
@@ -33,10 +33,14 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         const macs = store.all<{identifier: string}>("SELECT identifier FROM devices WHERE identifier_kind='mac'").map(d => d.identifier), scope = routerScopeOf(next);
         if (macs.some(m => next.protectedMacs.includes(m))) refuse('rebind_device_protected');
         if (macs.some(m => !scope.includes(m))) refuse('rebind_device_outside_scope');
-        // The schedule set the next manifest owns (with schedules.editable: the committed rows) must stay
-        // enforceable: without scheduleClock every router policy holding it, even an exact match, would be refused. The loader already
-        // checks the manifest's own enrollment schedules.
-        if (schedulesInDatabase(next) && scheduleWindows(store).length > 0 && !next.scheduleClock) refuse('rebind_schedule_clock_required');
+        // schedules.editable (unverified on this router); every flag flip changes the manifest digest, so it always passes through here.
+        // off->off reads nothing. on->on: the committed rows stay the truth and must stay enforceable (without scheduleClock every router
+        // policy holding them, even an exact match, would be refused). on->off: the manifest becomes the owner again, so it must own exactly
+        // the committed rows. off->on: forget any earlier rows and the seed marker, so the next open seeds once from this manifest.
+        const was = schedulesInDatabase(old), will = schedulesInDatabase(next);
+        if (was && will && scheduleWindows(store).length > 0 && !next.scheduleClock) refuse('rebind_schedule_clock_required');
+        if (was && !will && canonicalSchedules(scheduleWindows(store)) !== canonicalSchedules(normalizePolicy(next.enrollment).schedules)) refuse('rebind_schedules_diverge');
+        if (!was && will) { store.run('DELETE FROM schedule_windows'); store.run('DELETE FROM schedule_seed'); }
         // Scope observed under the old generation says nothing about the new router: forget it, so the next observation re-baselines on the new floor.
         store.run('DELETE FROM router_scope_observed');
         // A request made against the old router can never be observed by the new one.
