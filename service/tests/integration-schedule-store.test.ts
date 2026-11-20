@@ -156,6 +156,36 @@ test('flag on: an unknown outcome keeps the staged windows pending', async () =>
     } finally { await f.automatic.stop(); f.cleanup(); }
 });
 
+test('flag on: the outbound policy must match the operation\'s own staged proposal, not just any acceptable set', async () => {
+    const f = integrationFixture();
+    try {
+        setup(f, true);
+        f.store.transaction(() => seedScheduleWindows(f.store, f.config));
+        await f.observe();
+        // Staged proposal differs from the payload (which keeps the old, committed set): refused, nothing staged.
+        assert.throws(() => queueWindows(f, [night], 'schedule_key_0123456', p => ({...p, schedules: []})), /owner_schedule_configuration_changed/);
+        assert.deepEqual(staged(f), []);
+        // An operation that stages nothing must carry the committed set, not another operation's proposal.
+        assert.throws(() => f.store.transaction(() => f.policy.queue(actor, 'pilot', 'pause', JSON.stringify({permissionVersion: actor.permissionVersion}), 'schedule_key_plain_01', f.policy.people(actor).revisionToken!,
+            base => policyWithWindows(base, 'pilot', [night]))), /owner_schedule_configuration_changed/);
+    } finally { f.cleanup(); }
+});
+
+test('flag on: a never-dispatched operation whose base went stale discards its staged windows even if the router happens to hold them', async () => {
+    const f = automatic();
+    try {
+        await f.automatic.tick();
+        const op = queueWindows(f, [night]);
+        // Out-of-band router change that happens to equal the staged proposal, on a newer revision (stale base).
+        f.router.policy = normalizePolicy({...f.router.policy, revision: f.router.policy.revision + 1, schedules: [{person: 'pilot', ...night}]});
+        await f.automatic.tick();
+        await f.automatic.tick();
+        assert.notEqual(f.policy.operation(actor, op.id).state, 'confirmed');
+        assert.deepEqual(scheduleWindows(f.store), []);
+        assert.deepEqual(staged(f), []);
+    } finally { await f.automatic.stop(); f.cleanup(); }
+});
+
 test('flag on at construction seeds from the manifest; reopening does not seed again', () => {
     const f = integrationFixture();
     try {

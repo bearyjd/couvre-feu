@@ -60,17 +60,22 @@ export function stageScheduleWindows(store: Store, person: string, windows: read
     store.run('INSERT INTO schedule_staged(operation_id,person_id,windows_json) VALUES(?,?,?)', operationId, id(person), JSON.stringify(checkedSet(windows)));
 }
 interface Staged { operation_id: string; person_id: string; windows_json: string }
-/** Every schedule set reconciliation may meet: the committed rows (base) and, per staged operation, the rows with that proposal applied. */
-export function acceptableSchedules(store: Store): Schedule[][] {
+/**
+ * Every schedule set reconciliation may meet: the committed rows (base) and, per staged operation, the rows with that proposal applied.
+ * With an operationId: only that operation's proposal (or the committed rows when it staged nothing).
+ */
+export function acceptableSchedules(store: Store, operationId?: string): Schedule[][] {
     const committed = scheduleWindows(store);
-    const proposals = store.all<Staged>('SELECT * FROM schedule_staged ORDER BY operation_id').map(row => [...committed.filter(s => s.person !== row.person_id),
+    if (operationId !== undefined && !store.get('SELECT 1 FROM schedule_staged WHERE operation_id=?', operationId)) return [committed];
+    const proposals = (operationId === undefined ? store.all<Staged>('SELECT * FROM schedule_staged ORDER BY operation_id') : store.all<Staged>('SELECT * FROM schedule_staged WHERE operation_id=?', operationId)).map(row => [...committed.filter(s => s.person !== row.person_id),
         ...(JSON.parse(row.windows_json) as ScheduleWindow[]).map(w => ({person: row.person_id, ...w}))]);
-    return [committed, ...proposals];
+    return operationId === undefined ? [committed, ...proposals] : proposals;
 }
 /**
  * Settles an operation's staged windows with it, in the caller's transaction. Confirmed promotes them to the committed rows; failed discards
- * them; unknown keeps them pending. A conflict may follow an accepted receipt that was later superseded, so it promotes only when the stored
- * observation holds exactly the proposed windows for that child.
+ * them; unknown keeps them pending. A conflict promotes only with an exact stored receipt for this operation (delivery accepted, so it was
+ * dispatched and the router did accept it, later superseded) AND a stored observation holding exactly the proposed windows for that child.
+ * A conflict proven before dispatch (no receipt) discards: a coincident out-of-band router change is not this operation's.
  */
 export function settleScheduleWindows(store: Store, operationId: string, state: 'confirmed' | 'unknown' | 'failed' | 'conflict', observed: RouterPolicy | null): void {
     if (state === 'unknown') return;
@@ -78,7 +83,8 @@ export function settleScheduleWindows(store: Store, operationId: string, state: 
     if (!row) return;
     const proposal = JSON.parse(row.windows_json) as ScheduleWindow[];
     const held = observed?.schedules.filter(s => s.person === row.person_id).map(({person: _person, ...w}) => w);
-    const promote = state === 'confirmed' || (state === 'conflict' && JSON.stringify(held) === JSON.stringify(proposal));
+    const receipt = store.get<{attempt_count: number}>("SELECT attempt_count FROM operation_rpc WHERE operation_id=? AND delivery='accepted' AND receipt_json IS NOT NULL", operationId);
+    const promote = state === 'confirmed' || (state === 'conflict' && receipt !== undefined && receipt !== null && receipt.attempt_count > 0 && JSON.stringify(held) === JSON.stringify(proposal));
     if (promote) replaceScheduleWindows(store, row.person_id, proposal);
     store.run('DELETE FROM schedule_staged WHERE operation_id=?', operationId);
 }

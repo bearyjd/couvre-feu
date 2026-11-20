@@ -52,22 +52,26 @@ export const configuredMacs = (store: Store, person: string, heldByRouter: reado
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a
  * queued change are admitted), never a protected MAC, and exactly the manifest-owned schedules of the children present.
  */
-export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true): void {
+export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true, operationId?: string): void {
     normalizePolicy(policy, config.protectedMacs);
     if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
     // A moving device is admitted under both its source and its target child, so a policy on either side of the change validates.
     const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
         .flatMap(d => [`${d.person_id}\n${d.identifier}`, ...(d.move_to ? [`${d.move_to}\n${d.identifier}`] : [])]));
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
-    if (!schedulesOwned(policy, config, store)) throw new AppError(409, 'owner_schedule_configuration_changed');
+    if (!schedulesOwned(policy, config, store, operationId)) throw new AppError(409, 'owner_schedule_configuration_changed');
     if (policy.schedules.length > 0 && !config.scheduleClock) throw new AppError(409, 'owner_schedule_clock_required');
 }
-/** With the flag on, a policy is owned when its schedules equal the committed rows or a queued operation's proposed rows, and nothing else. */
-function schedulesOwned(policy: RouterPolicy, config: Pick<IntegrationManifest, 'enrollment' | 'schedules'>, store: Store): boolean {
+/**
+ * With the flag on, a policy is owned when its schedules equal the committed rows or a queued operation's proposed rows, and nothing else
+ * (reconciliation). With an operationId (the outbound payload of that operation) only that operation's own proposal, or the committed rows
+ * when it staged none, is acceptable.
+ */
+function schedulesOwned(policy: RouterPolicy, config: Pick<IntegrationManifest, 'enrollment' | 'schedules'>, store: Store, operationId?: string): boolean {
     const actual = JSON.stringify(policy.schedules);
     if (!schedulesInDatabase(config)) return actual === JSON.stringify(ownerSchedules(policy, config, store));
     const present = new Set(policy.people.map(p => p.id));
-    return acceptableSchedules(store).some(rows => actual === JSON.stringify(normalizePolicy({version: 1, revision: 0, people: policy.people, pauses: [], schedules: rows.filter(s => present.has(s.person))}).schedules));
+    return acceptableSchedules(store, operationId).some(rows => actual === JSON.stringify(normalizePolicy({version: 1, revision: 0, people: policy.people, pauses: [], schedules: rows.filter(s => present.has(s.person))}).schedules));
 }
 /**
  * Schedules stay owner-configured in the manifest; they apply to whichever of their children are on the router. With schedules.editable
