@@ -4,6 +4,7 @@
 # refresh both together when package.json "engines.node" changes.
 FROM node:26.13.1-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS deps
 WORKDIR /app
+RUN npm install -g npm@11.21.3 && test "$(npm --version)" = "11.21.3"
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
