@@ -332,6 +332,7 @@ test('HTTP: child routes need only the body token; parent routes need session an
         assert.equal((await fetch(`${origin}/request.html`)).status, 200);
         assert.equal((await fetch(`${origin}/time-requests.js`)).status, 200);
         assert.equal((await fetch(`${origin}/reward-time.js`)).status, 200);
+        assert.equal((await fetch(`${origin}/focus-window.js`)).status, 200);
     } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); f.close(); }
 });
 

@@ -14,6 +14,7 @@
 | tabs.js | bottom tab bar (top bar from 900 px) and hash routes #home #kids #devices #alerts #more[/sub]; wraps the panels, never re-creates them |
 | time-requests.js | parent: request links, approve/decline |
 | reward-time.js | parent: Reward +15 / +30 min buttons (shown only when `/people` says `rewardTime`; flagged off) |
+| focus-window.js | parent: Focus 15-120 min buttons (shown only when `/people` says `focusWindow`; flagged off) and the Focus chip |
 | audit.js | parent: "Activity log" panel (`GET /audit/limit/50`, "Show older" via `/before/:id`; shown only when `/people` says `auditLog`; flagged off) |
 | request.html, request.js | child page; token in URL fragment |
 | sw.js | shell-only offline cache; no API cache, no queued writes |

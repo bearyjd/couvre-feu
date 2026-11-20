@@ -40,7 +40,7 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/kids-card.js': ['kids-card.js', 'text/javascript; charset=utf-8'], '/kids-model.js': ['kids-model.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/inventory-triage.js': ['inventory-triage.js', 'text/javascript; charset=utf-8'], '/inventory-wizard.js': ['inventory-wizard.js', 'text/javascript; charset=utf-8'], '/inventory-wizard-model.js': ['inventory-wizard-model.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'],  '/focus-window.js': ['focus-window.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/kids-card.js': ['kids-card.js', 'text/javascript; charset=utf-8'], '/kids-model.js': ['kids-model.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/inventory-triage.js': ['inventory-triage.js', 'text/javascript; charset=utf-8'], '/inventory-wizard.js': ['inventory-wizard.js', 'text/javascript; charset=utf-8'], '/inventory-wizard-model.js': ['inventory-wizard-model.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
     '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'], '/pwa-update.js': ['pwa-update.js', 'text/javascript; charset=utf-8'],
@@ -117,6 +117,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
     const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
     // Reward time: off (the manifest default), time requests off, or a parent the owner-mode gate excludes is a route that does not exist.
+    const focusOn = (actor: Actor) => Boolean(grants && timeRequestsEnabled && mayDecide(actor) && grants.policy.store.config.focus?.enabled === true);
     const rewardOn = (actor: Actor) => Boolean(grants && timeRequestsEnabled && mayDecide(actor) && grants.policy.store.config.rewardTime?.enabled === true);
     const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock, undefined, grants);
     // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
@@ -290,7 +291,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 // Focus window: the same gates as Reward Time, plus its own flag.
                 const focus = /^\/people\/([a-z][a-z0-9_]{0,31})\/focus$/.exec(path);
-                if (focus && grants && timeRequestsEnabled && mayDecide(session.dto.actor) && grants.policy.store.config.focus?.enabled === true) {
+                if (focus && grants && focusOn(session.dto.actor)) {
                     const result = grants.policy.focus(session.dto.actor, focus[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
@@ -360,7 +361,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             if (path === '/people') {
                 // rewardTime: one viewer-level boolean, present only when the reward route would answer for this viewer (never per child).
-                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(auditOn() ? {auditLog: true} : {}), ...(installReadiness && session.dto.actor.role === 'admin' ? {installReadiness: true} : {})});
+                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(focusOn(session.dto.actor) ? {focusWindow: true} : {}), ...(auditOn() ? {auditLog: true} : {}), ...(installReadiness && session.dto.actor.role === 'admin' ? {installReadiness: true} : {})});
                 return;
             }
             const childRead = childrenGet(children, session, path);

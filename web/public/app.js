@@ -5,6 +5,7 @@ import { createParentAlerts } from './parent-alerts.js';
 import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
 import { createRewardTime } from './reward-time.js';
+import { createFocusWindow } from './focus-window.js';
 import { createAuditLog } from './audit.js';
 import { createContentFilter } from './content-filter.js';
 import { createInstallReadiness } from './install-readiness.js';
@@ -28,6 +29,7 @@ const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
 const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
+const focusWindow = createFocusWindow({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'focus', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
 const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
 const contentFilter = createContentFilter({ session: () => state.session, people: () => state.people?.people ?? [] });
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
@@ -313,11 +315,11 @@ async function mutate(personId, action, presetSeconds, minutes) {
   let outcome = { sent: false, reason: 'Your session changed.' };
   state.busy = true;
   renderControlState();
-  announce(`Sending ${({ resume: 'resume', reward: 'extra time' })[action] ?? 'manual pause'} request. A request is not confirmation.`);
+  announce(`Sending ${({ resume: 'resume', reward: 'extra time', focus: 'focus window' })[action] ?? 'manual pause'} request. A request is not confirmation.`);
   try {
     const until = requestedDuration === '0' ? 0 : now() + Number(requestedDuration);
     const result = await api(`/people/${encodeURIComponent(personId)}/${action}`, {
-      method: 'POST', body: action === 'pause' ? { until } : action === 'reward' ? { minutes } : {},
+      method: 'POST', body: action === 'pause' ? { until } : action === 'reward' || action === 'focus' ? { minutes } : {},
       headers: { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken },
     });
     if (generation !== state.generation) return outcome;
@@ -333,7 +335,7 @@ async function mutate(personId, action, presetSeconds, minutes) {
   } catch (error) {
     if (generation !== state.generation) return outcome;
     state.needsRefresh = true;
-    if (action === 'reward' && error instanceof APIError && ![401, 403].includes(error.status)) {
+    if ((action === 'reward' || action === 'focus') && error instanceof APIError && ![401, 403].includes(error.status)) {
       // The Reward Time controls explain every refusal themselves from the code; a 404 means the feature is off for this viewer.
       outcome = { sent: false, reason: null, code: error.code, status: error.status };
       state.needsRefresh = error.code === 'revision_conflict'; // every other refusal changed nothing
@@ -425,7 +427,7 @@ function renderAuthControls() {
 
 function renderControlState() {
   const enabled = canControl();
-  for (const button of document.querySelectorAll('[data-control], [data-quick-pause], [data-reward-minutes]:not([data-reward-busy])')) button.disabled = !enabled;
+  for (const button of document.querySelectorAll('[data-control], [data-quick-pause], [data-reward-minutes]:not([data-reward-busy]), [data-focus-minutes]:not([data-focus-busy])')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   bulk.update();
   for (const button of document.querySelectorAll('[data-refresh]')) button.disabled = state.busy || state.refreshing || state.offline;
@@ -442,7 +444,7 @@ function renderConnection() {
 }
 
 function renderPeople() {
-  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown, rewardTime.signature()]);
+  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown, rewardTime.signature(), focusWindow.signature()]);
   if (renderKey === state.renderKey) return;
   const focused = document.activeElement?.dataset?.focusKey;
   const openDetails = new Set([...document.querySelectorAll('[data-details-key][open]')].map((element) => element.dataset.detailsKey));
@@ -457,14 +459,15 @@ function renderPeople() {
     const choices = [['0', 'Until I resume'], ['60', isReal() ? '1 minute' : '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
     const timedPause = effectiveManual && effectiveManual.until > 0;
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
-      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${person.kind === 'device_group' ? 'Device group' : isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
-      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
+      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${person.kind === 'device_group' ? 'Device group' : isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div>${person.pauseLabel === 'focus' ? '<span class="badge focus">Focus</span>' : ''}<span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
+      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `${person.pauseLabel === 'focus' ? 'Focus' : 'Paused'} until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
       <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}${device.change ? ` · ${device.change === 'adding' ? 'being added' : device.change === 'moving' ? 'being moved' : 'being removed'}` : ''}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="quick-pauses" role="group" aria-label="Quick pause for ${label}">${[[900, '15'], [1800, '30'], [3600, '60']].map(([seconds, minutes]) => `<button class="button primary" type="button" data-quick-pause="${seconds}" data-person-id="${id}" data-focus-key="quick-${seconds}-${id}" aria-label="Pause ${label} for ${minutes} minutes">Pause ${minutes} min</button>`).join('')}</div>
       ${timedPause ? `<p class="remaining" role="timer" aria-label="Time remaining on ${label} timed pause">Time left: <strong data-remaining="${effectiveManual.until}"></strong></p>` : ''}
       ${rewardTime.offered() ? '' : `<p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: extra time is not turned on for your account in this installation. Pausing and ending a pause work as shown.</span></p>`}
       <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="${timedPause ? `End ${label} timed pause now` : `Resume ${label} manual pause`}">${timedPause ? 'End now' : 'Resume'}</button></div>
       ${rewardTime.markup(person)}
+      ${focusWindow.markup(person)}
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
       <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy ${isReal() ? 'router' : 'synthetic'} confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
     </article>`;
@@ -535,7 +538,7 @@ function render() {
   $('#build-info').textContent = build;
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
-    renderConnection(); renderPeople(); renderControlState(); rewardTime.afterRender();
+    renderConnection(); renderPeople(); renderControlState(); rewardTime.afterRender(); focusWindow.afterRender();
     activityPanel.update(state.people.people, Boolean(state.session) && !state.offline);
   } else {
     activityPanel.clear();
@@ -607,6 +610,8 @@ $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);
 });
 $('#people').addEventListener('click', (event) => {
+  const focusButton = event.target.closest('[data-focus-minutes]');
+  if (focusButton && !focusButton.disabled) { void focusWindow.tap(focusButton.dataset.personId, Number(focusButton.dataset.focusMinutes)); return; }
   const reward = event.target.closest('[data-reward-minutes]');
   if (reward && !reward.disabled) { void rewardTime.tap(reward.dataset.personId, Number(reward.dataset.rewardMinutes)); return; }
   const button = event.target.closest('[data-control], [data-quick-pause]');

@@ -424,3 +424,27 @@ test('HTTP: flag off, time requests off, out-of-scope child and the owner-mode g
         } finally { await s.close(); r.w.f.cleanup(); }
     }
 });
+
+test('HTTP: GET /people carries a read-only focusWindow boolean only when the focus route would answer for that viewer', async () => {
+    const cases: {name: string; focus: boolean; mode?: 'off' | 'owner' | 'parents'; account: string; expected: boolean}[] = [
+        {name: 'flag off', focus: false, mode: 'parents', account: 'operator', expected: false},
+        {name: 'time requests off', focus: true, mode: 'off', account: 'operator', expected: false},
+        {name: 'time requests absent', focus: true, account: 'operator', expected: false},
+        {name: 'owner mode, non-owner parent', focus: true, mode: 'owner', account: 'parent', expected: false},
+        {name: 'owner mode, the owner', focus: true, mode: 'owner', account: 'operator', expected: true},
+        {name: 'parents mode, a scoped parent', focus: true, mode: 'parents', account: 'parent', expected: true}];
+    for (const c of cases) {
+        const r = await focusWorld({}, {focus: c.focus, audit: true});
+        if (c.mode) r.w.f.config.timeRequests = {mode: c.mode};
+        if (c.mode === 'owner') r.w.f.config.ownerAccountId = 'operator';
+        const s = await serve(r, await freePort());
+        try {
+            const who = await session(r.w.f, s.o, c.account);
+            const people = await who.send('GET', '/people');
+            assert.equal(people.status, 200, c.name);
+            if (c.expected) assert.equal(people.body.focusWindow, true, c.name); else assert.ok(!('focusWindow' in people.body), `${c.name}: absent`);
+            assert.ok(people.body.people.every((p: Record<string, unknown>) => !('focusWindow' in p)), `${c.name}: not per child`);
+            assert.equal(r.audit().length, 0, c.name); assert.equal(r.ops(), 0, c.name);
+        } finally { await s.close(); r.w.f.cleanup(); }
+    }
+});
