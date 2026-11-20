@@ -16,7 +16,7 @@
 
 ## Build, Test, and Development Commands
 
-Use Node **26.13.1** and npm **11.21.2**. Node runs TypeScript directly.
+Use Node **26.13.1** and npm **11.21.3**. Node runs TypeScript directly.
 
 - `npm ci`: install locked dependencies.
 - `npm run demo:router` and `npm run demo:start`: start the fictional router and loopback parent service in separate terminals.

@@ -184,6 +184,10 @@ jobs:
         with:
           node-version: '26.13.1'
           cache: npm
+      - name: Install and verify the pinned npm
+        run: |
+          npm install -g npm@11.21.3
+          test "$(npm --version)" = "11.21.3"
       - name: Install locked project dependencies
         run: |
           node --version
