@@ -1,0 +1,11 @@
+[Unit]
+Description=Couvre-feu daily database backup
+Documentation=https://github.com/bearyjd/couvre-feu/blob/main/docs/runbooks/deploy.md
+
+[Timer]
+OnCalendar=*-*-* 03:30
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

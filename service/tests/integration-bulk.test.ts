@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -19,6 +20,7 @@ import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import { PRE_WRITE_REJECTIONS, movePolicy } from '../src/integration-children.ts';
 import { TimeRequestService } from '../src/time-requests.ts';
+import { IntegrationGrants } from '../src/integration-allowance.ts';
 
 // Placeholder, locally administered unicast MACs only.
 const SEED = '02:10:20:30:40:50', PROTECTED = '02:10:20:30:40:51', K2 = '02:10:20:30:40:62', K3 = '02:10:20:30:40:63';
@@ -163,6 +165,28 @@ test('pause_all clears active time allowances of the blocked children (block-all
         const all = await f.block(op, 'pause_all', {until: 0}); await f.dispatch(all.body.operation.id);
         assert.equal(f.router.policy.allowances, undefined);
         assert.deepEqual(f.router.policy.pauses.map(p => p.person), ALL);
+    } finally { f.cleanup(); }
+});
+
+test('pause_all ends an approved time-request grant end to end: the request reports grant_ended', async () => {
+    const f = world();
+    try {
+        const service = new TimeRequestService(f.store, f.policy, f.now, undefined, new IntegrationGrants(f.policy));
+        const parent = await f.signIn('parent'); await f.observe();
+        const link = await service.issueLink(f.wide, 'pilot');
+        service.submit(link.token, 30, 'homework', 'c');
+        const id = f.store.get<{id: string}>("SELECT id FROM time_requests WHERE state='pending'")!.id;
+        await service.approve(f.wide, id, 30);
+        await f.dispatch(f.store.get<{grant_operation_id: string}>('SELECT grant_operation_id FROM time_requests WHERE id=?', id)!.grant_operation_id);
+        await service.advance();
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM time_requests WHERE id=?', id)!.state, 'approved');
+        f.advance(1); await f.observe();
+        const r = await f.block(parent, 'pause_all'); await f.dispatch(r.body.operation.id);
+        f.advance(1); await f.observe(); await service.advance();
+        assert.equal(f.router.policy.allowances, undefined, 'the router no longer holds the allowance');
+        const status = service.status(link.token, 'c');
+        assert.equal(status.code, 'grant_ended');
+        assert.equal(status.allowanceUntil, null);
     } finally { f.cleanup(); }
 });
 
@@ -386,7 +410,7 @@ test('integration-005 rebuilds devices in place: rows, FKs and uniqueness surviv
 });
 
 test('HTTP: bulk and move routes are CSRF/Origin-checked and step-up gated; step-up options route by action', async () => {
-    const f = world(), port = 36000 + process.pid % 9000, base = `http://localhost:${port}`;
+    const f = world(), port = await freePort(), base = `http://localhost:${port}`;
     const auth = new Auth(f.store, base, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: base, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');

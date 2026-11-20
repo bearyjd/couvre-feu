@@ -11,12 +11,19 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
+import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
+import { audited } from './parent-audit.ts';
+import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
+/** Focus window (F5): the minutes a parent may start. */
+export const FOCUS_MINUTES: readonly number[] = [15, 30, 45, 60, 90, 120];
+/** How a pause ends: 'manual' takes the caller's `until`; 'focus' runs `minutes` from router time (F5). */
+type PauseSpec = {kind: 'manual'} | {kind: 'focus'; minutes: number};
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
 }
@@ -86,12 +93,33 @@ export class IntegrationPolicy {
         return {status: dto.currentHealthy && op.state === 'confirmed' ? 200 : op.state === 'conflict' ? 409 : op.state === 'failed' ? 502 : 202,
             result: {...this.store.config.provenance, operation: dto, operationUrl: `/operations/${op.id}`}};
     }
-    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
+    /** `auditAs` names who the audit log records, apart from `actor` who is authorized: 'system' for background work, null for no entry (the caller records its own). */
+    mutate(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, auditAs: string | null = actor.id): {status: number; result: OperationResult} {
         this.authorized(actor, person);
-        const body = object(input, action === 'pause' ? ['until'] : []), until = action === 'pause' ? integer(body.until) : null;
+        if (auditAs === null) return this.mutateAuthorized(actor, person, action, input, precondition, key);
+        return audited(this.store, {actor: auditAs, action, now: this.now, people: () => [person], done: r => ({operationId: r.result.operation.id})},
+            () => this.mutateAuthorized(actor, person, action, input, precondition, key));
+    }
+    /**
+     * Focus window (F5): the existing timed pause (same mutateAuthorized/queue() path) for `minutes` from ROUTER time, recorded with the closed label
+     * 'focus' on the operation. Only a pause that is not already in force is replaced: a focus window never shortens or converts a parent's pause.
+     * Off unless the manifest sets focus.enabled (404 route_not_found). Audited as focus_start.
+     */
+    focus(actor: Actor, person: string, minutes: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
+        if (this.store.config.focus?.enabled !== true) throw new AppError(404, 'route_not_found');
+        this.authorized(actor, person);
+        return audited(this.store, {actor: actor.id, action: 'focus_start', now: this.now, people: () => [person], done: r => ({operationId: r.result.operation.id})}, () => {
+            if (typeof minutes !== 'number' || !FOCUS_MINUTES.includes(minutes)) throw new AppError(400, 'invalid_minutes');
+            return this.mutateAuthorized(actor, person, 'pause', {}, precondition, key, {kind: 'focus', minutes});
+        });
+    }
+    private mutateAuthorized(actor: Actor, person: string, action: 'pause' | 'resume', input: unknown, precondition: string | undefined, key: string | undefined, spec: PauseSpec = {kind: 'manual'}): {status: number; result: OperationResult} {
+        const manualPause = action === 'pause' && spec.kind === 'manual';
+        const body = object(input, manualPause ? ['until'] : []), until = manualPause ? integer(body.until) : null;
         if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !/^"s(?:0|[1-9][0-9]{0,9})-r(?:0|[1-9][0-9]{0,9})-[0-9a-f]{64}"$/.test(precondition)) throw new AppError(428, 'revision_precondition_required');
-        const request = JSON.stringify({person, action, until, precondition, permissionVersion: actor.permissionVersion});
+        // A focus window's deadline comes from router time inside the transaction, so it is not part of the replay identity.
+        const request = JSON.stringify({person, action, until, ...(spec.kind === 'focus' ? {label: 'focus', minutes: spec.minutes} : {}), precondition, permissionVersion: actor.permissionVersion});
         const op = this.store.transaction(() => {
             this.store.assertIdentity();
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
@@ -99,8 +127,17 @@ export class IntegrationPolicy {
             if (until !== null && until !== 0 && until <= this.now()) throw new AppError(400, 'pause_expiry_must_be_future');
             return this.queue(actor, person, action, request, key, precondition, base => {
                 if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
-                return normalizePolicy({...base, revision: base.revision + 1,
-                    pauses: [...base.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: until!}] : [])]}, this.store.config.protectedMacs);
+                let pauseUntil = until;
+                if (spec.kind === 'focus') {
+                    const routerTime = this.store.observation().value!.routerTime;
+                    if (base.pauses.some(p => p.person === person && (p.until === 0 || p.until > routerTime))) throw new AppError(409, 'child_paused');
+                    pauseUntil = routerTime + spec.minutes * 60;
+                }
+                // Pause wins: a pause also ends the child's time allowance (as cfctl pause does, core.sh cf_pause_edit), or the
+                // router would keep the child unblocked. Resume keeps the allowance, matching cf_resume_edit.
+                const allowances = action === 'pause' && base.allowances ? {allowances: base.allowances.filter(a => a.person !== person)} : {};
+                return normalizePolicy({...base, revision: base.revision + 1, ...allowances,
+                    pauses: [...base.pauses.filter(p => p.person !== person), ...(action === 'pause' ? [{person, until: pauseUntil!}] : [])]}, this.store.config.protectedMacs);
             });
         });
         return this.result(op);
@@ -119,7 +156,7 @@ export class IntegrationPolicy {
         if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
         if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
-        const policy = build(o.acceptedPolicy), id = randomUUID(), now = this.now();
+        const policy = this.withStaticDoh(build(o.acceptedPolicy)), id = randomUUID(), now = this.now();
         stage?.(id);
         validateManagedPolicy(policy, this.store.config, this.store, false);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
@@ -131,10 +168,21 @@ export class IntegrationPolicy {
         this.store.run("INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,'pending')", actor.id, id, action, policy.revision, now);
         return this.row(id)!;
     }
+    /**
+     * Flag dnsHardening.dohList: true adds the static public DoH list (and strips retired entries); an explicit false removes the
+     * list and retired entries from the policy being submitted. An absent key returns the policy untouched.
+     */
+    private withStaticDoh(policy: RouterPolicy): RouterPolicy {
+        const config = this.store.config;
+        if (config.dnsHardening === undefined) return policy;
+        const merged = reconcileStaticDoh(policy.doh, config.dnsHardening.dohList, protectedAddressesOf(config));
+        if (merged.refused > 0) process.stderr.write(`${merged.tag}\n`);
+        return normalizePolicy({...policy, doh: merged.doh}, config.protectedMacs);
+    }
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
     private enrolled(o: RPCObservation | null, child: string): boolean {
         if (o === null) return false;
-        const configured = configuredMacs(this.store, child), routed = o.acceptedPolicy.people.find(p => p.id === child)?.macs ?? [];
+        const routed = o.acceptedPolicy.people.find(p => p.id === child)?.macs ?? [], configured = configuredMacs(this.store, child, this.fresh() ? routed : []);
         return configured.length === routed.length && configured.every(m => routed.includes(m));
     }
     people(actor: Actor): PeopleDTO {
@@ -144,7 +192,8 @@ export class IntegrationPolicy {
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
         let allEnrolled = true;
         const people = children.map(child => {
-            const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id);
+            const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id, this.fresh() ? o?.acceptedPolicy.people.find(p => p.id === child.id)?.macs ?? [] : []);
+            const validUntil = Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, allowance = allowanceView(o, healthy, child.id);
             if (!enrolled) allEnrolled = false;
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
@@ -153,7 +202,8 @@ export class IntegrationPolicy {
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
-                ...integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, child.id),
+                ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
+                allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
                     generationMatches: o?.generation === config.router.generation, readError: Boolean(info.observation_error || o?.errors.length), healthy,
@@ -167,6 +217,18 @@ export class IntegrationPolicy {
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
+    }
+    /**
+     * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the
+     * focus label. A later manual pause, bulk pause, resume or expiry therefore clears it; the router never sees the label.
+     * Only confirmed or pending operations count (a failed or conflicted newer one changed nothing) and "latest" is insertion order,
+     * so a service clock step backwards cannot reorder them. The caller passes null while an allowance lifts the pause.
+     */
+    private pauseLabel(child: string, inForceUntil: number | undefined): 'focus' | null {
+        if (inForceUntil === undefined) return null;
+        const latest = this.store.get<IntegrationOperation>("SELECT * FROM operations WHERE action IN ('pause','resume','pause_all','resume_all') AND state IN ('confirmed','pending') AND id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY rowid DESC LIMIT 1", child);
+        if (!latest || latest.action !== 'pause' || (JSON.parse(latest.request_json) as {label?: string}).label !== 'focus') return null;
+        return (JSON.parse(latest.payload_json) as RouterPolicy).pauses.find(p => p.person === child)?.until === inForceUntil ? 'focus' : null;
     }
     /** Admin-only, scoped: device identifiers never reach parents. */
     devices(actor: Actor) {

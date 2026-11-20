@@ -1,0 +1,14 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "npm is a pinned toolchain version (Dockerfile, deploy runbook, AGENTS.md, offline CT107 install, CI assertion). A major bump needs a deliberate PR with a matching Node bump and updated pins, not an automatic one.",
+      "matchPackageNames": ["npm"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    }
+  ]
+}

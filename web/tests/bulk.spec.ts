@@ -1,5 +1,9 @@
 import { test, expect, dispatchPending, signIn, noHorizontalScroll, NAMES } from './bulk-fixture.ts';
 
+// Drain every route handler before a test ends, also when an assertion threw: a handler still awaiting route.fetch would
+// otherwise be charged to the NEXT test ("route.fetch: Test ended") and hide the real failure behind a misleading one.
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' }); });
+
 const HOSTILE = '<img src=x onerror="window.__xss=1">';
 
 test('admin blocks all kids: in-page confirmation lists every child, then the passkey, then the router; honest until confirmed (phone width)', async ({ page, integration: f }) => {

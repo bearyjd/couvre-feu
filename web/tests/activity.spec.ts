@@ -1,4 +1,4 @@
-import { test, expect, enroll, browserAPI } from './browser-fixture.ts';
+import { test, expect, enroll, browserAPI, openTab } from './browser-fixture.ts';
 
 const ACTIVITY_LABEL = 'Estimated network activity — not app use, websites or screen time';
 const ALEX = '02:00:00:00:02:01', BLAIR = '02:00:00:00:02:02';
@@ -27,6 +27,7 @@ test('assigned parent sees labelled, honest per-child estimates with gaps and th
   const errors: string[] = []; page.on('pageerror', (error) => errors.push(error.message));
   seed(demo);
   await enroll(page, demo);
+  await openTab(page, 'more');
   const card = page.locator('[data-activity-person="alex"]');
   await expect(card).toBeVisible();
   await expect(page.locator('[data-activity-person="blair"]')).toHaveCount(0);
@@ -65,6 +66,7 @@ test('activity is server-enforced for assigned people only and unavailable witho
   seed(demo);
   expect((await fetch(`${demo.origin}/people/alex/activity`)).status).toBeGreaterThanOrEqual(401);
   await enroll(page, demo);
+  await openTab(page, 'more');
   const own = await browserAPI(page, '/people/alex/activity');
   expect(own.status).toBe(200);
   expect(own.body.disclaimer).toBe(ACTIVITY_LABEL);
@@ -77,6 +79,7 @@ test('activity is server-enforced for assigned people only and unavailable witho
 test('without any samples the panel says unknown and never reports zero', async ({ page, demo }) => {
   demo.setActivityClock(T);
   await enroll(page, demo);
+  await openTab(page, 'more');
   const card = page.locator('[data-activity-person="alex"]');
   await expect(card.locator('.activity-day[data-coverage="none"]')).toHaveCount(8);
   await expect(card.locator('.activity-figures')).toHaveText(Array(8).fill('No data: activity unknown'));

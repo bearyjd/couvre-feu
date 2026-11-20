@@ -13,6 +13,7 @@
 # @CF_GENERATED_PARAMETERS_BEGIN@
 CFR_SOURCE_COMMIT=
 CFR_RELEASE_ID=
+CFR_SETSID_HELPER_SHA256=
 CFR_PROFILE=
 CFR_MGMT_IP=
 CFR_MGMT_MAC=
@@ -31,9 +32,9 @@ CFR_LIVE_STATES='REACHABLE STALE DELAY'
 CFR_PRESENT_STATES='REACHABLE STALE DELAY PROBE PERMANENT'
 # Every path the installer may create or modify (router/install.sh and
 # router/lib/install-common.sh FILES, scoped and profile inventory).
-CFR_FILES='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh usr/lib/couvrefeu/activity.sh usr/sbin/cfctl usr/sbin/cfctl-ssh usr/sbin/cfctl-scope etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state etc/couvrefeu/platform-profile etc/couvrefeu/rpc-allowed'
+CFR_FILES='usr/lib/couvrefeu/busybox-static usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh usr/lib/couvrefeu/activity.sh usr/sbin/cfctl usr/sbin/cfctl-ssh usr/sbin/cfctl-scope etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state etc/couvrefeu/platform-profile etc/couvrefeu/rpc-allowed'
 CFR_DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu etc/couvrefeu/backup etc/couvrefeu/runtime'
-CFR_RELEASE_FILES='install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh lib/activity.sh'
+CFR_RELEASE_FILES='lib/busybox-static install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope release.sha256 lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/platform-bootstrap.sh lib/activity.sh'
 
 # Durable phase log first, then best-effort stdout (EPIPE never aborts).
 cfr_out() {
@@ -79,7 +80,7 @@ cfr_cleanup() {
         done < "$CFR_STAGE/manifest"
     fi
     for cfr_name in manifest mtime-probe identity.neigh connectivity.neigh status.json snapshot.before snapshot.after \
-        phase.log child.log diff.txt \
+        phase.log child.log diff.txt ash busybox helper-shell decode.commands decode.probe \
         text.before.iptables text.before.ip6tables text.before.ipset text.before.ipsetsave text.before.uci text.before.cron \
         text.after.iptables text.after.ip6tables text.after.ipset text.after.ipsetsave text.after.uci text.after.cron; do
         rm -f "$CFR_STAGE/$cfr_name"
@@ -102,7 +103,7 @@ cfr_setup_paths() {
         CFR_INSTALL_LOCK=$CF_ROOT/.couvrefeu-install.lock
         CFR_STAGE_PARENT=$CF_ROOT
         CFR_STAGE_PREFIX=.couvrefeu-stage.
-        case "${CF_TEST_SHELL:-sh}" in sh) CFR_SH='sh';; 'busybox ash') CFR_SH='busybox ash';; *) return 1;; esac
+        case "${CF_TEST_SHELL:-sh}" in sh|'busybox ash') CFR_SH=/bin/sh;; *) return 1;; esac
     else
         [ -z "${CF_ROOT:-}${CF_BACKEND_DIR:-}" ] || return 1
         CFR_FIXTURE=0
@@ -122,10 +123,114 @@ cfr_setup_paths() {
 # Normal-PATH stat (coreutils-stat on the target); PREREQ proves its format.
 cfr_stat() { stat "$@"; }
 cfr_run_sh() {
-    # Deliberate split of the fixed shell selection ("busybox ash").
-    # Child diagnostics go to the stage log, never to the marker stream.
-    # shellcheck disable=SC2086
-    $CFR_SH "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
+    # A single absolute executable; children never resolve their shell through PATH.
+    case $CFR_SH in /*) ;; *) cfr_refuse SUPERVISOR helper_shell_path;; esac
+    "$CFR_SH" "$@" </dev/null 2>>"$CFR_STAGE/child.log" 5>&-
+}
+
+# Admit extraction tools before staging, using only shell builtins on refusal.
+cfr_payload_prereq() {
+    for cfr_tool in awk cat chmod date id mkdir mktemp rm rmdir sed sha256sum wc; do
+        command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
+    done
+}
+
+# Decode canonical 76-column base64 to ASCII shell commands, never raw bytes:
+# some BusyBox awk versions drop NUL from %c. Each line holds at most 57 bytes
+# as three-digit octal escapes. Validate the entire private file before sh sees
+# it; the caller hashes every extracted file before any helper runs.
+cfr_decode_helper() {
+    LC_ALL=C awk -v bytes="$1" -v target="$2" '
+        BEGIN {
+            alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            if(bytes !~ /^[0-9]+$/ || bytes<1 || bytes>16777216) {bad=1; exit 1}
+            for(i=1;i<=64;i++) value[substr(alphabet,i,1)]=i-1
+        }
+        {
+            width=length($0)
+            if(done || shortline || width<4 || width>76 || width%4) {bad=1; exit 1}
+            shortline=(width<76)
+            printf "printf \047"
+            for(i=1;i<=width;i+=4) {
+                a=substr($0,i,1); b=substr($0,i+1,1)
+                c=substr($0,i+2,1); d=substr($0,i+3,1)
+                if(!(a in value) || !(b in value)) {bad=1; exit 1}
+                padding=0
+                if(c=="=") {
+                    if(d!="=" || value[b]%16) {bad=1; exit 1}
+                    padding=2
+                } else {
+                    if(!(c in value)) {bad=1; exit 1}
+                    if(d=="=") {
+                        if(value[c]%4) {bad=1; exit 1}
+                        padding=1
+                    } else if(!(d in value)) {bad=1; exit 1}
+                }
+                if(padding && i+3!=width) {bad=1; exit 1}
+                count+=3-padding
+                if(count>bytes) {bad=1; exit 1}
+                printf "\\%03o", value[a]*4+int(value[b]/16)
+                if(padding<2) printf "\\%03o", (value[b]%16)*16+int(value[c]/4)
+                if(!padding) printf "\\%03o", (value[c]%4)*64+value[d]
+                if(padding) done=1
+            }
+            printf "\047 >> \047%s\047\n", target
+        }
+        END {if(bad || count!=bytes) exit 1}
+    '
+}
+
+cfr_decode_file() {
+    # These are the only destinations, and neither contains shell metacharacters.
+    case "$CFR_STAGE" in /tmp/couvre-feu-first.[a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9][a-zA-Z0-9]) ;; *) return 1;; esac
+    case "$2" in "$CFR_STAGE/router/lib/busybox-static"|"$CFR_STAGE/decode.probe") ;; *) return 1;; esac
+    cfr_decode_helper "$1" "$2" > "$CFR_STAGE/decode.commands" || return 1
+    cfr_decode_lines=$(wc -l < "$CFR_STAGE/decode.commands") || return 1
+    cfr_decode_size=$(wc -c < "$CFR_STAGE/decode.commands") || return 1
+    LC_ALL=C awk -v bytes="$1" -v target="$2" -v lines="$cfr_decode_lines" -v size="$cfr_decode_size" '
+        BEGIN {prefix="printf \047"; suffix="\047 >> \047" target "\047"}
+        {
+            # BusyBox awk can treat NUL as a record separator. Account for
+            # physical bytes and LF lines independently before trusting records.
+            textsize+=length($0)+1
+            if(shortline || substr($0,1,length(prefix))!=prefix ||
+                substr($0,length($0)-length(suffix)+1)!=suffix) {bad=1; exit 1}
+            octal=substr($0,length(prefix)+1,length($0)-length(prefix)-length(suffix))
+            width=length(octal)
+            if(width<4 || width>228 || width%4) {bad=1; exit 1}
+            for(i=1;i<=width;i+=4)
+                if(substr(octal,i,4) !~ /^\\[0-3][0-7][0-7]$/) {bad=1; exit 1}
+            count+=width/4
+            if(count>bytes) {bad=1; exit 1}
+            shortline=(width<228)
+        }
+        END {if(bad || count!=bytes || NR!=lines || textsize!=size) exit 1}
+    ' "$CFR_STAGE/decode.commands" || return 1
+    : > "$2" || return 1
+    # A fresh absolute shell with an empty search path proves printf is builtin
+    # in the same process that sources the fully validated command file.
+    case "$CFR_SH" in /*) ;; *) return 1;; esac
+    # shellcheck disable=SC2016
+    PATH=/nonexistent LC_ALL=C "$CFR_SH" -ec '
+        [ "$(command -v printf)" = printf ] || exit 1
+        . "$1"
+    ' decode "$CFR_STAGE/decode.commands" </dev/null 5>&- || return 1
+    rm -f "$CFR_STAGE/decode.commands" || return 1
+}
+
+cfr_decoder_selftest() {
+    # shellcheck disable=SC2016
+    PATH=/nonexistent LC_ALL=C "$CFR_SH" -c '[ "$(command -v printf)" = printf ]' </dev/null 5>&- || cfr_refuse PREREQ decoder_printf
+    cfr_decode_file 256 "$CFR_STAGE/decode.probe" <<'CF_FIRST_DECODER_PROBE_EOF' || cfr_refuse PREREQ decoder_selftest
+AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4
+OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3Bx
+cnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmq
+q6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj
+5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==
+CF_FIRST_DECODER_PROBE_EOF
+    cfr_probe_sum=$(sha256sum < "$CFR_STAGE/decode.probe") || cfr_refuse PREREQ decoder_selftest
+    [ "${cfr_probe_sum%% *}" = 40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880 ] || cfr_refuse PREREQ decoder_selftest
+    rm -f "$CFR_STAGE/decode.probe" || cfr_refuse PREREQ decoder_selftest
 }
 
 cfr_extract() {
@@ -133,6 +238,7 @@ cfr_extract() {
     case "$CFR_STAGE" in /tmp/couvre-feu-first.??????) ;; *) CFR_STAGE=; cfr_refuse PAYLOAD staging_path_unexpected;; esac
     cfr_info "staging $CFR_STAGE"
     chmod 700 "$CFR_STAGE" || cfr_refuse PAYLOAD staging_mode
+    cfr_decoder_selftest
     cfr_payload_extract || cfr_refuse PAYLOAD extraction_failed
     cfr_count=0
     while read -r cfr_sum cfr_mode cfr_path; do
@@ -144,6 +250,12 @@ cfr_extract() {
     done < "$CFR_STAGE/manifest"
     [ "$cfr_count" = "$CFR_PAYLOAD_COUNT" ] || cfr_refuse PAYLOAD manifest_count
     for cfr_dir in $CFR_PAYLOAD_DIRS; do chmod 700 "$CFR_STAGE/$cfr_dir" || cfr_refuse PAYLOAD directory_mode; done
+    if [ "$CFR_FIXTURE" = 1 ] && [ "${CF_TEST_SHELL:-sh}" = 'busybox ash' ]; then
+        # The entry re-exec recognizes BusyBox by its executable basename.
+        if ! { cp "$CFR_STAGE/router/lib/busybox-static" "$CFR_STAGE/busybox" &&
+            chmod 755 "$CFR_STAGE/busybox" && ln -s busybox "$CFR_STAGE/ash"; }; then cfr_refuse PAYLOAD fixture_shell; fi
+        CFR_SH=$CFR_STAGE/ash
+    fi
     cfr_ok PAYLOAD
 }
 
@@ -232,10 +344,62 @@ cfr_glob_count() {
     printf '%s\n' "$cfr_n"
 }
 
+# Verify before every execution, including each supervisor launch. Never run a bare PATH setsid.
+cfr_helper_verify() {
+    # Use the independently admitted stat primitive before hashing or executing the
+    # helper. The private stage closes replacement by another uid after this check.
+    cfr_helper_owner=0:0
+    CFR_HELPER_ERROR=helper_hash
+    if [ "${CFR_FIXTURE:-0}" = 1 ]; then cfr_helper_owner=$(id -u):$(id -g)
+    else
+        case $CFR_STAGE in /tmp/couvre-feu-first.??????) ;; *) return 1;; esac
+        [ -d /tmp ] && [ ! -L /tmp ] || return 1
+        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' /tmp)" = 0:0:1777 ] || return 1
+    fi
+    case $CFR_STAGE in /*) ;; *) return 1;; esac
+    [ -d "$CFR_STAGE" ] && [ ! -L "$CFR_STAGE" ] || return 1
+    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$CFR_STAGE")" = "$cfr_helper_owner:700" ] || return 1
+    for cfr_helper_parent in "$CFR_STAGE/router" "$CFR_STAGE/router/lib"; do
+        [ -d "$cfr_helper_parent" ] && [ ! -L "$cfr_helper_parent" ] || return 1
+        [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$cfr_helper_parent")" = "$cfr_helper_owner:700" ] || return 1
+    done
+    [ "$CFR_SETSID_HELPER" = "$CFR_STAGE/router/lib/busybox-static" ] || return 1
+    if [ ! -e "$CFR_SETSID_HELPER" ] && [ ! -L "$CFR_SETSID_HELPER" ]; then
+        CFR_HELPER_ERROR=helper_missing
+        return 1
+    fi
+    [ -f "$CFR_SETSID_HELPER" ] && [ ! -L "$CFR_SETSID_HELPER" ] && [ -x "$CFR_SETSID_HELPER" ] || return 1
+    [ "$(LD_LIBRARY_PATH=/lib stat -c '%u:%g:%a' "$CFR_SETSID_HELPER")" = "$cfr_helper_owner:755" ] || return 1
+    cfr_helper_sum=$(sha256sum < "$CFR_SETSID_HELPER") || return 1
+    [ "${cfr_helper_sum%% *}" = "$CFR_SETSID_HELPER_SHA256" ]
+}
+cfr_helper_probe() {
+    CFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static
+    cfr_helper_verify || cfr_refuse "$1" "$CFR_HELPER_ERROR"
+    "$CFR_SETSID_HELPER" true </dev/null >/dev/null 2>&1 5>&- || cfr_refuse "$1" helper_exec
+    case $CFR_SH in /*) ;; *) cfr_refuse "$1" helper_shell_path;; esac
+    cfr_helper_shell=$(readlink -f "$CFR_SH") || cfr_refuse "$1" helper_shell_path
+    rm -f "$CFR_STAGE/helper-shell"
+    cfr_helper_verify || cfr_refuse "$1" "$CFR_HELPER_ERROR"
+    # The quoted program expands these variables in the supervised child.
+    # shellcheck disable=SC2016
+    ( exec "$CFR_SETSID_HELPER" setsid "$CFR_SH" -c '
+        printf "%s\n" "$$" > "$1"
+        readlink -f "/proc/$$/exe" >> "$1"
+        exit 7' helper-probe "$CFR_STAGE/helper-shell" ) </dev/null >/dev/null 2>&1 5>&- &
+    cfr_helper_pid=$!
+    wait "$cfr_helper_pid"
+    [ "$?" = 7 ] || cfr_refuse "$1" helper_setsid_forks
+    cfr_helper_expected=$(printf '%s\n%s' "$cfr_helper_pid" "$cfr_helper_shell")
+    [ "$(cat "$CFR_STAGE/helper-shell" 2>/dev/null)" = "$cfr_helper_expected" ] || cfr_refuse "$1" helper_shell_executable
+    rm -f "$CFR_STAGE/helper-shell"
+}
+
 cfr_prereq() {
     for cfr_tool in sha256sum awk sed sort cmp mktemp iptables-save ip6tables-save ipset uci ip; do
         command -v "$cfr_tool" >/dev/null 2>&1 || cfr_refuse PREREQ "missing_tool $cfr_tool"
     done
+    cfr_helper_probe PREREQ
     cfr_od=$(command -v od) || cfr_refuse PREREQ od_missing
     cfr_stat_path=$(command -v stat) || cfr_refuse PREREQ stat_missing
     cfr_info "tools stat=$cfr_stat_path od=$cfr_od"
@@ -414,6 +578,7 @@ cfr_connectivity() {
 
 cfr_main() {
     umask 077
+    cfr_payload_prereq
     CFR_START=$(date +%s)
     printf 'BEGIN first-rehearsal commit=%s release=%s profile=%s\n' "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE"
     for cfr_value in "$CFR_SOURCE_COMMIT" "$CFR_RELEASE_ID" "$CFR_PROFILE" "$CFR_MGMT_IP" "$CFR_MGMT_MAC" "$CFR_JD_IP" "$CFR_JD_MAC" "$CFR_PENN_IP" "$CFR_PENN_MAC" "$CFR_HISTORICAL_MACS"; do

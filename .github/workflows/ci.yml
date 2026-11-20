@@ -1,6 +1,7 @@
 name: isolated-project-checks
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -9,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
       - name: Install router-matching BusyBox 1.33.1
@@ -17,8 +18,18 @@ jobs:
       - name: Require every preflight suite in the preflight_suites matrix
         run: |
           sh tests/run.sh --list-preflight-suites | sort > "$RUNNER_TEMP/suites-run-sh.txt"
-          sed -n "s/^ *- suites: '\(.*\)'$/\1/p" .github/workflows/ci.yml | tr ' ' '\n' | sort > "$RUNNER_TEMP/suites-matrix.txt"
+          sed -n "s/^ *- suites: '\(.*\)'$/\1/p" .github/workflows/ci.yml | tr ' ' '\n' | sort -u > "$RUNNER_TEMP/suites-matrix.txt"
           diff -u "$RUNNER_TEMP/suites-run-sh.txt" "$RUNNER_TEMP/suites-matrix.txt"
+          # A sharded suite repeats once per partition; every i/N must be present exactly once per suite.
+          awk -v q="'" '/^ *- suites: / { suite = $3; gsub(q, "", suite) } $1 == "partition:" && substr($2, 1, 1) == q { part = $2; gsub(q, "", part); print suite, part }' .github/workflows/ci.yml | sort > "$RUNNER_TEMP/partitions-matrix.txt"
+          : > "$RUNNER_TEMP/partitions-expected.txt"
+          for cells in test-platform-integration.py:4 test-install.py:3 test-os-trust.py:3; do
+            suite=${cells%:*}; count=${cells#*:}
+            test "$(grep -c "^ *- suites: '$suite'$" .github/workflows/ci.yml)" = "$count"
+            i=1; while [ "$i" -le "$count" ]; do echo "$suite $i/$count" >> "$RUNNER_TEMP/partitions-expected.txt"; i=$((i + 1)); done
+          done
+          sort -o "$RUNNER_TEMP/partitions-expected.txt" "$RUNNER_TEMP/partitions-expected.txt"
+          diff -u "$RUNNER_TEMP/partitions-expected.txt" "$RUNNER_TEMP/partitions-matrix.txt"
       - name: Static checks and acceptance preflight
         env:
           CF_TEST_SHELL: busybox ash
@@ -28,28 +39,57 @@ jobs:
           busybox 2>&1 | awk 'NR == 1 { print }'
           python3 tools/freeze-router-release.py --check
           sh tests/run.sh --static-only
+          python3 -B tests/test-timeout-audit.py
           sh tests/acceptance.sh --preflight
           python3 tests/run-fixtures.py --write-plan "$RUNNER_TEMP/couvre-feu-plan.json"
       - name: Publish complete source-bound partition plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fixture-plan
           path: ${{ runner.temp }}/couvre-feu-plan.json
           if-no-files-found: error
   preflight_suites:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.timeout || 60 }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - suites: 'test-install.py'
+            partition: '1/3'
+            timeout: 30
+          - suites: 'test-install.py'
+            partition: '2/3'
+            timeout: 30
+          - suites: 'test-install.py'
+            partition: '3/3'
+            timeout: 30
           - suites: 'test-install-recovery.py'
           - suites: 'test-platform-integration.py'
+            partition: '1/4'
+            timeout: 30
+          - suites: 'test-platform-integration.py'
+            partition: '2/4'
+            timeout: 30
+          - suites: 'test-platform-integration.py'
+            partition: '3/4'
+            timeout: 30
+          - suites: 'test-platform-integration.py'
+            partition: '4/4'
+            timeout: 30
           - suites: 'test-os-trust.py'
-          - suites: 'test-install-recovery-primitives.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py'
+            partition: '1/3'
+            timeout: 30
+          - suites: 'test-os-trust.py'
+            partition: '2/3'
+            timeout: 30
+          - suites: 'test-os-trust.py'
+            partition: '3/3'
+            timeout: 30
+          - suites: 'test-permanent-install.py'
+          - suites: 'test-install-recovery-primitives.py test-pinned-helper-security.py test-install-retirement-recovery.py test-install-legacy-recovery.py test-no-dev-stdin.py test-client-probe.py test-live-rehearsal.py test-deploy-units.py test-service-key-entry.py test-heartbeat.py test-platform-integration-partitions.py'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash and lint tools
         run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
       - name: Install router-matching BusyBox 1.33.1
@@ -59,6 +99,7 @@ jobs:
           CF_TEST_SHELL: busybox ash
           CF_TEST_AWK: busybox awk
           CF_TEST_TIMEOUT: busybox timeout
+          CF_TEST_PARTITION: ${{ matrix.partition }}
         run: |
           busybox 2>&1 | awk 'NR == 1 { print }'
           sh tests/run.sh --preflight-suite ${{ matrix.suites }}
@@ -69,15 +110,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py, test-penn-pilot.py, test-penn-pilot-leg2.py, test-penn-pilot-leg2-guards.py, test-scope-admin.py, test-inventory.py]
+        suite: [test-transition.py, test-rpc.py, test-core.py, test-fixture-process.py, test-penn-pilot.py, test-penn-pilot-leg2.py, test-penn-pilot-leg2-guards.py, test-scope-admin.py, test-inventory.py, test-router-admission-check.py]
         partition: [0, 1, 2, 3]
+        include:
+          - suite: test-core.py
+            partition: 4
+          - suite: test-penn-pilot.py
+            partition: 4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install CI-only ash runtime
         run: sudo apt-get update && sudo apt-get install -y busybox
       - name: Install router-matching BusyBox 1.33.1
         uses: ./.github/actions/pinned-busybox
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: fixture-plan
           path: .ci-fixture-plan
@@ -92,7 +138,7 @@ jobs:
           python3 tests/run-fixtures.py --shard '${{ matrix.suite }}' --partition '${{ matrix.partition }}' --plan .ci-fixture-plan/couvre-feu-plan.json --receipt "$RUNNER_TEMP/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json"
       - name: Publish unique shard coverage receipt
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fixture-receipt-${{ matrix.suite }}-${{ matrix.partition }}
           path: ${{ runner.temp }}/fixture-receipts/${{ matrix.suite }}.${{ matrix.partition }}.json
@@ -103,7 +149,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require successful preflight and every matrix job
         env:
           PREFLIGHT_RESULT: ${{ needs.fixture_preflight.result }}
@@ -114,16 +160,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y busybox
       - name: Install router-matching BusyBox 1.33.1
         uses: ./.github/actions/pinned-busybox
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: fixture-plan
           path: .ci-fixture-plan
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: fixture-receipt-*
           merge-multiple: true
           path: .ci-fixture-receipts
-      - name: Prove all 36 unique partitions match complete source discovery
+      - name: Prove all 42 unique partitions match complete source discovery
         env:
           CF_TEST_SHELL: busybox ash
         run: python3 tests/run-fixtures.py --verify-receipts .ci-fixture-receipts --plan .ci-fixture-plan/couvre-feu-plan.json
@@ -131,11 +177,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - name: Install router-matching BusyBox for the marked runtime fixture
+        uses: ./.github/actions/pinned-busybox
+      - uses: actions/setup-node@v7
         with:
-          node-version: '26.8.1'
+          node-version: '26.13.1'
           cache: npm
+      - name: Install and verify the pinned npm
+        run: |
+          npm install -g npm@11.21.3
+          test "$(npm --version)" = "11.21.3"
       - name: Install locked project dependencies
         run: |
           node --version

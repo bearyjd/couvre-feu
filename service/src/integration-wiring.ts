@@ -1,4 +1,5 @@
 import type { Auth } from './auth.ts';
+import { pruneBatches } from './admin-children-batch.ts';
 import { ActivityStore, retentionDays } from './activity-store.ts';
 import { appServer } from './http.ts';
 import type { DemoConfig } from './config.ts';
@@ -8,6 +9,11 @@ import { IntegrationPolicy } from './integration-policy.ts';
 import { IntegrationWorker } from './integration-worker.ts';
 import { inventoryRetentionDays } from './inventory-store.ts';
 import { ParentAlerts } from './parent-alerts.ts';
+import { auditFor } from './parent-audit.ts';
+import { InstallReadiness } from './install-readiness.ts';
+import { wireContentFilter } from './content-filter-wiring.ts';
+import { ContentFilterWatch, startContentFilterWatch } from './content-filter-watch.ts';
+import { startContentFilterCounts } from './content-filter-counts.ts';
 import type { AsyncRouter } from './router-transport.ts';
 
 /**
@@ -21,7 +27,28 @@ export function wireIntegration(config: IntegrationConfig, store: IntegrationSto
         try { activity.prune(); } catch { process.stderr.write('activity_prune_failed\n'); }
         // Inventory retention holds even while automatic dispatch is off.
         try { worker.inventory.prune(); } catch { process.stderr.write('inventory_prune_failed\n'); }
+        // Audit rows age out after 90 days whether or not the log is still on; this runs at startup and hourly (a bounded delete).
+        try { auditFor(store).prune(); } catch { process.stderr.write('parent_audit_prune_failed\n'); }
+        try { pruneBatches(store); } catch { process.stderr.write('admin_batches_prune_failed\n'); }
     };
-    const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => appServer(auth, new IntegrationPolicy(store), serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory);
-    return {worker, activity, prune, app};
+    // Throws at startup (before anything listens) when filtering is on and the environment would expose the NextDNS API key.
+    const filter = wireContentFilter(config, store, env);
+    const app = (auth: Auth, serverConfig: DemoConfig): ReturnType<typeof appServer> => {
+        const policy = new IntegrationPolicy(store);
+        return appServer(auth, policy, serverConfig, new ParentAlerts(store, null), activity, undefined, worker.inventory, filter?.routes(auth, policy), config.installReadiness?.enabled ? new InstallReadiness(auth, worker.inventory) : undefined);
+    };
+    // Hourly read-only check of each child's NextDNS profile (PRP-006 A5); nothing exists unless content filtering is on.
+    const watch = filter ? new ContentFilterWatch(filter.reconciler, new ParentAlerts(store, null)) : null;
+    const startWatch = (): (() => void) | null => watch ? startContentFilterWatch(watch) : null;
+    // Hourly daily-counts pass (PRP phase C); null unless contentFilter.counts.enabled.
+    const startCounts = (): (() => void) | null => filter?.counts ? startContentFilterCounts(filter.counts) : null;
+    return {worker, activity, prune, app, startWatch, startCounts};
+}
+
+/** Owner mode fails closed when the owner account is missing, inactive or has no active passkey (nobody can decide requests); say so once at startup. Never throws, never logs ids. */
+export function checkOwnerAccount(config: IntegrationConfig, store: IntegrationStore, write: (line: string) => unknown = line => process.stderr.write(line)): void {
+    if (config.timeRequests?.mode !== 'owner' || config.ownerAccountId === undefined) return;
+    let available = false;
+    try { available = store.get<{n: number}>("SELECT count(*) n FROM accounts a JOIN credentials c ON c.account_id=a.id WHERE a.id=? AND a.active=1 AND c.state='active'", config.ownerAccountId)!.n > 0; } catch { /* unreadable counts as unavailable */ }
+    if (!available) write('owner_account_unavailable\n');
 }

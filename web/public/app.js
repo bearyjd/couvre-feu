@@ -4,8 +4,16 @@ import { createScheduleEditor, actionVerb } from './schedule-editor.js';
 import { createParentAlerts } from './parent-alerts.js';
 import { createActivityPanel } from './activity.js';
 import { createTimeRequests } from './time-requests.js';
+import { createRewardTime } from './reward-time.js';
+import { createFocusWindow } from './focus-window.js';
+import { createAuditLog } from './audit.js';
+import { createContentFilter } from './content-filter.js';
+import { createInstallReadiness } from './install-readiness.js';
 import { createAccounts } from './accounts.js';
+import { createTabs } from './tabs.js';
+import { composeAbort, createUpdatePrompt, createSessionGrace } from './pwa-update.js';
 import { createChildren, createBulk, createInventory, effectText } from './children.js';
+import { replacedMacs } from './kids-model.js';
 import { createAlertJournal, alertText, cacheAlertEvidence, ALERT_PREFIX, ALERT_ACTIVE } from './operational-alerts.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -14,38 +22,66 @@ const now = () => Math.floor(Date.now() / 1000);
 const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
 const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 const FRESH_SECONDS = 30;
+const WELCOME_SECONDS = 6;
 let alertStorage;
 try { alertStorage = localStorage; } catch { alertStorage = null; }
 const alertJournal = createAlertJournal(alertStorage);
 const parentAlerts = createParentAlerts({ escape, time, csrfToken: () => state.session?.csrfToken, personName: (id) => state.people?.people.find((person) => person.id === id)?.name });
 const activityPanel = createActivityPanel({ container: $('#activity-panel'), api });
-const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [] });
+const timeRequests = createTimeRequests({ session: () => state.session, people: () => state.people?.people ?? [], end: (personId) => mutate(personId, 'pause', '0') });
+const focusWindow = createFocusWindow({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'focus', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
+const rewardTime = createRewardTime({ session: () => state.session, people: () => state.people, send: (personId, minutes) => mutate(personId, 'reward', undefined, minutes), refresh: () => refresh({ quiet: true }), render: () => render(), escape });
+const contentFilter = createContentFilter({ session: () => state.session, people: () => state.people?.people ?? [] });
+const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
+const installReadiness = createInstallReadiness({ session: () => state.session, people: () => state.people, offline: () => state.offline });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
+const updatePrompt = createUpdatePrompt({ banner: $('#update-banner'), reloadButton: $('#update-reload') });
+const sessionGrace = createSessionGrace({ root: $('#session-grace'), text: $('#session-grace-text'), dismiss: $('#session-grace-dismiss') });
 const bulk = createBulk({ gate: () => controlBlock(), session: () => state.session, people: () => state.people?.people ?? [], revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
-const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
-const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children,
-  version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null });
+const tabs = createTabs();
+const children = createChildren({ session: () => state.session, revisionToken: () => state.people?.revisionToken ?? null, refresh: () => void refresh({ quiet: true }), version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null,
+  replaced: () => replacedMacs(inventory.devices()), wizard: { enabled: () => inventory.wizardEnabled(), open: (id, from) => inventory.openWizard(id, from) } }); // `inventory` is created just below; both are only called later
+// The add form lives on the Kids tab: opening it from a Devices row must show that tab first, or the form could not take focus.
+const childrenFromDevices = { ...children, startAdd: (id, values) => { tabs.show('kids'); return children.startAdd(id, values); }, showKids: () => tabs.show('kids') };
+const inventory = createInventory({ session: () => state.session, gate: () => controlBlock(), offline: () => state.offline, time, children: childrenFromDevices,
+  version: () => state.people ? `${state.people.observedAt}:${state.people.serviceDesiredRevision}` : null, onList: () => children.redraw() });
 const isReal = () => document.documentElement.dataset.source === 'real-router-integration';
 const state = {
-  session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine,
+  session: null, snapshotActor: null, snapshotExpiresAt: null, people: null, savedAt: null, offline: !navigator.onLine, serviceDown: null,
   busy: false, needsRefresh: true, refreshing: false, localUnknown: false, operation: null,
   generation: 0, renderKey: '', logoutRequired: needsServerLogout(), durations: new Map(),
   authController: null,
   scheduleClockBasis: null,
 };
 
+// The service did not answer in its own protocol: dead service, proxy error page, or a reply that is not Couvre-feu JSON.
+class UnreachableError extends Error {
+  constructor(status) { super('Couvre-feu is not responding.'); this.status = status; }
+}
+
 class APIError extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
 }
 
 async function api(path, { method = 'GET', body, headers = {}, signal } = {}) {
-  const response = await fetch(path, {
-    method, credentials: 'same-origin', cache: 'no-store', headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12000)]) : AbortSignal.timeout(12000),
-  });
-  const result = await response.json();
-  if (!response.ok) throw new APIError(response.status, result.error?.code ?? 'request_failed', result.error?.message ?? 'The request could not be completed.');
-  return result;
+  const abort = composeAbort(signal, 12000);
+  try {
+    const response = await fetch(path, {
+      method, credentials: 'same-origin', cache: 'no-store', headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body), signal: abort.signal,
+    });
+    let result;
+    try { result = await response.json(); } catch { throw new UnreachableError(response.status); }
+    if (!response.ok) throw new APIError(response.status, result.error?.code ?? 'request_failed', result.error?.message ?? 'The request could not be completed.');
+    return result;
+  } finally { abort.release(); }
+}
+
+// Phone online but the service did not answer: remember when it first failed (retries keep the stamp).
+function noteFailure(error) {
+  const unreachable = navigator.onLine && !(error instanceof APIError);
+  state.offline = !navigator.onLine || !(error instanceof APIError);
+  state.serviceDown = unreachable ? { since: state.serviceDown?.since ?? Math.floor(Date.now() / 1000), status: error instanceof UnreachableError && error.status ? error.status : null } : null;
 }
 
 function announce(message, error = false) {
@@ -87,7 +123,7 @@ function deviceEvidenceLabel(device) {
 function unsettled() { return state.localUnknown || state.operation && ['pending', 'unknown'].includes(state.operation.state) || state.people?.people.some((person) => ['pending', 'unknown'].includes(person.status)); }
 // Why mutating controls are unavailable right now (null = available). One source for per-person controls and the bulk panel.
 function controlBlock() {
-  if (state.offline) return 'Offline';
+  if (state.offline) return state.serviceDown ? 'Couvre-feu is not responding' : 'Offline';
   if (state.busy || unsettled()) return 'A change is already in progress';
   const fresh = state.session && state.people && !state.refreshing && !state.needsRefresh && age() <= FRESH_SECONDS && typeof state.people.revisionToken === 'string' && state.people.routerDesiredRevision !== null && state.session.expiresAt > now();
   return fresh ? null : 'Status is out of date — refresh';
@@ -98,7 +134,7 @@ function resetView() {
   state.generation++;
   state.authController?.abort(); state.authController = null;
   state.session = null; state.snapshotActor = null; state.snapshotExpiresAt = null; state.people = null; state.savedAt = null; state.scheduleClockBasis = null;
-  state.operation = null; state.localUnknown = false; state.needsRefresh = true; state.renderKey = '';
+  state.operation = null; state.localUnknown = false; state.serviceDown = null; state.needsRefresh = true; state.renderKey = '';
   state.busy = false; state.refreshing = false; state.durations.clear();
   clearStatusCache();
   alertJournal.clear();
@@ -127,6 +163,8 @@ function acceptSession(session) {
   }
   if (state.session && state.session.expiresAt !== session.expiresAt) alertJournal.clear();
   state.session = session;
+  updatePrompt.observe(session.version);
+  sessionGrace.update(session);
   state.snapshotActor = null;
   state.snapshotExpiresAt = null;
   broadcastScope(actorScope(session.actor));
@@ -140,12 +178,11 @@ async function completePendingLogout() {
   } catch (error) { if (!(error instanceof APIError && error.status === 401)) throw error; }
   state.logoutRequired = false;
   setServerLogoutNeeded(false);
-  window.dispatchEvent(new Event('cf:signed-out'));
 }
 
 async function refresh({ quiet = false } = {}) {
   if (state.refreshing || state.busy || state.logoutRequired && state.offline) return false;
-  if (state.offline || !navigator.onLine) { state.offline = true; state.needsRefresh = true; render(); return false; }
+  if (!navigator.onLine || state.offline && !state.serviceDown) { state.offline = true; state.serviceDown = null; state.needsRefresh = true; render(); return false; }
   const generation = state.generation;
   state.refreshing = true;
   renderConnection(); renderControlState(); renderAuthControls();
@@ -159,7 +196,7 @@ async function refresh({ quiet = false } = {}) {
     const people = await api('/people');
     if (generation !== state.generation) return false;
     if (people.source !== session.source || (people.integrationScope ?? null) !== (session.integrationScope ?? null)) throw new APIError(401, 'installation_scope_changed', 'The installation changed. Reload and sign in again.');
-    state.people = people; state.savedAt = now(); state.offline = false; state.needsRefresh = false;
+    state.people = people; state.savedAt = now(); state.offline = false; state.serviceDown = null; state.needsRefresh = false;
     state.scheduleClockBasis = {wall: Date.now() / 1000, started: performance.now() / 1000};
     const latest = state.operation && people.people.find((person) => person.id === state.operation.personId)?.latestOperation;
     if (latest?.id === state.operation?.id) state.operation = latest;
@@ -178,9 +215,10 @@ async function refresh({ quiet = false } = {}) {
       resetView();
       if (hadStatus || !quiet) announce('Your session or permissions changed. Sign in again to see permitted status.', true);
     } else {
-      state.offline = !navigator.onLine || !(error instanceof APIError);
+      noteFailure(error);
       if (!state.people && state.offline) showCachedStatus();
-      if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
+      if (state.serviceDown) announce('');
+      else if (!quiet) announce('Status could not be refreshed. Controls are disabled; no changes are queued.', true);
     }
     return false;
   } finally {
@@ -218,7 +256,12 @@ async function authenticate(kind, token) {
     acceptSession(session);
     state.busy = false;
     await refresh({ quiet: true });
-    if (state.people) announce(`Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`);
+    if (state.people) {
+      const welcome = `Signed in as ${state.session.actor.displayName}. ${isReal() ? document.documentElement.dataset.automaticDispatch === 'true' ? 'Owner-enabled router dispatch is configured.' : 'Router dispatch requires an operator-approved invocation.' : 'All status is fictional.'}`;
+      announce(welcome);
+      // Said once, then out of the way: it would otherwise sit above every tab for the whole session.
+      setTimeout(() => { if ($('#notice').textContent === welcome) announce(''); }, WELCOME_SECONDS * 1000);
+    }
   } catch (error) {
     if (generation !== state.generation) return;
     const message = error.name === 'NotAllowedError' ? 'Passkey sign-in was cancelled or unavailable. No control action was sent.'
@@ -240,7 +283,6 @@ async function logout() {
   setServerLogoutNeeded(true);
   broadcastLogout();
   resetView();
-  window.dispatchEvent(new Event('cf:signed-out'));
   announce('Local status cleared. Signing out of the server…');
   if (offline) {
     announce('Local status cleared. You are offline; server sign-out is still required and will run when the connection returns.');
@@ -256,29 +298,32 @@ async function logout() {
   }
 }
 
-async function mutate(personId, action, presetSeconds) {
-  if (!canControl()) return;
+// Resolves {sent, reason}: sent is true only once the service accepted the request (never a confirmation of the outcome).
+async function mutate(personId, action, presetSeconds, minutes) {
+  if (!canControl()) return { sent: false, reason: controlBlock() };
   const beforeRevision = state.people.revisionToken;
   const beforeScope = actorScope(state.session.actor);
   const requestedDuration = presetSeconds ?? state.durations.get(personId) ?? '0';
   const generation = state.generation;
   // Fresh reads are part of this click, never an automatic mutation retry.
   const refreshed = await refresh({ quiet: true });
-  if (!refreshed || generation !== state.generation || !canControl()) return;
+  if (!refreshed || generation !== state.generation || !canControl()) return { sent: false, reason: controlBlock() ?? 'Status could not be refreshed.' };
   if (beforeRevision !== state.people.revisionToken || beforeScope !== actorScope(state.session.actor)) {
     announce('The revision or your permissions changed. Status has been refreshed; review it and choose the action again.', true);
-    return;
+    return { sent: false, reason: 'The revision or your permissions changed. Review the status and try again.' };
   }
+  let outcome = { sent: false, reason: 'Your session changed.' };
   state.busy = true;
   renderControlState();
-  announce(`Sending ${action === 'resume' ? 'resume' : 'manual pause'} request. A request is not confirmation.`);
+  announce(`Sending ${({ resume: 'resume', reward: 'extra time', focus: 'focus window' })[action] ?? 'manual pause'} request. A request is not confirmation.`);
   try {
     const until = requestedDuration === '0' ? 0 : now() + Number(requestedDuration);
     const result = await api(`/people/${encodeURIComponent(personId)}/${action}`, {
-      method: 'POST', body: action === 'pause' ? { until } : {},
+      method: 'POST', body: action === 'pause' ? { until } : action === 'reward' || action === 'focus' ? { minutes } : {},
       headers: { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken },
     });
-    if (generation !== state.generation) return;
+    if (generation !== state.generation) return outcome;
+    outcome = { sent: true, reason: null, operationId: result.operation.id };
     state.operation = result.operation;
     const person = state.people.people.find((entry) => entry.id === personId);
     if (person) { person.latestOperation = result.operation; person.status = result.operation.state; }
@@ -288,23 +333,36 @@ async function mutate(personId, action, presetSeconds) {
     if (['pending', 'unknown'].includes(result.operation.state)) void followOperation(result.operation.id, generation);
     else await refresh({ quiet: true });
   } catch (error) {
-    if (generation !== state.generation) return;
+    if (generation !== state.generation) return outcome;
     state.needsRefresh = true;
-    if (error instanceof APIError && error.status === 409) {
+    if ((action === 'reward' || action === 'focus') && error instanceof APIError && ![401, 403].includes(error.status)) {
+      // The Reward Time controls explain every refusal themselves from the code; a 404 means the feature is off for this viewer.
+      outcome = { sent: false, reason: null, code: error.code, status: error.status };
+      state.needsRefresh = error.code === 'revision_conflict'; // every other refusal changed nothing
+      announce(''); // the per-child status line says what happened; drop the stale "Sending" notice
+    } else if (error instanceof APIError && error.status === 409) {
+      outcome = { sent: false, reason: 'Revision conflict. Nothing was sent again; review the status and try again.' };
       announce('Revision conflict. No retry was sent. Refresh status, review the change, then choose the action again.', true);
     } else if (error instanceof APIError && [401, 403].includes(error.status)) {
+      outcome = { sent: false, reason: 'This action is not authorized.' };
       resetView();
       announce('This action is not authorized. Sign in again; local status has been cleared.', true);
     } else if (error instanceof APIError) {
+      outcome = { sent: false, reason: error.message };
       announce(`The request failed: ${error.message} Refresh status before another action.`, true);
     } else {
+      outcome = { sent: false, reason: 'The outcome is unknown; check the pause status before trying again.' };
       state.localUnknown = true;
-      state.offline = !navigator.onLine;
-      announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
+      // Same banner as refresh/followOperation, with the unknown-outcome wording (localUnknown is set); only the offline flag differs:
+      // a lost mutation response must not block the Refresh that resolves it.
+      noteFailure(error); state.offline = !navigator.onLine;
+      if (state.serviceDown) announce('');
+      else announce(isReal() ? 'Outcome unknown. The intent may have been saved; no router invocation or retry is authorized by this response. Refresh the cached status.' : 'Outcome unknown. The response was lost; the action may have reached the fake router. No retry is queued. Reconnect and refresh status.', true);
     }
   } finally {
     if (generation === state.generation) { state.busy = false; render(); }
   }
+  return outcome;
 }
 
 const COVERAGE_REFUSALS = ['incomplete_address_coverage', 'incomplete_transition_address_coverage'];
@@ -353,8 +411,10 @@ async function followOperation(id, generation) {
       if (error instanceof APIError && [401, 403, 404].includes(error.status)) {
         resetView(); announce('Operation access changed. Sign in again to refresh permitted status.', true);
       } else {
-        state.needsRefresh = true; state.localUnknown = true; state.offline = !navigator.onLine || !(error instanceof APIError);
-        announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true); render();
+        state.needsRefresh = true; state.localUnknown = true; noteFailure(error);
+        if (state.serviceDown) announce('');
+        else announce('Operation observation is unavailable. Outcome is unknown; refresh before another action.', true);
+        render();
       }
       return;
     }
@@ -367,10 +427,10 @@ function renderAuthControls() {
 
 function renderControlState() {
   const enabled = canControl();
-  for (const button of document.querySelectorAll('[data-control], [data-quick-pause]')) button.disabled = !enabled;
+  for (const button of document.querySelectorAll('[data-control], [data-quick-pause], [data-reward-minutes]:not([data-reward-busy]), [data-focus-minutes]:not([data-focus-busy])')) button.disabled = !enabled;
   for (const field of document.querySelectorAll('[data-duration]')) field.disabled = !enabled;
   bulk.update();
-  $('#refresh').disabled = state.busy || state.refreshing || state.offline;
+  for (const button of document.querySelectorAll('[data-refresh]')) button.disabled = state.busy || state.refreshing || state.offline;
   scheduleEditor.render();
 }
 
@@ -378,13 +438,13 @@ function renderConnection() {
   if (!state.people) return;
   const stale = age() > FRESH_SECONDS || state.needsRefresh;
   const diagnosticsOpen = $('#connection details')?.open;
-  const status = state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : isReal() ? 'Connected · cached router observation' : 'Connected · current synthetic observation';
+  const status = state.serviceDown ? 'Not responding · read-only snapshot' : state.offline ? 'Offline · read-only snapshot' : state.refreshing ? 'Refreshing session and status…' : stale ? 'Status needs refresh · controls disabled' : isReal() ? 'Connected · cached router observation' : 'Connected · current synthetic observation';
   $('#connection').className = `connection${state.offline ? ' offline' : stale ? ' stale' : ''}`;
   $('#connection').innerHTML = `<strong>${escape(status)}</strong>Observed ${escape(time(state.people.observedAt))} · <span data-age>${Number.isFinite(age()) ? escape(duration(age())) + ' ago' : 'age unavailable'}</span>${state.savedAt ? ` · cached ${escape(time(state.savedAt))}` : ''}<details class="diagnostics" ${diagnosticsOpen ? 'open' : ''}><summary>${isReal() ? 'Router observation details' : 'Advanced demo status'}</summary><p>Service desired ${escape(state.people.serviceDesiredRevision)} · router desired ${escape(state.people.routerDesiredRevision ?? 'unknown')} · router confirmed ${escape(state.people.routerConfirmedRevision ?? 'unconfirmed')}${state.people.errors.length ? `<br>Observation errors: ${escape(state.people.errors.join(', '))}` : ''}<br>Source: ${isReal() ? 'real router integration · packet acceptance unmeasured' : 'synthetic fake router · target compatibility unverified'}</p></details>`;
 }
 
 function renderPeople() {
-  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown]);
+  const renderKey = JSON.stringify([state.people, state.offline, state.localUnknown, rewardTime.signature(), focusWindow.signature()]);
   if (renderKey === state.renderKey) return;
   const focused = document.activeElement?.dataset?.focusKey;
   const openDetails = new Set([...document.querySelectorAll('[data-details-key][open]')].map((element) => element.dataset.detailsKey));
@@ -399,13 +459,15 @@ function renderPeople() {
     const choices = [['0', 'Until I resume'], ['60', isReal() ? '1 minute' : '1 minute · demo'], ['900', '15 minutes'], ['1800', '30 minutes'], ['3600', '1 hour']];
     const timedPause = effectiveManual && effectiveManual.until > 0;
     return `<article class="person" data-person="${id}" aria-labelledby="name-${id}">
-      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${person.kind === 'device_group' ? 'Device group' : isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div><span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
-      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `Paused until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
+      <div class="person-top"><div class="person-name"><span class="avatar" aria-hidden="true">${escape(person.name.slice(0, 1))}</span><div><h3 id="name-${id}">${label}</h3><p class="person-id">${person.kind === 'device_group' ? 'Device group' : isReal() ? 'Private pilot person' : 'Fictional person'} · ${person.devices.length} assigned ${person.devices.length === 1 ? 'device' : 'devices'}</p></div></div>${person.pauseLabel === 'focus' ? '<span class="badge focus">Focus</span>' : ''}<span class="badge ${escape(personStatus)}">${escape(personStatus === 'confirmed' ? isReal() ? 'Router confirmed' : 'Fake confirmed' : personStatus[0].toUpperCase() + personStatus.slice(1))}</span></div>
+      <dl class="reasons"><div><dt>Manual pause</dt><dd>${effectiveManual ? effectiveManual.until === 0 ? 'Paused until you resume' : `${person.pauseLabel === 'focus' ? 'Focus' : 'Paused'} until ${escape(time(effectiveManual.until))}<span class="reason-detail" data-until="${effectiveManual.until}"></span>` : manual ? 'Expired in the latest observation' : 'No manual pause'}<span class="reason-detail">${effectiveManual ? 'Manual pause is separate from the schedule.' : 'A schedule may still block access.'}</span></dd></div><div><dt>Schedule</dt><dd><span data-schedule-state="${id}">${escape(scheduleLabel(person))}</span><span class="reason-detail">${escape(person.scheduleExplanation)}</span></dd></div></dl>
       <p class="devices-label">Assigned devices</p><ul class="devices" aria-label="${label} assigned devices">${person.devices.length ? person.devices.map((device) => `<li>${escape(device.label)}${device.change ? ` · ${device.change === 'adding' ? 'being added' : device.change === 'moving' ? 'being moved' : 'being removed'}` : ''}<span class="reason-detail" data-device-evidence="${escape(device.id)}">${escape(deviceEvidenceLabel(device))}</span></li>`).join('') : '<li>No assigned devices</li>'}</ul>
       <div class="quick-pauses" role="group" aria-label="Quick pause for ${label}">${[[900, '15'], [1800, '30'], [3600, '60']].map(([seconds, minutes]) => `<button class="button primary" type="button" data-quick-pause="${seconds}" data-person-id="${id}" data-focus-key="quick-${seconds}-${id}" aria-label="Pause ${label} for ${minutes} minutes">Pause ${minutes} min</button>`).join('')}</div>
       ${timedPause ? `<p class="remaining" role="timer" aria-label="Time remaining on ${label} timed pause">Time left: <strong data-remaining="${effectiveManual.until}"></strong></p>` : ''}
-      <p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: the router policy has no allowance concept yet, so a schedule block cannot be lifted temporarily. Pausing and ending a pause work as shown.</span></p>
+      ${rewardTime.offered() ? '' : `<p class="extra-time" data-extra-time="${id}"><button class="button secondary" type="button" disabled aria-describedby="extra-note-${id}">Extra time 15 / 30 / 60 min</button><span class="reason-detail" id="extra-note-${id}">Unavailable: extra time is not turned on for your account in this installation. Pausing and ending a pause work as shown.</span></p>`}
       <div class="person-controls"><div class="duration-field"><label for="duration-${id}">Pause duration for ${label}</label><select id="duration-${id}" data-duration="${id}" data-focus-key="duration-${id}">${choices.map(([value, text]) => `<option value="${value}" ${value === (state.durations.get(person.id) ?? '0') ? 'selected' : ''}>${text}</option>`).join('')}</select></div><button class="button primary" type="button" data-control="pause" data-person-id="${id}" data-focus-key="pause-${id}" aria-label="Pause ${label}">Pause</button><button class="button secondary" type="button" data-control="resume" data-person-id="${id}" data-focus-key="resume-${id}" aria-label="${timedPause ? `End ${label} timed pause now` : `Resume ${label} manual pause`}">${timedPause ? 'End now' : 'Resume'}</button></div>
+      ${rewardTime.markup(person)}
+      ${focusWindow.markup(person)}
       ${operation ? `<div class="operation ${escape(operation.state)}" role="status"><strong>${escape(operationText(operation))}</strong><details class="diagnostics" data-details-key="${id}" ${openDetails.has(person.id) ? 'open' : ''}><summary>Operation details</summary><p>Operation ${escape(operation.id)} · revision ${escape(operation.revision)} · updated ${escape(time(operation.updatedAt))}${operation.error ? `<br>Detail: ${escape(operation.error)}` : ''}</p></details></div>` : ''}
       <p class="confirmation">Current observation: ${escape(person.observationHealth)}. Last healthy ${isReal() ? 'router' : 'synthetic'} confirmation: ${escape(time(state.people.lastSuccessfulConfirmationAt))}. Resume clears only manual pause.</p>
     </article>`;
@@ -449,7 +511,19 @@ function renderAlerts() {
   panel.hidden = false;
 }
 
+function renderServiceDown() {
+  const box = $('#service-down'), down = state.serviceDown;
+  box.hidden = !down;
+  if (!down) { delete box.dataset.since; return; }
+  box.dataset.since = String(down.since);
+  const at = new Date(down.since * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  $('#service-down-text').textContent = unsettled() ? `Couvre-feu is not responding (since ${at}). A change you just made may or may not have gone through. Check the status once it is back.` : `Couvre-feu is not responding (since ${at}). Nothing was changed. Check your connection, then tap Retry.`;
+  $('#service-down-detail').textContent = down.status ? `The service answered with status ${down.status}.` : 'The service did not answer.';
+  $('#service-retry').disabled = state.refreshing;
+}
+
 function render() {
+  renderServiceDown();
   const hasStatus = Boolean(state.people && actor());
   $('#auth-view').hidden = hasStatus;
   $('#status-view').hidden = !hasStatus;
@@ -460,9 +534,11 @@ function render() {
     $('#account-actions').innerHTML = account ? `<div class="account-actions"><span class="account-name">${escape(account.displayName)} · ${escape(account.role)}</span><button id="logout" class="button secondary" type="button">Sign out</button></div>` : '';
     $('#logout')?.addEventListener('click', () => void logout());
   }
+  const build = hasStatus && state.session?.version ? `${String(state.session.version).slice(0, 64)} · schema ${Number(state.session.schemaVersion)}` : '';
+  $('#build-info').textContent = build;
   if (hasStatus) {
     $('#account-context').textContent = `${account.displayName} · ${account.role} · only your permitted ${isReal() ? 'private pilot person' : 'fictional people'}`;
-    renderConnection(); renderPeople(); renderControlState();
+    renderConnection(); renderPeople(); renderControlState(); rewardTime.afterRender(); focusWindow.afterRender();
     activityPanel.update(state.people.people, Boolean(state.session) && !state.offline);
   } else {
     activityPanel.clear();
@@ -472,6 +548,7 @@ function render() {
     state.renderKey = '';
     scheduleEditor.render();
   }
+  tabs.update({ signedIn: hasStatus, infrastructure: hasStatus && isReal() && account.role === 'admin' });
   renderAuthControls();
   renderAlerts();
   parentAlerts.render(hasStatus && !state.offline, document.querySelectorAll('#alert-feed .alert-current').length);
@@ -480,6 +557,9 @@ function render() {
   bulk.update();
   children.update();
   inventory.update();
+  contentFilter.update();
+  auditLog.update();
+  installReadiness.update();
 }
 
 function tick() {
@@ -503,6 +583,7 @@ function tick() {
     label.textContent = remaining > 0 ? `${duration(remaining)} until the expiry time; router observation remains authoritative.` : 'Expiry time reached. Waiting for a fresh router observation; this countdown cannot confirm expiry.';
   }
   if (state.people && currentAge > FRESH_SECONDS && !state.needsRefresh) { state.needsRefresh = true; renderConnection(); }
+  sessionGrace.update(state.session);
   if (state.session && state.session.expiresAt <= now()) { resetView(); announce('Your session expired. Sign in again; local status was cleared.', true); }
   if (state.snapshotExpiresAt && state.snapshotExpiresAt <= now()) { resetView(); announce('The cached session expired. Local status was cleared; reconnect and sign in again.', true); }
   if (state.people && actor()) { alertJournal.ingest(state.people, now(), false); renderAlerts(); }
@@ -522,18 +603,23 @@ $('#enroll-form').addEventListener('submit', (event) => {
   $('#enrollment-token').value = '';
   if (token) void authenticate('register', token);
 });
-$('#refresh').addEventListener('click', () => void refresh());
+// One Refresh status button per tab heading (Home keeps #refresh), so the "refresh" advice on any tab has a button to act on.
+document.addEventListener('click', (event) => { if (event.target.closest('[data-refresh]')) void refresh(); });
 $('#hide-recovery').addEventListener('change', event => { alertJournal.setHideRecovery(event.target.checked, now()); renderAlerts(); });
 $('#people').addEventListener('change', (event) => {
   if (event.target.matches('[data-duration]')) state.durations.set(event.target.dataset.duration, event.target.value);
 });
 $('#people').addEventListener('click', (event) => {
+  const focusButton = event.target.closest('[data-focus-minutes]');
+  if (focusButton && !focusButton.disabled) { void focusWindow.tap(focusButton.dataset.personId, Number(focusButton.dataset.focusMinutes)); return; }
+  const reward = event.target.closest('[data-reward-minutes]');
+  if (reward && !reward.disabled) { void rewardTime.tap(reward.dataset.personId, Number(reward.dataset.rewardMinutes)); return; }
   const button = event.target.closest('[data-control], [data-quick-pause]');
   if (button && !button.disabled) void mutate(button.dataset.personId, button.dataset.quickPause ? 'pause' : button.dataset.control, button.dataset.quickPause);
 });
-window.addEventListener('offline', () => { state.offline = true; state.needsRefresh = true; render(); announce('Offline. Last observed status is read-only; no control requests will be queued.'); });
+window.addEventListener('offline', () => { state.offline = true; state.serviceDown = null; state.needsRefresh = true; render(); announce('Offline. Last observed status is read-only; no control requests will be queued.'); });
 window.addEventListener('online', async () => {
-  state.offline = false; state.needsRefresh = true; render();
+  state.offline = false; state.serviceDown = null; state.needsRefresh = true; render();
   if (state.logoutRequired || needsServerLogout()) {
     try { await completePendingLogout(); announce('Server sign-out completed. Sign in again to refresh permitted status.'); }
     catch { announce('Server sign-out is still unconfirmed. Local status remains cleared.', true); }
@@ -546,7 +632,6 @@ window.addEventListener('storage', (event) => {
   }
   if (event.key === LOGOUT_EVENT) {
     state.logoutRequired = needsServerLogout(); resetView();
-    window.dispatchEvent(new Event('cf:signed-out'));
     announce('Signed out in another tab. Local status has been cleared.');
   } else if (event.key === SCOPE_EVENT && actor() && event.newValue !== actorScope(actor())) {
     resetView();
@@ -555,9 +640,10 @@ window.addEventListener('storage', (event) => {
     state.logoutRequired = false;
   }
 });
+$('#service-retry').addEventListener('click', () => void refresh({ quiet: true }));
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.session && !state.busy) void refresh({ quiet: true }); });
 setInterval(tick, 1000);
-setInterval(() => { if (state.session && !state.offline && !state.busy && !state.refreshing && !state.needsRefresh) void refresh({ quiet: true }); }, 10000);
+setInterval(() => { if (state.session && !state.busy && !state.refreshing && (state.serviceDown || !state.offline && !state.needsRefresh)) void refresh({ quiet: true }); }, 10000);
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { /* Online UI remains usable; offline installation is not claimed. */ });
 render();
@@ -565,85 +651,3 @@ if (state.offline) {
   showCachedStatus();
   announce(state.people ? 'Offline read-only snapshot. Sign-in and control requests are unavailable.' : 'Offline. No permitted status snapshot is available.');
 } else void refresh({ quiet: true });
-
-// ---------- Bottom tab bar ----------
-{
-// tab shows every section exactly as before; other tabs hide sections via CSS (data-tab on #status-view).
-const KEY = 'cf-tab';
-const view = document.querySelector('#status-view');
-const tabs = [...document.querySelectorAll('.tablist [role="tab"]')];
-const names = tabs.map((tab) => tab.dataset.tabTarget);
-const panel = document.querySelector('#tab-panel');
-const empty = document.querySelector('#tab-empty');
-
-function read(store) { try { return store(); } catch { return null; } }
-function stored() { return read(() => sessionStorage.getItem(KEY)); }
-function save(name) { try { sessionStorage.setItem(KEY, name); } catch { /* storage unavailable: tab simply is not remembered */ } }
-function fromHash() { const name = location.hash.slice(1); return names.includes(name) ? name : null; }
-
-// Empty state: a narrow-screen tab whose sections are all hidden shows a short message instead of a blank page.
-function syncEmpty() {
-  const name = view.dataset.tab;
-  const any = name === 'overview' || [...panel.querySelectorAll(`[data-tab-group="${name}"]`)].some((node) => !node.hidden);
-  if (empty.hidden === any) return; // assigning an unchanged value would re-trigger the observer forever
-  empty.hidden = any;
-}
-
-function select(name, { focus = false, persist = true, scroll = true } = {}) {
-  if (!names.includes(name)) name = 'overview';
-  for (const tab of tabs) {
-    const on = tab.dataset.tabTarget === name;
-    tab.setAttribute('aria-selected', String(on));
-    tab.tabIndex = on ? 0 : -1;
-    if (on) { panel.setAttribute('aria-labelledby', tab.id); if (focus) tab.focus(); }
-  }
-  view.dataset.tab = name;
-  syncEmpty();
-  if (persist) save(name);
-  if (scroll) window.scrollTo({ top: 0, behavior: 'auto' });
-}
-
-if (view && tabs.length && panel && empty) {
-  const start = fromHash() ?? stored();
-  if (start && names.includes(start) && start !== 'overview') select(start, { persist: false, scroll: false });
-  panel.setAttribute('aria-labelledby', document.querySelector('[role="tab"][aria-selected="true"]').id);
-  new MutationObserver(syncEmpty).observe(panel, { attributes: true, attributeFilter: ['hidden'], subtree: true });
-  syncEmpty();
-  // Signing out forgets the remembered tab so the next account starts on Overview.
-  window.addEventListener('cf:signed-out', () => {
-    try { sessionStorage.removeItem(KEY); } catch { /* storage unavailable */ }
-    select('overview', { persist: false, scroll: false });
-    try { history.replaceState(null, '', location.pathname + location.search); } catch { /* ignore */ }
-  });
-
-  for (const tab of tabs) tab.addEventListener('click', () => {
-    const name = tab.dataset.tabTarget;
-    select(name);
-    try { history.replaceState(null, '', name === 'overview' ? location.pathname + location.search : `#${name}`); } catch { /* ignore */ }
-  });
-  document.querySelector('.tablist').addEventListener('keydown', (event) => {
-    const at = tabs.indexOf(document.activeElement);
-    if (at < 0) return;
-    const last = tabs.length - 1;
-    const next = { ArrowRight: at === last ? 0 : at + 1, ArrowLeft: at === 0 ? last : at - 1, Home: 0, End: last }[event.key];
-    if (next === undefined) return;
-    event.preventDefault();
-    select(tabs[next].dataset.tabTarget, { focus: true, scroll: false });
-  });
-  window.addEventListener('hashchange', () => { const name = fromHash(); if (name) select(name); });
-
-  // Mirror the existing parent-alert count onto the Activity tab; the source badge is unchanged.
-  const source = document.querySelector('#alert-badge'), mirror = document.querySelector('#tab-badge-activity');
-  if (source && mirror) {
-    const sync = () => {
-      const count = source.hidden ? '' : source.textContent.trim();
-      mirror.hidden = !count || count === '0';
-      mirror.textContent = count;
-      const tab = mirror.closest('[role="tab"]');
-      tab.setAttribute('aria-label', mirror.hidden ? 'Activity' : `Activity, ${count} ${count === '1' ? 'alert' : 'alerts'}`);
-    };
-    new MutationObserver(sync).observe(source, { attributes: true, childList: true, characterData: true, subtree: true });
-    sync();
-  }
-}
-}

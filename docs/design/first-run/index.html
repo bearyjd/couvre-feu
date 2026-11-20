@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Couvre-feu · first-run setup (throwaway prototype)</title>
+<style>
+/* THROWAWAY PREVIEW. Tokens mirror origin/feat/ui-ios-style (PR #80): system fonts, inset grouped cards, pill buttons, tinted chips. */
+:root{color-scheme:light dark;--ink:#1c1c1e;--paper:#f2f2f7;--surface:#fff;--surface-2:#f7f7fa;--line:rgba(60,60,67,.18);--muted:#5f5f66;--fill:rgba(120,120,128,.12);--blue:#0a62d0;--blue-soft:#e3eefc;--green:#1b7a37;--green-soft:#e1f4e6;--amber:#8a5200;--amber-soft:#fff1d4;--red:#c0261d;--red-soft:#fde8e6;--focus:#0a62d0;--on-accent:#fff;--glass:rgba(242,242,247,.82);--shadow:0 1px 2px rgba(0,0,0,.04),0 6px 20px rgba(0,0,0,.05);--radius:20px;--radius-sm:14px;--ease:cubic-bezier(.32,.72,0,1);
+font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;color:var(--ink);background:var(--paper);-webkit-text-size-adjust:100%}
+@media(prefers-color-scheme:dark){:root{--ink:#f5f5f7;--paper:#000;--surface:#1c1c1e;--surface-2:#242426;--line:rgba(235,235,245,.16);--muted:#a1a1a8;--fill:rgba(120,120,128,.26);--blue:#4da3ff;--blue-soft:#10263f;--green:#5fd47f;--green-soft:#12301c;--amber:#ffb340;--amber-soft:#3a2a09;--red:#ff7168;--red-soft:#41171a;--focus:#4da3ff;--on-accent:#031325;--glass:rgba(0,0,0,.72);--shadow:0 0 0 .5px rgba(255,255,255,.05)}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;font-size:17px;line-height:1.4;overflow-wrap:anywhere;min-height:100vh}
+button,input,select{font:inherit;color:inherit;min-height:48px}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+p{margin:0 0 12px;line-height:1.5}h1,h2,h3{margin:0;letter-spacing:-.022em}
+.proto{background:repeating-linear-gradient(135deg,var(--surface-2),var(--surface-2) 8px,var(--surface) 8px,var(--surface) 16px);border-bottom:1px dashed var(--line);padding:8px 16px;font-size:13px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:center;color:var(--muted)}
+.proto label{display:flex;gap:6px;align-items:center}.proto select,.proto button{min-height:44px;font-size:14px;border-radius:10px;border:1px solid var(--line);background:var(--surface);padding:0 10px}
+.app{max-width:560px;margin:0 auto;padding-bottom:120px;position:relative}
+.topbar{position:sticky;top:0;z-index:20;background:var(--glass);-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);border-bottom:.5px solid var(--line);padding:6px 8px 0}
+.topbar-row{display:flex;align-items:center;gap:4px;min-height:48px}
+.topbar .back{background:none;border:0;color:var(--blue);min-width:44px;padding:0 10px;font-size:17px;border-radius:12px}
+.topbar .step{flex:1;text-align:center;font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.02em}
+.topbar .skip{background:none;border:0;color:var(--blue);padding:0 10px;min-width:44px;font-size:15px;border-radius:12px}
+.rail{display:flex;gap:4px;padding:4px 8px 8px}.rail i{flex:1;height:4px;border-radius:2px;background:var(--fill);transition:background .3s var(--ease)}.rail i.done{background:var(--blue)}
+.screen{padding:8px 16px 0}.screen.enter{animation:in .38s var(--ease)}
+@keyframes in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.screen.enter{animation:none}*{transition:none!important}}
+.eyebrow{margin:18px 0 4px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{font-size:32px;line-height:1.1;font-weight:800;margin-bottom:10px}h1:focus{outline:none}
+h2{font-size:20px;font-weight:700;margin:22px 0 8px}
+.lede{color:var(--muted);font-size:17px}
+.card{background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px;margin:0 0 14px}
+.card.flush{padding:0;overflow:hidden}
+.btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:52px;border-radius:999px;border:0;font-weight:600;padding:0 22px;text-decoration:none}
+.btn.primary{background:var(--blue);color:var(--on-accent)}.btn.secondary{background:var(--fill);color:var(--blue)}
+.btn.small{min-height:44px;width:auto;font-size:15px;padding:0 16px}
+.linkbtn{background:none;border:0;color:var(--blue);padding:0 4px;min-height:44px;text-decoration:underline;border-radius:8px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:13px;font-weight:600;padding:3px 10px;border-radius:999px;background:var(--fill);color:var(--muted);min-height:26px}
+.chip.blue{background:var(--blue-soft);color:var(--blue)}.chip.green{background:var(--green-soft);color:var(--green)}.chip.amber{background:var(--amber-soft);color:var(--amber)}.chip.red{background:var(--red-soft);color:var(--red)}
+.note{display:flex;gap:10px;border-radius:var(--radius-sm);padding:12px 14px;margin:0 0 14px;font-size:15px;background:var(--blue-soft)}.note p{margin:0}.note.amber{background:var(--amber-soft);color:var(--amber)}.note.red{background:var(--red-soft)}.note.amber a,.note.amber .linkbtn{color:inherit}
+.note .g{flex:none;font-weight:800}.note strong{display:block}
+.fine{font-size:14px;color:var(--muted)}
+.steps{list-style:none;margin:0;padding:0}.steps li{display:flex;gap:14px;padding:14px 16px;border-top:.5px solid var(--line)}.steps li:first-child{border-top:0}
+.steps .n{flex:none;width:32px;height:32px;border-radius:50%;background:var(--blue-soft);color:var(--blue);font-weight:800;display:grid;place-items:center}.steps b{display:block}
+label.f{display:block;font-weight:600;font-size:15px;margin:0 0 6px}
+input[type=text]{width:100%;border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:0 14px;font-size:17px}
+.namerow{display:flex;gap:8px;align-items:center;margin-bottom:10px}.namerow input{flex:1}.avatar{flex:none;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:var(--ink);background:var(--fill)}
+.a0{background:var(--blue-soft);color:var(--blue)}.a1{background:var(--green-soft);color:var(--green)}.a2{background:var(--amber-soft);color:var(--amber)}.a3{background:var(--red-soft);color:var(--red)}
+.icon-btn{flex:none;width:44px;min-height:44px;border-radius:50%;border:0;background:var(--fill);font-size:20px;line-height:1}
+.dev{padding:14px 16px;border-top:.5px solid var(--line)}.dev:first-child{border-top:0}
+.dev .name{font-weight:700;font-size:17px}.dev .name.none{font-style:italic;color:var(--muted);font-weight:600}
+.dev .meta{font-size:14px;color:var(--muted);margin:2px 0 8px}.chips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+fieldset{border:0;margin:8px 0 0;padding:0;min-width:0}legend{font-size:13px;font-weight:600;color:var(--muted);padding:0;margin-bottom:6px}
+.pills{display:flex;gap:6px;flex-wrap:wrap}.pills input{position:absolute;opacity:0;width:1px;height:1px;min-height:0}
+.pills label{flex:1 1 64px;min-height:44px;display:grid;place-items:center;padding:0 10px;border-radius:999px;background:var(--fill);font-weight:600;font-size:16px;cursor:pointer;border:2px solid transparent;transition:background .2s var(--ease),color .2s}
+.pills input:checked+label{background:var(--blue);color:var(--on-accent)}.pills input:focus-visible+label{outline:3px solid var(--focus);outline-offset:2px}
+.pills input[value=skip]:checked+label{background:var(--surface);color:var(--ink);border-color:var(--line)}
+.inline-warn{margin-top:10px}
+.bar{position:fixed;inset:auto 0 0 0;z-index:30;background:var(--glass);-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);border-top:.5px solid var(--line);padding:10px 16px calc(12px + env(safe-area-inset-bottom,0px))}
+.bar>div{max-width:560px;margin:0 auto}.bar .fine{text-align:center;margin:6px 0 0}
+.kid-head{display:flex;gap:12px;align-items:center;padding:14px 16px;background:var(--surface-2)}.kid-head b{font-size:19px}
+.rev{padding:12px 16px;border-top:.5px solid var(--line)}.rev input{margin:6px 0}
+.state{display:flex;gap:8px;align-items:flex-start;padding:12px 16px;border-top:.5px solid var(--line)}.state .t{flex:1}.state b{display:block}
+.empty{text-align:center;padding:28px 18px}.empty .big{font-size:40px;margin-bottom:6px}
+dialog{border:0;border-radius:24px;padding:0;max-width:min(520px,calc(100vw - 24px));width:100%;background:var(--surface);color:var(--ink);box-shadow:0 20px 60px rgba(0,0,0,.35)}dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog .in{padding:20px}details{border-top:.5px solid var(--line);padding:4px 0}summary{min-height:44px;display:flex;align-items:center;font-weight:600;cursor:pointer}details ol{margin:0 0 10px;padding-left:22px}details li{margin-bottom:6px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+@media(min-width:600px){.devgrid{display:grid;grid-template-columns:1fr 1fr}.devgrid .dev{border-top:.5px solid var(--line)}.devgrid .dev:nth-child(odd){border-right:.5px solid var(--line)}.devgrid .dev:nth-child(-n+2){border-top:0}}
+.skip-link{position:absolute;left:-999px}.skip-link:focus{left:8px;top:8px;background:var(--surface);padding:10px;z-index:99}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+<div class="proto" role="group" aria-label="Prototype controls (not part of the product)">
+  <strong>Prototype</strong>
+  <label>Jump to <select id="jump"><option value="welcome">1 Welcome</option><option value="children">2 Add children</option><option value="prepare">3 Prepare phones</option><option value="devices">4 Assign devices</option><option value="review">5 Review</option><option value="sending">6 Sending</option><option value="done">7 Done</option></select></label>
+  <label>Router <select id="rstate"><option value="ok">Scan OK</option><option value="empty">Scan OK, no devices</option><option value="down">Unreachable</option></select></label>
+  <button id="confirm-sim" type="button" disabled>Simulate: router confirms</button>
+</div>
+<div class="app">
+  <header class="topbar" id="topbar" hidden>
+    <div class="topbar-row"><button class="back" id="back" type="button" aria-label="Back">&#8249; Back</button><span class="step" id="step"></span><button class="skip" id="later" type="button">Later</button></div>
+    <div class="rail" id="rail" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+  </header>
+  <main id="main" tabindex="-1">
+    <p class="sr" id="live" role="status" aria-live="polite"></p>
+
+    <!-- 1 WELCOME -->
+    <section class="screen" data-screen="welcome" aria-labelledby="h-welcome">
+      <p class="eyebrow">Signed in as JD &middot; admin</p>
+      <h1 id="h-welcome" tabindex="-1">Let&rsquo;s set up your family.</h1>
+      <p class="lede">Group each child&rsquo;s phones, tablets and consoles, so one pause or schedule reaches all of them. About five minutes.</p>
+      <div class="card flush"><ol class="steps">
+        <li><span class="n" aria-hidden="true">1</span><div><b>Add your children</b><span class="fine">Just first names. Jack, Penn, Ford.</span></div></li>
+        <li><span class="n" aria-hidden="true">2</span><div><b>Check each phone&rsquo;s Wi-Fi setting</b><span class="fine">Some phones use a changing address that can break the grouping.</span></div></li>
+        <li><span class="n" aria-hidden="true">3</span><div><b>Pick their devices from your router&rsquo;s list</b><span class="fine">Newest first, so a phone you just woke up is easy to spot.</span></div></li>
+        <li><span class="n" aria-hidden="true">4</span><div><b>Review and send to the router</b><span class="fine">You confirm with your passkey. The router then confirms back.</span></div></li>
+      </ol></div>
+      <div class="note"><span class="g" aria-hidden="true">&#9675;</span><p>Setup doesn&rsquo;t block anything by itself, and your own protected devices are never listed. Couvre-feu doesn&rsquo;t read messages, sites or apps.</p></div>
+      <div class="bar"><div><button class="btn primary" data-go="children" type="button">Start setup</button></div></div>
+    </section>
+
+    <!-- 2 CHILDREN -->
+    <section class="screen" data-screen="children" hidden aria-labelledby="h-children">
+      <p class="eyebrow">Step 1 of 4</p>
+      <h1 id="h-children" tabindex="-1">Who are we setting up?</h1>
+      <p class="lede">Use the name you&rsquo;d say out loud. You can rename later. Adults&rsquo; devices aren&rsquo;t added here.</p>
+      <form id="kids-form" class="card" novalidate>
+        <div id="kid-rows"></div>
+        <button class="btn secondary small" id="add-kid" type="button">+ Add another child</button>
+        <p class="fine" style="margin:12px 0 0" id="kid-err" role="alert"></p>
+        <p class="fine" style="margin:12px 0 0">Need a shared device such as the living-room TV? Add it as a <button class="linkbtn" id="add-group" type="button">device group</button> instead.</p>
+      </form>
+      <div class="note"><span class="g" aria-hidden="true">&#9675;</span><p>A child is saved here first. They join the router once they have a device, which comes next.</p></div>
+      <div class="bar"><div><button class="btn primary" id="kids-next" type="button">Continue</button></div></div>
+    </section>
+
+    <!-- 3 PREPARE -->
+    <section class="screen" data-screen="prepare" hidden aria-labelledby="h-prepare">
+      <p class="eyebrow">Step 2 of 4</p>
+      <h1 id="h-prepare" tabindex="-1">One setting on each phone first.</h1>
+      <p class="lede">Many phones hide behind a <strong>random Wi-Fi address</strong> that can change. When it changes, the router stops recognising the phone and its limits stop applying until you add it again.</p>
+      <div class="card" id="howto-inline"></div>
+      <div class="note"><span class="g" aria-hidden="true">&#9675;</span><p><strong>Only for your home Wi-Fi.</strong>Switching it off makes the phone appear in the next list as a new entry. Pick that one and ignore the older entry.</p></div>
+      <div class="bar"><div><button class="btn primary" data-go="devices" type="button">Done &mdash; show the devices</button><p class="fine"><button class="linkbtn" data-go="devices" type="button">Skip for now, I&rsquo;ll do it later</button></p></div></div>
+    </section>
+
+    <!-- 4 DEVICES -->
+    <section class="screen" data-screen="devices" hidden aria-labelledby="h-devices">
+      <p class="eyebrow">Step 3 of 4</p>
+      <h1 id="h-devices" tabindex="-1">Which devices are whose?</h1>
+      <p class="lede">This is what your router has seen on the home network. Skip anything that isn&rsquo;t a child&rsquo;s.</p>
+      <div id="dev-status"></div>
+      <div id="dev-body"></div>
+      <div class="bar" id="dev-bar"><div><button class="btn primary" id="dev-next" type="button" disabled>Review</button><p class="fine"><button class="linkbtn" id="manual" type="button">Add one by its Wi-Fi address</button></p></div></div>
+    </section>
+
+    <!-- 5 REVIEW -->
+    <section class="screen" data-screen="review" hidden aria-labelledby="h-review">
+      <p class="eyebrow">Step 4 of 4</p>
+      <h1 id="h-review" tabindex="-1">Check, then send.</h1>
+      <p class="lede" id="review-lede"></p>
+      <div id="review-body"></div>
+      <div class="bar"><div><button class="btn primary" id="send" type="button"></button><p class="fine" id="send-fine"></p></div></div>
+    </section>
+
+    <!-- 6 SENDING -->
+    <section class="screen" data-screen="sending" hidden aria-labelledby="h-sending">
+      <h1 id="h-sending" tabindex="-1" style="margin-top:22px">Sending to the router.</h1>
+      <p class="lede" id="sending-lede">Your phone will ask for your passkey for each change.</p>
+      <div class="card flush" id="send-list" aria-live="off"></div>
+      <div class="note"><span class="g" aria-hidden="true">&#9675;</span><p><strong>Sent is not the same as confirmed.</strong>A device is only on the router once the router says so. This list updates when it does.</p></div>
+      <div class="bar"><div><button class="btn primary" id="sending-next" type="button" disabled>Continue</button></div></div>
+    </section>
+
+    <!-- 7 DONE -->
+    <section class="screen" data-screen="done" hidden aria-labelledby="h-done">
+      <p class="eyebrow">Setup</p>
+      <h1 id="h-done" tabindex="-1"></h1>
+      <p class="lede" id="done-lede"></p>
+      <div class="card" id="done-summary"></div>
+      <h2>What happens next</h2>
+      <div class="card flush"><ol class="steps">
+        <li><span class="n" aria-hidden="true">1</span><div><b>Set quiet hours</b><span class="fine">Until you add a schedule or a pause, nothing is limited.</span></div></li>
+        <li><span class="n" aria-hidden="true">2</span><div><b>Try one pause while you&rsquo;re home</b><span class="fine">Pause one child, see their device go quiet, then unblock.</span></div></li>
+        <li><span class="n" aria-hidden="true">3</span><div><b>Invite Bryn</b><span class="fine">She signs in with her own passkey on her phone.</span></div></li>
+        <li><span class="n" aria-hidden="true">4</span><div><b>New phone or a changed address?</b><span class="fine">Devices tab &rarr; the newest devices are flagged New.</span></div></li>
+      </ol></div>
+      <div class="bar"><div><button class="btn primary" type="button" data-fake="Opens the Schedules tab">Set up schedules</button><p class="fine"><button class="linkbtn" type="button" data-fake="Opens the Overview tab">Go to Overview</button></p></div></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="howto-dlg" aria-labelledby="howto-title"><div class="in"><h2 id="howto-title" style="margin-top:0">Turn off the random Wi-Fi address</h2><div id="howto-dlg-body"></div><button class="btn secondary" type="button" id="howto-close" style="margin-top:12px">Close</button></div></dialog>
+<dialog id="manual-dlg" aria-labelledby="manual-title"><form class="in" id="manual-form" method="dialog" novalidate>
+  <h2 id="manual-title" style="margin-top:0">Add by Wi-Fi address</h2>
+  <p class="fine">Read the address in the device&rsquo;s own Wi-Fi settings (not from this page), then type it here.</p>
+  <label class="f" for="m-label">Device name</label><input type="text" id="m-label" maxlength="64" autocomplete="off"><div style="height:10px"></div>
+  <label class="f" for="m-mac">Wi-Fi address</label><input type="text" id="m-mac" maxlength="17" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="aa:bb:cc:dd:ee:ff"><div style="height:10px"></div>
+  <fieldset><legend>Belongs to</legend><div class="pills" id="m-who"></div></fieldset>
+  <p class="fine" id="m-err" role="alert" style="margin-top:8px"></p>
+  <button class="btn primary" type="submit" id="m-add">Add to the list</button><div style="height:8px"></div><button class="btn secondary" type="button" id="m-cancel">Cancel</button>
+</form></dialog>
+
+<template id="howto-tpl">
+  <details open><summary>iPhone or iPad</summary><ol><li>Settings &rarr; Wi-Fi</li><li>Tap the <b>&#9432;</b> next to your home network</li><li>Turn <b>Private Wi-Fi Address</b> off, then rejoin if asked</li></ol></details>
+  <details><summary>Android phone or tablet</summary><ol><li>Settings &rarr; Network &amp; internet &rarr; Wi-Fi</li><li>Tap the gear next to your home network</li><li>Privacy &rarr; choose <b>Use device MAC</b>, then reconnect</li></ol><p class="fine">Menu names vary a little by phone maker.</p></details>
+  <details><summary>Windows laptop</summary><ol><li>Settings &rarr; Network &amp; internet &rarr; Wi-Fi</li><li>Open your home network&rsquo;s properties</li><li>Set <b>Random hardware addresses</b> to Off</li></ol></details>
+</template>
+
+<script>
+/* Throwaway prototype logic. No network, no storage, no MAC address is ever written into the DOM except the manual-add input's own value. */
+(function(){
+var $=function(s,r){return (r||document).querySelector(s)}, $$=function(s,r){return Array.from((r||document).querySelectorAll(s))};
+function el(tag,props){var n=document.createElement(tag);props=props||{};Object.keys(props).forEach(function(k){if(k==='class')n.className=props[k];else if(k.indexOf('aria-')===0||k.indexOf('data-')===0||k==='for'||k==='role')n.setAttribute(k,props[k]);else n[k]=props[k]});for(var i=2;i<arguments.length;i++){var c=arguments[i];if(c==null||c===false)continue;n.append(c.nodeType?c:document.createTextNode(c))}return n}
+var ORDER=['welcome','children','prepare','devices','review','sending','done'];
+var STEP={children:1,prepare:2,devices:3,review:4};
+var S={screen:'welcome',kids:[{id:'k1',name:'Jack'},{id:'k2',name:'Penn'},{id:'k3',name:'Ford'}],seq:3,assign:{},labels:{},ops:[],rstate:'ok',
+ devices:[
+  {id:'d5',name:null,ip:'192.168.1.77',seen:'just now',isNew:true,priv:true},
+  {id:'d1',name:'Galaxy-S24',ip:'192.168.1.41',seen:'2 min ago',isNew:true,priv:true},
+  {id:'d2',name:'iPhone',ip:'192.168.1.52',seen:'3 min ago',isNew:true,priv:true},
+  {id:'d7',name:'Roku-Ultra',ip:'192.168.1.30',seen:'today 18:02',priv:false},
+  {id:'d4',name:'Nintendo-Switch',ip:'192.168.1.64',seen:'today 17:20',priv:false,needsScope:true},
+  {id:'d3',name:'iPad-de-Ford',ip:'192.168.1.60',seen:'1 h ago',priv:false},
+  {id:'d6',name:'DESKTOP-4F2K9',ip:'192.168.1.23',seen:'yesterday',priv:false}]};
+var AV=['a0','a1','a2','a3'];
+function say(t){$('#live').textContent=t}
+function kidIdx(id){return S.kids.findIndex(function(k){return k.id===id})}
+function kidName(id){var k=S.kids[kidIdx(id)];return k?k.name:''}
+function devName(d){return d.name||'Unnamed device'}
+
+function show(name,opts){
+  S.screen=name;
+  $$('.screen').forEach(function(s){var on=s.dataset.screen===name;s.hidden=!on;s.classList.toggle('enter',on)});
+  var n=STEP[name];$('#topbar').hidden=!n;
+  if(n){$('#step').textContent='Setup · step '+n+' of 4';$$('#rail i').forEach(function(i,ix){i.classList.toggle('done',ix<n)})}
+  $('#back').hidden=name==='welcome';
+  $('#jump').value=name;$('#confirm-sim').disabled=name!=='sending'&&name!=='done';
+  if(name==='children')renderKids();
+  if(name==='prepare')$('#howto-inline').replaceChildren($('#howto-tpl').content.cloneNode(true));
+  if(name==='devices')renderDevices();
+  if(name==='review')renderReview();
+  if(name==='sending')startSend();
+  if(name==='done')renderDone();
+  window.scrollTo(0,0);
+  var h=$('[data-screen="'+name+'"] h1');if(h&&!(opts&&opts.quiet)){h.focus({preventScroll:true})}
+}
+function go(name){show(name)}
+
+/* ---- children ---- */
+function renderKids(){
+  var box=$('#kid-rows');box.replaceChildren();
+  S.kids.forEach(function(k,i){
+    var id='kn-'+k.id;
+    var input=el('input',{type:'text',id:id,value:k.name,maxLength:64,autocomplete:'off','aria-label':(k.group?'Device group':'Child')+' '+(i+1)+' name'});
+    input.addEventListener('input',function(){k.name=input.value.trim();$('#kid-err').textContent=''});
+    var rm=el('button',{class:'icon-btn',type:'button','aria-label':'Remove '+(k.name||('entry '+(i+1)))},'×');
+    rm.addEventListener('click',function(){S.kids.splice(i,1);delete S.assign[k.id];renderKids();say('Removed.')});
+    box.append(el('div',{class:'namerow'},el('span',{class:'avatar '+AV[i%4],'aria-hidden':'true'},(k.name||'?').charAt(0).toUpperCase()),input,rm))
+  })
+}
+function addKid(group){S.kids.push({id:'k'+(++S.seq),name:'',group:!!group});renderKids();var ins=$$('#kid-rows input');ins[ins.length-1].focus()}
+function kidsNext(){
+  var names=S.kids.map(function(k){return k.name.trim()});
+  if(!names.length||names.some(function(n){return !n})){$('#kid-err').textContent='Give each entry a name, or remove the empty one.';return}
+  var seen={};if(names.some(function(n){var l=n.toLowerCase();if(seen[l])return true;seen[l]=1})){$('#kid-err').textContent='Two entries share a name. Add a last initial to tell them apart.';return}
+  go('prepare')
+}
+
+/* ---- devices ---- */
+function renderStatus(){
+  var b=$('#dev-status');b.replaceChildren();
+  if(S.rstate==='down'){
+    b.append(el('div',{class:'note red',role:'alert'},el('span',{class:'g','aria-hidden':'true'},'!'),el('p',{},el('strong',{},'Can’t reach the router'),'Router connection problem. No device list yet, so nothing can be assigned and nothing has been changed.')));return}
+  b.append(el('div',{class:'note'},el('span',{class:'g','aria-hidden':'true'},'○'),el('p',{},'Last complete scan 18:42. Names are chosen by the devices themselves and aren’t verified.')));
+  b.append(el('button',{class:'btn secondary small',type:'button',id:'refresh'},'Refresh now'));
+  $('#refresh').addEventListener('click',function(){say('Refresh requested. The list updates when the router answers.')});
+  b.lastChild.style.marginBottom='14px'
+}
+function devRow(d){
+  var li=el('li',{class:'dev'});
+  var chips=el('div',{class:'chips'});
+  if(d.isNew)chips.append(el('span',{class:'chip blue'},'New'));
+  if(d.priv)chips.append(el('span',{class:'chip amber'},'Random address – may change'));
+  if(d.manual)chips.append(el('span',{class:'chip'},'Added by address'));
+  li.append(el('div',{class:'name'+(d.name?'':' none')},devName(d)),
+    el('div',{class:'meta'},(d.name?'Name reported by the device · ':'')+(d.ip||'No IPv4 address')+' · last seen '+d.seen));
+  if(chips.childNodes.length)li.append(chips);
+  var fs=el('fieldset',{},el('legend',{},'Whose is '+devName(d)+'?'));
+  var pills=el('div',{class:'pills'});var cur=S.assign[d.id]||'skip';
+  S.kids.concat([{id:'skip',name:'Skip'}]).forEach(function(k){
+    var rid='r-'+d.id+'-'+k.id;
+    var inp=el('input',{type:'radio',name:'who-'+d.id,id:rid,value:k.id,checked:cur===k.id});
+    inp.addEventListener('change',function(){if(k.id==='skip')delete S.assign[d.id];else S.assign[d.id]=k.id;renderDevices(true);say(k.id==='skip'?devName(d)+' skipped.':devName(d)+' will go to '+k.name+'.')});
+    pills.append(inp,el('label',{for:rid},k.name))
+  });
+  fs.append(pills);li.append(fs);
+  if(S.assign[d.id]){
+    if(d.priv)li.append(el('div',{class:'note amber inline-warn'},el('span',{class:'g','aria-hidden':'true'},'!'),el('p',{},el('strong',{},'This address may change.'),'If it does, '+devName(d)+' stops being matched and '+kidName(S.assign[d.id])+'’s limits stop reaching it until you add it again. ',el('button',{class:'linkbtn',type:'button','data-howto':''},'Turn off the random address'))));
+    if(!d.name)li.append(el('p',{class:'fine',style:'margin:10px 0 0'},'Not sure whose it is? Turn that phone’s Wi-Fi off and on, then Refresh now: it moves to the top with a newer “last seen”.'))
+  } else if(!d.name){
+    li.append(el('p',{class:'fine',style:'margin:10px 0 0'},'No name reported. Turn a phone’s Wi-Fi off and on, then Refresh now, to see which row is its.'))
+  }
+  return li
+}
+function renderDevices(keep){
+  var y=window.scrollY;renderStatus();
+  var body=$('#dev-body');body.replaceChildren();
+  var bar=$('#dev-bar');
+  if(S.rstate==='down'){
+    body.append(el('div',{class:'card'},el('h2',{style:'margin-top:0'},'Things to check'),el('ul',{style:'margin:0 0 12px;padding-left:20px'},el('li',{},'The router is on and the cable or Wi-Fi is working.'),el('li',{},'This phone is on the home network, or Tailscale is connected.'),el('li',{},'If it stays like this, ask whoever installed the router.')),
+      el('button',{class:'btn primary',type:'button',id:'retry'},'Try again'),el('div',{style:'height:8px'}),el('button',{class:'btn secondary',type:'button','data-fake':'Saves progress, back to Overview'},'Finish later')));
+    $('#retry').addEventListener('click',function(){say('Trying the router again…')});
+    $('#dev-next').disabled=true;$('#dev-next').textContent='Review';$('#manual').hidden=true;bar.hidden=false;return}
+  $('#manual').hidden=false;
+  if(S.rstate==='empty'){
+    body.append(el('div',{class:'card empty'},el('div',{class:'big','aria-hidden':'true'},'◌'),el('h2',{style:'margin:0 0 8px'},'No devices to show yet'),el('p',{class:'lede'},'The router answered, but hasn’t reported any devices on the home network. Wake each child’s phone or tablet, make sure it’s joined to your home Wi-Fi, then refresh.'),
+      el('button',{class:'btn primary',type:'button',id:'retry2'},'Refresh now'),el('div',{style:'height:8px'}),el('button',{class:'btn secondary',type:'button',id:'m2'},'Add one by its Wi-Fi address')));
+    $('#retry2').addEventListener('click',function(){say('Refresh requested. The list updates when the router answers.')});$('#m2').addEventListener('click',openManual);
+    $('#dev-next').disabled=true;$('#dev-next').textContent='Review';return}
+  var list=el('ul',{class:'card flush devgrid',style:'list-style:none;margin:0 0 14px;padding:0','aria-label':'Devices on the network'});
+  S.devices.forEach(function(d){list.append(devRow(d))});
+  body.append(list,el('p',{class:'fine'},'Your own protected devices are never listed.'));
+  $$('[data-howto]').forEach(function(b){b.addEventListener('click',openHowto)});
+  var n=Object.keys(S.assign).length;
+  $('#dev-next').disabled=n===0;$('#dev-next').textContent=n?('Review '+n+' device'+(n===1?'':'s')):'Pick at least one device';
+  if(keep)window.scrollTo(0,y)
+}
+
+/* ---- review ---- */
+function assignedTo(kid){return S.devices.filter(function(d){return S.assign[d.id]===kid.id})}
+function renderReview(){
+  var body=$('#review-body');body.replaceChildren();
+  var devs=S.devices.filter(function(d){return S.assign[d.id]}),priv=devs.filter(function(d){return d.priv}).length;
+  var total=S.kids.length+devs.length;
+  $('#review-lede').textContent=S.kids.length+' children and '+devs.length+' devices. Nothing has been sent yet.';
+  if(priv)body.append(el('div',{class:'note amber'},el('span',{class:'g','aria-hidden':'true'},'!'),el('p',{},el('strong',{},priv+(priv===1?' device uses':' devices use')+' a random address.'),'You can still send. If an address changes later, that device stops being matched. ',el('button',{class:'linkbtn',type:'button',id:'rv-howto'},'How to fix it'))));
+  S.kids.forEach(function(k,i){
+    var ds=assignedTo(k);var card=el('div',{class:'card flush'});
+    card.append(el('div',{class:'kid-head'},el('span',{class:'avatar '+AV[i%4],'aria-hidden':'true'},k.name.charAt(0).toUpperCase()),el('div',{},el('b',{},k.name),el('div',{class:'fine'},ds.length?ds.length+' device'+(ds.length===1?'':'s'):'No devices yet'))));
+    if(!ds.length)card.append(el('div',{class:'rev'},el('p',{class:'fine',style:'margin:0'},k.name+' will be saved here but won’t be on the router until a device is added. '),el('button',{class:'linkbtn',type:'button','data-go':'devices'},'Pick a device')));
+    ds.forEach(function(d){
+      var lid='lbl-'+d.id;var inp=el('input',{type:'text',id:lid,value:S.labels[d.id]!=null?S.labels[d.id]:devName(d),maxLength:64,autocomplete:'off'});
+      inp.addEventListener('input',function(){S.labels[d.id]=inp.value});
+      card.append(el('div',{class:'rev'},el('label',{class:'f',for:lid},'Name shown for this device'),inp,
+        d.priv?el('span',{class:'chip amber'},'Random address – may change'):el('span',{class:'chip green'},'Stable address'),' ',
+        el('span',{class:'chip'},d.needsScope?'Router may need approval first':'Ready to send')))
+    });
+    body.append(card)
+  });
+  var rh=$('#rv-howto');if(rh)rh.addEventListener('click',openHowto);
+  $$('[data-go]',body).forEach(function(b){b.addEventListener('click',function(){go(b.dataset.go)})});
+  $('#send').textContent='Confirm '+total+' changes with passkey';
+  $('#send-fine').textContent='Your phone asks for your passkey once per change: '+S.kids.length+' for children, '+devs.length+' for devices.';
+  $('#send').disabled=S.kids.some(function(k){return !k.name})||devs.some(function(d){return S.labels[d.id]!=null&&!S.labels[d.id].trim()})
+}
+
+/* ---- sending ---- */
+var timers=[];
+function startSend(){
+  timers.forEach(clearTimeout);timers=[];
+  var ops=[];S.kids.forEach(function(k){ops.push({type:'child',kid:k,state:'wait'})});
+  S.devices.filter(function(d){return S.assign[d.id]}).forEach(function(d){ops.push({type:'dev',dev:d,state:'wait'})});
+  S.ops=ops;drawSend();$('#sending-next').disabled=true;$('#sending-lede').textContent='Your phone will ask for your passkey for each change.';
+  var t=500;ops.forEach(function(op,i){
+    timers.push(setTimeout(function(){op.state='passkey';drawSend();say('Confirm with your passkey: '+opTitle(op))},t));t+=700;
+    timers.push(setTimeout(function(){op.state=op.type==='child'?'saved':(op.dev.needsScope?'approval':'queued');drawSend();
+      if(i===ops.length-1){$('#sending-next').disabled=false;$('#sending-lede').textContent='All changes handed over. Some are still waiting on the router.';say('All changes sent. Waiting for the router to confirm.')}},t));t+=500})
+}
+function opTitle(op){return op.type==='child'?op.kid.name:(S.labels[op.dev.id]||devName(op.dev))+' → '+kidName(S.assign[op.dev.id])}
+function chipFor(op){
+  switch(op.state){
+    case 'wait':return ['','Waiting'];case 'passkey':return ['blue','Waiting for your passkey'];
+    case 'saved':return ['','Saved here'];
+    case 'queued':return ['amber','Sent to the router — not confirmed yet'];
+    case 'confirmed':return ['green','On the router — confirmed'];
+    case 'approval':return ['red','Waiting for router approval — nothing added']}
+}
+function drawSend(){
+  var box=$('#send-list');box.replaceChildren();
+  S.ops.forEach(function(op){
+    var c=chipFor(op),detail='';
+    if(op.state==='approval')detail='The router doesn’t know this device yet, so nothing was added and nothing is blocked. A router administrator must approve its address first. Add it again here afterwards.';
+    if(op.state==='queued')detail='The device list updates once the router confirms.';
+    if(op.type==='child'){var any=S.ops.some(function(o){return o.type==='dev'&&S.assign[o.dev.id]===op.kid.id&&o.state==='confirmed'});if(any){c=['green','On the router — confirmed']}else if(op.state==='saved'){detail=S.ops.some(function(o){return o.type==='dev'&&S.assign[o.dev.id]===op.kid.id})?'Joins the router when its first device is confirmed.':'No device yet, so not on the router.'}}
+    box.append(el('div',{class:'state'},el('div',{class:'t'},el('b',{},opTitle(op)),detail&&el('span',{class:'fine'},detail)),el('span',{class:'chip '+c[0]},c[1])))
+  })
+}
+function simulateConfirm(){
+  S.ops.forEach(function(op){if(op.state==='queued')op.state='confirmed'});
+  if($('[data-screen="sending"]').hidden===false)drawSend();else renderDone();
+  say('The router confirmed the queued devices.')
+}
+
+/* ---- done ---- */
+function renderDone(){
+  var devOps=S.ops.filter(function(o){return o.type==='dev'});
+  var c=devOps.filter(function(o){return o.state==='confirmed'}).length,q=devOps.filter(function(o){return o.state==='queued'}).length,a=devOps.filter(function(o){return o.state==='approval'}).length;
+  $('#h-done').textContent=(q||a)?'You’re set up, with a few waiting.':'All set.';
+  $('#done-lede').textContent=(q||a)?'Children are saved. Some devices are not on the router yet; they’re listed below so nothing is a surprise.':'Every device is confirmed on the router.';
+  var box=$('#done-summary');box.replaceChildren();
+  function row(chip,cls,text){box.append(el('p',{style:'display:flex;gap:10px;align-items:flex-start;margin:0 0 10px'},el('span',{class:'chip '+cls},chip),el('span',{},text)))}
+  row(S.kids.length+' children','green','saved for JD and Bryn to manage.');
+  row(c+' confirmed','green','on the router. Their limits can now apply.');
+  if(q)row(q+' sent','amber','to the router, not confirmed yet. Check the Devices tab in a minute.');
+  if(a)row(a+' waiting','red','for router approval. Nothing was added; add them again once approved.');
+  box.lastChild.style.marginBottom='0'
+}
+
+/* ---- dialogs ---- */
+function openHowto(){var b=$('#howto-dlg-body');b.replaceChildren($('#howto-tpl').content.cloneNode(true));$('#howto-dlg').showModal()}
+function openManual(){
+  var w=$('#m-who');w.replaceChildren();
+  S.kids.forEach(function(k,i){w.append(el('input',{type:'radio',name:'mw',id:'mw'+i,value:k.id,checked:i===0}),el('label',{for:'mw'+i},k.name))});
+  $('#m-label').value='';$('#m-mac').value='';$('#m-err').textContent='';$('#manual-dlg').showModal();$('#m-label').focus()
+}
+$('#manual-form').addEventListener('submit',function(e){
+  e.preventDefault();var l=$('#m-label').value.trim(),m=$('#m-mac').value.trim().toLowerCase().replace(/-/g,':');
+  if(!l){$('#m-err').textContent='Give the device a name.';return}
+  if(!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(m)){$('#m-err').textContent='That doesn’t look like a Wi-Fi address. It has six pairs of letters and numbers, like aa:bb:cc:dd:ee:ff.';return}
+  var sel=$('#m-who input:checked'),id='m'+(++S.seq);
+  S.devices.unshift({id:id,name:l,ip:'',seen:'not seen yet',manual:true,priv:/^[0-9a-f][2367abef]:/.test(m),needsScope:true});S.assign[id]=sel?sel.value:S.kids[0].id;
+  $('#manual-dlg').close();renderDevices();say(l+' added to the list.')
+});
+
+/* ---- wiring ---- */
+document.addEventListener('click',function(e){
+  var g=e.target.closest('[data-go]');if(g&&!g.closest('#review-body')){go(g.dataset.go);return}
+  var f=e.target.closest('[data-fake]');if(f){say(f.dataset.fake+' (prototype: not wired).')}
+});
+$('#back').addEventListener('click',function(){var i=ORDER.indexOf(S.screen);if(i>0&&S.screen!=='sending'&&S.screen!=='done')go(ORDER[i-1])});
+$('#later').addEventListener('click',function(){say('Progress is kept. You can finish setup from the Devices tab. (prototype: not wired)')});
+$('#add-kid').addEventListener('click',function(){addKid(false)});$('#add-group').addEventListener('click',function(){addKid(true)});
+$('#kids-next').addEventListener('click',kidsNext);
+$('#dev-next').addEventListener('click',function(){go('review')});$('#manual').addEventListener('click',openManual);
+$('#send').addEventListener('click',function(){go('sending')});
+$('#sending-next').addEventListener('click',function(){go('done')});
+$('#howto-close').addEventListener('click',function(){$('#howto-dlg').close()});$('#m-cancel').addEventListener('click',function(){$('#manual-dlg').close()});
+$('#jump').addEventListener('change',function(e){var v=e.target.value;if(v==='review'&&!Object.keys(S.assign).length){S.assign.d1='k1';S.assign.d3='k3';S.assign.d4='k2';S.assign.d5='k2'}if((v==='sending'||v==='done')&&!Object.keys(S.assign).length){S.assign.d1='k1';S.assign.d3='k3';S.assign.d4='k2'}if(v==='done'&&!S.ops.length){startSend();timers.forEach(clearTimeout);S.ops.forEach(function(o){o.state=o.type==='child'?'saved':(o.dev.needsScope?'approval':'queued')})}go(v)});
+$('#rstate').addEventListener('change',function(e){S.rstate=e.target.value;if(S.screen!=='devices')go('devices');else renderDevices()});
+$('#confirm-sim').addEventListener('click',simulateConfirm);
+show('welcome',{quiet:true});
+})();
+</script>
+</body>
+</html>

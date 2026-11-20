@@ -27,6 +27,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, policy  # noqa: E402
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 KEYS = ['inventory_version', 'generation', 'routerTime', 'devices', 'truncated', 'errors']
 DEVICE_KEYS = ['mac', 'ipv4', 'hostname', 'source']
@@ -57,7 +60,7 @@ class InventoryCommon:
         self.f.close()
 
     def script(self, name, *args, env=None):
-        return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *args],
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / name), *args],
                               env=env or self.f.env, capture_output=True, text=True, timeout=120)
 
     def install(self, *floor):
@@ -105,7 +108,7 @@ class InventoryCommon:
 
     def core_shell(self, body):
         prelude = ('set -f;PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;umask 077;CF_LOCAL_TEST=1;CF_BASE=$CF_ROOT\n'
-                   'CF_LIB=' + str(REPO / 'router/lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
+                   'CF_LIB=' + str(TEST_ROUTER / 'lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
                    'platform_entry_root_validate;platform_choose runtime "$CF_BASE"\n. "$CF_LIB/core.sh"\n'
                    'platform_admit runtime "$CF_BASE" "$CF_LIB"\n. "$CF_LIB/rpc.sh";. "$CF_LIB/firewall.sh";. "$CF_LIB/activity.sh"\n')
         return subprocess.run(self.f.shell + ['-c', prelude + body], env=self.f.env, stdin=subprocess.DEVNULL,
@@ -601,7 +604,7 @@ class AwkParityTests(unittest.TestCase):
                    'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00', '02:00:00:00:00:0A', '02:00:00:00:00:003', '2:00:00:00:00:03',
                    '02-00-00-00-00-03', '02:00:00:00:00', '02:00:00:00:00:03:', '', 'zz:00:00:00:00:00']
         valid = subprocess.run(['sh', '-c', 'CF_BASE=;. "$0";for s;do if cf_mac_valid "$s";then echo 1;else echo 0;fi;done',
-                                str(REPO / 'router/lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
+                                str(TEST_ROUTER / 'lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
         expected = valid.stdout.split()
         self.assertEqual(len(expected), len(samples), valid.stderr)
         for runtime in (['awk'], [str(BUSYBOX), 'awk']):
@@ -613,7 +616,7 @@ class AwkParityTests(unittest.TestCase):
     def test_inventory_hostname_rule_matches_the_shared_sanitiser(self):
         samples = ['host-a', 'a' * 63, 'a' * 64, '-x', '.x', '_x', 'x y', 'x!', '9', '*', '', 'A.b_c-d']
         sanitised = subprocess.run(['sh', '-c', 'CF_BASE=;. "$0";for s;do printf "%s\\n" "$s" | cf_hostname_sanitise;done',
-                                    str(REPO / 'router/lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
+                                    str(TEST_ROUTER / 'lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
         expected = ['' if line == '(unnamed)' else line for line in sanitised.stdout.split('\n')[:len(samples)]]
         source = (REPO / 'router/lib/activity.sh').read_text()
         copies = [line.strip() for line in source.splitlines() if line.strip().startswith('function hname(')]
@@ -637,7 +640,7 @@ class GrammarTests(unittest.TestCase):
 
     def wrapper(self, command, *flags):
         env = dict(self.f.env, SSH_ORIGINAL_COMMAND=command)
-        return subprocess.run(self.f.shell + [str(REPO / 'router/cfctl-ssh'), *flags], env=env, capture_output=True, text=True, timeout=30)
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / 'cfctl-ssh'), *flags], env=env, capture_output=True, text=True, timeout=30)
 
     def test_rpc_inventory_admitted_exactly(self):
         for flags in ((), ('--rpc-only',)):

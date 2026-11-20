@@ -7,8 +7,8 @@ Couvre-feu is a router enforcement layer (POSIX ash under `router/`), a TypeScri
 <!-- AUTO-GENERATED -->
 | Tool | Version | Needed for |
 |---|---|---|
-| Node.js | `26.8.1` (pinned in `package.json` `engines` and CI) | Service, shared, demo router, Playwright. Node runs `.ts` directly |
-| npm | `11.19.0` (pinned) | `npm ci` from the lockfile |
+| Node.js | `26.13.1` (pinned in `package.json` `engines` and CI) | Service, shared, demo router, Playwright. Node runs `.ts` directly |
+| npm | `11.21.3` (pinned) | `npm ci` from the lockfile |
 | Python 3 | any recent 3.x | Router fixtures under `tests/`, `tools/freeze-router-release.py`, `tools/live/*` |
 | BusyBox | with `ash`, `awk`, `timeout` applets | Router fixtures. CI runs them under BusyBox, not the host `sh` |
 | ShellCheck | any (CI installs the Ubuntu package) | Static gate in `tests/run.sh` (it fails without it) |
@@ -45,7 +45,9 @@ Host `sh -n` alone is not ash proof: `tests/run.sh` reports `PENDING` when BusyB
 
 **Service and web.** `npm ci && npm run typecheck && npm run test:service`, then `npx playwright install chromium && npm run test:web`. This is the CI `local-demo` job.
 
-**Router fixtures.** The nine sharded suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`, `test-penn-pilot.py`, `test-penn-pilot-leg2.py`, `test-penn-pilot-leg2-guards.py`, `test-scope-admin.py`, `test-inventory.py`) are slow. CI splits each into 4 partitions (36 shards) and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
+**Router fixtures.** The ten sharded suites (`test-transition.py`, `test-rpc.py`, `test-core.py`, `test-fixture-process.py`, `test-penn-pilot.py`, `test-penn-pilot-leg2.py`, `test-penn-pilot-leg2-guards.py`, `test-scope-admin.py`, `test-inventory.py`, `test-router-admission-check.py`) include slow enforcement fixtures and the offline admission checker. CI splits each into 4 partitions, except `test-core.py` and `test-penn-pilot.py` with 5 (42 shards), and proves every case ran. Mirror that locally instead of running `sh tests/run.sh` end to end:
+
+**Permanent-install preflight suite.** `tests/test-permanent-install.py` (fake-ssh fixtures for `tools/live/permanent-install.py`) is listed in `tests/run.sh --list-preflight-suites` and runs as its own `preflight_suites` matrix entry in `ci.yml` because it takes several minutes; keep both lists consistent.
 
 ```sh
 export CF_TEST_SHELL="busybox ash" CF_TEST_AWK="busybox awk" CF_TEST_TIMEOUT="busybox timeout" CF_TEST_WORKERS=1
@@ -56,9 +58,30 @@ python3 tests/run-fixtures.py --shard test-core.py --partition 0 --plan "$PRIVAT
 python3 tests/run-fixtures.py --verify-receipts "$PRIVATE_DIR/receipts" --plan "$PRIVATE_DIR/plan.json"
 ```
 
-`--shard` takes one of the nine suites (the `SUITES` tuple in `tests/run-fixtures.py`, which must match the `ci.yml` matrix) and `--partition` 0 to 3. A lane that skips a case is a failure. Smaller suites (`test-install.py`, `test-no-dev-stdin.py`, `test-platform-integration.py`, `test-os-trust.py`, `test-client-probe.py`, `test-live-rehearsal.py`) run directly with `python3 tests/<name>.py`.
+`--shard` takes one of the ten suites (the `SUITES` tuple in `tests/run-fixtures.py`, which must match the `ci.yml` matrix) and `--partition` 0 to 3 (0 to 4 for `test-core.py` and `test-penn-pilot.py`). A lane that skips a case is a failure. Smaller suites (`test-install.py`, `test-no-dev-stdin.py`, `test-platform-integration.py`, `test-os-trust.py`, `test-client-probe.py`, `test-live-rehearsal.py`) run directly with `python3 tests/<name>.py`.
 
 **TMPDIR.** Fixtures and the integration service require private roots. A path whose ancestors are symlinks or writable by other users (without the sticky bit, owned by root) is refused with `unsafe_private_ancestor`. Point `TMPDIR` at a directory under your home that only you can write, mode 0700, and keep evidence and manifests there, never in the repository.
+
+## Timeouts in tests
+
+CI runners are shared and often several times slower than a developer host, so a tight hard-coded timeout flakes there. `tests/test-timeout-audit.py` fails on any literal timeout below 20 seconds (`MIN_LITERAL_SECONDS`) that bounds a call:
+
+- Python under `tests/`: `subprocess.run`, `check_output`, `check_call`, `call`, `communicate` (keyword `timeout=`) and `wait` (keyword or first positional argument).
+- TypeScript or JavaScript (`.ts`, `.mjs`) under `shared/tests`, `service/tests` and `tests/`: a `timeout: <milliseconds>` option below 20000.
+
+Not covered: `thread.join`, socket timeouts and Playwright expectations. Timeouts given by a named constant or variable are not literals and pass; the usual fix is to raise the value through a named constant.
+
+To keep a tight bound on purpose (for example a test of the timeout path itself), justify it with a marker comment `# timeout-ok: <reason>` (Python) or `// timeout-ok: <reason>` (TypeScript or JavaScript), with a non-empty reason, on the line above the call or on any line of the call.
+
+A file whose short limits were all measured with large headroom may instead carry one `# timeout-ok-file: <reason>` (or `//`) comment within its first 40 lines. The text must say `measured` or `UNMEASURED`. An UNMEASURED marker must also say `expires: YYYY-MM-DD`; once that date passes the audit fails until the file is measured and the marker rewritten. A malformed marker, an invalid date or an expired one is a finding.
+
+Run it with:
+
+```sh
+python3 -B tests/test-timeout-audit.py
+```
+
+CI runs it in the `fixture_preflight` job.
 
 ## Environment variables
 

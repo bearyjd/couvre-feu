@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import type { Actor, OperationDTO, PeopleDTO, PersonDTO } from '../../shared/src/contracts.ts';
@@ -197,7 +198,7 @@ test('a failing people source does not clear existing state alerts', () => {
 
 test('HTTP alert routes require an authenticated session and reject malformed ids', async () => {
     const store = new Store(':memory:'); seedAccounts(store);
-    const origin = 'http://localhost:45999', port = 45999;
+    const port = await freePort(), origin = `http://localhost:${port}`;
     const alerts = new ParentAlerts(store, null, () => now);
     const server = appServer(new Auth(store, origin), {} as never, {port, origin, host: `localhost:${port}`, dataDir: '.'}, alerts);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -207,4 +208,18 @@ test('HTTP alert routes require an authenticated session and reject malformed id
         const post = await fetch(origin + '/alerts/1/acknowledge', {method: 'POST', headers: {Origin: origin, 'Content-Type': 'application/json'}, body: '{}'});
         assert.equal(post.status, 401);
     } finally { server.close(); store.close(); }
+});
+
+test('hidden kinds: list, openCount and acknowledge omit them for the caller only', () => {
+    const {store, alerts} = fixture();
+    alerts.reconcile({now, timeRequests: [{person: 'alex', requestId: 'r1', createdAt: now - 10}], people: people([person('alex', {status: 'failed'})])});
+    const kindsOf = (hidden?: string[]) => alerts.list(parent, undefined, hidden).alerts.map(a => a.kind);
+    assert.ok(kindsOf().includes('time_request_pending'));
+    const open = alerts.list(parent).openCount;
+    assert.ok(!kindsOf(['time_request_pending']).includes('time_request_pending'));
+    assert.equal(alerts.list(parent, undefined, ['time_request_pending']).openCount, open - 1);
+    const id = alerts.list(parent).alerts.find(a => a.kind === 'time_request_pending')!.id;
+    assert.throws(() => alerts.acknowledge(parent, id, ['time_request_pending']), {message: 'alert_not_found'});
+    assert.equal(alerts.acknowledge(parent, id).state, 'acknowledged');
+    store.db.close();
 });

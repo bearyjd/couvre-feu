@@ -1,6 +1,7 @@
 import { ChildAdmin, childrenGet, childrenPost } from './admin-children.ts';
 import { BulkOps, bulkPost } from './integration-bulk.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
+import { IntegrationGrants } from './integration-allowance.ts';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -12,6 +13,8 @@ import type { PolicyService } from './policy.ts';
 import type { DemoConfig } from './config.ts';
 import type { ActivityStore } from './activity-store.ts';
 import { provenance } from '../../shared/src/contracts.ts';
+import type { Actor } from '../../shared/src/contracts.ts';
+import { timeRequestMode } from './integration-config.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object, parseJSON } from '../../shared/src/json.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
@@ -19,8 +22,16 @@ import { TimeRequestService } from './time-requests.ts';
 import { childRoute, parentGet, parentPost } from './time-requests-http.ts';
 import { AccountAdmin } from './admin-accounts.ts';
 import { accountGet, accountPost } from './admin-accounts-http.ts';
-import { inventoryGet, inventoryPost } from './inventory-http.ts';
+import { INVENTORY_LINK_PATH, inventoryDelete, inventoryGet, inventoryPost } from './inventory-http.ts';
 import type { InventoryStore } from './inventory-store.ts';
+import type { InstallReadiness } from './install-readiness.ts';
+import { auditFor } from './parent-audit.ts';
+import { FILTER_PATH } from './content-filter-http.ts';
+import type { ContentFilterRoutes } from './content-filter-http.ts';
+import { Health } from './health.ts';
+import { buildServiceWorker } from './sw-shell.ts';
+import { applyRewrites, integrationHTMLRewrites, integrationManifestRewrites } from './integration-copy.ts';
+import type { SessionDTO, SessionInfoDTO } from '../../shared/src/contracts.ts';
 const STATIC: Record<string, [
     string,
     string
@@ -30,9 +41,10 @@ const STATIC: Record<string, [
     '/operational-alerts.js': ['operational-alerts.js', 'text/javascript; charset=utf-8'],
     '/schedule-editor.js': ['schedule-editor.js', 'text/javascript; charset=utf-8'], '/schedule-editor.css': ['schedule-editor.css', 'text/css; charset=utf-8'],
     '/parent-alerts.js': ['parent-alerts.js', 'text/javascript; charset=utf-8'], '/activity.js': ['activity.js', 'text/javascript; charset=utf-8'],
-    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
+    '/time-requests.js': ['time-requests.js', 'text/javascript; charset=utf-8'], '/reward-time.js': ['reward-time.js', 'text/javascript; charset=utf-8'],  '/focus-window.js': ['focus-window.js', 'text/javascript; charset=utf-8'], '/audit.js': ['audit.js', 'text/javascript; charset=utf-8'], '/install-readiness.js': ['install-readiness.js', 'text/javascript; charset=utf-8'], '/content-filter.js': ['content-filter.js', 'text/javascript; charset=utf-8'], '/accounts.js': ['accounts.js', 'text/javascript; charset=utf-8'], '/children.js': ['children.js', 'text/javascript; charset=utf-8'], '/kids-card.js': ['kids-card.js', 'text/javascript; charset=utf-8'], '/kids-model.js': ['kids-model.js', 'text/javascript; charset=utf-8'], '/tabs.js': ['tabs.js', 'text/javascript; charset=utf-8'], '/inventory-triage.js': ['inventory-triage.js', 'text/javascript; charset=utf-8'], '/inventory-wizard.js': ['inventory-wizard.js', 'text/javascript; charset=utf-8'], '/inventory-wizard-model.js': ['inventory-wizard-model.js', 'text/javascript; charset=utf-8'], '/request.html': ['request.html', 'text/html; charset=utf-8'], '/request.js': ['request.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
     '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'],
+    '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'], '/pwa-update.js': ['pwa-update.js', 'text/javascript; charset=utf-8'],
 };
 function cookies(request: IncomingMessage): Record<string, string> {
     const result: Record<string, string> = Object.create(null);
@@ -81,8 +93,12 @@ function send(response: ServerResponse, status: number, value: unknown) {
     });
     response.end(JSON.stringify(value));
 }
+function healthSend(response: ServerResponse, request: IncomingMessage, status: number, value: object) {
+    response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8'});
+    response.end(request.method === 'HEAD' ? undefined : JSON.stringify(value));
+}
 type PolicyAPI = Pick<PolicyService, 'people' | 'devices' | 'mutate' | 'operation' | 'reconcile'> & Partial<Pick<PolicyService, 'scheduleMutate'>>;
-type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'>;
+type AlertsAPI = Pick<ParentAlerts, 'list' | 'acknowledge'> & Partial<Pick<ParentAlerts, 'reconcile'>>;
 /** Node reports IPv4 peers on dual-stack sockets as ::ffff:a.b.c.d; compare the plain IPv4 literal. */
 export function remoteIPv4(address: string | undefined): string | undefined {
     return address?.startsWith('::ffff:') ? address.slice(7) : address;
@@ -90,23 +106,54 @@ export function remoteIPv4(address: string | undefined): string | undefined {
 /** The Idempotency-Key header, dropped when it uses the `tr-` prefix reserved for the time-request service (the route then reports the key as missing). */
 const clientKey = (value: string | string[] | undefined): string | undefined => typeof value === 'string' && !value.startsWith('tr-') ? value : undefined;
 const alertId = (text: string) => { const id = Number(text); if (!/^[1-9][0-9]{0,15}$/.test(text) || !Number.isSafeInteger(id)) throw new AppError(404, 'alert_not_found'); return id; };
-export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore) {
-    // Demo: always on. Real-router integration: only when the private manifest sets timeRequests.enabled (default off).
-    const timeRequestsEnabled = timeRequests !== undefined || auth.provenance.source !== 'real-router-integration' || (config as {timeRequests?: {enabled?: boolean}}).timeRequests?.enabled === true;
+export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, alerts?: AlertsAPI, activity?: ActivityStore, timeRequests?: TimeRequestService, inventory?: InventoryStore, contentFilter?: ContentFilterRoutes, installReadiness?: InstallReadiness) {
+    // Demo: always on. Real-router integration: per the private manifest's timeRequests mode (default off); child routes and the timer run in any mode but off.
+    const gated = timeRequests === undefined && auth.provenance.source === 'real-router-integration';
+    const mode = timeRequestMode((config as {timeRequests?: unknown}).timeRequests), ownerAccountId = (config as {ownerAccountId?: string}).ownerAccountId;
+    const timeRequestsEnabled = !gated || mode !== 'off';
+    // Who may see and decide requests (parent routes) and read their alert: everyone unless the manifest narrows it to the owner account.
+    const mayDecide = (actor: Actor) => !gated || mode === 'parents' || (mode === 'owner' && actor.id === ownerAccountId);
+    const hiddenAlerts = (actor: Actor): readonly string[] => [...(mayDecide(actor) ? [] : ['time_request_pending']), ...(contentFilter?.visibleTo(actor) === true ? [] : ['filter_drift'])];
     const clock = (policy as {now?: () => number}).now ?? auth.now;
-    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock);
+    // Real router: approvals are router-side allowances (grants), confirmed only from router observations.
+    const grants = policy instanceof IntegrationPolicy ? new IntegrationGrants(policy) : undefined;
+    // Reward time: off (the manifest default), time requests off, or a parent the owner-mode gate excludes is a route that does not exist.
+    const focusOn = (actor: Actor) => Boolean(grants && timeRequestsEnabled && mayDecide(actor) && grants.policy.store.config.focus?.enabled === true);
+    const rewardOn = (actor: Actor) => Boolean(grants && timeRequestsEnabled && mayDecide(actor) && grants.policy.store.config.rewardTime?.enabled === true);
+    const requests = !timeRequestsEnabled ? null : timeRequests ?? new TimeRequestService(auth.store, policy, clock, undefined, grants);
     // Switched off after approvals were made: no routes, but owed restores of lifted pauses still drain (fail-closed).
-    const drain = requests ? null : new TimeRequestService(auth.store, policy, clock);
+    const drain = requests ? null : new TimeRequestService(auth.store, policy, clock, undefined, grants);
+    // The demo feeds its alerts from main.ts; on the real path only the time-request rule is reconciled here, nothing else.
+    const reconcileAlerts = alerts?.reconcile?.bind(alerts);
+    const pendingAlerts = requests && grants && reconcileAlerts ? () => reconcileAlerts({now: clock(), timeRequests: requests.pendingForAlerts()}) : null;
     const provenance = auth.provenance;
-    const accounts = new AccountAdmin(auth);
+    const accounts = new AccountAdmin(auth, gated && mode === 'owner' ? ownerAccountId : undefined);
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
+    // Audit log of parent actions: real-router integration only, and only when the manifest turns it on (read per request).
+    const audit = policy instanceof IntegrationPolicy ? auditFor(policy.store) : null;
+    // The one gate for the audit routes and for the per-viewer auditLog signal on GET /people.
+    const auditOn = () => audit?.enabled === true;
     const automatic = (config as DemoConfig & {dispatch?: {enabled: boolean}}).dispatch?.enabled === true;
+    // The bytes of index.html and the manifest as served (rewritten for the integration variant).
+    const integration = provenance.source === 'real-router-integration';
+    const servedBytes = (name: string, data: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
+        if (!integration) return data;
+        if (name === 'index.html') return Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
+        if (name === 'manifest.webmanifest') return Buffer.from(applyRewrites(data.toString('utf8'), integrationManifestRewrites(automatic), name));
+        return data;
+    };
+    // Computed once at startup (a missing shipped asset fails here, not per request): the cache name follows the bytes actually served, so flipping automatic dispatch renames it too. The integration variant keeps a scope-specific name.
+    const serviceWorker = buildServiceWorker(fileURLToPath(new URL('../../web/public/', import.meta.url)), integration ? `integration-${provenance.integrationScope}` : undefined, servedBytes);
     const secure = config.origin.startsWith('https:') ? '; Secure' : '';
     // Plain-HTTP LAN proxy mode: X-Forwarded-* and Forwarded are never read; only the TCP source address is trusted.
     const trusted = config.trustedProxies;
     const untrusted = (address: string | undefined) => trusted !== undefined && !trusted.includes(remoteIPv4(address) ?? '');
+    // Unauthenticated and content-free by design; see service/src/health.ts for the only fields it may carry.
+    const health = new Health(auth.store, () => inventory?.lastOkAt() ?? null, clock);
+    // Build identity for every signed-in caller; the exact inventory age only for admins.
+    const sessionInfo = (dto: SessionDTO): SessionInfoDTO => ({...dto, version: health.version, schemaVersion: health.schemaVersion(), ...(dto.actor.role === 'admin' ? {lastInventoryOkAgeSeconds: health.inventoryAge()} : {})});
     const handler = async (request: IncomingMessage, response: ServerResponse) => {
         if (untrusted(request.socket.remoteAddress)) {
             request.socket.destroy();
@@ -135,17 +182,24 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             if (path.includes('?') || path.includes('%') || path.includes('#')) {
                 throw new AppError(400, 'invalid_path');
             }
+            if (path === '/health') {
+                if (request.method !== 'GET' && request.method !== 'HEAD') {
+                    response.setHeader('Allow', 'GET, HEAD');
+                    healthSend(response, request, 405, {ok: false});
+                    return;
+                }
+                if (health.limited()) { healthSend(response, request, 429, {ok: false}); return; }
+                const answer = health.answer();
+                healthSend(response, request, answer ? 200 : 503, answer ?? {ok: false});
+                return;
+            }
             if (!requests && ['/request.html', '/request.js'].includes(path)) {
                 throw new AppError(404, 'route_not_found');
             }
             if (request.method === 'GET' && STATIC[path]) {
                 const [name, type] = STATIC[path];
-                let data = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
-                if (name === 'index.html' && provenance.source === 'real-router-integration') {
-                    data = Buffer.from(integrationHTML(data.toString('utf8'), provenance.integrationScope!, automatic));
-                }
-                if (name === 'sw.js' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace("'cf-shell-v4'", `'cf-shell-integration-${provenance.integrationScope}-v2'`));
-                if (name === 'manifest.webmanifest' && provenance.source === 'real-router-integration') data = Buffer.from(data.toString('utf8').replace('Couvre-feu synthetic demo', 'Couvre-feu private integration').replace('Local fictional parent-control prototype. Fake router only.', automatic ? 'Private router integration with owner-enabled dispatch.' : 'Private one-device router pilot. Operator-approved dispatch only.'));
+                const file = readFileSync(fileURLToPath(new URL(`../../web/public/${name}`, import.meta.url)));
+                const data = name === 'sw.js' ? Buffer.from(serviceWorker.source) : servedBytes(name, file);
                 response.setHeader('Content-Type', type);
                 response.end(data);
                 return;
@@ -161,7 +215,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                         throw new AppError(404, 'route_not_found');
                     }
                     // Capability token in the body is the only credential: no cookies, no ambient authority, so no CSRF surface.
-                    const routed = childRoute(requests, path, payload);
+                    const routed = childRoute(requests, path, payload, remoteIPv4(request.socket.remoteAddress));
                     send(response, routed.status, routed.body);
                     return;
                 }
@@ -184,7 +238,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                             return;
                         }
                         response.setHeader('Set-Cookie', [`cf_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`, `cf_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secure}`]);
-                        send(response, 200, result.dto);
+                        send(response, 200, sessionInfo(result.dto));
                         return;
                     }
                 }
@@ -199,7 +253,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const session = auth.session(sessionToken, jar.cf_browser);
                 auth.csrf(session, request.headers['x-csrf-token']);
-                const child = await childrenPost(children, session, path, payload);
+                const child = await childrenPost(children, session, path, payload, clientKey(request.headers['idempotency-key']));
                 if (child) {
                     send(response, child.status, {...provenance, ...child.body as object});
                     return;
@@ -214,9 +268,34 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, inventoryWrite.status, {...provenance, ...inventoryWrite.body as object});
                     return;
                 }
+                const readinessWrite = await installReadiness?.post(session, path, payload);
+                if (readinessWrite) {
+                    send(response, readinessWrite.status, {...provenance, ...readinessWrite.body as object});
+                    return;
+                }
+                const filterStepUp = await contentFilter?.post(session, path, payload);
+                if (filterStepUp) {
+                    send(response, filterStepUp.status, {...provenance, ...filterStepUp.body as object});
+                    return;
+                }
                 const account = await accountPost(accounts, session, path, payload);
                 if (account) {
                     send(response, account.status, {...provenance, ...account.body as object});
+                    return;
+                }
+                const reward = /^\/people\/([a-z][a-z0-9_]{0,31})\/reward$/.exec(path);
+                if (reward && grants && rewardOn(session.dto.actor)) {
+                    const result = grants.reward(session.dto.actor, reward[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
+                // Focus window: the same gates as Reward Time, plus its own flag.
+                const focus = /^\/people\/([a-z][a-z0-9_]{0,31})\/focus$/.exec(path);
+                if (focus && grants && focusOn(session.dto.actor)) {
+                    const result = grants.policy.focus(session.dto.actor, focus[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
                     return;
                 }
                 const match = /^\/people\/([a-z][a-z0-9_]{0,31})\/(pause|resume)$/.exec(path);
@@ -240,26 +319,50 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const acknowledge = /^\/alerts\/([0-9]+)\/acknowledge$/.exec(path);
                 if (acknowledge && alerts) {
                     object(payload, []);
-                    send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]))});
+                    send(response, 200, {...provenance, alert: alerts.acknowledge(session.dto.actor, alertId(acknowledge[1]), hiddenAlerts(session.dto.actor))});
                     return;
                 }
-                const parent = requests && await parentPost(requests, session.dto.actor, path, payload);
+                const parent = requests && mayDecide(session.dto.actor) && await parentPost(requests, session.dto.actor, path, payload);
                 if (parent) {
                     send(response, parent.status, parent.body);
                     return;
                 }
                 throw new AppError(404, 'route_not_found');
             }
+            if (request.method === 'PUT' && contentFilter && FILTER_PATH.test(path)) {
+                // No filter service, mode off or an excluded actor: like any other PUT path (405).
+                if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
+                const payload = await body(request);
+                const session = auth.session(sessionToken, jar.cf_browser);
+                auth.csrf(session, request.headers['x-csrf-token']);
+                const written = await contentFilter.put(session, path, payload);
+                if (!written) throw new AppError(405, 'method_not_allowed');
+                send(response, written.status, {...provenance, ...written.body as object});
+                return;
+            }
+            if (request.method === 'DELETE' && inventory && INVENTORY_LINK_PATH.test(path)) {
+                // Session and CSRF first, so an anonymous caller learns nothing about the flag; then without inventoryUi.triage this is any other DELETE (405).
+                // No body is read: the row id in the path is the whole request.
+                if (request.headers.origin !== config.origin) throw new AppError(403, 'origin_rejected');
+                request.resume();
+                const session = auth.session(sessionToken, jar.cf_browser);
+                auth.csrf(session, request.headers['x-csrf-token']);
+                const removed = inventoryDelete(inventory, session, path);
+                if (!removed) throw new AppError(405, 'method_not_allowed');
+                send(response, removed.status, {...provenance, ...removed.body as object});
+                return;
+            }
             if (request.method !== 'GET') {
                 throw new AppError(405, 'method_not_allowed');
             }
             const session = auth.session(sessionToken, jar.cf_browser);
             if (path === '/auth/session') {
-                send(response, 200, session.dto);
+                send(response, 200, sessionInfo(session.dto));
                 return;
             }
             if (path === '/people') {
-                send(response, 200, await policy.people(session.dto.actor));
+                // rewardTime: one viewer-level boolean, present only when the reward route would answer for this viewer (never per child).
+                send(response, 200, {...await policy.people(session.dto.actor), ...(rewardOn(session.dto.actor) ? {rewardTime: true} : {}), ...(focusOn(session.dto.actor) ? {focusWindow: true} : {}), ...(auditOn() ? {auditLog: true} : {}), ...(installReadiness && session.dto.actor.role === 'admin' ? {installReadiness: true} : {})});
                 return;
             }
             const childRead = childrenGet(children, session, path);
@@ -270,6 +373,16 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const inventoryRead = inventoryGet(inventory ?? null, session, path);
             if (inventoryRead) {
                 send(response, inventoryRead.status, {...provenance, ...inventoryRead.body as object});
+                return;
+            }
+            const readinessRead = installReadiness?.get(session, path);
+            if (readinessRead) {
+                send(response, readinessRead.status, {...provenance, ...readinessRead.body as object});
+                return;
+            }
+            const filterRead = contentFilter?.get(session, path);
+            if (filterRead) {
+                send(response, filterRead.status, {...provenance, ...filterRead.body as object});
                 return;
             }
             const accountRead = accountGet(accounts, session, path);
@@ -288,10 +401,18 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             }
             const page = /^\/alerts(?:\/before\/([0-9]+))?$/.exec(path);
             if (page && alerts) {
-                send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]))});
+                send(response, 200, {...provenance, ...alerts.list(session.dto.actor, page[1] === undefined ? undefined : alertId(page[1]), hiddenAlerts(session.dto.actor))});
                 return;
             }
-            const parent = requests && await parentGet(requests, session.dto.actor, path);
+            // Off (the default) is indistinguishable from a route that does not exist. No query strings: the page size and cursor are path segments, like /alerts/before/:id.
+            const auditPage = /^\/audit(?:\/limit\/([0-9]{1,4}))?(?:\/before\/([0-9]{1,15}))?$/.exec(path);
+            if (auditPage && audit && auditOn()) {
+                const limit = auditPage[1] === undefined ? undefined : Number(auditPage[1]);
+                if (limit === 0) throw new AppError(400, 'invalid_limit');
+                send(response, 200, {...provenance, ...audit.list(session.dto.actor, {limit, before: auditPage[2] === undefined ? undefined : Number(auditPage[2])})});
+                return;
+            }
+            const parent = requests && mayDecide(session.dto.actor) && await parentGet(requests, session.dto.actor, path);
             if (parent) {
                 send(response, parent.status, parent.body);
                 return;
@@ -325,7 +446,9 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     let timer: NodeJS.Timeout | undefined;
     server.on('listening', () => {
         if (requests) {
-            timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')), 5000);
+            timer = setInterval(() => requests.advance().catch(() => void process.stderr.write('time_request_advance_failed\n')).then(() => {
+                try { pendingAlerts?.(); } catch { process.stderr.write('time_request_alert_failed\n'); }
+            }), 5000);
             timer.unref();
         } else if (drain?.hasObligations()) {
             timer = setInterval(() => drain.drain().then(({remaining, overdue}) => {
@@ -343,15 +466,5 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
 }
 function integrationHTML(html: string, scope: string, automatic: boolean): string {
     if (!/^[a-f0-9]{64}$/.test(scope)) throw new Error('invalid_integration_scope');
-    return html.replace('<html lang="en">', `<html lang="en" data-source="real-router-integration" data-integration-scope="${scope}" data-automatic-dispatch="${automatic}">`)
-        .replace('Fictional, local Couvre-feu parent-control prototype.', 'Private one-device Couvre-feu router integration.')
-        .replace('Couvre-feu · synthetic demo', 'Couvre-feu · private router integration')
-        .replace('<strong>Synthetic demo</strong><span>Fictional people · fake router · target compatibility unverified</span>', `<strong>Private router integration</strong><span>One test device · ${automatic ? 'owner-enabled automatic dispatch' : 'operator approval required'} · packet behavior unverified</span>`)
-        .replace('Local prototype / 002', 'Private one-device pilot')
-        .replace('This demo changes a fake router. It does not control a household connection.', automatic ? 'Authenticated requests dispatch automatically while the owner authorization is active. Unknown outcomes remain blocked for review.' : 'Requests wait for an operator-approved router invocation. Router observations and packet measurements are separate.')
-        .replace('Sign in to the fictional account bound to your passkey.', 'Sign in to the private account bound to your passkey.')
-        .replace('Use the token from the local demo bootstrap. It already identifies your fictional account.', 'Use the token from the private integration bootstrap. It fixes your account and permissions.')
-        .replace('Create a demo passkey', 'Create a passkey')
-        .replace('Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.', 'Source: real router integration. Accepted policy, current runtime health and packet acceptance are distinct. Packet cutoff and target compatibility remain unverified.')
-        .replace('Local, fictional prototype', 'Private one-device pilot');
+    return applyRewrites(html, integrationHTMLRewrites(scope, automatic), 'index.html');
 }

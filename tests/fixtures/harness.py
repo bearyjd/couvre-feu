@@ -1,3 +1,4 @@
+# timeout-ok-file: UNMEASURED: 5-10 s reaps after SIGKILL of a process group in the shared fixture, follow-up expires: 2026-12-31
 """Private-root fixture harness. Networking commands cannot fall through to PATH."""
 import json
 import os
@@ -9,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import unittest
+from pinned_helper import fixture_environment, fixture_source
 
 REPO = Path(__file__).resolve().parents[2]
 PROTECTED = "02:00:00:00:00:aa"
@@ -29,6 +32,19 @@ def _interrupt_lane(signum, frame):
 
 if os.environ.get("CF_TEST_LANE") == "1":
     signal.signal(signal.SIGTERM, _interrupt_lane)
+
+    # Report every case's wall time; run-fixtures.py relays these lines so the
+    # CASE_WEIGHTS table there can be refreshed from any CI run's logs.
+    _run_case = unittest.TestCase.run
+
+    def _timed_run(self, result=None):
+        started = time.monotonic()
+        try:
+            return _run_case(self, result)
+        finally:
+            print(f'TIMING: {self.id()} {time.monotonic() - started:.1f}s', file=sys.stderr, flush=True)
+
+    unittest.TestCase.run = _timed_run
 
 
 def _terminate_owned_process(process):
@@ -100,7 +116,11 @@ def start_with_full_stdout(command, env, stdin=None, seconds=90):
 
     Returns (process, read_end) once the shell itself is blocked writing (wchan pipe_write). The
     caller owns read_end and the process (kill its group on failure); drain with drain_full_stdout.
+    `stdin` is text to write and close, or an open descriptor (e.g. a pty slave for the scope verbs).
     """
+    stdin_fd = stdin if isinstance(stdin, int) else None
+    if stdin_fd is not None:
+        stdin = None
     read_end, write_end = os.pipe()
     filler = os.open("/proc/self/fd/%d" % write_end, os.O_WRONLY | os.O_NONBLOCK)  # own description
     try:
@@ -111,7 +131,7 @@ def start_with_full_stdout(command, env, stdin=None, seconds=90):
     finally:
         os.close(filler)
     try:
-        process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+        process = subprocess.Popen(command, env=env, stdin=stdin_fd if stdin_fd is not None else subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                                    stdout=write_end, stderr=subprocess.DEVNULL, start_new_session=True)
     finally:
         os.close(write_end)
@@ -238,7 +258,9 @@ class RouterFixture:
         leases.parent.mkdir(parents=True)
         leases.parent.chmod(0o1777)  # Stands in for the router's sticky 0:0:1777 /tmp.
         leases.write_text(f"0 {KID} 192.168.1.20 fixture *\n0 {OTHER_KID} 192.168.1.22 fixture2 *\n")
-        self.env = dict(os.environ, CF_ROOT=str(self.root), CF_TEST_MODE="1",
+        self.router = fixture_source(REPO) / "router"
+        self.env = dict(fixture_environment(os.environ), CF_ROOT=str(self.root), CF_TEST_MODE="1",
+                        CF_FIXTURE_ROUTER=str(self.router),
                         CF_BACKEND_DIR=str(self.bin), CF_BACKEND_STATE=str(self.state),
                         CF_BACKEND_LOG=str(self.log), CF_NOW="1736204400",
                         PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", ""))
@@ -269,7 +291,7 @@ class RouterFixture:
     def run(self, *args, document=None, raw=None, timeout=60, env=None, started=None):
         if document is not None:
             raw = json.dumps(document, separators=(",", ":"))
-        return run_owned_process(self.shell + [str(REPO / "router/cfctl"), *args],
+        return run_owned_process(self.shell + [str(self.router / "cfctl"), *args],
                                  env=self.env if env is None else env, input=raw,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, started=started)
 

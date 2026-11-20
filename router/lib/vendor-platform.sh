@@ -5,7 +5,7 @@ vp_hash_value() {
     # Ordinary paths never follow a link; the explicit proc-image caller below
     # hashes its admitted magic link separately, after exact target validation.
     regular "$1"
-    value=$(timeout -s KILL 6 sha256sum "$1") || fail hash_read
+    value=$(timeout -s KILL 6 sha256sum "$1" 9>&-) || fail hash_read
     value=${value%% *}
     case "$value" in ''|*[!0-9a-f]*) fail hash_format;; esac
     [ "${#value}" = 64 ] || fail hash_length
@@ -29,8 +29,12 @@ vp_metadata() {
     # This private primitive is used inside a fresh transaction. Callers must
     # use vp_transaction_check, never retain its success as later permission.
     case "$1:$tuple" in
-        /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775)
+        /lib/config:0:0:775|/etc:0:0:775|/etc/opkg:0:0:775|/usr/libexec:0:0:775|/sbin:0:0:775|/etc/init.d:0:0:775|/usr/share:0:0:775)
             [ -d "$1" ] || fail exception_type;;
+        /etc/rc.common:0:0:775)
+            [ "$(vp_hash_value "$1")" = ebeeedc132a75942ce876465e4636a75f745e468c573fdf9ad058e57e58a0341 ] || fail helper_pin;;
+        /lib/functions/service.sh:0:0:664)
+            [ "$(vp_hash_value "$1")" = afb750abd9c4b4eeb1e8dc5eb9f66c7d47774782494f2c168183390803db3b91 ] || fail helper_pin;;
         /lib/functions.sh:0:0:664)
             [ "$(vp_hash_value "$1")" = b2b07ca83222f8677f8117e4ed8bff162ef9e6ad0aadaa42d6248c5865831406 ] || fail helper_pin;;
         /lib/config/uci.sh:0:0:664)
@@ -80,7 +84,7 @@ vp_read_body() {
     # NUL is mapped to reserved SOH before BusyBox awk sees it; both controls
     # are rejected. Explicit dd and transform status footers preserve failures.
     {
-        if timeout -s KILL 6 dd if="$1" bs=1 count="$2" 2>/dev/null; then rc=0; else rc=$?; fi
+        if timeout -s KILL 6 dd if="$1" bs=1 count="$2" 2>/dev/null 9>&-; then rc=0; else rc=$?; fi
         printf '\nCF008_DD_END=%s\n' "$rc"
     } | tr '\000' '\001'
     transform_rc=$?
@@ -142,7 +146,7 @@ vp_starttime() {
 }
 vp_exe() {
     [ -L "$1" ] || return 2
-    exe=$(timeout -s KILL 4 readlink "$1" && printf ".") || return 2
+    exe=$(timeout -s KILL 4 readlink "$1" 9>&- && printf ".") || return 2
     # Keep any newline in the target; strip only our marker and readlink delimiter.
     exe=${exe%.}; exe=${exe%?}
     case "$exe" in /*) ;; *) return 2;; esac
@@ -269,7 +273,7 @@ vp_image() {
     [ "$(vp_exe "$1")" = "$2" ] || fail process_image_target
     inode=$(stat_private -L -c '%d:%i:%s' "$1") || fail process_image_stat
     [ "$inode" = "$(stat_private -c '%d:%i:%s' "$2")" ] || fail process_image_inode
-    image=$(timeout -s KILL 6 sha256sum "$1") || fail process_image_hash
+    image=$(timeout -s KILL 6 sha256sum "$1" 9>&-) || fail process_image_hash
     image=${image%% *}
     [ "$image" = "$(vp_hash_value "$2")" ] || fail process_image_hash
     [ "$(vp_exe "$1")" = "$2" ] && [ "$(stat_private -L -c '%d:%i:%s' "$1")" = "$inode" ] || fail process_image_changed

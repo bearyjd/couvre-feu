@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,10 +21,15 @@ import time
 import unittest
 
 REPO=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(REPO/'tests/fixtures'))
+import partition
 spec=importlib.util.spec_from_file_location('platform_fixtures',REPO/'tests/test-platform-integration.py')
 platform=importlib.util.module_from_spec(spec);spec.loader.exec_module(platform)
 SHELL=platform.SHELL
 PROFILE='gl-xe3000-4.8.3-os-trust-v1'
+# Bound for one shell snippet or reap. Measured at 0.00-0.23 s (one case sleeps ~4 s on purpose) with load average 3-25;
+# 30 s keeps >100x headroom for a CI runner yet a real hang still fails in 30 s.
+SHELL_TIMEOUT=30
 
 class StaticWitnessTests(unittest.TestCase):
     def setUp(self):
@@ -66,7 +72,7 @@ vp_profile={PROFILE}
 
     def tearDown(self):self.temp.cleanup()
     def run_helper(self,extra=''):
-        return subprocess.run(SHELL+['-c',self.setup+extra+'\nvp_transaction_check'],capture_output=True,text=True,timeout=10)
+        return subprocess.run(SHELL+['-c',self.setup+extra+'\nvp_transaction_check'],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
     def test_static_success_has_distinct_result_without_population_scan(self):
         r=self.run_helper();self.assertEqual(r.returncode,0,r.stderr)
         self.assertIn('OS_TRUST_PROFILE_ATTESTED:',r.stdout);self.assertNotIn('VENDOR_PROFILE_ATTESTED:',r.stdout)
@@ -115,7 +121,7 @@ vp_profile={PROFILE}
         for profile in [PROFILE,'strict',platform.PROFILE,None]:
             with self.subTest(profile=profile):
                 selector='unset vp_profile' if profile is None else 'vp_profile='+profile
-                result=subprocess.run(SHELL+['-c',self.setup+'\n'+selector+direct],capture_output=True,text=True,timeout=10)
+                result=subprocess.run(SHELL+['-c',self.setup+'\n'+selector+direct],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
                 self.assertEqual(result.returncode==0,profile==PROFILE,result.stderr)
                 if profile!=PROFILE:self.assertIn('unobserved_group_writable_path' if profile==platform.PROFILE else 'unsupported_vendor_profile',result.stderr)
         result=self.run_helper();self.assertEqual(result.returncode,0,result.stderr)
@@ -126,7 +132,7 @@ vp_profile={PROFILE}
         firmware.chmod(0o664)
         self.assertIn('metadata_owner',self.run_helper('stat_private() { printf "7:0:664\\n"; }').stderr)
         other=self.root/'etc/unknown-firmware';other.write_text('4.8.3\n');other.chmod(0o664)
-        result=subprocess.run(SHELL+['-c',self.setup+f'\nvp_metadata "{other}"'],capture_output=True,text=True,timeout=10)
+        result=subprocess.run(SHELL+['-c',self.setup+f'\nvp_metadata "{other}"'],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
         self.assertIn('unobserved_group_writable_path',result.stderr)
     def test_account_drift_and_provider_appearance_after_first_witness_refuse(self):
         # Rename only the fixture wrapper so the actual complete PID1 witness
@@ -148,7 +154,7 @@ class DeadlineTests(unittest.TestCase):
         self.bootstrap=REPO/'router/lib/platform-bootstrap.sh'
         self.setup=f'. "{self.bootstrap}"; CF_PLATFORM_PROFILE={PROFILE}; CF_PLATFORM_ENTRY_TICK=100; '
     def run_shell(self,body):
-        return subprocess.run(SHELL+['-c',self.setup+body],capture_output=True,text=True,timeout=10)
+        return subprocess.run(SHELL+['-c',self.setup+body],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
     def test_exclusive_centisecond_boundary_and_anchor_reuse(self):
         for tick,ok in [(100,True),(1399,True),(1400,False),(99,False)]:
             r=self.run_shell(f'platform_clock_tick() {{ printf {tick}; }}; platform_deadline_check; platform_deadline_check;printf complete')
@@ -203,7 +209,7 @@ class DeadlineTests(unittest.TestCase):
                 self.assertEqual(list((root/'tmp').iterdir()),[])
             finally:
                 if child.poll() is None:child.kill()
-                child.communicate(timeout=5)
+                child.communicate(timeout=SHELL_TIMEOUT)
     def test_native_blocked_stat_producer_cannot_grant_initial_write(self):
         text=self.bootstrap.read_text();start=text.index('    platform_stat() {')
         stop=text.index('    [ "$(platform_stat -c',start);fragment=text[start:stop]
@@ -255,14 +261,32 @@ mkdir() {{ command mkdir "$@";fixture_tick=1400; }};cf_lock;printf unsafe'''
         with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-dead-lock-') as folder:
             root=Path(folder);lock=root/'lock';lock.mkdir();(lock/'pid').write_text('999999999\n')
             text=self.bootstrap.read_text();start=text.index('platform_lock_recover() (');stop=text.index('platform_profile_validate()',start)
-            fn=text[start:stop].replace('/tmp/couvrefeu-platform.lock',str(lock))
+            fn=text[start:stop]
             body=f'''set -eu
+platform_lock_path={lock}
 {fn}
 fixture_tick=100;platform_clock_tick() {{ printf '%s' "$fixture_tick"; }};
 platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ fixture_tick=1400; }};
 platform_lock_recover;printf unsafe'''
             r=self.run_shell(body);self.assertNotEqual(r.returncode,0);self.assertIn('admission_deadline',r.stderr);self.assertNotIn('unsafe',r.stdout)
             self.assertEqual((lock/'pid').read_text(),'999999999\n')
+    def test_platform_lock_path_is_the_single_source(self):
+        # Explicit recovery (install-common.sh) reads platform_lock_path; acquire, release, recover and the
+        # compatibility fence must name the same lock, never a second hard-coded copy.
+        text=self.bootstrap.read_text()
+        self.assertEqual([line for line in text.splitlines() if '/tmp/couvrefeu-platform.lock' in line],
+                         ['platform_lock_path=/tmp/couvrefeu-platform.lock'])
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-os-trust-lock-path-') as folder:
+            lock=Path(folder)/'platform.lock'
+            body=f'''set -eu
+. "{self.bootstrap}"
+platform_lock_path={lock}
+platform_stat() {{ printf '0:0:1777'; }};platform_private() {{ :; }};platform_deadline_check() {{ :; }}
+platform_lock_acquire;[ "$(cat "{lock}/pid")" = "$$" ];printf acquired;platform_lock_release;[ ! -e "{lock}" ];printf released
+mkdir "{lock}";printf '999999999\\n' > "{lock}/pid";platform_lock_recover;[ ! -e "{lock}" ];printf recovered
+platform_transaction_paths() {{ :; }};mkdir "{lock}";(platform_transaction_compat_clear) 2>/dev/null || printf fenced'''
+            r=self.run_shell(body)
+            self.assertEqual(r.stdout,'acquiredreleasedrecoveredfenced',r.stderr)
     def test_internal_receipt_separates_kernel_proof_and_protected_attempt(self):
         for zero,started,ok in [(True,False,True),(True,True,True),(False,True,True),(False,False,False)]:
             receipt=json.dumps({'ok':True,'removed':True,'zeroOwnedMutations':zero,'initialProtectedWrite':started,'errors':[]},separators=(',',':'))
@@ -338,22 +362,137 @@ fixture_tools() {{ fixture_tick=1400; }};reload_firewall;printf complete"""
             # Production dispatch has the same immediate primitive boundary.
             self.assertIn('else platform_initial_write; env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /etc/init.d/firewall reload; fi',fn)
 
+class HelperParentTrustTests(unittest.TestCase):
+    def test_helper_ancestry_uses_the_selected_platform_trust(self):
+        # Both predicates see identical metadata for real isolated directory
+        # paths. Only the exact absolute exception names are mapped into /tmp.
+        allowed=['/lib/config','/etc','/etc/opkg','/usr/libexec','/sbin','/etc/init.d','/usr/share']
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-trust-') as folder:
+            root=Path(folder)
+            bootstrap=(REPO/'router/lib/platform-bootstrap.sh').read_text()
+            vendor=(REPO/'router/lib/vendor-platform.sh').read_text()
+            for path in allowed:
+                mapped=root/path.lstrip('/');mapped.mkdir(parents=True,exist_ok=True)
+                bootstrap=bootstrap.replace(path+':0:0:775',str(mapped)+':0:0:775')
+                vendor=vendor.replace(path+':0:0:775',str(mapped)+':0:0:775')
+            bootstrap_path=root/'bootstrap.sh';bootstrap_path.write_text(bootstrap)
+            vendor_path=root/'vendor.sh';vendor_path.write_text(vendor)
+            for path in allowed:
+                target=root/path.lstrip('/')
+                for profile in ['strict',platform.PROFILE,PROFILE]:
+                    for metadata in ['0:0:755','0:0:0755','0:0:775','0:0:777','0:0:1775',
+                                     '0:0:2755','0:0:4755','0:0:75','0:0:000755','7:0:775','0:7:775']:
+                        with self.subTest(path=path,profile=profile,metadata=metadata):
+                            body=f''' . "{bootstrap_path}"
+. "{vendor_path}"
+CF_PLATFORM_PROFILE={profile};vp_profile={profile}
+platform_helper_stat() {{
+    case "$3" in '{target}') printf '%s\\n' '{metadata}';; /tmp) printf '0:0:1777\\n';; *) printf '0:0:755\\n';; esac
+}}
+stat_private() {{ platform_helper_stat "$@"; }}
+fail() {{ exit 2; }}
+(platform_helper_parents '{target}') >/dev/null 2>&1; helper_status=$?
+(vp_metadata '{target}') >/dev/null 2>&1; vendor_status=$?
+printf '%s:%s' "$helper_status" "$vendor_status"'''
+                            result=subprocess.run(SHELL+['-c',body],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
+                            self.assertEqual(result.returncode,0,result.stderr)
+                            expected=metadata in ['0:0:755','0:0:0755'] or (metadata=='0:0:775' and profile!='strict')
+                            self.assertEqual(result.stdout,'0:0' if expected else '2:2',result.stderr)
+
+    def test_helper_ancestry_rejects_unlisted_group_write_and_symlinks(self):
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-parents-') as folder:
+            root=Path(folder);directory=root/'directory';directory.mkdir()
+            alias=root/'alias';alias.symlink_to(directory,target_is_directory=True)
+            for ancestor,metadata in [(directory,'0:0:775'),(alias,'0:0:755')]:
+                with self.subTest(ancestor=ancestor.name):
+                    body=f'''. "{REPO}/router/lib/platform-bootstrap.sh"
+CF_PLATFORM_PROFILE={PROFILE}
+platform_helper_stat() {{ printf '%s\\n' '{metadata}'; }}
+platform_helper_parents '{ancestor}'
+printf unsafe'''
+                    result=subprocess.run(SHELL+['-c',body],capture_output=True,text=True,timeout=SHELL_TIMEOUT)
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertIn('helper_missing',result.stderr)
+                    self.assertNotIn('unsafe',result.stdout)
+
 class OperationalFlowTests(unittest.TestCase):
-    def os_trust_release(self,f):
+    def os_trust_release(self,f,stat_payload=None,etc_release=False):
         # The genuine ash/router code uses the isolated JSON backend. Hardware
         # admission is the same explicit inert adapter as recovery fixtures.
+        # stat_payload keeps the genuine vendor platform_stat (env -i + timeout -s KILL)
+        # with only its payload path replaced, so its children can be observed.
         (f.root/'tmp').chmod(0o1777)
-        release=f.root/'release';shutil.copytree(REPO/'router',release)
+        release=f.root/('release-source' if etc_release else 'release')
+        shutil.copytree(platform.fixture_source(REPO)/'router',release)
         bootstrap=release/'lib/platform-bootstrap.sh';text=bootstrap.read_text()
         start=text.index('platform_bootstrap_vendor() {');stop=text.index('platform_verify_modules()',start)
-        text=text[:start]+'platform_bootstrap_vendor() { :; }\n'+text[stop:]
+        adapter='platform_bootstrap_vendor() { :; }\n'
+        if stat_payload is not None:
+            body=text[start:stop];stat_start=body.index('    platform_stat() {');stat_stop=body.index('\n    }\n',stat_start)+7
+            adapter=('platform_bootstrap_vendor() {\n'+body[stat_start:stat_stop].replace('/usr/libexec/stat-coreutils',str(stat_payload))
+                     +'    stat() { platform_stat "$@"; }\n}\n')
+        text=text[:start]+adapter+text[stop:]
         text=text.replace('/tmp/couvrefeu-platform.lock',str(f.root/'tmp/couvrefeu-platform.lock'))
         text=text.replace("'%u:%g:%a' /tmp)","'%u:%g:%a' "+str(f.root/'tmp')+')').replace('0:0:1777',f'{os.getuid()}:{os.getgid()}:1777')
         text=text.replace('        vp_transaction_check >/dev/null','        vp_transaction_check() { return 0; }; vp_transaction_check >/dev/null')
+        if etc_release:
+            # Map the production /etc root:GID0 exception onto this unprivileged
+            # fixture only. The real ancestor walk and mode checks still run.
+            text=text.replace('/etc:0:0:775|',str(f.root/'etc')+f':{os.getuid()}:{os.getgid()}:775|')
+            core=release/'lib/core.sh'
+            core.write_text(core.read_text().replace('[ "$cf_dir" = /etc ]',f'[ "$cf_dir" = "{f.root}/etc" ]'))
         bootstrap.write_text(text)
         compiler=(REPO/'tools/freeze-router-release.py').read_text().replace("Path(__file__).resolve().parent / 'strip-test-mode.py'", 'Path(' + repr(str(REPO / 'tools/strip-test-mode.py')) + ')').replace("router = Path(__file__).resolve().parents[1] / 'router'",'router = Path('+repr(str(release))+')')
         subprocess.run(['python3','-c',compiler],capture_output=True,check=True)
+        if etc_release:
+            # Retention validates every manifest byte, including wrappers
+            # emitted with their fixture blocks stripped.
+            # Emit the complete adapted tree through the production compiler.
+            emitted=f.root/'etc/external-release'
+            subprocess.run(['python3','-c',compiler,'--emit',str(emitted)],capture_output=True,check=True)
+            return emitted
         return release
+
+    def test_root_group_writable_etc_release_installs_and_uninstalls(self):
+        from harness import RouterFixture,PROTECTED,KID
+        f=RouterFixture()
+        try:
+            private=f.root/'etc/couvrefeu'
+            (private/'state').unlink();(private/'protected').unlink();private.rmdir()
+            release=self.os_trust_release(f,etc_release=True)
+            etc=f.root/'etc';etc.chmod(0o775)
+            env=dict(f.env,CF_TEST_INSTALL_KERNEL='1',CF_TEST_RELEASE_DIR='1')
+            installed=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,
+                                     '--activate','--protect',PROTECTED,'--rpc-allow',KID],
+                                     env=env,capture_output=True,text=True,timeout=120)
+            self.assertEqual(installed.returncode,0,installed.stderr+installed.stdout)
+            retained=list(etc.glob('.couvrefeu-release-*'))
+            self.assertEqual(len(retained),1)
+            saved=retained[0]
+            self.assertEqual(saved.stat().st_mode&0o777,0o700)
+            self.assertEqual((saved/'lib').stat().st_mode&0o777,0o700)
+            result=subprocess.run(f.shell+[str(saved/'uninstall.sh')],env=env,capture_output=True,text=True,timeout=120)
+            self.assertEqual(result.returncode,0,result.stderr+result.stdout)
+            self.assertFalse(saved.exists(),'the executing external release must retire safely')
+            self.assertFalse((etc/'couvrefeu').exists())
+            self.assertFalse((f.root/'usr/lib/couvrefeu/busybox-static').exists())
+            self.assertFalse((f.root/'.couvrefeu-transaction').exists())
+            self.assertFalse((f.root/'tmp/couvrefeu-platform.lock').exists())
+        finally:f.close()
+
+    def test_world_writable_etc_release_refuses_before_managed_writes(self):
+        from harness import RouterFixture,PROTECTED
+        f=RouterFixture()
+        try:
+            release=self.os_trust_release(f,etc_release=True)
+            (f.root/'etc').chmod(0o777)
+            before=platform.fixtures.full_snapshot(f.root)
+            result=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,
+                                  '--activate','--protect',PROTECTED],env=f.env,capture_output=True,text=True,timeout=60)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('helper_missing',result.stderr)
+            self.assertEqual(platform.fixtures.full_snapshot(f.root),before)
+        finally:f.close()
 
     def test_native_complete_flows_record_latency_without_target_claim(self):
         sys.path.insert(0,str(REPO/'tests/fixtures'))
@@ -408,7 +547,12 @@ class OperationalFlowTests(unittest.TestCase):
                                        expected_revision=current['acceptedPolicy']['revision'],expected_digest=current['policyDigest'],policy=data))
             cases=(('status',('status','--json'),None),('sync',('sync',),lambda:json.dumps(document()[1])),
                    ('rpc-sync',('rpc-sync',),rpc_request),('pause',('pause','alice'),None),('resume',('resume','alice'),None),
-                   ('expire',('expire',),None),('rpc-status',('rpc-status','--json'),None))
+                   ('expire',('expire',),None),('rpc-status',('rpc-status','--json'),None),
+                   ('apply-fw',('apply-fw',),None),('rpc-activity',('rpc-activity','--json'),None),
+                   ('rpc-inventory',('rpc-inventory','--json'),None),
+                   # A refusal raised under the platform lock and cf_lock (stale CAS revision).
+                   ('refusal',('rpc-sync',),lambda:json.dumps(dict(json.loads(rpc_request()),expected_revision=999))),
+                   ('remove-fw',('remove-fw',),None))  # last: it changes the firewall state
             for label,args,stdin in cases:
                 with self.subTest(command=label):
                     child,read_end=start_with_full_stdout(f.shell+[entry,*args],env,stdin() if stdin else None)
@@ -418,8 +562,82 @@ class OperationalFlowTests(unittest.TestCase):
                         self.assertIsNone(child.poll(),'the blocked command must still be writing')
                     finally:
                         status,stdout=drain_full_stdout(child,read_end)
-                    self.assertEqual(status,0,stdout)
+                    self.assertEqual(status,1 if label=='refusal' else 0,stdout)
                     self.assertTrue(stdout.rstrip().endswith('}'),stdout)
         finally:f.close()
 
-if __name__=='__main__':unittest.main()
+    def installed_entry(self,f,**release_options):
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import PROTECTED,KID
+        release=self.os_trust_release(f,**release_options)
+        env=dict(f.env,CF_TEST_INSTALL_KERNEL='1')
+        installed=subprocess.run(f.shell+[str(release/'install.sh'),'--platform-profile',PROFILE,'--activate','--protect',PROTECTED,'--rpc-allow',KID],
+                                 env=env,capture_output=True,text=True,timeout=120)
+        self.assertEqual(installed.returncode,0,installed.stderr+installed.stdout)
+        return str(f.root/'usr/sbin/cfctl'),env
+
+    def test_signal_while_output_blocked_keeps_a_foreign_platform_lock(self):
+        # The blocked command released every lock before writing. Another command then holds the
+        # platform lock, the mutex and cf_lock (stopped at before_write). HUP/TERM to the blocked one
+        # must release nothing it no longer owns.
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import RouterFixture,KID,policy,start_with_full_stdout,drain_full_stdout
+        f=RouterFixture()
+        try:
+            entry,env=self.installed_entry(f)
+            data=policy(2);data['people'][0]['macs']=[KID]
+            synced=subprocess.run(f.shell+[entry,'sync'],env=env,input=json.dumps(data),capture_output=True,text=True,timeout=120)
+            self.assertEqual(synced.returncode,0,synced.stderr+synced.stdout)
+            platform_lock=f.root/'tmp/couvrefeu-platform.lock';marker=f.root/'rpc-stopped'
+            for signum,code in ((signal.SIGHUP,129),(signal.SIGTERM,143)):
+                with self.subTest(signal=signum):
+                    child,read_end=start_with_full_stdout(f.shell+[entry,'expire'],env)
+                    marker.unlink(missing_ok=True)
+                    parked=subprocess.Popen(f.shell+[entry,'pause','alice'],env=dict(env,CF_TEST_RPC_STOP='before_write'),stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+                    try:
+                        deadline=time.monotonic()+90
+                        while not (marker.exists() and open('/proc/%d/stat'%parked.pid).read().rsplit(') ',1)[1][0]=='T'):
+                            self.assertLess(time.monotonic(),deadline,'checkpoint not reached');time.sleep(.1)
+                        held=(platform_lock/'pid').read_text();self.assertEqual(held.strip(),str(parked.pid))
+                        os.kill(child.pid,signum)
+                        status,stdout=drain_full_stdout(child,read_end)
+                        self.assertIn(status,(code,0),stdout)
+                        self.assertEqual((platform_lock/'pid').read_text(),held,'a foreign platform lock was released')
+                        self.assertTrue((f.root/'etc/couvrefeu/runtime/lock').exists(),'a foreign cf_lock was released')
+                        os.kill(parked.pid,signal.SIGCONT)
+                        out,err=parked.communicate(timeout=120)
+                        self.assertEqual(parked.returncode,0,out+err)
+                    finally:
+                        for process in (child,parked):
+                            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.wait()
+                    resumed=subprocess.run(f.shell+[entry,'resume','alice'],env=env,capture_output=True,text=True,timeout=120)
+                    self.assertEqual(resumed.returncode,0,resumed.stderr+resumed.stdout)
+        finally:f.close()
+
+    def test_mutex_children_do_not_inherit_fd9(self):
+        # The vendor platform_stat runs `timeout -s KILL` children, many of them under the transaction
+        # mutex. BusyBox timeout is reported to leave a detached watcher that inherits fds above 2; the
+        # payload below records fd 9 and emulates that watcher with a 2 s background sleep. A child that
+        # inherits fd 9 keeps the flock after cfctl exits, so the next `expire` gets transaction_contention.
+        sys.path.insert(0,str(REPO/'tests/fixtures'))
+        from harness import RouterFixture
+        f=RouterFixture()
+        try:
+            log=f.root/'stat-fd9.log';payload=f.root/'stat-payload'
+            payload.write_text('#!/bin/sh\nprintf "%s\\n" "$(readlink /proc/$$/fd/9 2>/dev/null || echo closed)" >> '+str(log)+'\n'
+                               'sleep 2 </dev/null >/dev/null 2>&1 &\nexec stat "$@"\n')
+            payload.chmod(0o700)
+            entry,env=self.installed_entry(f,stat_payload=payload)
+            log.write_text('')
+            for args in (('expire',),('apply-fw',),('expire',),('pause','nobody')):
+                result=subprocess.run(f.shell+[entry,*args],env=env,capture_output=True,text=True,timeout=120)
+                self.assertNotIn('transaction_contention',result.stderr,args)
+                if args!=('pause','nobody'):self.assertEqual(result.returncode,0,(args,result.stdout,result.stderr))
+            seen=log.read_text().splitlines()
+            self.assertGreater(len(seen),10,'the genuine platform_stat was not exercised')
+            self.assertEqual([line for line in seen if line.endswith('.couvrefeu-mutex')],[],'a timeout child inherited the mutex fd 9')
+        finally:
+            time.sleep(2.2);f.close()
+
+if __name__=='__main__':partition.main(sys.argv)

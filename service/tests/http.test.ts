@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { once } from 'node:events';
@@ -14,7 +15,7 @@ import { PolicyService } from '../src/policy.ts';
 import { appServer } from '../src/http.ts';
 import { demoConfig } from '../src/config.ts';
 test('genuine authenticated HTTP controls enforce Host, identity, scope, CSRF, origin, expiry and revocation', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-http-')), port = 45000 + process.pid % 10000, origin = `http://localhost:${port}`;
+    const dir = mkdtempSync(join(tmpdir(), 'couvre-feu-http-')), port = await freePort(), origin = `http://localhost:${port}`;
     const store = new Store(join(dir, 'service.sqlite'));
     seedAccounts(store);
     let now = 1791691200;
@@ -109,6 +110,12 @@ test('genuine authenticated HTTP controls enforce Host, identity, scope, CSRF, o
         csrf = verified.body.csrfToken;
         assert.equal(verified.body.actor.id, 'bryn');
         assert.equal(verified.body.actor.role, 'parent');
+        // /auth/session also names the running build; nothing else about the install.
+        const info = await request('/auth/session');
+        assert.equal(info.status, 200);
+        assert.match(info.body.version, /^[A-Za-z0-9._+-]{1,64}$/);
+        assert.equal(info.body.schemaVersion, store.get<{user_version: number}>('PRAGMA user_version')!.user_version);
+        assert.deepEqual(Object.keys(info.body).sort(), ['actor', 'csrfToken', 'expiresAt', 'routerCompatibilityVerified', 'schemaVersion', 'source', 'version']);
         const people = await request('/people');
         assert.equal(people.status, 200);
         assert.deepEqual(people.body.people.map((p: {

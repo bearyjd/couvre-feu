@@ -6,12 +6,17 @@
 - `shared/`: TypeScript contracts, validation, RPC parsing, and shared tests.
 - `service/`: authentication, policy persistence, integration workers, SQLite migrations, and tests.
 - `demo-router/`: the fictional router and scenario tools.
-- `web/public/`: parent UI, styles, service worker, and static assets; `web/tests/` contains browser scenarios.
+- `web/public/`: parent UI, styles, service worker, and static assets (list every shipped file in `sw.js` `ASSETS`; the service serves `sw.js` with the cache name `cf-shell-<content hash>` computed at startup from `sw.js` and those files, so PRs never bump a cache version, and a missing listed file stops startup); `web/tests/` contains browser scenarios.
 - `tests/`: Python router fixtures, acceptance scripts, and client probes. `docs/` contains PRPs, contracts, spike findings, and runbooks.
+
+## Service Worker Cache
+
+- The update banner compares `/auth/session.version` (VERSION/package.json) with the loaded build; the offline cache name is the content hash. Online loads are network-first, so pages get current JS either way; only the offline copy can lag until the next online load.
+- `sw.js` and its assets are hashed once at server startup: editing them while the server runs needs a restart before the cache name changes. The integration variant hashes the bytes it actually serves (scope and automatic-dispatch rewrites included).
 
 ## Build, Test, and Development Commands
 
-Use Node **26.8.1** and npm **11.19.0**. Node runs TypeScript directly.
+Use Node **26.13.1** and npm **11.21.3**. Node runs TypeScript directly.
 
 - `npm ci`: install locked dependencies.
 - `npm run demo:router` and `npm run demo:start`: start the fictional router and loopback parent service in separate terminals.

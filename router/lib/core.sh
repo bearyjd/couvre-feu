@@ -370,8 +370,9 @@ cf_unlock() {
 # stdout goes to an unlinked private file under the root-owned sticky tmp; cf_output_release drops
 # cf_lock, the platform lock and the transaction mutex, and only then writes it with a builtin. Every
 # EXIT trap ends here, so later refusals and platform_fail lines are released first too. Nothing is
-# created before a lock is held: a refusal at admission leaves the fixture tree untouched. Residuals
-# (stderr, admission-time refusal lines): docs/contracts/tier1-rpc.md section 9.
+# created before admission and the transaction gate (a refusal there leaves tmp untouched); under the
+# strict profile the buffer is made right after the gate, before cf_lock. Residuals (stderr,
+# admission-time refusal lines, lost buffer): docs/contracts/tier1-rpc.md section 9.
 # Never a new dependency of enforcement: if the buffer cannot be made, warn and write directly.
 cf_output_begin() {
     [ "$CF_OUTPUT_WANTED" = 1 ] && [ "$CF_OUTPUT_HELD" != 1 ] || return 0
@@ -387,10 +388,15 @@ cf_output_open() {
     case $cf_ob_file in "$cf_ob_parent"/couvrefeu-output.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) return 1;; esac
     # One write and one independent read description of the same private file, by design.
     # shellcheck disable=SC2094
-    cf_safe_file "$cf_ob_file" && command exec 7>"$cf_ob_file" 8<"$cf_ob_file" || { rm -f "$cf_ob_file";return 1; }
-    rm -f "$cf_ob_file" || return 1
-    command exec 6>&1 1>&7 || return 1
-    CF_OUTPUT_HELD=1
+    if cf_safe_file "$cf_ob_file" && command exec 7>"$cf_ob_file" 8<"$cf_ob_file" && rm -f "$cf_ob_file" && command exec 6>&1 1>&7; then
+        CF_OUTPUT_HELD=1
+        return 0
+    fi
+    # A failed `command exec` keeps the shell AND any descriptor it already opened (BusyBox 1.33.1 ash):
+    # close all three and remove the file before the caller falls back to direct output.
+    exec 6>&- 7>&- 8<&-
+    rm -f "$cf_ob_file" || :
+    return 1
 }
 cf_output_release() {
     cf_or_status=$?
@@ -401,7 +407,8 @@ cf_output_release() {
     platform_lock_release
     platform_transaction_release
     exec 1>&6 6>&- 7>&-
-    cf_or_text=$(cat <&8 && printf .) || cf_or_text=.
+    # A lost buffer keeps the command's own status (sync/rpc-sync have already committed): warn only.
+    cf_or_text=$(cat <&8 && printf .) || { cf_or_text=.; printf '%s\n' 'couvre-feu: warning: buffered output lost' >&2; }
     exec 8<&-
     printf '%s' "${cf_or_text%.}"
     return "$cf_or_status"

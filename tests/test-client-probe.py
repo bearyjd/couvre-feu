@@ -17,6 +17,8 @@ import unittest
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent / "client-probe"
+# The node check takes ~0.1 s here, but a 10 s limit expired on a loaded CI runner (job 123143961182). 60 s still fails a real hang.
+NODE_TIMEOUT = 60
 spec = importlib.util.spec_from_file_location("probe_helper", ROOT / "helper.py")
 helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper)
@@ -51,7 +53,7 @@ assert.equal(x.q.stopped, true); assert.ok(x.q.sequence <= 120);
 x = trial(); x.s.onclose(); assert.equal(x.q.stopped, true); assert.throws(() => x.q.start());
 assert.ok(!first.includes('child') && !first.includes('adult'));
 '''
-        result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT.parents[1], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT.parents[1], capture_output=True, text=True, timeout=NODE_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr[:1000])
 
     def test_bind_and_lifetime_validation(self):

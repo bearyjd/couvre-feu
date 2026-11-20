@@ -57,7 +57,7 @@ export function validateDraft(draft, { schedules, editingId = null, deviceCount 
 }
 
 export function actionVerb(action) {
-  return ({ pause: 'Pause', resume: 'Resume', schedule_create: 'Schedule addition', schedule_update: 'Schedule change', schedule_delete: 'Schedule removal', enroll: 'Device addition', unenroll: 'Device removal', pause_all: 'Block all', resume_all: 'Unblock all', move: 'Move' })[action] ?? 'Change';
+  return ({ pause: 'Pause', resume: 'Resume', schedule_create: 'Schedule addition', schedule_update: 'Schedule change', schedule_delete: 'Schedule removal', enroll: 'Device addition', unenroll: 'Device removal', pause_all: 'Block all', resume_all: 'Unblock all', move: 'Move', allow: 'Extra time' })[action] ?? 'Change';
 }
 
 const SERVER_FIELD = {

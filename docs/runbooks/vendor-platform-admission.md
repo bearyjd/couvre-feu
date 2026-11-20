@@ -21,7 +21,19 @@ Compile source pins and the full manifest with
 is the outer reviewed release proof. Entry scripts do not recursively
 self-authenticate their own bytes. Never supply a replacement manifest, source
 or hash through the environment. A production source release has canonical
-root-owned700 release/lib directories,755 entries,644 modules and600 manifest.
+root-owned700 release/lib directories,755 entries and static helper,644 modules and600 manifest.
+The 16-entry closure includes `lib/busybox-static`: Alpine v3.14 aarch64
+BusyBox static 1.33.1-r8, SHA-256
+`c25f66e5ac29ea3e373b8fb2d3549a59d058fbef9ed11b67fdaba1dc37bf75f5`.
+It ships inside the reviewed release, without a package-manager install.
+The installed copy is `/usr/lib/couvrefeu/busybox-static`, root:root0755
+beneath the existing owned non-world-writable directory on persistent overlay.
+It avoids a writable temporary launcher and needs no additional directory.
+The install journal covers its original bytes, mode, owner, exact mtime or prior
+absence; uninstall restores or removes it. Launchers verify SHA-256 before
+executing the helper as `"$helper" setsid ...`. The source-release copy remains
+available during restoration. Session pid == pgid == sid admission and owner
+liveness/recovery rules are unchanged.
 
 Mutating transaction admission validates the permanent `/etc/.couvrefeu-mutex`
 inode and acquires its kernel exclusion; direct transaction workers retain the
@@ -54,9 +66,21 @@ publication. Cron and firewall callbacks invoke the immutable versioned source
 with an installation generation; a stale callback refuses after retirement or a
 later installation of the same release. Recovery reconciles the audited service
 state; daemon exit alone is not a job-drain proof or whole-system quiescence.
-Production admission requires exact audited cron init, `rc.common`, `procd.sh`
-and firewall init hashes plus the admitted procd image binding. Unknown sources
-refuse before managed writes. Target source bytes, flock/setsid and service
+Production admission requires exact audited hashes for cron init, `rc.common`,
+`procd.sh`, `functions.sh`, `service.sh`, `uci.sh`, `jshn.sh`, firewall init
+and the admitted procd image binding. Both `gl-xe3000-4.8.3-logd-011-v1` and
+`gl-xe3000-4.8.3-os-trust-v1` permit the three exact metadata shapes observed
+on GL-XE3000 vendor firmware, accepting its existing GID0 writer trust:
+`/usr/share` root:root real directory 0775, `/etc/rc.common` root:root
+regular file 0775 and `/lib/functions/service.sh` root:root regular file 0664. Canonical
+ancestry, non-symlink types and all other parent rules remain enforced; strict
+retains its original modes. The `rc.common` pin remains
+`ebeeedc132a75942ce876465e4636a75f745e468c573fdf9ad058e57e58a0341`;
+the `service.sh` pin remains
+`afb750abd9c4b4eeb1e8dc5eb9f66c7d47774782494f2c168183390803db3b91`.
+Group-writable exceptions trust every GID0 writer, including unobserved holders;
+metadata and pins alone cannot prove writer exclusion. Unknown sources
+refuse before managed writes. Target source bytes, flock, pinned-helper setsid and service
 behavior remain UNVERIFIED; this narrows eligibility, not a hardware admission.
 
 An administrator uses a complete independently authenticated external release:

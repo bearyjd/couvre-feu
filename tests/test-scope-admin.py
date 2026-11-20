@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# timeout-ok-file: UNMEASURED: fixture shard (too long to time here); 10 s bounds on single shell runs, follow-up expires: 2026-12-31
 """M1d: admin-only scope-preview / scope-add / scope-remove and the per-admin cfctl-scope wrapper.
 
 Isolated fixtures only (no SSH, Dropbear, router or packets). All MACs and admin names are fictional.
@@ -32,6 +33,9 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'fixtures'))
 from harness import KID, OTHER_KID, PROTECTED, REPO, RouterFixture, drain_full_stdout, policy, start_with_full_stdout  # noqa: E402
+from pinned_helper import fixture_source
+
+TEST_ROUTER = fixture_source(REPO) / "router"
 
 NEW = '02:00:00:00:00:03'
 NEW2 = '02:00:00:00:00:04'
@@ -81,7 +85,7 @@ class ScopeCommon:
         script_env = env or self.f.env
         if name == 'uninstall.sh':
             script_env = dict(script_env, CF_TEST_INSTALL_KERNEL='1')
-        return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *args],
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / name), *args],
                               env=script_env, capture_output=True, text=True, timeout=120)
 
     def install(self, *floor, unscoped=False):
@@ -115,7 +119,7 @@ class ScopeCommon:
         the child starts, so the read returns at once; stdout/stderr stay pipes so output is captured whole.
         It is not the child's controlling terminal (no job control, no XOFF): those are tested separately.
         """
-        command = self.f.shell + [str(REPO / 'router/cfctl'), *args]
+        command = self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args]
         if not tty:
             return subprocess.run(command, env=env or self.f.env, input=(confirm or '') + '\n',
                                   capture_output=True, text=True, timeout=timeout)
@@ -137,7 +141,7 @@ class ScopeCommon:
     def core_shell(self, body, *args, env=None, tty=True):
         """Source the real router modules over this fixture and run `body`, bypassing cfctl's early block."""
         prelude = ('set -f;PATH=/usr/sbin:/usr/bin:/sbin:/bin;LC_ALL=C;umask 077;CF_LOCAL_TEST=1;CF_BASE=$CF_ROOT\n'
-                   'CF_LIB=' + str(REPO / 'router/lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
+                   'CF_LIB=' + str(TEST_ROUTER / 'lib') + '\n. "$CF_LIB/platform-bootstrap.sh"\n'
                    'platform_entry_root_validate;platform_choose runtime "$CF_BASE"\n. "$CF_LIB/core.sh"\n'
                    'platform_admit runtime "$CF_BASE" "$CF_LIB"\n. "$CF_LIB/rpc.sh";. "$CF_LIB/firewall.sh";. "$CF_LIB/activity.sh"\n')
         command = self.f.shell + ['-c', prelude + body, 'core', *args]
@@ -450,7 +454,7 @@ class ScopeConcurrencyTests(ScopeCommon, unittest.TestCase):
             master, slave = pty.openpty()
             os.write(master, (confirm + '\n').encode())
             self.addCleanup(os.close, master);self.addCleanup(os.close, slave)
-        child = subprocess.Popen(self.f.shell + [str(REPO / 'router/cfctl'), *args],
+        child = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args],
                                  env=dict(env or self.f.env, CF_TEST_RPC_STOP=checkpoint),
                                  stdin=slave if slave is not None else subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -586,7 +590,7 @@ class FakeTargetMixin:
             environment.pop('SSH_ORIGINAL_COMMAND', None)
         else:
             environment['SSH_ORIGINAL_COMMAND'] = command
-        return subprocess.run(self.f.shell + [str(REPO / 'router' / name), *argv], env=environment,
+        return subprocess.run(self.f.shell + [str(TEST_ROUTER / name), *argv], env=environment,
                               text=True, capture_output=True, timeout=10)
 
 
@@ -710,7 +714,7 @@ class AdminWrapperEndToEndTests(ScopeCommon, unittest.TestCase):
         target = self.f.bin / 'cfctl'
         keep = {k: v for k, v in self.f.env.items() if k.startswith('CF_') and k != 'CF_TEST_RPC_STOP'}
         exports = ''.join('export {}={}\n'.format(k, json.dumps(v)) for k, v in sorted(keep.items()))
-        target.write_text('#!/bin/sh\n' + exports + 'exec ' + ' '.join(self.f.shell) + ' ' + str(REPO / 'router/cfctl') + ' "$@"\n')
+        target.write_text('#!/bin/sh\n' + exports + 'exec ' + ' '.join(self.f.shell) + ' ' + str(TEST_ROUTER / 'cfctl') + ' "$@"\n')
         target.chmod(0o700)
 
     def via_wrapper(self, command, confirm=None):
@@ -719,7 +723,7 @@ class AdminWrapperEndToEndTests(ScopeCommon, unittest.TestCase):
         try:
             if confirm is not None:
                 os.write(master, (confirm + '\n').encode())
-            return subprocess.run(self.f.shell + [str(REPO / 'router/cfctl-scope'), ADMIN], env=env, stdin=slave,
+            return subprocess.run(self.f.shell + [str(TEST_ROUTER / 'cfctl-scope'), ADMIN], env=env, stdin=slave,
                                   capture_output=True, text=True, timeout=120)
         finally:
             os.close(slave);os.close(master)
@@ -778,7 +782,8 @@ class InstallerTests(ScopeCommon, unittest.TestCase):
     def test_release_manifest_lists_the_wrapper_and_is_frozen(self):
         names = [line.split()[1] for line in (REPO / 'router/release.sha256').read_text().splitlines()]
         self.assertIn('cfctl-scope', names)
-        self.assertEqual(len(names), 15)
+        self.assertIn('lib/busybox-static', names)
+        self.assertEqual(len(names), 16)
         result = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--check'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -804,7 +809,7 @@ class ScopeReviewFixTests(ScopeCommon, unittest.TestCase):
         self.before = self.f.durable_snapshot()
 
     def cfctl(self, *args):
-        return self.f.shell + [str(REPO / 'router/cfctl'), *args]
+        return self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args]
 
     def test_add_and_remove_are_refused_when_the_intent_cannot_be_logged(self):
         self.ok(self.add(NEW))
@@ -1082,7 +1087,7 @@ class ScopeStaticTests(unittest.TestCase):
                    'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00', '02:00:00:00:00:0A', '02:00:00:00:00:003', '2:00:00:00:00:03',
                    '02-00-00-00-00-03', '02:00:00:00:00', '02:00:00:00:00:03:', '', 'zz:00:00:00:00:00']
         valid = subprocess.run(['sh', '-c', 'CF_BASE=;. "$0";for s;do if cf_mac_valid "$s";then echo 1;else echo 0;fi;done',
-                                str(REPO / 'router/lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
+                                str(TEST_ROUTER / 'lib/core.sh'), *samples], capture_output=True, text=True, timeout=60)
         expected = valid.stdout.split()
         self.assertEqual(len(expected), len(samples), valid.stderr)
         self.assertEqual(expected[:3], ['1', '1', '1'])
@@ -1106,18 +1111,107 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
         document['people'][0]['macs'] = [KID]
         return json.dumps(document, separators=(',', ':'))
 
-    def assert_blocked_output_holds_no_lock(self, args, stdin=None, errors=()):
-        child, read_end = start_with_full_stdout(self.f.shell + [str(REPO / 'router/cfctl'), *args], self.f.env, stdin)
+    def assert_blocked_output_holds_no_lock(self, args, stdin=None, errors=(), status=0, confirm=None):
+        slave = None
+        if confirm is not None:
+            # The scope verbs need a TTY on stdin (else scope_tty_required before any lock).
+            master, slave = pty.openpty()
+            self.addCleanup(os.close, master)
+            os.write(master, (confirm + '\n').encode())
+            stdin = slave
+        try:
+            child, read_end = start_with_full_stdout(self.f.shell + [str(TEST_ROUTER / 'cfctl'), *args], self.f.env, stdin)
+        finally:
+            if slave is not None:
+                os.close(slave)
         self.addCleanup(lambda: child.poll() is None and (os.killpg(child.pid, signal.SIGKILL), child.wait()))
         probe = self.f.run('expire', timeout=120)
         self.assertEqual(probe.returncode, 0, (args, probe.stdout, probe.stderr))
         self.assertIsNone(child.poll(), 'the blocked command must still be writing')
-        status, stdout = drain_full_stdout(child, read_end)
-        self.assertEqual(status, 0, stdout)
+        exit_status, stdout = drain_full_stdout(child, read_end)
+        self.assertEqual(exit_status, status, stdout)
         reply = last_json(stdout)
         if errors is not None:
             self.assertEqual(reply.get('errors'), list(errors), stdout)
         return reply
+
+    def test_apply_fw(self):
+        self.assert_blocked_output_holds_no_lock(('apply-fw',))
+
+    def test_remove_fw(self):
+        self.assert_blocked_output_holds_no_lock(('remove-fw',), errors=None)
+
+    def test_rpc_activity_and_inventory(self):
+        for verb in ('rpc-activity', 'rpc-inventory'):
+            with self.subTest(verb=verb):
+                self.assert_blocked_output_holds_no_lock((verb, '--json'), errors=None)
+
+    def test_scope_add_and_remove(self):
+        reply = self.assert_blocked_output_holds_no_lock(('scope-add', NEW, '--base', self.base()), confirm=tail6(NEW))
+        self.assertTrue(reply['ok'], reply)
+        reply = self.assert_blocked_output_holds_no_lock(('scope-remove', NEW, '--base', self.base()), confirm=tail6(NEW))
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(self.status()['scope'], [KID])
+
+    def test_refusal_raised_under_a_lock(self):
+        # A stale --base is refused under cf_lock (after the CAS read): that refusal is buffered too.
+        reply = self.assert_blocked_output_holds_no_lock(('scope-add', NEW, '--base', SHA_ZERO), confirm=tail6(NEW),
+                                                         errors=('scope_base_conflict',), status=1)
+        self.assertFalse(reply['ok'], reply)
+        self.assertEqual(self.status()['scope'], [KID])
+
+    def parked_pause(self, first=True):
+        """A `pause alice` stopped at before_write: it holds the transaction mutex and cf_lock."""
+        if first:
+            synced = self.f.run('sync', raw=self.document(), timeout=180)
+            self.assertEqual(synced.returncode, 0, synced.stdout + synced.stderr)
+        marker = self.f.root / 'rpc-stopped'
+        marker.unlink(missing_ok=True)
+        parked = subprocess.Popen(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'pause', 'alice'],
+                                  env=dict(self.f.env, CF_TEST_RPC_STOP='before_write'), stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: parked.poll() is None and (os.killpg(parked.pid, signal.SIGKILL), parked.wait()))
+        self.assertTrue(wait_for(lambda: marker.exists() and proc_state(parked.pid) == 'T', 90), 'checkpoint not reached')
+        return parked
+
+    def test_signal_while_buffered_under_a_lock_releases_once(self):
+        # HUP/TERM delivered while the output is still buffered under the locks: the trap releases cf_lock and the
+        # mutex exactly once (no lock_owner_changed/unsafe_lock), writes at most the one buffered reply, and exits
+        # with the signal status; the next command is not fenced.
+        for signum, code in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(signal=signum):
+                parked = self.parked_pause(first=signum == signal.SIGHUP)
+                os.kill(parked.pid, signum)
+                os.kill(parked.pid, signal.SIGCONT)
+                stdout, stderr = parked.communicate(timeout=60)
+                self.assertEqual(parked.returncode, code, stdout + stderr)
+                self.assertLessEqual(len([line for line in stdout.splitlines() if line.startswith('{')]), 1, stdout)
+                self.assertNotIn('lock_owner_changed', stderr)
+                self.assertFalse((self.runtime / 'lock').exists(), 'cf_lock left behind')
+                probe = self.f.run('expire', timeout=120)
+                self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+
+    def test_signal_while_output_blocked_never_releases_a_foreign_lock(self):
+        # The blocked command has already released everything; another command then takes the mutex and cf_lock.
+        # HUP/TERM to the blocked one must not remove the other's cf_lock (nor close its flock).
+        for signum, code in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(signal=signum):
+                child, read_end = start_with_full_stdout(self.f.shell + [str(TEST_ROUTER / 'cfctl'), 'expire'], self.f.env)
+                self.addCleanup(lambda c=child: c.poll() is None and (os.killpg(c.pid, signal.SIGKILL), c.wait()))
+                parked = self.parked_pause(first=signum == signal.SIGHUP)
+                held = (self.runtime / 'lock/pid').read_text()
+                self.assertEqual(held.strip(), str(parked.pid))
+                os.kill(child.pid, signum)
+                status, stdout = drain_full_stdout(child, read_end)
+                self.assertIn(status, (code, 0), stdout)
+                self.assertEqual((self.runtime / 'lock/pid').read_text(), held, 'a foreign cf_lock was released')
+                contended = self.f.run('expire', timeout=120)
+                self.assertNotEqual(contended.returncode, 0, 'the parked command must still hold the mutex/cf_lock')
+                os.kill(parked.pid, signal.SIGCONT)
+                stdout, stderr = parked.communicate(timeout=120)
+                self.assertEqual(parked.returncode, 0, stdout + stderr)
+                self.assertTrue(last_json(stdout)['ok'], stdout)
+                self.assertEqual(self.f.run('resume', 'alice', timeout=120).returncode, 0)
 
     def test_sync(self):
         self.assert_blocked_output_holds_no_lock(('sync',), self.document())
@@ -1159,6 +1253,44 @@ class OutputBackpressureTests(ScopeCommon, unittest.TestCase):
         # before errors=None: this fixture reports observed_set_read_failed before any apply, which tripped the
         # errors==[] assertion (not a lock). Only the complete status object matters here.
         self.assertIn('drift', self.assert_blocked_output_holds_no_lock(('status', '--json'), errors=None))
+
+
+class OutputBufferFailureTests(ScopeCommon, unittest.TestCase):
+    """cf_output_open must leave no descriptor (6/7/8) or buffer file behind when it fails part-way, and a
+    buffer that cannot be read back must be reported on stderr (the command's own exit status is kept)."""
+
+    LEFTOVERS = ('fds() { for n in 6 7 8; do [ ! -e /proc/$$/fd/$n ] || printf "FD%s_OPEN\\n" "$n" >&2; done; }\n'
+                 'left() { set +f; for x in "$CF_BASE"/tmp/couvrefeu-output.*; do [ ! -e "$x" ] || printf "LEFT\\n" >&2; done; set -f; }\n')
+
+    def assert_clean_fallback(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('output buffer unavailable', result.stderr)
+        self.assertNotIn('_OPEN', result.stderr)
+        self.assertNotIn('LEFT', result.stderr)
+        self.assertEqual(result.stdout, 'DIRECT\n')
+
+    def test_redirection_failure_closes_the_write_descriptor(self):
+        # BusyBox 1.33.1 ash (host binary): a failed `command exec 7>ok 8<bad` returns 1, the shell survives,
+        # and fd 7 stays open. A write-only buffer makes the `8<` open fail (non-root fixture).
+        body = self.LEFTOVERS + 'cf_safe_file() { chmod 200 "$1"; }\nCF_OUTPUT_WANTED=1;cf_output_begin\nfds;left;echo DIRECT\n'
+        self.assert_clean_fallback(self.core_shell(body, tty=False))
+
+    def test_unlink_failure_closes_descriptors_and_removes_the_file(self):
+        body = self.LEFTOVERS + ('rm() { if [ ! -e "$CF_BASE/rm-failed" ]; then : > "$CF_BASE/rm-failed"; return 1; fi; command rm "$@"; }\n'
+                                 'CF_OUTPUT_WANTED=1;cf_output_begin\nfds;left;echo DIRECT\n')
+        self.assert_clean_fallback(self.core_shell(body, tty=False))
+
+    def test_lost_buffer_is_reported_and_the_status_is_kept(self):
+        for status in (0, 3):
+            with self.subTest(status=status):
+                body = ('CF_OUTPUT_WANTED=1;cf_output_begin\necho BUFFERED\ncat() { return 1; }\n'
+                        '(exit %d);cf_output_release;echo "rc=$?"\n' % status)
+                result = self.core_shell(body, tty=False)
+                self.assertEqual(result.stdout, 'rc=%d\n' % status, result.stdout + result.stderr)
+                self.assertIn('couvre-feu: warning: buffered output lost', result.stderr)
+        # Control: a readable buffer is written whole and silently.
+        result = self.core_shell('CF_OUTPUT_WANTED=1;cf_output_begin\necho BUFFERED\n(exit 0);cf_output_release;echo "rc=$?"\n', tty=False)
+        self.assertEqual((result.stdout, result.stderr), ('BUFFERED\nrc=0\n', ''))
 
 
 class StrippedScopeWrapperTests(unittest.TestCase):

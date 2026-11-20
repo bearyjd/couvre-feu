@@ -5,11 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
     <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <meta name="description" content="Fictional, local Couvre-feu parent-control prototype.">
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Couvre-feu">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <link rel="stylesheet" href="/styles.css">
     <link rel="stylesheet" href="/schedule-editor.css">
     <title>Couvre-feu · synthetic demo</title>
@@ -23,6 +26,13 @@
       <div id="account-actions"></div>
     </header>
     <main id="main" tabindex="-1">
+      <div id="service-down" class="notice service-down" role="status" hidden>
+        <p id="service-down-text"></p>
+        <button id="service-retry" class="button secondary" type="button">Retry</button>
+        <details><summary>Details</summary><p id="service-down-detail" class="fine-print"></p></details>
+      </div>
+      <div id="update-banner" class="notice" role="status" hidden><p>Update available · <button id="update-reload" class="button secondary" type="button">Reload</button></p></div>
+      <div id="session-grace" class="notice" role="status" hidden><p id="session-grace-text"></p><button id="session-grace-dismiss" class="button secondary" type="button">Dismiss</button></div>
       <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
       <section id="auth-view" class="auth-layout" aria-labelledby="welcome-title">
         <div class="intro"><p class="eyebrow">Local prototype / 002</p><h1 id="welcome-title">Make space<br>for the moment.</h1><p>See each person’s manual pause and schedule, then make a deliberate change.</p><div class="honesty-note"><span aria-hidden="true">○</span><p>This demo changes a fake router. It does not control a household connection.</p></div></div>
@@ -40,39 +50,77 @@
           <p class="fine-print">Passkeys require a supported browser and secure context. This local prototype uses localhost.</p>
         </div>
       </section>
-      <section id="status-view" aria-labelledby="people-title" data-tab="overview" hidden>
-        <div id="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
-        <div class="section-heading" data-tab-group="overview"><div><p class="eyebrow">Your people</p><h1 id="people-title">Time, with intention.</h1><p id="account-context"></p></div><button id="refresh" class="button secondary" type="button">Refresh status</button></div>
-        <div id="connection" class="connection" role="status"></div>
-        <div id="people" data-tab-group="overview" class="people-list"></div>
-        <section id="schedule-editor" data-tab-group="schedules" class="schedule-editor" aria-labelledby="schedules-title" hidden></section>
-        <section id="parent-alerts" data-tab-group="activity" class="alert-panel" aria-labelledby="parent-alerts-title" hidden>
-          <h2 id="parent-alerts-title">Parent alerts <span id="alert-badge" class="alert-badge" hidden>0</span></h2>
-          <p class="fine-print">Saved by the service for your permitted people and kept for 90 days. They resolve on their own when the condition clears. The badge also counts current warnings from this browser, listed below.</p>
-          <p id="parent-alerts-hint" class="fine-print" role="alert" hidden>The alert could not be acknowledged. Check your connection and try again.</p>
-          <ul id="parent-alert-feed" aria-label="Saved parent alerts" aria-live="polite"></ul>
-          <button id="parent-alerts-more" class="button secondary" type="button" hidden>Show older alerts</button>
-        </section>
-        <section id="activity-panel" data-tab-group="activity" class="activity-panel" aria-label="Estimated network activity" hidden></section>
-        <section id="time-requests" data-tab-group="requests" class="alert-panel" aria-labelledby="time-requests-title" hidden></section>
-        <section id="bulk-panel" data-tab-group="devices" class="alert-panel" aria-labelledby="bulk-title" hidden></section>
-        <section id="children-panel" data-tab-group="devices" class="alert-panel" aria-labelledby="children-title" hidden></section>
-        <section id="inventory-panel" data-tab-group="devices" class="alert-panel" aria-labelledby="inventory-title" hidden></section>
-        <section id="accounts-panel" data-tab-group="devices" class="alert-panel" aria-labelledby="accounts-title" hidden></section>
-        <section id="operational-alerts" data-tab-group="activity" class="alert-panel" aria-labelledby="alerts-title" hidden>
-          <h2 id="alerts-title">Recent alerts in this browser</h2>
-          <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>
-          <label class="alert-preference"><input id="hide-recovery" type="checkbox"> Hide recovery history</label>
-          <ul id="alert-feed" aria-label="Recent operational alerts" aria-live="polite"></ul>
-        </section>
-        <section class="unavailable" data-tab-group="activity" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No app, domain or screen-time measurement is included. The estimated network activity above comes from router byte counters only.</p></section>
-        <p class="source-footnote" data-tab-group="overview">Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.</p>
-        <p id="tab-empty" class="tab-empty" hidden>Nothing to show here yet. Items appear here once there is something for this section.</p>
+      <section id="status-view" aria-labelledby="people-title" hidden>
+        <nav id="tabbar" class="tabbar" aria-label="Sections" hidden>
+          <div class="tablist" role="tablist" aria-label="Couvre-feu sections">
+          <a id="tab-home" class="tab" role="tab" href="#home" aria-controls="panel-home" aria-selected="true" tabindex="0" aria-label="Home"><svg class="tab-icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4v-5h-6v5H5a1 1 0 0 1-1-1z"/></svg><span class="tab-label">Home</span><span class="tab-badge" aria-hidden="true" hidden></span></a>
+          <a id="tab-kids" class="tab" role="tab" href="#kids" aria-controls="panel-kids" aria-selected="false" tabindex="-1" aria-label="Kids" hidden><svg class="tab-icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="9" cy="8.5" r="3"/><path d="M3.5 19c.5-3.2 2.7-5 5.5-5s5 1.8 5.5 5"/><circle cx="17" cy="10" r="2.2"/><path d="M16 14.2c2.4-.2 4 1.2 4.5 4.3"/></svg><span class="tab-label">Kids</span><span class="tab-badge" aria-hidden="true" hidden></span></a>
+          <a id="tab-devices" class="tab" role="tab" href="#devices" aria-controls="panel-devices" aria-selected="false" tabindex="-1" aria-label="Devices" hidden><svg class="tab-icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="7" y="3.5" width="10" height="17" rx="2"/><path d="M11 17.5h2"/></svg><span class="tab-label">Devices</span><span class="tab-badge" aria-hidden="true" hidden></span></a>
+          <a id="tab-alerts" class="tab" role="tab" href="#alerts" aria-controls="panel-alerts" aria-selected="false" tabindex="-1" aria-label="Alerts"><svg class="tab-icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M6.5 16.5V11a5.5 5.5 0 0 1 11 0v5.5l1.5 2h-14z"/><path d="M10 21h4"/></svg><span class="tab-label">Alerts</span><span class="tab-badge" aria-hidden="true" hidden></span></a>
+          <a id="tab-more" class="tab" role="tab" href="#more" aria-controls="panel-more" aria-selected="false" tabindex="-1" aria-label="More"><svg class="tab-icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="6" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18" cy="12" r="1.4"/></svg><span class="tab-label">More</span><span class="tab-badge" aria-hidden="true" hidden></span></a>
+          </div>
+        </nav>
+        <div id="panel-home" class="tab-panel" role="tabpanel" aria-labelledby="tab-home">
+          <div class="section-heading"><div><p class="eyebrow">Your people</p><h1 id="people-title" tabindex="-1">Time, with intention.</h1><p id="account-context"></p></div><button id="refresh" class="button secondary" type="button" data-refresh>Refresh status</button></div>
+          <div id="connection" class="connection" role="status"></div>
+          <div id="people" class="people-list"></div>
+          <section id="time-requests" class="alert-panel" aria-labelledby="time-requests-title" hidden></section>
+          <section id="bulk-panel" class="alert-panel" aria-labelledby="bulk-title" hidden></section>
+          <section id="filter-panel" class="alert-panel" aria-labelledby="filter-title" hidden></section>
         </div>
-        <div class="tabbar"><div class="tablist" role="tablist" aria-label="Sections"><button id="tab-overview" class="tab" role="tab" type="button" data-tab-target="overview" aria-selected="true" aria-controls="tab-panel" tabindex="0"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M3.5 11 12 4l8.5 7"/><path d="M5.5 9.5V20h13V9.5"/><path d="M10 20v-5.5h4V20"/></svg><span class="tab-label">Overview</span></button><button id="tab-schedules" class="tab" role="tab" type="button" data-tab-target="schedules" aria-selected="false" aria-controls="tab-panel" tabindex="-1"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg><span class="tab-label">Schedules</span></button><button id="tab-activity" class="tab" role="tab" type="button" data-tab-target="activity" aria-selected="false" aria-controls="tab-panel" tabindex="-1"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 13h3l2.5-6 4 11 2.5-5H20"/></svg><span class="tab-label">Activity</span><span id="tab-badge-activity" class="tab-badge" hidden></span></button><button id="tab-requests" class="tab" role="tab" type="button" data-tab-target="requests" aria-selected="false" aria-controls="tab-panel" tabindex="-1"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.5 12a8 7 0 0 1-11.7 6L4 19.5l1.4-4A7 7 0 0 1 4 12a8 7 0 0 1 16.5 0Z"/><path d="M9 11.5h.01M12.5 11.5h.01M16 11.5h.01"/></svg><span class="tab-label">Requests</span></button><button id="tab-devices" class="tab" role="tab" type="button" data-tab-target="devices" aria-selected="false" aria-controls="tab-panel" tabindex="-1"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3.5" y="4.5" width="13" height="10" rx="2"/><path d="M2 18.5h16"/><rect x="17.5" y="8" width="4" height="9.5" rx="1.2"/></svg><span class="tab-label">Devices</span></button></div></div>
+        <div id="panel-kids" class="tab-panel" role="tabpanel" aria-labelledby="tab-kids" hidden>
+          <div class="tab-heading"><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
+          <section id="children-panel" class="alert-panel" aria-labelledby="children-title" hidden></section>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
+        </div>
+        <div id="panel-devices" class="tab-panel" role="tabpanel" aria-labelledby="tab-devices" hidden>
+          <div class="tab-heading"><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
+          <section id="inventory-panel" class="alert-panel" aria-labelledby="inventory-title" hidden></section>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
+        </div>
+        <div id="panel-alerts" class="tab-panel" role="tabpanel" aria-labelledby="tab-alerts" hidden>
+          <div class="tab-heading"><h2 id="alerts-heading" class="tab-title" tabindex="-1">Alerts</h2><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
+          <section id="parent-alerts" class="alert-panel" aria-labelledby="parent-alerts-title" hidden>
+            <h2 id="parent-alerts-title">Parent alerts <span id="alert-badge" class="alert-badge" hidden>0</span></h2>
+            <p class="fine-print">Saved by the service for your permitted people and kept for 90 days. They resolve on their own when the condition clears. The badge also counts current warnings from this browser, listed below.</p>
+            <p id="parent-alerts-hint" class="fine-print" role="alert" hidden>The alert could not be acknowledged. Check your connection and try again.</p>
+            <ul id="parent-alert-feed" aria-label="Saved parent alerts" aria-live="polite"></ul>
+            <button id="parent-alerts-more" class="button secondary" type="button" hidden>Show older alerts</button>
+          </section>
+          <section id="operational-alerts" class="alert-panel" aria-labelledby="alerts-title" hidden>
+            <h2 id="alerts-title">Recent alerts in this browser</h2>
+            <p class="fine-print">Local, partial history from permitted policy observations. First noticed is an evaluation time, not when a problem began. No activity or presence monitoring.</p>
+            <label class="alert-preference"><input id="hide-recovery" type="checkbox"> Hide recovery history</label>
+            <ul id="alert-feed" aria-label="Recent operational alerts" aria-live="polite"></ul>
+          </section>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
+        </div>
+        <div id="panel-more" class="tab-panel" role="tabpanel" aria-labelledby="tab-more" hidden>
+          <div class="tab-heading"><h2 id="more-heading" class="tab-title" tabindex="-1">More</h2><button class="button secondary icon-button" type="button" data-refresh aria-label="Refresh status"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg></button></div>
+          <nav id="more-jump" class="more-jump" aria-label="On this page">
+            <a href="#more/schedules" data-target="#schedule-editor">Schedules</a>
+            <a href="#more/activity" data-target="#activity-panel">Activity</a>
+            <a href="#more/audit" data-target="#audit-panel">Audit log</a>
+            <a href="#more/accounts" data-target="#accounts-panel">Accounts</a>
+            <a href="#more/install" data-target="#install-readiness-panel">Install readiness</a>
+            <a href="#more/about" data-target="#about-panel">About</a>
+          </nav>
+          <section id="schedule-editor" class="schedule-editor" aria-labelledby="schedules-title" hidden></section>
+          <section id="activity-panel" class="activity-panel" aria-label="Estimated network activity" hidden></section>
+          <section id="activity-boundary" class="unavailable" aria-labelledby="activity-title"><div><p class="eyebrow">Activity</p><h2 id="activity-title">A clear boundary.</h2></div><dl><div><dt>Usage</dt><dd>Unavailable</dd></div><div><dt>Domains</dt><dd>Unavailable</dd></div><div><dt>App history</dt><dd>Unavailable</dd></div></dl><p>No app, domain or screen-time measurement is included. The estimated network activity above comes from router byte counters only.</p></section>
+          <section id="audit-panel" class="alert-panel" aria-labelledby="audit-title" hidden></section>
+          <section id="accounts-panel" class="alert-panel" aria-labelledby="accounts-title" hidden></section>
+          <section id="install-readiness-panel" class="alert-panel" aria-labelledby="install-readiness-title" hidden></section>
+          <section id="about-panel" class="alert-panel about-panel" aria-labelledby="about-title">
+            <h2 id="about-title">About</h2>
+            <p class="fine-print" id="about-source">Couvre-feu parent app. This service does not report a version yet.</p>
+          </section>
+          <p class="tab-empty fine-print" hidden>Nothing to show here yet. It fills in when the status loads.</p>
+        </div>
+        <p class="source-footnote">Source: synthetic fake router. Confirmation describes this fixture only. Real packet cutoff, router compatibility and phone deployment remain unverified.</p>
       </section>
       <noscript><p class="notice">JavaScript is required for passkey sign-in and status. No controls can run without it.</p></noscript>
     </main>
-    <footer><span>Couvre-feu</span><span>Local, fictional prototype · <a href="https://github.com/bearyjd/couvre-feu">Source</a> · <a href="https://github.com/bearyjd/couvre-feu/blob/main/LICENSE">AGPL-3.0</a></span></footer>
+    <footer><span>Couvre-feu <span id="build-info"></span></span><span>Local, fictional prototype · <a href="https://github.com/bearyjd/couvre-feu">Source</a> · <a href="https://github.com/bearyjd/couvre-feu/blob/main/LICENSE">AGPL-3.0</a></span></footer>
   </body>
 </html>

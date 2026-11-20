@@ -11,7 +11,17 @@ import { scheduleClockReader } from './schedule-clock.ts';
 import { loadTLS, privateIPv4, privateListenHost } from './tls.ts';
 import type { TLSFiles } from './tls.ts';
 import { ACCOUNT_LIMIT } from './account-limits.ts';
+import { parseContentFilter } from './content-filter-config.ts';
+import { parseInventoryUi } from './inventory-ui-config.ts';
+import type { InventoryUiConfig } from './inventory-ui-config.ts';
+import type { ContentFilterConfig } from './content-filter-config.ts';
 
+export type TimeRequestMode = 'off' | 'owner' | 'parents';
+/** The mode of a config's timeRequests setting; absent is off, and the legacy {enabled} form maps true to 'parents'. */
+export function timeRequestMode(setting: unknown): TimeRequestMode {
+    const s = (setting ?? {}) as {mode?: TimeRequestMode; enabled?: boolean};
+    return s.mode ?? (s.enabled === true ? 'parents' : 'off');
+}
 export interface IntegrationManifest {
     version: 1; mode: 'integration'; port: number; dataDir: string;
     origin?: string;
@@ -19,8 +29,28 @@ export interface IntegrationManifest {
     /** Plain-HTTP LAN listener behind a TLS-terminating proxy: only these exact source addresses may connect. */
     trustedProxies?: string[];
     dispatch?: {enabled: boolean; pollSeconds: number; maxBackoffSeconds: number};
-    /** Child time requests are off unless the owner enables them here. */
-    timeRequests?: {enabled: boolean};
+    /** Child time requests are off unless enabled here: 'owner' lets only ownerAccountId decide them, 'parents' every parent account. Legacy {enabled} is read as parents/off. */
+    timeRequests?: {mode: TimeRequestMode};
+    /** Audit log of parent actions; absent is off. */
+    auditLog?: {enabled: boolean};
+    /** Content-free admin push through ntfy (topic and token come from the environment, see push-sender.ts); absent is off. */
+    push?: {enabled: boolean};
+    /** Weekly counts-only digest, sent through push (so it needs push.enabled); absent is off. */
+    digest?: {enabled: boolean};
+    /** Reward time (F4): extra minutes added to a grant, capped with it at MAX_GRANT_MINUTES; absent is off. */
+    rewardTime?: {enabled: boolean};
+    /** Focus window (F5): a labelled timed pause a parent starts for 15 to 120 minutes; absent is off. */
+    focus?: {enabled: boolean};
+    /** DNS hardening for the kids' firewall DNS rules; absent is off. dohList merges the static public DoH resolver list into each submitted policy (docs/dns-hardening.md). */
+    dnsHardening?: {dohList: boolean};
+    /** Content filtering (PRP-006): off unless set; 'owner' lets only ownerAccountId edit filters, 'parents' every parent. Names the root-only API key file, never holds the key; nothing enforces it yet. */
+    contentFilter?: ContentFilterConfig;
+    /** Admin inventory UI switches (device decisions, wizard, install readiness); absent is all off. `triage` and `wizard` are used so far. */
+    inventoryUi?: InventoryUiConfig;
+    /** Install readiness review and export (UI plan I): admin routes that list what the permanent install will protect and allow; absent is off. Never touches the router. */
+    installReadiness?: {enabled: boolean};
+    /** The account that decides time requests in 'owner' mode; must be one of `accounts`. */
+    ownerAccountId?: string;
     scheduleClock?: {timezone: string; conformance?: {utcOffsetMinutes: number; verifiedAt: number; validUntil: number; evidenceSha256: string}};
     router: {host: string; user: 'root'; port: number; knownHosts: string; hostFingerprint: string; agentSocket: string; publicIdentity: string; publicKeyFingerprint: string; generation: string};
     /** Seeds the first child and device of a fresh database; children and devices are managed in the database afterwards. */
@@ -87,7 +117,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'rewardTime', 'focus', 'dnsHardening', 'contentFilter', 'inventoryUi', 'installReadiness', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -119,12 +149,67 @@ export function integrationConfig(path: string): IntegrationConfig {
     }
     let timeRequests: IntegrationManifest['timeRequests'];
     if (m.timeRequests !== undefined) {
-        const settings = object(m.timeRequests, ['enabled']);
-        if (typeof settings.enabled !== 'boolean') bad('invalid_time_requests');
-        timeRequests = {enabled: settings.enabled as boolean};
+        const legacy = typeof m.timeRequests === 'object' && m.timeRequests !== null && !Array.isArray(m.timeRequests) && 'enabled' in m.timeRequests;
+        if (legacy) {
+            const settings = object(m.timeRequests, ['enabled']);
+            if (typeof settings.enabled !== 'boolean') bad('invalid_time_requests');
+            timeRequests = {mode: settings.enabled ? 'parents' : 'off'};
+        } else {
+            const settings = object(m.timeRequests, ['mode']);
+            if (!['off', 'owner', 'parents'].includes(settings.mode as string)) bad('invalid_time_requests');
+            timeRequests = {mode: settings.mode as TimeRequestMode};
+        }
     }
+    let auditLog: IntegrationManifest['auditLog'];
+    if (m.auditLog !== undefined) {
+        const settings = object(m.auditLog, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_audit_log');
+        auditLog = {enabled: settings.enabled as boolean};
+    }
+    let installReadiness: IntegrationManifest['installReadiness'];
+    if (m.installReadiness !== undefined) {
+        const settings = object(m.installReadiness, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_install_readiness');
+        installReadiness = {enabled: settings.enabled as boolean};
+    }
+    let push: IntegrationManifest['push'];
+    if (m.push !== undefined) {
+        const settings = object(m.push, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_push');
+        push = {enabled: settings.enabled as boolean};
+    }
+    let digest: IntegrationManifest['digest'];
+    if (m.digest !== undefined) {
+        const settings = object(m.digest, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_digest');
+        digest = {enabled: settings.enabled as boolean};
+    }
+    if (digest?.enabled && !push?.enabled) bad('digest_requires_push');
+    let focus: IntegrationManifest['focus'];
+    if (m.focus !== undefined) {
+        const settings = object(m.focus, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_focus');
+        focus = {enabled: settings.enabled as boolean};
+    }
+    let rewardTime: IntegrationManifest['rewardTime'];
+    if (m.rewardTime !== undefined) {
+        const settings = object(m.rewardTime, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_reward_time');
+        rewardTime = {enabled: settings.enabled as boolean};
+    }
+    let dnsHardening: IntegrationManifest['dnsHardening'];
+    if (m.dnsHardening !== undefined) {
+        const settings = object(m.dnsHardening, ['dohList']);
+        if (typeof settings.dohList !== 'boolean') bad('invalid_dns_hardening');
+        dnsHardening = {dohList: settings.dohList as boolean};
+    }
+    const contentFilter = parseContentFilter(m.contentFilter);
+    const inventoryUi = parseInventoryUi(m.inventoryUi);
+    const ownerAccountId = m.ownerAccountId === undefined ? undefined : id(m.ownerAccountId);
+    if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
+    if ((timeRequests?.mode === 'owner' || contentFilter?.mode === 'owner') && ownerAccountId === undefined) bad('owner_account_required');
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(inventoryUi ? {inventoryUi} : {}), ...(installReadiness ? {installReadiness} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));

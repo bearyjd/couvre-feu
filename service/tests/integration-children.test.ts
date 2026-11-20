@@ -1,4 +1,6 @@
+import { OBSERVATION_FRESH_SECONDS } from '../src/integration-policy.ts';
 import test from 'node:test';
+import { freePort } from './free-port.ts';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,6 +10,9 @@ import { join } from 'node:path';
 import { integrationFixture, actor, testConfig } from './fixtures/integration.ts';
 import { Auth, issueOperatorBootstrap } from '../src/auth.ts';
 import type { AuthSession } from '../src/auth.ts';
+import { InventoryStore } from '../src/inventory-store.ts';
+import { scopeDigest } from '../../shared/src/router-rpc.ts';
+import { ParentAlerts } from '../src/parent-alerts.ts';
 import { ChildAdmin } from '../src/admin-children.ts';
 import { AccountAdmin } from '../src/admin-accounts.ts';
 import type { ChildAction } from '../src/admin-children.ts';
@@ -81,7 +86,7 @@ test('an existing integration database with a live operation migrates in place: 
         db.close(); chmodSync(path, 0o600);
         const store = new IntegrationStore(config);
         try {
-            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 6);
+            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 14, '016 adds the counts tables');
             assert.equal(store.integrationState().active_operation_id, 'op1');
             assert.equal(store.all('PRAGMA foreign_key_check').length, 0);
             assert.equal(store.get<{n: number}>('PRAGMA foreign_keys' as string) !== undefined, true);
@@ -214,7 +219,9 @@ test('removing devices: confirmed unenroll deletes the row, the last device take
         f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,created_at) VALUES('d_tmp',?,'T','mac',?,'active',1)", child, OUTSIDE);
         await assert.rejects(f.act(op, 'child_remove', child, {}), code('child_has_devices'));
         f.store.run("DELETE FROM devices WHERE id='d_tmp'");
+        f.store.run("INSERT INTO content_filter_desired(person_id,revision,desired_json,desired_sha256,state,state_at,updated_at,updated_by) VALUES(?,1,'{}',?,'pending',1,1,'operator'),('pilot',1,'{}',?,'pending',1,1,'operator')", child, 'a'.repeat(64), 'a'.repeat(64));
         assert.deepEqual((await f.act(op, 'child_remove', child, {})).body, {removed: child});
+        assert.deepEqual(f.store.all<{person_id: string}>('SELECT person_id FROM content_filter_desired').map(r => r.person_id), ['pilot'], "the removed child's desired filter is deleted with it, another child's is kept");
         assert.ok(!f.admin.list(fresh(op)).children.some(c => c.id === child));
     } finally { f.cleanup(); }
 });
@@ -304,7 +311,7 @@ test('account scope_all: only a scope_all admin grants it, and the account then 
 });
 
 test('HTTP: child admin routes are admin-only, CSRF/Origin-checked, and step-up options route by action', async () => {
-    const f = fixture(), port = 36000 + process.pid % 9000, base = `http://localhost:${port}`;
+    const f = fixture(), port = await freePort(), base = `http://localhost:${port}`;
     const auth = new Auth(f.store, base, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const server = appServer(auth, f.policy, {...f.config, port, origin: base, host: `localhost:${port}`});
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
@@ -361,5 +368,123 @@ test('the refusal banner is scoped: a restricted admin never sees another scopeâ
         assert.equal(f.admin.list(fresh(op)).lastRejection?.code, 'incomplete_transition_address_coverage');
         f.store.run('UPDATE operations SET updated_at=updated_at-86401');
         assert.equal(f.admin.list(fresh(op)).lastRejection, null);
+    } finally { f.cleanup(); }
+});
+
+// Exercise the real authenticated assignment path, including its step-up and scope-request result.
+for (const scenario of ['manifest-only', 'fresh', 'remembered', 'stale', 'wrong-generation', 'error-only', 'observation-failure'] as const) {
+    test(`inventory inScope agrees with device_add scope refusal: ${scenario}`, async () => {
+        const f = fixture([SEED]);
+        try {
+            const op = await f.signIn('operator');
+            await f.observe();
+            const precondition = f.token();
+            if (!['manifest-only', 'error-only'].includes(scenario)) {
+                const scope = [SEED, TABLET];
+                f.router.transform = o => ({...o, scope, scopeSha: scopeDigest(scope)});
+                f.advance(1); await f.observe();
+            }
+            if (scenario === 'remembered') {
+                f.advance(1); f.router.transform = null; await f.observe();
+            }
+            if (scenario === 'stale') f.advance(31);
+            if (scenario === 'wrong-generation') f.store.run('UPDATE router_scope_observed SET generation=?', 'e'.repeat(64));
+            if (scenario === 'error-only') {
+                const scope = [SEED, TABLET];
+                f.router.transform = o => ({...o, scope, scopeSha: scopeDigest(scope), errors: ['busy']});
+                f.advance(1); await f.observe();
+            }
+            if (scenario === 'observation-failure') f.store.run("UPDATE integration_state SET observation_error='ssh_timeout' WHERE singleton=1");
+            const inventory = new InventoryStore(f.store, new ParentAlerts(f.store, null, f.now), f.now);
+            inventory.ingest({inventory_version: 1, generation: f.config.router.generation, routerTime: f.now(), devices: [SEED, TABLET, LAPTOP].map(mac => ({mac, ipv4: [], hostname: null, source: 'neigh'})), truncated: false, errors: []});
+            const rows = inventory.list(actor).devices;
+            assert.deepEqual(rows.map(d => [d.mac, d.inScope]), [[SEED, true], [TABLET, ['fresh', 'remembered'].includes(scenario)], [LAPTOP, false]]);
+            // Pending rows first; an admitted enrollment may create an active operation.
+            for (const row of [...rows].sort((a, b) => Number(a.inScope) - Number(b.inScope))) {
+                const result = await f.act(op, 'device_add', 'pilot', {label: 'Inventory device', mac: row.mac, precondition}).catch((error: {status: number; code: string}) => ({status: error.status, body: {error: {code: error.code}}}));
+                assert.equal(result.status === 409 && result.body.error?.code === 'device_pending_router_scope', !row.inScope, row.mac);
+                assert.equal(inventory.acknowledge(actor, row.mac).inScope, row.inScope, 'acknowledge uses the same DTO scope calculation');
+            }
+        } finally { f.cleanup(); }
+    });
+}
+
+test('an enrolling row whose operation has ended is removed through the normal path; one still in flight is refused', async () => {
+    const f = fixture();
+    try {
+        const op = await f.signIn('operator'); await f.observe();
+        const id = (await f.act(op, 'device_add', 'pilot', {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id as string;
+        await f.dispatch(id); f.advance(1); await f.observe();
+        const tablet = f.store.get<{id: string}>('SELECT id FROM devices WHERE identifier=?', TABLET)!.id;
+        const stick = (state: string) => { f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE id=?", id, tablet); f.store.run('UPDATE operations SET state=? WHERE id=?', state, id); };
+        for (const state of ['pending', 'unknown']) { stick(state); await assert.rejects(f.act(op, 'device_remove', tablet, {precondition: f.token()}), code('device_change_in_progress'), state); }
+        // Final operation, router holds it: the removal is queued on the router, and the row goes when that settles.
+        stick('conflict');
+        const removed = await f.act(op, 'device_remove', tablet, {precondition: f.token()});
+        assert.equal(removed.body.operation.action, 'unenroll');
+        assert.equal(f.store.get<{state: string}>('SELECT state FROM devices WHERE id=?', tablet)!.state, 'removing');
+        await f.dispatch(removed.body.operation.id);
+        assert.equal(f.store.get('SELECT id FROM devices WHERE id=?', tablet), undefined);
+        assert.deepEqual(f.router.policy.people, [{id: 'pilot', macs: [SEED]}]);
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken, 'the list is healthy again once the stuck row is gone');
+        // Final operation, router does not hold it: no router change.
+        f.advance(1); await f.observe();
+        f.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES('d_stuck','pilot','Stuck','mac',?,'enrolling',?,1)", LAPTOP, id);
+        stick('failed'); f.store.run("UPDATE devices SET state='enrolling',operation_id=? WHERE id='d_stuck'", id); f.store.run("DELETE FROM devices WHERE id=?", tablet);
+        assert.deepEqual((await f.act(op, 'device_remove', 'd_stuck', {precondition: null})).body, {removed: 'd_stuck', routerChange: false});
+    } finally { f.cleanup(); }
+});
+
+/** The real way to get an unsettled enrol: the operation ends in conflict while no observation is stored (worker settleDevices returns early). */
+async function stuckEnrol(f: ReturnType<typeof fixture>) {
+    const op = await f.signIn('operator'); await f.observe();
+    const id = (await f.act(op, 'device_add', 'pilot', {label: 'Tablet', mac: TABLET, precondition: f.token()})).body.operation.id as string;
+    f.store.run('UPDATE service_state SET observation_json=NULL,observed_at=NULL WHERE singleton=1');
+    (f.worker as any).updateOperation(id, 'conflict', 'router_base_changed');
+    f.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+    assert.equal(f.store.get<{state: string}>('SELECT state FROM devices WHERE identifier=?', TABLET)!.state, 'enrolling');
+    return {op, id, tablet: f.store.get<{id: string}>('SELECT id FROM devices WHERE identifier=?', TABLET)!.id};
+}
+
+test('a stuck enrol the router does not hold neither hides the revision token nor blocks other changes; removing it is local', async () => {
+    const f = fixture();
+    try {
+        const s = await stuckEnrol(f);
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken);
+        await f.dispatch(f.pause(0, 'pause_while_stuck_1').result.operation.id);
+        f.advance(1); await f.observe();
+        assert.deepEqual((await f.act(s.op, 'device_remove', s.tablet, {precondition: null})).body, {removed: s.tablet, routerChange: false});
+    } finally { f.cleanup(); }
+});
+
+test('a stuck enrol the router holds counts as configured, so the list is healthy and the removal queues a router unenroll', async () => {
+    const f = fixture();
+    try {
+        const s = await stuckEnrol(f);
+        f.router.policy = {...f.router.policy, people: f.router.policy.people.map((p: any) => p.id === 'pilot' ? {...p, macs: [...p.macs, TABLET].sort()} : p)};
+        f.advance(1); await f.observe();
+        assert.ok(f.policy.people(actor).revisionToken);
+        const removed = await f.act(s.op, 'device_remove', s.tablet, {precondition: f.token()});
+        assert.equal(removed.body.operation.action, 'unenroll');
+    } finally { f.cleanup(); }
+});
+
+test('a stuck enrol with no fresh observation is not counted, and its removal is refused 503 without touching anything', async () => {
+    const f = fixture();
+    try {
+        const s = await stuckEnrol(f);
+        const snapshot = () => JSON.stringify([f.store.all('SELECT * FROM devices'), f.store.all('SELECT id,state FROM operations'), f.store.get<{n: number}>('SELECT count(*) n FROM audit')]);
+        const before = snapshot();
+        await assert.rejects(f.act(s.op, 'device_remove', s.tablet, {precondition: null}), code('approved_router_observation_required'));
+        assert.equal(snapshot(), before);
+        // Even once an observation that holds the device exists, it stops counting when that observation goes stale.
+        f.router.policy = {...f.router.policy, people: f.router.policy.people.map((p: any) => p.id === 'pilot' ? {...p, macs: [...p.macs, TABLET].sort()} : p)};
+        f.advance(1); await f.observe();
+        assert.ok(!(f.policy.people(actor) as any).errors.includes('pilot_device_not_enrolled'));
+        f.advance(OBSERVATION_FRESH_SECONDS + 1);
+        assert.ok((f.policy.people(actor) as any).errors.includes('pilot_device_not_enrolled'));
+        assert.equal(f.policy.people(actor).revisionToken, null);
     } finally { f.cleanup(); }
 });

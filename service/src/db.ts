@@ -6,7 +6,7 @@ export class Store {
     readonly db: DatabaseSync;
     constructor(path: string, migrationSQL?: string, internalMode?: 'integration') {
         const migrations = migrationSQL === undefined
-            ? (internalMode === 'integration' ? ['001.sql', '002.sql', '005.sql', '006.sql', '007.sql', '008.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql', '007.sql', '008.sql']).map(name => {
+            ? (internalMode === 'integration' ? ['001.sql', '002.sql', '005.sql', '006.sql', '007.sql', '008.sql', '009.sql', '010.sql', '011.sql', '012.sql', '013.sql', '014.sql', '015.sql', '016.sql'] : ['001.sql', '002.sql', '003.sql', '004.sql', '005.sql', '006.sql', '007.sql', '008.sql', '009.sql', '010.sql', '011.sql', '012.sql', '013.sql', '014.sql', '015.sql', '016.sql']).map(name => {
                 const sql = readFileSync(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url)), 'utf8');
                 // CAS allocates base+1. An explicitly never-delivered intent cannot reserve that router revision.
                 return internalMode === 'integration' && name === '001.sql' ? sql.replace('revision INTEGER NOT NULL UNIQUE', 'revision INTEGER NOT NULL') : sql;
@@ -59,12 +59,14 @@ export class Store {
                     operations: 'id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error,confirmed_at',
                     audit: 'id,actor_id,operation_id,action,revision,timestamp,outcome',
                     request_links: 'id,person_id,token_hash,created_by,created_at,revoked_at,revoked_by',
-                    time_requests: 'id,link_id,person_id,minutes,reason,state,created_at,expires_at,decided_by,decided_at,granted_minutes,allowance_until,decision_code,attempts,resume_operation_id,resume_revision,original_pause_until,repause_state,repause_operation_id,repause_error,repause_failures,next_attempt_at',
+                    time_requests: 'id,link_id,person_id,minutes,reason,state,created_at,expires_at,decided_by,decided_at,granted_minutes,allowance_until,decision_code,attempts,resume_operation_id,resume_revision,original_pause_until,repause_state,repause_operation_id,repause_error,repause_failures,next_attempt_at,apply_via,grant_operation_id',
                 };
                 if (internalMode !== 'integration') required.parent_alerts = 'id,person_id,kind,severity,created_at,first_seen,last_seen,count,state,acknowledged_at,acknowledged_by,resolved_at,details'; // demo-only table; integration migrations stop at 002
                 try {
                     for (const [table, columns] of Object.entries(required)) this.db.prepare(`SELECT ${columns} FROM ${table} LIMIT 0`).all();
                 } catch { throw new Error('unsupported_database_schema'); }
+                // Intentionally outside the numbered migrations: the previous service must remain able to open this DB.
+                this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/admin-batches.sql', import.meta.url), 'utf8')));
             }
         }
         catch (error) {

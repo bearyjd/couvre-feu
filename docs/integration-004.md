@@ -124,6 +124,31 @@ database — `integration.sqlite` together with `integration.sqlite-wal` and
   adults' devices can never be added — changing protection stays a manifest edit plus
   rebind), never already managed by any entry (`device_already_enrolled`, without naming
   the owner).
+- **First-run batch step-up (service).** `child_batch` options commit to the exact ordered
+  canonical list (at most 40 `child_create`, `child_rename`, `device_add` items), the
+  client idempotency key and the shared revision precondition. One 120-second, one-use
+  assertion is bound to session/account; its challenge is SHA-256 of the UTF-8 binding
+  digest plus a random base64url nonce. Before prompting, the future client must check
+  both the canonical echo and the derived challenge. Execute is `POST /admin/children/batch`
+  with the same `Idempotency-Key`. Singles retain their existing step-up flow.
+  Only ready devices enter a batch: assignment `inScope`, fresh healthy router observation,
+  and a lease/neighbour address in the current generation's latest complete inventory
+  poll within 30 seconds. These checks run again inside the transaction; any unready item
+  refuses the entire batch with `device_not_ready`, never creates a scope request.
+  Creates/renames alone need no router precondition and never queue a router operation.
+  With device adds, all rows stage for one composed policy (revision +1), one operation,
+  and all-or-nothing local writes. A later router rejection removes every pending device
+  while keeping the children saved. Limits accumulate per item and are reasserted before
+  commit. Audit reuses existing actions once per child, counts devices in the legacy log,
+  stores ids only, and commits in the same transaction. Additive tables preserve old-binary
+  readability without rebuilding parent_audit or bumping user_version.
+  Options issuance is limited to three batches per actor per minute. A persisted first-run
+  marker gates later setup unless an admin has fresh proof that no nonseed active device
+  is router-confirmed. Transactional retry lookup precedes that gate; fresh-assertion retries
+  return stored results, changed bodies with an old key conflict, and consumed refusals
+  are retained. See [the batch contract](service-contract.md#first-run-batch-step-up-integration-service)
+  for wire fields, canonicalization and retry behavior. The [throwaway design](design/first-run/DESIGN.md)
+  is preserved for the later client task; its original single-change API notes are historical.
 - **Router scope.** The router's `--rpc-allow` set is the install-time floor; the live
   `rpc-allowed` may grow past it, and `rpc-status` reports `scope`/`scopeSha` on scoped installs
   (see `docs/contracts/tier1-rpc.md` section 7; routers before the scope release do not report
@@ -263,9 +288,12 @@ must invalidate the record externally after any such reviewed event and re-estab
 exact-target clock/schedule evidence before definitive schedule state. This is an
 operational acceptance gate; local date/IANA conversion cannot substitute for it.
 
-Optional `timeRequests` is an exact object `{"enabled": true|false}`; any other shape
-rejects the manifest. Child time requests are OFF in integration mode unless it is
-present with `enabled: true`: when off, `/child/*`, `/request.html` and `/request.js`
+Optional `timeRequests` is an exact object `{"mode": "off"|"owner"|"parents"}` (legacy
+`{"enabled": true|false}` still parses as `parents`/`off`); any other shape rejects the
+manifest. `owner` requires the optional top-level `ownerAccountId`, which must name an
+entry of `accounts`; only that account sees or decides requests and their alert. `ownerAccountId` is validated but ignored in other modes. Mode `off` hides existing `time_request_pending` alerts from everyone (rows are kept and reappear when the mode is turned back on). Owner mode narrows the parent UI/API; it is **not** a security boundary against other admins: an admin whose scope covers all of the owner's children can still add a credential to the owner account. Tracked follow-ups: protect the owner account from other admins, and a startup check that the owner account exists and is active. A non-owner admin can still see an active allowance in `/people` and can end it with Pause (pause wins), and deleting a child is refused while a request is pending. Using
+these keys changes `manifestDigest` and `integrationScope`. Child time requests are OFF
+in integration mode unless a mode other than `off` is present: when off, `/child/*`, `/request.html` and `/request.js`
 return 404, no request link can be issued, and no follow-up timer runs. When on, an
 approval writes a resume through the normal revision-CAS path and the service later
 writes a re-pause. Without automatic `dispatch`, both of those queued intents wait for
@@ -358,7 +386,7 @@ Apply requires an approved cached exact-base/runtime observation within 30 secon
 
 ## Ordered live gates
 
-M4b still blocks the first live rehearsal and permanent installation: the new-format authenticated recovery path requires a final release identity, full independent adversarial review/test cycle and target eligibility checks. INSTALL remains unbounded until a separately reviewed whole-transaction supervisor phase. Production legacy automatic restoration refuses; narrowing the previous compatibility promise remains an outstanding scope decision and needs a separate maintenance recovery follow-up. Complete the separately approved read-only `setsid` inspection before rehearsal; retain password login and full administrator recovery access. See the [v2 pilot runbook](runbooks/live-penn-pilot-v2.md) and [authenticated recovery contract](runbooks/vendor-platform-admission.md). New-format recovery runs a complete authenticated external `cfctl recover-install-lock`, then the single ordinary `uninstall.sh`; never remove locks manually. Immutable PREPARED, permanent kernel exclusion and generation-bound cron/firewall callbacks preserve recovery ownership. Exact source-hash admission narrows production eligibility; target sources and behavior remain UNVERIFIED. Historical fixtures provide no hardware, packet, reboot or production legacy proof.
+M4b still blocks the first live rehearsal and permanent installation: the new-format authenticated recovery path requires a final release identity, full independent adversarial review/test cycle and target eligibility checks. INSTALL remains unbounded until a separately reviewed whole-transaction supervisor phase. Production legacy automatic restoration refuses; narrowing the previous compatibility promise remains an outstanding scope decision and needs a separate maintenance recovery follow-up. Complete the separately approved read-only pinned static helper inspection (hash verification before the status-7 `setsid` probe; the helper ships inside the reviewed release and uninstall removes or restores it, without a package-manager install) before rehearsal; retain password login and full administrator recovery access. See the [v2 pilot runbook](runbooks/live-penn-pilot-v2.md) and [authenticated recovery contract](runbooks/vendor-platform-admission.md). New-format recovery runs a complete authenticated external `cfctl recover-install-lock`, then the single ordinary `uninstall.sh`; never remove locks manually. Immutable PREPARED, permanent kernel exclusion and generation-bound cron/firewall callbacks preserve recovery ownership. Exact source-hash admission narrows production eligibility; target sources and behavior remain UNVERIFIED. Historical fixtures provide no hardware, packet, reboot or production legacy proof.
 
 1. **Access and inspection:** independently approve any public-key provisioning;
    preserve exact original authorization bytes/modes/absence. Establish trusted host

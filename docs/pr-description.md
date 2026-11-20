@@ -8,7 +8,7 @@ Healthy unchanged expire/apply-fw and identical same-revision sync verify actual
 
 - Native fw3 schedules use early bidirectional time mirrors before established acceptance; persistent section/full-selector validation and concrete WAN reject-path witnesses prevent metadata-only health claims.
 - Bounded ASCII JSON without escapes becomes one atomic normalized TSV policy file, with revision checks, persisted protection and a ten-second pre-lock input deadline. Expanded native windows are capped at 256.
-- IPv4 kids DNS uses scoped redirection/INPUT handling; IPv6 external DNS is blocked instead of NAT6 redirected. No dnsmasq/WAN configuration edits. Bonus/Allow-until and future service/PWA work remain deferred.
+- IPv4 kids DNS uses scoped redirection/INPUT handling; IPv6 external DNS is blocked instead of NAT6 redirected. Kids' DoT/DoQ (TCP/UDP 853, UDP 784/8853) and policy-listed DoH addresses are rejected too ([details](enforcement-contract.md#dns-enforcement-today)). No dnsmasq/WAN configuration edits (the 2026-10-27 owner lift covers only the kids' firewall DNS rules). Bonus/Allow-until and future service/PWA work remain deferred.
 
 ## Validation and remaining gates
 

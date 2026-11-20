@@ -53,7 +53,7 @@ test('shared serialization passes actual cfctl awk parser with canonical record/
     writeFileSync(path, serialized + '\n');
     try {
         const result = spawnSync('awk', ['-f', fileURLToPath(new URL('../../router/lib/json.awk', import.meta.url)), path], {
-            encoding: 'utf8', timeout: 3000
+            encoding: 'utf8', timeout: 3000 // timeout-ok: awk parse of a tiny file measured 0.01 s (300x headroom)
         });
         assert.equal(result.status, 0, result.stderr);
         assert.match(result.stdout, /A\talex\t1791691201/);

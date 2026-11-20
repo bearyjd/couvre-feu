@@ -27,11 +27,12 @@ export function testConfig(dir: string): IntegrationConfig {
 }
 export const actor: Actor = {id: 'operator', displayName: 'Test operator', role: 'admin', personIds: ['pilot'], permissionVersion: '1'};
 export function observation(config: IntegrationConfig, policy: RouterPolicy, time: number, receipt: RPCReceipt | null = null): RPCObservation {
-    const kids = policy.people.flatMap(p => p.macs).sort(), effective = effectivePauses(policy, time);
+    // Like cf_enforced_policy: an active allowance lifts the person's pause, so their MACs are not observed paused.
+    const kids = policy.people.flatMap(p => p.macs).sort(), effective = effectivePauses(policy, time), allowed = new Set(effectiveAllowances(policy, time).map(a => a.person));
     return {rpc_version: 1, generation: config.router.generation, acceptedPolicy: policy, policyDigest: policyDigest(policy), currentOperationId: receipt?.current ? receipt.operationId : null,
         routerTime: time, receipt, errors: [], status: {ok: true, desiredRevision: policy.revision, confirmedRevision: policy.revision, desiredPauses: policy.pauses, effectivePauses: effective,
             ...(policy.allowances ? {desiredAllowances: policy.allowances, effectiveAllowances: effectiveAllowances(policy, time)} : {}),
-            observed: {kids, paused: effective.flatMap(p => policy.people.find(person => person.id === p.person)!.macs).sort()}, drift: false, errors: [], capabilities: {ipv6: true, conntrack: true, nativeKernelConfirmed: true, addressCoverageComplete: true, routerCompatibilityVerified: false}}};
+            observed: {kids, paused: effective.filter(p => !allowed.has(p.person)).flatMap(p => policy.people.find(person => person.id === p.person)!.macs).sort()}, drift: false, errors: [], capabilities: {ipv6: true, conntrack: true, nativeKernelConfirmed: true, addressCoverageComplete: true, routerCompatibilityVerified: false}}};
 }
 /** Explicit fake transport for integration tests; never imported by an integration entry point. */
 export class TestRouter implements AsyncRouter {

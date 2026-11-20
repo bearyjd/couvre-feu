@@ -3,35 +3,45 @@ import type { Actor, EntryKind } from '../../shared/src/contracts.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
 import { mac as canonicalMac } from '../../shared/src/router-schema.ts';
+import { lookupVendor } from '../../shared/src/oui.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
-import { routerScopeOf } from './integration-config.ts';
 import { ScopeTracker } from './integration-scope.ts';
 import { ParentAlerts } from './parent-alerts.ts';
 import type { IntegrationPolicy, IntegrationOperation } from './integration-policy.ts';
-import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, TOKEN, activeChildren, devicesOf, movePolicy, withDevice, withoutDevice } from './integration-children.ts';
+import { ADDRESS_COVERAGE_REJECTIONS, CHILD_LIMIT, DEVICES_PER_CHILD, DEVICE_LIMIT, TOKEN, activeChildren, devicesOf, enrolInFlight, movePolicy, withDevice, withoutDevice } from './integration-children.ts';
 import type { ChildRow, DeviceRow } from './integration-children.ts';
 import type { Routed } from './time-requests-http.ts';
+import { audited, auditFor } from './parent-audit.ts';
+import { hasObligation } from './time-request-obligations.ts';
+import type { AuditAction } from './parent-audit.ts';
+import { ChildBatchAdmin } from './admin-children-batch.ts';
 
 /** Child/device-group and device changes. Admin-only; every one needs a fresh step-up bound to the exact change. */
 export type ChildAction = 'child_create' | 'child_remove' | 'device_add' | 'device_remove' | 'device_move';
+/** The device changes that reach the audit log; adding or removing a child entry is an admin setup change, not a parent action. */
+const AUDITED: Partial<Record<ChildAction, AuditAction>> = {device_add: 'device_assign', device_move: 'device_move', device_remove: 'device_remove'};
 export const CHILD_ACTIONS: readonly ChildAction[] = ['child_create', 'child_remove', 'device_add', 'device_remove', 'device_move'];
 const ID = /^[a-z][a-z0-9_]{0,31}$/;
 const KINDS: readonly EntryKind[] = ['child', 'device_group'];
 export interface ChildAdminDTO {
     id: string; name: string; kind: EntryKind;
-    devices: {id: string; label: string; mac: string; state: DeviceRow['state']; onRouter: boolean | null}[];
+    devices: {id: string; label: string; mac: string; vendor?: string; state: DeviceRow['state']; onRouter: boolean | null}[];
 }
+/** A device request still waiting for the router's own administrator. Ids, the child, the device-reported name and the age only: never the address, never who asked or the digests. */
+export interface PendingScopeDTO { id: string; childId: string; name: string | null; status: 'pending'; ageSeconds: number }
+/** More than the per-child cap allows across every child; a bound on the read, not a limit on requests. */
+export const PENDING_SCOPE_LIST_LIMIT = 64;
 export interface RejectionDTO { operationId: string; code: string; at: number; devices: {child: string; device: string}[]; otherDevices: number }
 
-function label(value: unknown, code: string): string {
+export function label(value: unknown, code: string): string {
     if (typeof value !== 'string') throw new AppError(400, code);
     const trimmed = value.trim();
     if (trimmed.length < 1 || trimmed.length > 64 || /[\x00-\x1f\x7f]/.test(trimmed)) throw new AppError(400, code);
     return trimmed;
 }
 /** Accepts upper case and dash separators; the result is the router's canonical unicast form (multicast/zero refused). */
-function macInput(value: unknown): string {
+export function macInput(value: unknown): string {
     if (typeof value !== 'string' || value.length > 17) throw new AppError(400, 'invalid_mac');
     return canonicalMac(value.trim().toLowerCase().replaceAll('-', ':'));
 }
@@ -62,29 +72,43 @@ function normalize(kind: ChildAction, target: unknown, params: unknown): {target
 const bindingOf = (kind: ChildAction, target: string, params: Record<string, unknown>) => digest(JSON.stringify(['child_admin', kind, target, params]));
 /** A placeholder for a person to fill in at the router, never a command with a MAC or digest: the app must not hand out something paste-ready (design H2). */
 const PENDING_SCOPE_TEXT = 'The router has not approved this device yet. A router administrator runs: cfctl scope-add <ADDRESS FROM DEVICE SETTINGS> --base <router-read>. Read the address from the device\'s own Wi-Fi settings, never from this page.';
+const vendorOf = (mac: string): {vendor?: string} => { const vendor = lookupVendor(mac); return vendor ? {vendor} : {}; };
 const id = (prefix: string) => `${prefix}_${randomBytes(5).toString('hex')}`;
 
 export class ChildAdmin {
     readonly auth: Auth;
     readonly policy: IntegrationPolicy;
     readonly scope: ScopeTracker;
+    readonly batch: ChildBatchAdmin;
     constructor(auth: Auth, policy: IntegrationPolicy) {
         this.auth = auth; this.policy = policy;
         this.scope = new ScopeTracker(policy.store, new ParentAlerts(policy.store, null, policy.now), policy.now);
+        this.batch = new ChildBatchAdmin(auth, policy);
     }
     private get store() { return this.policy.store; }
     private allowed(actor: Actor): void { if (actor.role !== 'admin') throw new AppError(403, 'admin_required'); }
     static isAction(value: unknown): value is ChildAction { return CHILD_ACTIONS.includes(value as ChildAction); }
     /** In-scope entries with their device identifiers (admins type them in), router membership and the last refusal. */
-    list(actor: Actor): {children: ChildAdminDTO[]; canCreate: boolean; limits: {children: number; devicesPerChild: number; devices: number}; lastRejection: RejectionDTO | null} {
+    list(actor: Actor): {children: ChildAdminDTO[]; canCreate: boolean; limits: {children: number; devicesPerChild: number; devices: number}; lastRejection: RejectionDTO | null; pendingScope: PendingScopeDTO[]} {
         this.allowed(actor);
         const o = this.policy.fresh() ? this.store.observation().value : null;
         const children = activeChildren(this.store).filter(child => actor.personIds.includes(child.id)).map(child => ({id: child.id, name: child.name, kind: child.kind,
-            devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, mac: d.identifier, state: d.state,
+            devices: devicesOf(this.store, child.id).map(d => ({id: d.id, label: d.label, mac: d.identifier, ...vendorOf(d.identifier), state: d.state,
                 onRouter: o ? o.acceptedPolicy.people.some(p => p.id === child.id && p.macs.includes(d.identifier)) : null}))}));
-        return {children, canCreate: this.scopeAll(actor.id), limits: {children: CHILD_LIMIT, devicesPerChild: DEVICES_PER_CHILD, devices: DEVICE_LIMIT}, lastRejection: this.rejection(actor)};
+        return {children, canCreate: this.scopeAll(actor.id), limits: {children: CHILD_LIMIT, devicesPerChild: DEVICES_PER_CHILD, devices: DEVICE_LIMIT}, lastRejection: this.rejection(actor), pendingScope: this.pendingScope(children.map(c => c.id))};
+    }
+    /** Requests still waiting for router approval, from the service's own records so they survive a reload. Names come from the router's device list, never from the request. */
+    private pendingScope(visible: string[]): PendingScopeDTO[] {
+        if (!visible.length) return [];
+        const now = this.policy.now();
+        return this.store.all<{id: string; person_id: string; created_at: number; hostname: string | null}>(
+            `SELECT r.id,r.person_id,r.created_at,i.hostname FROM scope_requests r LEFT JOIN inventory_devices i ON i.generation=r.generation AND i.mac=r.mac
+             WHERE r.state='pending' AND r.generation=? AND r.expires_at>? AND r.person_id IN (${visible.map(() => '?').join(',')}) ORDER BY r.created_at,r.id LIMIT ?`,
+            this.store.config.router.generation, now, ...visible, PENDING_SCOPE_LIST_LIMIT)
+            .map(r => ({id: r.id, childId: r.person_id, name: r.hostname, status: 'pending' as const, ageSeconds: Math.max(0, now - r.created_at)}));
     }
     async stepUpOptions(session: AuthSession, input: unknown) {
+        if ((input as {action?: unknown} | null)?.action === 'child_batch') return this.batch.stepUpOptions(session, input);
         const body = object(input, ['action', 'target', 'params']);
         if (!ChildAdmin.isAction(body.action)) throw new AppError(400, 'invalid_action');
         this.allowed(session.dto.actor);
@@ -93,6 +117,18 @@ export class ChildAdmin {
     }
     /** Verifies the step-up, then re-checks role, scope and installation identity and applies the change with its audit row in one transaction. */
     async perform(session: AuthSession, kind: ChildAction, target: string, input: unknown): Promise<Routed> {
+        const action = AUDITED[kind];
+        if (!action || !auditFor(this.store).enabled) return this.performChange(session, kind, target, input);
+        const actor = session.dto.actor;
+        // Read before the change: a local device removal deletes the row it would be found by.
+        const owner = kind === 'device_add' ? target : this.store.get<{person_id: string}>('SELECT person_id FROM devices WHERE id=?', target)?.person_id;
+        const people = owner && actor.personIds.includes(owner) ? [owner] : [];
+        return audited(this.store, {actor: actor.id, action, now: this.policy.now, people: () => people, done: r => {
+            const id = (r.body as {operation?: {id: string}}).operation?.id ?? null, op = id ? this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id) : undefined;
+            return {operationId: id, ...(op ? {people: this.policy.affectedPeople(op)} : {}), result: r.status >= 500 ? 'failed' : r.status >= 400 ? 'refused' : 'applied'};
+        }}, () => this.performChange(session, kind, target, input));
+    }
+    private async performChange(session: AuthSession, kind: ChildAction, target: string, input: unknown): Promise<Routed> {
         this.allowed(session.dto.actor);
         if (!input || typeof input !== 'object' || Array.isArray(input)) throw new AppError(400, 'invalid_object');
         const {stepUp, ...rest} = input as Record<string, unknown>;
@@ -112,13 +148,7 @@ export class ChildAdmin {
     }
     private scopeAll(account: string): boolean { return this.store.get<{scope_all: number}>('SELECT scope_all FROM accounts WHERE id=?', account)?.scope_all === 1; }
     private obligations(person: string): boolean {
-        return Boolean(this.store.get("SELECT id FROM time_requests WHERE person_id=? AND (state IN ('pending','approving') OR repause_state IN ('waiting','applying')) LIMIT 1", person));
-    }
-    /** The install-time floor, or a MAC the router itself reported in scope on a fresh observation. Old routers report none, so only the floor counts. */
-    private inRouterScope(mac: string): boolean {
-        if (routerScopeOf(this.store.config).includes(mac)) return true;
-        // The remembered scope is generation-checked and only ever written from a clean reply; a reply carrying errors cannot vouch for a MAC.
-        return this.policy.fresh() && this.scope.observedScope().includes(mac);
+        return hasObligation(this.store, {person, includePending: true});
     }
     private apply(actor: Actor, kind: ChildAction, target: string, params: Record<string, unknown>): {status?: number; body?: unknown; op?: IntegrationOperation; audit: string} {
         const now = this.policy.now(), config = this.store.config;
@@ -142,6 +172,8 @@ export class ChildAdmin {
             if (this.store.get("SELECT 1 FROM devices WHERE move_to=? AND state='moving'", target)) throw new AppError(409, 'device_change_in_progress', 'A device is being moved to this entry.');
             if (this.obligations(target)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
             this.store.run('UPDATE people SET active=0 WHERE id=?', target);
+            // The desired content filter belongs to this child only; a later entry must never inherit it.
+            this.store.run('DELETE FROM content_filter_desired WHERE person_id=?', target);
             this.store.run('UPDATE request_links SET revoked_at=?,revoked_by=? WHERE person_id=? AND revoked_at IS NULL', now, actor.id, target);
             return {body: {removed: target}, audit: target};
         }
@@ -156,7 +188,7 @@ export class ChildAdmin {
             if (devicesOf(this.store, target).length >= DEVICES_PER_CHILD) throw new AppError(409, 'child_device_limit_reached', `The router holds at most ${DEVICES_PER_CHILD} devices per entry.`);
             if (this.store.get<{n: number}>('SELECT count(*) n FROM devices')!.n >= DEVICE_LIMIT) throw new AppError(409, 'device_limit_reached', `The router holds at most ${DEVICE_LIMIT} devices.`);
             if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
-            if (!this.inRouterScope(mac)) {
+            if (!this.scope.inRouterScope(mac, this.policy)) {
                 // Not thrown: the request row and the audit entry must commit. The canonical MAC is a field for the admin UI only.
                 const request = this.scope.request(actor, target, mac);
                 return {status: 409, body: {error: {code: 'device_pending_router_scope', message: PENDING_SCOPE_TEXT, mac, requestId: request.id}}, audit: `scope_request:${request.id}:${mac}:${actor.id}`};
@@ -170,7 +202,8 @@ export class ChildAdmin {
         const row = this.store.get<DeviceRow>('SELECT * FROM devices WHERE id=?', target);
         if (!row || !actor.personIds.includes(row.person_id) || !this.store.get('SELECT id FROM people WHERE id=? AND active=1', row.person_id)) throw new AppError(404, 'device_not_found');
         if (kind === 'device_move') return this.move(actor, row, params, request);
-        if (row.state !== 'active') throw new AppError(409, 'device_change_in_progress');
+        // An enrolling row whose operation has ended without settling it (a conflict with no stored observation) can only be left by this removal; one still in flight cannot.
+        if (row.state !== 'active' && (row.state !== 'enrolling' || enrolInFlight(this.store, row))) throw new AppError(409, 'device_change_in_progress');
         if (!this.policy.fresh()) throw new AppError(503, 'approved_router_observation_required');
         const o = this.store.observation().value!;
         if (!o.acceptedPolicy.people.some(p => p.id === row.person_id && p.macs.includes(row.identifier))) {
@@ -215,7 +248,7 @@ export class ChildAdmin {
         const op = this.store.all<IntegrationOperation>('SELECT * FROM operations ORDER BY created_at DESC,rowid DESC LIMIT 64').find(row => this.policy.affectedPeople(row).some(person => actor.personIds.includes(person)));
         if (!op || op.state !== 'failed' || !op.error || !ADDRESS_COVERAGE_REJECTIONS.has(op.error) || this.policy.now() - op.updated_at > 86400) return null;
         const macs = [...new Set([op.base_json, op.payload_json].flatMap(json => (JSON.parse(json) as {people: {id: string; macs: string[]}[]}).people.flatMap(p => p.macs.map(m => `${p.id}\n${m}`))))].sort();
-        const request = JSON.parse(op.request_json) as {mac?: string; label?: string; target?: string};
+        const request = JSON.parse(op.request_json) as {mac?: string; label?: string; target?: string; devices?: {mac: string; label: string; person: string}[]};
         const names = new Map(this.store.all<ChildRow>('SELECT * FROM people').map(c => [c.id, c.name]));
         const devices: RejectionDTO['devices'] = [];
         let otherDevices = 0;
@@ -223,7 +256,7 @@ export class ChildAdmin {
             const [person, mac] = entry.split('\n');
             if (!actor.personIds.includes(person)) { otherDevices++; continue; }
             const row = this.store.get<DeviceRow>("SELECT * FROM devices WHERE identifier_kind='mac' AND identifier=?", mac);
-            const device = row?.label ?? (request.mac === mac ? request.label : undefined);
+            const device = row?.label ?? (request.mac === mac ? request.label : undefined) ?? request.devices?.find(d => d.person === person && d.mac === mac)?.label;
             if (device) devices.push({child: names.get(person) ?? person, device}); else otherDevices++;
         }
         return {operationId: op.id, code: op.error, at: op.updated_at, devices, otherDevices};
@@ -238,8 +271,10 @@ const DEVICE_MOVE = /^\/admin\/devices\/([a-z][a-z0-9_]{0,31})\/move$/;
 const CHILD = /^\/admin\/children\/([a-z][a-z0-9_]{0,31})\/(remove|devices)$/;
 const DEVICE = /^\/admin\/devices\/([a-z][a-z0-9_]{0,31})\/remove$/;
 /** Session- and CSRF-checked changes. `/step-up/options` is claimed only for this module's actions. */
-export async function childrenPost(admin: ChildAdmin | null, session: AuthSession, path: string, payload: unknown): Promise<Routed | null> {
+export async function childrenPost(admin: ChildAdmin | null, session: AuthSession, path: string, payload: unknown, key?: string): Promise<Routed | null> {
     if (!admin) return null;
+    if (path === '/admin/children/batch') return admin.batch.perform(session, payload, key);
+    if (path === '/step-up/options' && (payload as {action?: unknown} | null)?.action === 'child_batch') return {status: 200, body: await admin.stepUpOptions(session, payload)};
     if (path === '/step-up/options') return ChildAdmin.isAction((payload as {action?: unknown} | null)?.action) ? {status: 200, body: await admin.stepUpOptions(session, payload)} : null;
     if (path === '/admin/children') return admin.perform(session, 'child_create', '', payload);
     const child = CHILD.exec(path);

@@ -39,9 +39,45 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         save({...manifest, accounts: [...manifest.accounts, ...Array.from({length: ACCOUNT_LIMIT}, (_, i) => ({id: `p${i}`, displayName: 'P', role: 'parent', personIds: ['pilot']}))]}); assert.throws(() => integrationConfig(path), /invalid_integration_manifest|body_too_large/); // the 64 KiB manifest bound may bind first
         assert.equal(c.dispatch, undefined);
         assert.equal(c.timeRequests, undefined, 'time requests are off unless explicitly enabled');
-        save({...manifest, timeRequests: {enabled: true}}); assert.equal(integrationConfig(path).timeRequests?.enabled, true);
-        save({...manifest, timeRequests: {enabled: false}}); assert.equal(integrationConfig(path).timeRequests?.enabled, false);
+        // Legacy {enabled} still parses: true is 'parents' (every parent, as before), false is 'off'.
+        save({...manifest, timeRequests: {enabled: true}}); assert.deepEqual(integrationConfig(path).timeRequests, {mode: 'parents'});
+        save({...manifest, timeRequests: {enabled: false}}); assert.deepEqual(integrationConfig(path).timeRequests, {mode: 'off'});
+        for (const mode of ['off', 'parents']) { save({...manifest, timeRequests: {mode}}); assert.deepEqual(integrationConfig(path).timeRequests, {mode}); assert.equal(integrationConfig(path).ownerAccountId, undefined); }
+        save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId: 'parent'});
+        const owned = integrationConfig(path); assert.deepEqual(owned.timeRequests, {mode: 'owner'}); assert.equal(owned.ownerAccountId, 'parent');
+        assert.notEqual(owned.manifestDigest, c.manifestDigest, 'the new keys change the manifest digest and integration scope');
+        assert.notEqual(owned.provenance.integrationScope, c.provenance.integrationScope);
+        save({...manifest, timeRequests: {mode: 'parents'}, ownerAccountId: 'operator'}); assert.equal(integrationConfig(path).ownerAccountId, 'operator');
+        save({...manifest, timeRequests: {mode: 'owner'}}); assert.throws(() => integrationConfig(path), /owner_account_required/);
+        save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId: 'stranger'}); assert.throws(() => integrationConfig(path), /invalid_owner_account/);
+        save({...manifest, ownerAccountId: 'stranger'}); assert.throws(() => integrationConfig(path), /invalid_owner_account/);
+        for (const ownerAccountId of [1, null, '', ['parent']]) { save({...manifest, timeRequests: {mode: 'owner'}, ownerAccountId}); assert.throws(() => integrationConfig(path)); }
+        for (const timeRequests of [{mode: 'everyone'}, {mode: 1}, {mode: 'owner', extra: 1}, {mode: 'owner', enabled: true}, {mode: 'off', enabled: false}]) { save({...manifest, timeRequests, ownerAccountId: 'parent'}); assert.throws(() => integrationConfig(path)); }
         for (const timeRequests of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, true, null, []]) { save({...manifest, timeRequests}); assert.throws(() => integrationConfig(path)); }
+        // auditLog: absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.auditLog, undefined, 'the audit log is off unless explicitly enabled');
+        for (const enabled of [true, false]) { save({...manifest, auditLog: {enabled}}); assert.deepEqual(integrationConfig(path).auditLog, {enabled}); }
+        for (const auditLog of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, auditLog}); assert.throws(() => integrationConfig(path)); }
+        // installReadiness (UI plan I): absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.installReadiness, undefined);
+        for (const enabled of [true, false]) { save({...manifest, installReadiness: {enabled}}); assert.deepEqual(integrationConfig(path).installReadiness, {enabled}); }
+        for (const installReadiness of [{enabled: 'true'}, {}, {enabled: true, extra: 1}, true, null]) { save({...manifest, installReadiness}); assert.throws(() => integrationConfig(path)); }
+        // push and digest (B7): absent is OFF; strict {enabled: boolean}; the digest is delivered by push, so it needs push on.
+        assert.equal(c.push, undefined); assert.equal(c.digest, undefined);
+        for (const enabled of [true, false]) { save({...manifest, push: {enabled}}); assert.deepEqual(integrationConfig(path).push, {enabled}); }
+        for (const push of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, topic: 'x'}, true, null, []]) { save({...manifest, push}); assert.throws(() => integrationConfig(path)); }
+        for (const digest of [{enabled: 'true'}, {}, {enabled: true, day: 1}, null]) { save({...manifest, push: {enabled: true}, digest}); assert.throws(() => integrationConfig(path)); }
+        save({...manifest, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
+        save({...manifest, push: {enabled: false}, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
+        save({...manifest, push: {enabled: true}, digest: {enabled: true}}); assert.deepEqual(integrationConfig(path).digest, {enabled: true});
+        // rewardTime (F4): absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.rewardTime, undefined, 'reward time is off unless explicitly enabled');
+        for (const enabled of [true, false]) { save({...manifest, rewardTime: {enabled}}); assert.deepEqual(integrationConfig(path).rewardTime, {enabled}); }
+        for (const rewardTime of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, rewardTime}); assert.throws(() => integrationConfig(path)); }
+        // focus (F5): absent is OFF; strict {enabled: boolean}.
+        assert.equal(c.focus, undefined, 'focus window is off unless explicitly enabled');
+        for (const enabled of [true, false]) { save({...manifest, focus: {enabled}}); assert.deepEqual(integrationConfig(path).focus, {enabled}); }
+        for (const focus of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, extra: 1}, {mode: 'on'}, true, null, []]) { save({...manifest, focus}); assert.throws(() => integrationConfig(path)); }
         save({...manifest, origin: 'https://parent.example.test:8443', dispatch: {enabled: true, pollSeconds: 2, maxBackoffSeconds: 60}});
         const enabled = integrationConfig(path); assert.equal(enabled.origin, 'https://parent.example.test:8443'); assert.equal(enabled.host, 'parent.example.test:8443'); assert.equal(enabled.dispatch?.enabled, true);
         const scheduled = {...manifest, enrollment: {...manifest.enrollment, schedules: [{person: 'pilot', id: 'bedtime', weekdays: ['Mon'], start: '21:00', stop: '07:00'}]}, scheduleClock: {timezone: 'America/New_York'}};

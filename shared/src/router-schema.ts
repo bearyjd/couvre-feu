@@ -247,6 +247,8 @@ export function allowanceWithinHorizon(until: number, now: number): boolean {
     return Number.isInteger(now) && now >= MIN_VALID_ROUTER_TIME && Number.isInteger(until) && until > now && until <= now + MAX_ALLOWANCE_SECONDS;
 }
 export function scheduleBlocked(policy: RouterPolicy, person: string, now: number): boolean {
+    // An active allowance lifts the person's schedules (router cf_enforced_policy); an expired one is inert.
+    if (effectiveAllowances(policy, now).some(a => a.person === person)) return false;
     // Fictional router explicitly uses UTC; deployment timezone/DST compatibility is not claimed.
     const date = new Date(now * 1000), day = (date.getUTCDay() + 6) % 7, previous = (day + 6) % 7;
     const time = `${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}`;

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+# timeout-ok-file: measured: installer shell runs 0.5 s max against 10-20 s limits (load 3-25)
 """Filesystem recovery fixtures; never invokes router/system backends."""
 import atexit
 import contextlib
 import hashlib
+import io
 import os
 import re
 import selectors
@@ -11,6 +13,7 @@ import shutil
 import shlex
 import subprocess
 import tempfile
+import tarfile
 import sys
 import time
 import unittest
@@ -18,6 +21,8 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
 import overlay  # noqa: E402
+from pinned_helper import fixture_environment, fixture_router
+import partition
 FILES = ('usr/lib/couvrefeu/core.sh', 'usr/lib/couvrefeu/rpc.sh', 'usr/lib/couvrefeu/state.awk', 'usr/lib/couvrefeu/firewall.sh', 'usr/lib/couvrefeu/json.awk', 'usr/lib/couvrefeu/rules.awk', 'usr/lib/couvrefeu/install-common.sh', 'usr/sbin/cfctl', 'usr/sbin/cfctl-ssh', 'etc/firewall.couvrefeu',
          'etc/config/firewall', 'etc/sysupgrade.conf', 'etc/crontabs/root',
          'etc/couvrefeu/protected', 'etc/couvrefeu/state')
@@ -33,8 +38,7 @@ def emitted_router():
         tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-emitted-')
         atexit.register(tmp.cleanup)
         tree = Path(tmp.name) / 'router'
-        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(tree)],
-                       check=True, capture_output=True)
+        fixture_router(REPO, tree)
         _EMITTED.append(tree)
     return _EMITTED[0]
 
@@ -141,11 +145,13 @@ def full_snapshot(root, *, completed_provenance=False):
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-install-')
+        # The fixture admission contract requires /tmp/couvre-feu-* even when
+        # a caller selects a persistent TMPDIR for other test artifacts.
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-install-', dir='/tmp')
         self.root = Path(self.tmp.name)
         # Permanent exclusion infrastructure survives ordinary uninstall.
         (self.root / '.couvrefeu-mutex').touch(mode=0o600)
-        self.env = dict(os.environ, CF_TEST_MODE='1', CF_ROOT=str(self.root))
+        self.env = dict(fixture_environment(os.environ), CF_TEST_MODE='1', CF_ROOT=str(self.root))
         self.env.pop('SSH_CONNECTION', None)
         self.env.pop('SSH_CLIENT', None)
 
@@ -391,7 +397,7 @@ class LiveScopeRecoveryTests(unittest.TestCase):
         self.assertIn('invalid RPC scope', result.stderr)
 
 
-NEW_FILES = FILES + ('usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh')
+NEW_FILES = FILES + ('usr/sbin/cfctl-scope', 'usr/lib/couvrefeu/platform-bootstrap.sh', 'usr/lib/couvrefeu/vendor-platform.sh', 'etc/couvrefeu/platform-profile', 'usr/lib/couvrefeu/activity.sh', 'usr/lib/couvrefeu/busybox-static')
 
 
 class InstallerTests(unittest.TestCase):
@@ -434,6 +440,9 @@ esac
         (self.source / 'lib/core.sh').write_text('cf_check() { [ "${CF_TEST_CHECK_FAIL:-0}" != 1 ]; }\n')
         for lib in ('install-common.sh', 'platform-bootstrap.sh', 'vendor-platform.sh'):
             shutil.copy2(REPO / 'router/lib' / lib, self.source / 'lib' / lib)
+        shutil.copy2(emitted_router() / 'lib/busybox-static', self.source / 'lib/busybox-static')
+        # Fake source fixtures still use the host helper pin in their bootstrap.
+        shutil.copy2(emitted_router() / 'lib/platform-bootstrap.sh', self.source / 'lib/platform-bootstrap.sh')
         backend = self.root / 'bin'
         backend.mkdir()
         (backend / '.couvrefeu-test-backend').touch()
@@ -608,7 +617,7 @@ esac
     def enable_release(self):
         self.env['CF_TEST_RELEASE_DIR'] = '1'
         (self.root / 'etc').mkdir(mode=0o755, exist_ok=True)
-        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        bootstrap = (emitted_router() / 'lib/platform-bootstrap.sh').read_text()
         release_id = next(line.split('=', 1)[1] for line in bootstrap.splitlines() if line.startswith('CF_RELEASE_ID='))
         return self.root / ('etc/.couvrefeu-release-' + release_id)
 
@@ -1347,7 +1356,7 @@ exec ''' + shlex.quote(real_hash) + ''' "$@"
         signal = self.root / 'hash-blocked'
         block.touch()
         command = [*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')),
-                   str(REPO / 'router/uninstall.sh')]
+                   str(emitted_router() / 'uninstall.sh')]
         process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         try:
@@ -1375,6 +1384,252 @@ exec ''' + shlex.quote(real_hash) + ''' "$@"
             if process.poll() is None:
                 process.kill()
             process.communicate()
+
+
+class ServiceSourceAdmissionTests(unittest.TestCase):
+    """Production gates with private paths, native modes and inert pinned bytes.
+
+    Only absolute paths, expected content pins and native UID/GID are adapted.
+    CF_TEST_MODE stays zero, so the production service gate cannot skip checks.
+    """
+    PROFILES = ('strict', 'gl-xe3000-4.8.3-logd-011-v1', 'gl-xe3000-4.8.3-os-trust-v1')
+    EXCEPTIONS = {'/usr/share': 0o775, '/etc/rc.common': 0o775,
+                  '/lib/functions/service.sh': 0o664}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='couvre-feu-service-sources-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        vendor = (REPO / 'router/lib/vendor-platform.sh').read_text()
+        gate = bootstrap[bootstrap.index('platform_service_sources() {'):bootstrap.index('platform_admit() {')]
+        pins = re.findall(r'(/[^ )]+)\) service_mode=([0-7]+); service_pin=([0-9a-f]{64});;', gate)
+        self.assertEqual(len(pins), 9)
+        for path in ['/etc', '/etc/init.d', '/lib', '/lib/functions', '/lib/config',
+                     '/usr', '/usr/share', '/usr/share/libubox', '/sbin']:
+            self.path(path).mkdir(parents=True, exist_ok=True)
+            self.path(path).chmod(0o755)
+        self.contents = {}
+        for path, mode, pin in pins:
+            content = ('inert source fixture for ' + path + '\n').encode()
+            if path == '/etc/init.d/cron':
+                content += b'USE_PROCD=1\n'
+            self.contents[path] = content
+            self.path(path).write_bytes(content)
+            self.path(path).chmod(int(mode, 8))
+            replacement = hashlib.sha256(content).hexdigest()
+            bootstrap = bootstrap.replace(pin, replacement)
+            vendor = vendor.replace(pin, replacement)
+        # One pass prevents remapping the private prefix introduced by a match.
+        def mapped(source):
+            return re.sub(r'/(etc|lib|usr|sbin)(?=/|[^A-Za-z0-9_-]|$)',
+                          lambda match: str(self.root / match.group(1)), source)
+        self.bootstrap = self.root / 'bootstrap.sh'
+        self.bootstrap.write_text(mapped(bootstrap))
+        self.vendor = self.root / 'vendor.sh'
+        self.vendor.write_text(mapped(vendor))
+        self.lib = self.root / 'admission-lib'
+        self.lib.mkdir(mode=0o700)
+        (self.lib / 'platform-bootstrap.sh').write_text('inert verified module fixture\n')
+        (self.lib / 'platform-bootstrap.sh').chmod(0o644)
+
+    def path(self, path):
+        return self.root / path.lstrip('/')
+
+    def run_gate(self, profile, path=None, metadata=None, entry=None, vendor=False):
+        target = str(self.path(path)) if path else ''
+        script = f'''set -eu
+CF_TEST_MODE=0
+. {shlex.quote(str(self.bootstrap))}
+. {shlex.quote(str(self.vendor))}
+CF_PLATFORM_PROFILE={profile}; vp_profile={profile}
+CF_PLATFORM_ENTRY_TICK=100
+platform_clock_tick() {{ printf 100; }}
+platform_stat() {{
+    if [ "$3" = {shlex.quote(target)} ] && [ -n {shlex.quote(metadata or '')} ]; then
+        printf '%s\\n' {shlex.quote(metadata or '')}
+    else
+        fixture_meta=$(command stat "$@") || return
+        printf '0:0:%s\\n' "${{fixture_meta##*:}}"
+    fi
+}}
+stat_private() {{ platform_stat "$@"; }}
+regular() {{ platform_regular "$@"; }}
+fail() {{ platform_fail "$@"; }}
+'''
+        if entry == 'cron-preflight':
+            common = (REPO / 'router/lib/install-common.sh').read_text()
+            start = common.index('cron_preflight() {')
+            stop = common.index('\n}', start) + 2
+            script += common[start:stop] + '\n'
+            script += re.search(r'^service_source_gate\(\).*$', common, re.M).group() + '\n'
+            script += f'''cron_script() {{ printf '%s\\n' {shlex.quote(str(self.path('/etc/init.d/cron')))}; }}
+cron_service() {{ printf cron-dispatch; }}
+cron_preflight
+'''
+        elif entry:
+            # Keep platform_admit's real entry dispatch and service checks;
+            # unrelated hardware, release and transaction work is inert.
+            script += f'''
+platform_choose() {{ CF_PLATFORM_PROFILE=$1; }}
+platform_bootstrap_vendor() {{ :; }}
+platform_verify_modules() {{ :; }}
+platform_external_closure() {{ :; }}
+platform_attest_vendor() {{ :; }}
+platform_profile_validate() {{ :; }}
+platform_lock_acquire() {{ :; }}
+platform_transaction_begin() {{ printf 'transaction:%s' "$1"; exit 91; }}
+ACTIVATE=1
+platform_admit {profile} '' {shlex.quote(str(self.lib))}
+'''
+        elif vendor:
+            script += f'vp_metadata {shlex.quote(target)}\n'
+        else:
+            script += 'platform_service_sources\n'
+        env = dict(os.environ, CF_TEST_MODE='0')
+        command = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        return subprocess.run(command + ['-c', script, str(self.root / (entry or 'gate'))],
+                              env=env, capture_output=True, text=True, timeout=15)
+
+    def assert_admission(self, profile, path=None, metadata=None, accepted=False):
+        # Run both independently: a production refusal cannot mask vp_metadata.
+        result = self.run_gate(profile, path, metadata)
+        self.assertEqual(result.returncode == 0, accepted, result.stderr)
+        if path:
+            result = self.run_gate(profile, path, metadata, vendor=True)
+            self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_observed_tuples_require_vendor_profiles(self):
+        for profile in self.PROFILES:
+            self.assert_admission(profile, accepted=True)
+        for path, mode in self.EXCEPTIONS.items():
+            with self.subTest(path=path):
+                target = self.path(path)
+                original = target.stat().st_mode & 0o7777
+                target.chmod(mode)
+                for profile in self.PROFILES:
+                    self.assert_admission(profile, path, accepted=profile != 'strict')
+                target.chmod(original)
+        for path, mode in self.EXCEPTIONS.items():
+            self.path(path).chmod(mode)
+        for profile in self.PROFILES:
+            self.assert_admission(profile, accepted=profile != 'strict')
+
+    def test_nearby_modes_and_owners_refuse_in_both_gates(self):
+        for path, admitted_mode in self.EXCEPTIONS.items():
+            target = self.path(path)
+            original = target.stat().st_mode & 0o7777
+            for mode in [0o777, 0o776, 0o2775, 0o1775, 0o4775, 0o665]:
+                target.chmod(mode)
+                for profile in self.PROFILES[1:]:
+                    with self.subTest(path=path, mode=oct(mode), profile=profile):
+                        self.assert_admission(profile, path)
+            target.chmod(admitted_mode)
+            for owner in ['1000:0', '0:1000']:
+                for mode in {admitted_mode, 0o775}:
+                    metadata = owner + ':' + format(mode, 'o')
+                    for profile in self.PROFILES[1:]:
+                        with self.subTest(path=path, metadata=metadata, profile=profile):
+                            self.assert_admission(profile, path, metadata)
+            target.chmod(original)
+
+    def test_links_and_canonical_parents_refuse(self):
+        for path, mode in self.EXCEPTIONS.items():
+            target = self.path(path)
+            saved = target.with_name(target.name + '.saved')
+            target.rename(saved)
+            target.symlink_to(saved, target_is_directory=saved.is_dir())
+            for profile in self.PROFILES[1:]:
+                with self.subTest(path=path, profile=profile):
+                    self.assert_admission(profile, path)
+            target.unlink()
+            saved.rename(target)
+        # A canonicality check must reject a symlink above an ordinary file.
+        parent = self.path('/lib/functions')
+        saved = parent.with_name('functions.saved')
+        parent.rename(saved)
+        parent.symlink_to(saved, target_is_directory=True)
+        for profile in self.PROFILES[1:]:
+            self.assert_admission(profile, '/lib/functions/service.sh')
+
+    def test_wrong_exception_types_refuse(self):
+        for path, mode in self.EXCEPTIONS.items():
+            target = self.path(path)
+            saved = target.with_name(target.name + '.saved')
+            target.rename(saved)
+            if saved.is_dir():
+                target.write_text('a file cannot replace a trusted parent\n')
+            else:
+                target.mkdir()
+            target.chmod(mode)
+            for profile in self.PROFILES[1:]:
+                with self.subTest(path=path, profile=profile):
+                    self.assert_admission(profile, path)
+            if target.is_dir():
+                target.rmdir()
+            else:
+                target.unlink()
+            saved.rename(target)
+
+    def test_exceptions_do_not_spread_to_other_paths(self):
+        for path, mode in [('/usr/share/libubox', 0o775), ('/lib/functions', 0o775),
+                           ('/etc/init.d/cron', 0o775), ('/lib/functions/procd.sh', 0o664)]:
+            target = self.path(path)
+            original = target.stat().st_mode & 0o7777
+            target.chmod(mode)
+            for profile in self.PROFILES[1:]:
+                with self.subTest(path=path, profile=profile):
+                    self.assert_admission(profile, path)
+            target.chmod(original)
+
+    def test_changed_content_refuses_even_with_observed_metadata(self):
+        for path in ['/etc/rc.common', '/lib/functions/service.sh']:
+            target = self.path(path)
+            original = target.stat().st_mode & 0o7777
+            for observed in [False, True]:
+                if observed:
+                    target.chmod(self.EXCEPTIONS[path])
+                target.write_bytes(self.contents[path] + b'changed\n')
+                for profile in self.PROFILES:
+                    with self.subTest(path=path, profile=profile, observed=observed):
+                        result = self.run_gate(profile)
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        if observed:
+                            result = self.run_gate(profile, path, vendor=True)
+                            self.assertNotEqual(result.returncode, 0, result.stderr)
+                target.write_bytes(self.contents[path])
+            target.chmod(original)
+
+    def test_install_uninstall_and_cron_share_production_gate(self):
+        for path, mode in self.EXCEPTIONS.items():
+            self.path(path).chmod(mode)
+        for entry in ['install.sh', 'uninstall.sh']:
+            for profile in self.PROFILES:
+                with self.subTest(entry=entry, profile=profile):
+                    result = self.run_gate(profile, entry=entry)
+                    self.assertEqual(result.returncode, 2 if profile == 'strict' else 91, result.stderr)
+                    self.assertEqual('transaction:' in result.stdout, profile != 'strict')
+        for profile in self.PROFILES:
+            with self.subTest(entry='cron-preflight', profile=profile):
+                result = self.run_gate(profile, entry='cron-preflight')
+                self.assertEqual(result.returncode, 2 if profile == 'strict' else 0, result.stderr)
+                self.assertEqual('cron-dispatch' in result.stdout, profile != 'strict')
+        for entry in ['install.sh', 'uninstall.sh']:
+            self.assertIn('platform_admit ', (REPO / 'router' / entry).read_text())
+
+    def test_cron_recovery_gate_precedes_observation_and_restoration(self):
+        common = (REPO / 'router/lib/install-common.sh').read_text()
+        headers = list(re.finditer(r'^[a-zA-Z_]+\(\) [({]', common, re.M))
+        functions = {header.group().split('(')[0]: common[header.start():
+                     headers[index + 1].start() if index + 1 < len(headers) else len(common)]
+                     for index, header in enumerate(headers)}
+        pending = functions['cron_quiescence_preflight']
+        self.assertLess(pending.index('service_source_gate'), pending.index('cron_quiescence_capture'))
+        restore = functions['cron_restore_barrier']
+        for operation in ['cron_quiescence_capture', 'journal_record', 'restore_original', 'cron_service reload']:
+            self.assertLess(restore.index('service_source_gate'), restore.index(operation))
+        uninstall = (REPO / 'router/uninstall.sh').read_text()
+        self.assertIn('then cron_restore_barrier; fi', uninstall)
 
 
 class SourceClosureBeforeAdmissionTests(unittest.TestCase):
@@ -1806,8 +2061,10 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
                          'usr/lib/couvrefeu/vendor-platform.sh',
                          'etc/couvrefeu/platform-profile',
                          'usr/lib/couvrefeu/activity.sh',
-                         # A legacy journal also predates the M1d per-admin scope wrapper.
-                         'usr/sbin/cfctl-scope')
+                         # A legacy journal also predates the M1d scope wrapper
+                         # and the journaled static session helper.
+                         'usr/sbin/cfctl-scope',
+                         'usr/lib/couvrefeu/busybox-static')
         for rel in FILES + adapter_files:
             key = rel.replace('/', '_')
             original = backup / (key + '.original')
@@ -1881,7 +2138,7 @@ grep -o -E '"running": *(true|false)' | sed 's/.*: *//'
                 before_refusal = full_snapshot(self.root)
                 result = self.install('--activate')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn('recovery required; run ordinary uninstall', result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
                 self.assertEqual(full_snapshot(self.root), before_refusal)
                 self.env.pop('CF_TEST_UNINSTALL_FAIL_AFTER')
                 result = self.run_script('uninstall.sh')
@@ -2156,7 +2413,7 @@ class ReleaseRetirementTests(unittest.TestCase):
         self.env['CF_TEST_RELEASE_DIR'] = '1'
         # Production /etc always exists before the release is created.
         (self.root / 'etc').mkdir(mode=0o755, exist_ok=True)
-        bootstrap = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
+        bootstrap = (emitted_router() / 'lib/platform-bootstrap.sh').read_text()
         release_id = next(line.split('=', 1)[1] for line in bootstrap.splitlines() if line.startswith('CF_RELEASE_ID='))
         return self.root / ('etc/.couvrefeu-release-' + release_id)
 
@@ -2192,12 +2449,11 @@ class ReleaseRetirementTests(unittest.TestCase):
         (release / 'lib').mkdir(parents=True, mode=0o700)
         release.chmod(0o700)
         emitted = self.root / 'emitted-release'
-        subprocess.run([sys.executable, '-I', str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
-                       check=True, capture_output=True)
+        shutil.copytree(emitted_router(), emitted)
         for line in (emitted / 'release.sha256').read_text().splitlines():
             name = line.split()[1]
             shutil.copyfile(emitted / name, release / name)
-            (release / name).chmod(0o644 if name.startswith('lib/') else 0o755)
+            (release / name).chmod(0o644 if name.startswith('lib/') and name != 'lib/busybox-static' else 0o755)
         shutil.copyfile(emitted / 'release.sha256', release / 'release.sha256')
         (release / 'release.sha256').chmod(0o600)
         before = self.snapshot()
@@ -2253,7 +2509,7 @@ class ReleaseRetirementTests(unittest.TestCase):
                 contextlib.closing(RouterFixture()) as fixture, contextlib.ExitStack() as stack:
             control = Path(folder)
             env = dict(fixture.env, CF_LOCK_PROBE=str(control), CF_TEST_INSTALL_KERNEL='1')
-            managed = (*NEW_FILES, 'usr/sbin/cfctl-scope', 'etc/couvrefeu/rpc-allowed')
+            managed = (*NEW_FILES, 'etc/couvrefeu/rpc-allowed')
             originals = {rel: exact_signature(fixture.root / rel) for rel in managed}
             kernel_before = fixture.backend()
             directories = {rel: (path.stat().st_mode & 0o7777, path.stat().st_uid, path.stat().st_gid)
@@ -2341,7 +2597,7 @@ class ReleaseRetirementTests(unittest.TestCase):
         self.legacy_runtime_lock()
         before = full_snapshot(self.root)
         result = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')),
-                                 str(REPO / 'router/uninstall.sh')], env=self.env,
+                                 str(emitted_router() / 'uninstall.sh')], env=self.env,
                                 capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('runtime lock present', result.stderr)
@@ -2678,5 +2934,259 @@ class CrondPickupTests(unittest.TestCase):
         self.assertEqual(self.restorable(), before)
 
 
+class PinnedHelperTests(unittest.TestCase):
+    setUp = InstallerTests.setUp
+    tearDown = InstallerTests.tearDown
+    run_script = InstallerTests.run_script
+    install = InstallerTests.install
+    snapshot = InstallerTests.snapshot
+
+    def common(self, body):
+        lib = emitted_router() / 'lib'
+        script = ('. ' + shlex.quote(str(lib / 'platform-bootstrap.sh')) + '\n'
+                  'CF_PLATFORM_OWNER=$(id -u):$(id -g)\n'
+                  'CF_TRANSACTION_DEFINITIONS_ONLY=1\nplatform_transaction_paths\n'
+                  '. ' + shlex.quote(str(lib / 'install-common.sh')) + '\n' + body)
+        return subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), '-c', script],
+                              env=self.env, capture_output=True, text=True, timeout=15)
+
+    def test_committed_install_reinstalls_with_original_or_explicit_absence(self):
+        from harness import RouterFixture, PROTECTED, run_owned_process
+        shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                fixture = RouterFixture()
+                self.addCleanup(fixture.close)
+                helper = fixture.root / 'usr/lib/couvrefeu/busybox-static'
+                if existing:
+                    helper.parent.mkdir(parents=True)
+                    helper.write_bytes(b'original helper')
+                command = [*shell, str(emitted_router() / 'install.sh'), '--activate', '--protect', PROTECTED]
+                result = run_owned_process(command, env=fixture.env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                backup = fixture.root / 'etc/couvrefeu/backup'
+                before = (backup / 'usr_lib_couvrefeu_busybox-static.before').read_text()
+                self.assertEqual(before == 'absent\n', not existing)
+                journal = {p.name: p.read_bytes() for p in backup.iterdir() if p.is_file()}
+                # Exercise the committed-journal evidence independently of the
+                # optional PREPARED evidence, using actual release install records.
+                script = ('. ' + shlex.quote(str(emitted_router() / 'lib/platform-bootstrap.sh')) + '\n'
+                          'platform_helper_inventory_evidence ' + shlex.quote(str(backup)) + ' /nonexistent')
+                evidence = subprocess.run([*shell, '-c', script], env=fixture.env,
+                                          capture_output=True, text=True, timeout=15)
+                self.assertEqual(evidence.returncode, 0, evidence.stderr)
+                result = run_owned_process(command, env=fixture.env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual({p.name: p.read_bytes() for p in backup.iterdir() if p.is_file()}, journal)
+                result = run_owned_process([*shell, str(emitted_router() / 'uninstall.sh')],
+                                           env=fixture.env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_legacy_helperless_install_refuses_before_mutation_and_old_expire_runs(self):
+        from harness import RouterFixture, PROTECTED, run_owned_process
+        fixture = RouterFixture()
+        self.addCleanup(fixture.close)
+        legacy = fixture.root / 'captured-main4ff'
+        archive = (REPO / 'tests/fixtures/m4b-legacy-main4ff.tar.gz').read_bytes()
+        self.assertEqual(hashlib.sha256(archive).hexdigest(),
+                         'd355296fbd2d020a30ea3a52d8b1496c0fac965f92de6c0feeabe518d9ee20da')
+        legacy.mkdir(mode=0o700)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
+            bundle.extractall(legacy, filter='data')
+        shell = shlex.split(os.environ.get('CF_TEST_SHELL', 'sh'))
+        installed = subprocess.run([*shell, str(legacy / 'install.sh'), '--activate',
+                                    '--protect', PROTECTED], env=fixture.env,
+                                   capture_output=True, text=True, timeout=45, start_new_session=True)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        before = full_snapshot(fixture.root)
+        attempted = subprocess.run([*shell, str(emitted_router() / 'install.sh'), '--activate',
+                                    '--protect', PROTECTED], env=fixture.env,
+                                   capture_output=True, text=True, timeout=45, start_new_session=True)
+        self.assertNotEqual(attempted.returncode, 0, attempted.stdout + attempted.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', attempted.stderr)
+        self.assertEqual(full_snapshot(fixture.root), before)
+        installed_cfctl = fixture.root / 'usr/sbin/cfctl'
+        self.assertEqual(installed_cfctl.read_bytes(), (legacy / 'cfctl').read_bytes())
+        installed_hash = signature(installed_cfctl)
+        expired = run_owned_process([*shell, str(installed_cfctl), 'expire'], env=fixture.env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+        self.assertEqual(expired.returncode, 0, expired.stdout + expired.stderr)
+        self.assertEqual(signature(installed_cfctl), installed_hash)
+
+    def test_retirement_helper_claim_is_ignored_until_validation(self):
+        backup = self.root / 'etc/couvrefeu/backup'
+        backup.mkdir(parents=True)
+        receipt = self.root / '.couvrefeu-retirement'
+        # A malformed receipt cannot add helper ownership while definitions load.
+        receipt.write_text('\n' * 7 + 'usr/lib/couvrefeu/busybox-static\n')
+        result = self.common('printf "%s\\n" "$HELPER_INVENTORY"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '0\n')
+        # DONE cleanup may already have retired all other inventory evidence;
+        # definitions must still load so the receipt validator can decide.
+        shutil.rmtree(self.root / 'etc')
+        (self.root / '.couvrefeu-recovery.done').write_text('3\nstrict\n' + 'a' * 64 + '\n')
+        result = self.common('printf "%s\\n" "$HELPER_INVENTORY"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '0\n')
+
+    def test_retirement_inventory_rejects_empty_and_control_bytes(self):
+        receipt = self.root / '.couvrefeu-retirement'
+        pin = 'a' * 64
+        for inventory in ('', 'usr/lib/couvrefeu/busybox-static\t',
+                          'usr/lib/couvrefeu/busybox-static\r'):
+            with self.subTest(inventory=repr(inventory)):
+                lines = ['CFRETIREMENT 2', pin, 'strict', pin, pin, '1:1', '1',
+                         inventory, 'etc', pin, pin, pin,
+                         ' '.join(f'item{i}:{pin}' for i in range(16))]
+                lines += [f'item{i}\t{pin}\tvalue' for i in range(5)]
+                receipt.write_text('\n'.join(lines) + '\n')
+                receipt.chmod(0o600)
+                before = full_snapshot(self.root)
+                result = self.common('platform_transaction_mutex_check() { :; }\nretirement_validate')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('invalid retirement receipt', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+
+    def test_helperless_backup_and_legacy_done_refuse_without_mutex_creation(self):
+        mutex = self.root / '.couvrefeu-mutex'
+        mutex.unlink()
+        backup = self.root / 'etc/couvrefeu/backup'
+        backup.mkdir(parents=True)
+        (backup / 'usr_lib_couvrefeu_busybox-static.after').write_text('a' * 64 + ':755:0:0\n')
+        # A missing .before must never be confused with an explicit absence.
+        before = full_snapshot(self.root)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+        shutil.rmtree(self.root / 'etc')
+        done = self.root / '.couvrefeu-recovery.done'
+        for version in ('1\n', '2\n'):
+            with self.subTest(version=version):
+                done.write_text(version)
+                done.chmod(0o600)
+                before = full_snapshot(self.root)
+                result = self.install('--activate')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+        done.unlink()
+
+    def test_prepared_helper_evidence_requires_complete_inventory_shape(self):
+        (self.root / '.couvrefeu-mutex').unlink()
+        prepared = self.root / '.couvrefeu-prepared'
+        prepared.mkdir()
+        for inventory in ('usr/lib/couvrefeu/busybox-static\n',
+                          ' '.join(FILES) + ' usr/lib/couvrefeu/busybox-static\nforeign\n',
+                          ' '.join(FILES) + ' usr/lib/couvrefeu/busybox-static foreign\n'):
+            with self.subTest(inventory=inventory):
+                (prepared / 'inventory').write_text(inventory)
+                before = full_snapshot(self.root)
+                result = self.install('--activate')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+
+    def test_explicit_install_entry_rejects_legacy_inventory_in_shell_wrapper(self):
+        backup = self.root / 'etc/couvrefeu/backup'
+        backup.mkdir(parents=True)
+        self.env['CF_ENTRY'] = 'install'
+        before = full_snapshot(self.root)
+        result = self.common(':')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+
+    def test_helper_hash_refused_before_mutation(self):
+        (self.source / 'lib/busybox-static').write_bytes(b'foreign helper')
+        (self.root / '.couvrefeu-mutex').unlink(missing_ok=True)
+        before = full_snapshot(self.root)
+        result = self.install('--activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('helper_hash', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+        self.assertFalse((self.root / '.couvrefeu-mutex').exists())
+        self.assertFalse((self.root / '.couvrefeu-transaction').exists())
+
+    def test_entry_helper_hash_refuses_before_execution_or_mutation(self):
+        tree = Path(self.tmp.name) / 'corrupted-release'
+        shutil.copytree(emitted_router(), tree)
+        marker = self.root / 'untrusted-helper-executed'
+        helper = tree / 'lib/busybox-static'
+        helper.write_text('#!/bin/sh\n: > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+        helper.chmod(0o755)
+        before = full_snapshot(self.root)
+        original = _EMITTED[:]
+        _EMITTED[:] = [tree]
+        try:
+            result = self.install('--activate')
+        finally:
+            _EMITTED[:] = original
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('helper_hash', result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(full_snapshot(self.root), before)
+
+    def test_old_inventory_and_pending_recovery_refuse_before_transaction_writes(self):
+        mutex = self.root / '.couvrefeu-mutex'
+        mutex.unlink()
+        backup = self.root / 'etc/couvrefeu/backup'
+        prepared = self.root / '.couvrefeu-prepared'
+        backup.mkdir(parents=True)
+        prepared.mkdir()
+        (prepared / 'inventory').write_text('usr/lib/couvrefeu/busybox-static.evil\n')
+        before = full_snapshot(self.root)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+        self.assertEqual(full_snapshot(self.root), before)
+        shutil.rmtree(self.root / 'etc')
+        shutil.rmtree(prepared)
+        for name in ('.couvrefeu-recovery', '.couvrefeu-recovery.done'):
+            with self.subTest(name=name):
+                pending = self.root / name
+                pending.write_text('3\nstrict\nlegacy or modern pending journal\n')
+                before = full_snapshot(self.root)
+                result = self.install('--activate')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('helper_inventory_upgrade_refused', result.stderr)
+                self.assertEqual(full_snapshot(self.root), before)
+                pending.unlink()
+
+    def test_helper_restores_original_exactly_without_bare_setsid(self):
+        isolated = Path(self.tmp.name) / 'without-setsid'
+        isolated.mkdir()
+        for directory in self.env['PATH'].split(os.pathsep):
+            path = Path(directory)
+            if not path.is_dir():
+                continue
+            for command in path.iterdir():
+                target = isolated / command.name
+                if command.name != 'setsid' and not target.exists() and command.is_file() and os.access(command, os.X_OK):
+                    target.symlink_to(command.absolute())
+        self.env['PATH'] = str(isolated)
+        self.assertIsNone(shutil.which('setsid', path=self.env['PATH']))
+        probe = subprocess.run([*shlex.split(os.environ.get('CF_TEST_SHELL', 'sh')), '-c',
+                                'command -v setsid'], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        original = self.root / 'usr/lib/couvrefeu/busybox-static'
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(b'preexisting helper bytes')
+        original.chmod(0o640)
+        os.utime(original, ns=(FRACTIONAL, FRACTIONAL))
+        before = exact_signature(original)
+        result = self.install('--activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(original.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(original.read_bytes(), (self.source / 'lib/busybox-static').read_bytes())
+        result = self.run_script('uninstall.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(exact_signature(original), before)
+
+
 if __name__ == '__main__':
-    unittest.main()
+    partition.main(sys.argv)

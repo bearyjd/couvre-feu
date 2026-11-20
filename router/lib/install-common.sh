@@ -79,6 +79,18 @@ elif [ -e "$DONE" ] && ! platform_done_legacy "$DONE"; then PROFILE_INVENTORY=1;
 if [ "$PROFILE_INVENTORY" = 1 ]; then
     FILES="$FILES usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh"
 elif [ "${CF_PLATFORM_PROFILE:-strict}" != strict ]; then fail 'legacy journal cannot select vendor profile'; fi
+# Infer helper ownership from the same journal/PREPARED predicate used by
+# installer admission. Receipt inventory is selected only by retirement_validate.
+HELPER_INVENTORY=0
+if { [ ! -e "$BACKUP" ] && [ ! -e "$DONE" ]; } ||
+    platform_helper_inventory_evidence "$BACKUP" "${CF_TRANSACTION_PREPARED:-/nonexistent}"; then
+    HELPER_INVENTORY=1
+fi
+if [ "$HELPER_INVENTORY" = 1 ]; then FILES="$FILES usr/lib/couvrefeu/busybox-static"
+elif [ "${CF_ENTRY:-}" = install ] || {
+    [ -e "$DONE" ] && ! platform_done_legacy "$DONE" &&
+    [ ! -e "${CF_TRANSACTION_RETIREMENT:-/nonexistent}" ] && [ ! -L "${CF_TRANSACTION_RETIREMENT:-/nonexistent}" ]
+}; then fail helper_inventory_upgrade_refused; fi
 DIRS='etc usr usr/sbin usr/lib usr/lib/couvrefeu etc/config etc/crontabs etc/couvrefeu'
 
 for dep in sha256sum stat cp mv mkdir rmdir chmod awk sed cmp dd od tr sync wc; do
@@ -244,10 +256,13 @@ prepared_validate() {
     prepared_fixed='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state'
     case "$prepared_inventory" in "$prepared_fixed"*) ;; *) fail 'invalid PREPARED inventory';; esac
     prepared_optional=${prepared_inventory#"$prepared_fixed"}
-    for prepared_option in ' etc/couvrefeu/rpc-allowed' ' usr/sbin/cfctl-scope' ' usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh'; do
+    for prepared_option in ' etc/couvrefeu/rpc-allowed' ' usr/sbin/cfctl-scope' ' usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh' ' usr/lib/couvrefeu/busybox-static'; do
         case "$prepared_optional" in "$prepared_option"*) prepared_optional=${prepared_optional#"$prepared_option"};; esac
     done
     [ -z "$prepared_optional" ] || fail 'invalid PREPARED inventory'
+    if [ "${CF_ENTRY:-}" = install ]; then
+        platform_helper_inventory_record "$prepared_tree/inventory" || fail helper_inventory_upgrade_refused
+    fi
     FILES=$prepared_inventory
     prepared_records
     for prepared_record in inventory directories profile release-absent manifest $PREPARED_RECORDS; do
@@ -636,7 +651,11 @@ retirement_legacy_id() { printf '%s\n' 28b3278555e61239471497b7e806b05c8f5eed82b
 retirement_legacy_manifest() { printf '%s\n' 71bd50c7ddde584404e738f349b95a8c0b5a828df34f491c8065f0c54070c463; }
 retirement_legacy_bootstrap() { printf '%s\n' c254b9b4364d5f6e252126f4e37d05312cf7cec18b81515a3004b37009ce5820; }
 retirement_target_names() {
-    printf '%s\n' 'install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/activity.sh lib/platform-bootstrap.sh'
+    if [ "${RETIRE_LEGACY:-0}" = 1 ]; then
+        printf '%s\n' 'install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/activity.sh lib/platform-bootstrap.sh'
+        return
+    fi
+    printf '%s\n' 'install.sh uninstall.sh cfctl cfctl-ssh cfctl-scope lib/core.sh lib/rpc.sh lib/firewall.sh lib/install-common.sh lib/state.awk lib/rules.awk lib/json.awk lib/vendor-platform.sh lib/activity.sh lib/platform-bootstrap.sh lib/busybox-static'
 }
 retirement_records() {
     RETIRE_RECORDS='inventory directories profile release-absent'
@@ -663,13 +682,18 @@ retirement_validate() {
         fail 'legacy callback quiescence is unproven; legacy receipt preserved for separately authorized recovery'
     fi
     [ "$(stat -c '%h:%s' "$CF_TRANSACTION_RETIREMENT" | awk -F: '$1==1&&$2<=32768{print "ok"}')" = ok ] || fail 'unsafe retirement receipt; preserved'
-    awk -F '\t' 'NR==1{if($0!="CFRETIREMENT 2")exit 1}
+    RETIRE_TARGET=$(sed -n '2p' "$CF_TRANSACTION_RETIREMENT")
+    RETIRE_LEGACY=0
+    [ "$RETIRE_TARGET" != "$(retirement_legacy_id)" ] || RETIRE_LEGACY=1
+    retirement_target_count=$(retirement_target_names | awk '{print NF}')
+    awk -F '\t' -v target_count="$retirement_target_count" 'NR==1{if($0!="CFRETIREMENT 2")exit 1}
         NR==2||NR==4||NR==10||NR==11||NR==12{if(length($0)!=64||$0~/[^0-9a-f]/)exit 1}
         NR==5{if($0!="none"&&(length($0)!=64||$0~/[^0-9a-f]/))exit 1}
         NR==3{if($0!~/^(strict|gl-xe3000-4.8.3-logd-011-v1|gl-xe3000-4.8.3-os-trust-v1)$/)exit 1}
         NR==6{if(length($0)>42||$0!~/^[0-9]+:[0-9]+$/)exit 1}
         NR==7{if($0!~/^[01]$/)exit 1}
-        NR==13{n=split($0,p," ");if(n!=15)exit 1;for(i=1;i<=n;i++){if(split(p[i],a,":")!=2||length(a[2])!=64||a[2]~/[^0-9a-f]/)exit 1}}
+        NR==8{if(length($0)>8192||$0!~/^[a-z0-9_.\/-]+( [a-z0-9_.\/-]+)*$/)exit 1}
+        NR==13{n=split($0,p," ");if(n!=target_count)exit 1;for(i=1;i<=n;i++){if(split(p[i],a,":")!=2||length(a[2])!=64||a[2]~/[^0-9a-f]/)exit 1}}
         NR>13{if(NF!=3||$1~/[^a-z0-9_.-]/||length($2)!=64||$2~/[^0-9a-f]/||length($3)>8192)exit 1}
         END{if(NR<18)exit 1}' "$CF_TRANSACTION_RETIREMENT" || fail 'invalid retirement receipt; preserved'
     RETIRE_TARGET=$(sed -n '2p' "$CF_TRANSACTION_RETIREMENT")
@@ -693,7 +717,7 @@ retirement_validate() {
     retirement_fixed='usr/lib/couvrefeu/core.sh usr/lib/couvrefeu/rpc.sh usr/lib/couvrefeu/state.awk usr/lib/couvrefeu/firewall.sh usr/lib/couvrefeu/json.awk usr/lib/couvrefeu/rules.awk usr/lib/couvrefeu/install-common.sh usr/sbin/cfctl usr/sbin/cfctl-ssh etc/firewall.couvrefeu etc/config/firewall etc/sysupgrade.conf etc/crontabs/root etc/couvrefeu/protected etc/couvrefeu/state'
     case "$retirement_inventory" in "$retirement_fixed"*) ;; *) fail 'invalid retirement inventory';; esac
     retirement_optional=${retirement_inventory#"$retirement_fixed"}
-    for retirement_option in ' etc/couvrefeu/rpc-allowed' ' usr/sbin/cfctl-scope' ' usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh'; do
+    for retirement_option in ' etc/couvrefeu/rpc-allowed' ' usr/sbin/cfctl-scope' ' usr/lib/couvrefeu/platform-bootstrap.sh usr/lib/couvrefeu/vendor-platform.sh etc/couvrefeu/platform-profile usr/lib/couvrefeu/activity.sh' ' usr/lib/couvrefeu/busybox-static'; do
         case "$retirement_optional" in "$retirement_option"*) retirement_optional=${retirement_optional#"$retirement_option"};; esac
     done
     [ -z "$retirement_optional" ] || fail 'invalid retirement inventory'

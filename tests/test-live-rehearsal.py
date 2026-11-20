@@ -22,9 +22,11 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tests/fixtures'))
+from pinned_helper import helper_binary, prepare_helper_release
 from harness import RouterFixture  # noqa: E402
 
 MGMT = {'ip': '192.0.2.10', 'mac': '02:00:00:00:00:10'}
@@ -79,10 +81,14 @@ class SourceCopy:
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-live-src-')
         self.root = Path(self.tmp.name)
-        shutil.copytree(REPO / 'router', self.root / 'router')
-        shutil.copytree(REPO / 'tools/live', self.root / 'tools/live',
+        source = globals().get('SOURCE')
+        source_root = source.root if source is not None else REPO
+        shutil.copytree(source_root / 'router', self.root / 'router')
+        shutil.copytree(source_root / 'tools/live', self.root / 'tools/live',
                         ignore=shutil.ignore_patterns('__pycache__'))
-        shutil.copyfile(REPO / 'tools/strip-test-mode.py', self.root / 'tools/strip-test-mode.py')
+        for name in ('strip-test-mode.py', 'freeze-router-release.py'):
+            shutil.copyfile(source_root / 'tools' / name, self.root / 'tools' / name)
+        prepare_helper_release(self.root)
         quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'check': True}
         git = ['git', '-C', str(self.root), '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid']
         subprocess.run(git + ['init', '-q'], **quiet)
@@ -102,6 +108,398 @@ def setUpModule():
 
 def tearDownModule():
     SOURCE.tmp.cleanup()
+
+
+class HelperPrerequisiteTests(unittest.TestCase):
+    def probe(self, setup='', helper_bytes=None, shell='/bin/sh'):
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        functions = template[template.index('cfr_helper_verify() {'):template.index('cfr_prereq() {')]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-prereq-') as temp:
+            stage = Path(temp)
+            helper = stage / 'router/lib/busybox-static'
+            helper.parent.mkdir(parents=True)
+            for directory in (stage, helper.parent.parent, helper.parent):
+                directory.chmod(0o700)
+            helper.write_bytes(helper_bytes if helper_bytes is not None else helper_binary()[0].read_bytes())
+            helper.chmod(0o755)
+            script = ('cfr_refuse() { echo "$1 $2"; exit 10; }\n' + functions
+                      + 'CFR_FIXTURE=1\nCFR_STAGE=' + shlex.quote(str(stage))
+                      + '\nCFR_SH=' + shlex.quote(shell)
+                      + '\nCFR_SETSID_HELPER_SHA256=' + hashlib.sha256(helper.read_bytes()).hexdigest()
+                      + '\nCFR_SETSID_HELPER=$CFR_STAGE/router/lib/busybox-static\n' + setup
+                      + '\ncfr_helper_probe PREREQ\necho MUTATION_BEGIN\n')
+            return subprocess.run(['sh', '-c', script], text=True, capture_output=True, check=False)
+
+    def test_stage_and_ancestors_are_checked_before_hashing_every_time(self):
+        for directory, mode in (('$CFR_STAGE', '755'), ('$CFR_STAGE', '777'),
+                                ('$CFR_STAGE/router', '777'), ('$CFR_STAGE/router/lib', '755')):
+            with self.subTest(directory=directory, mode=mode):
+                done = self.probe('cfr_helper_verify || exit 90\n'
+                                  + f'chmod {mode} "{directory}"\n'
+                                  + 'sha256sum() { echo HASH_EXECUTED; return 1; }\n')
+                self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+
+    def test_unsafe_owner_is_refused_before_hashing(self):
+        done = self.probe('stat() { printf "99999:99999:700\\n"; }\n'
+                          'sha256sum() { echo HASH_EXECUTED; return 1; }\n')
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+
+    def test_symlinks_share_the_helper_hash_refusal(self):
+        for target in ('busybox-real', 'missing'):
+            done = self.probe('mv "$CFR_SETSID_HELPER" "$CFR_STAGE/router/lib/busybox-real"\n'
+                              + f'ln -s {target} "$CFR_SETSID_HELPER"\n')
+            self.assertEqual(done.returncode, 10)
+            self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+
+    def test_absent_helper_and_unexecutable_payload_have_distinct_refusals(self):
+        done = self.probe('rm "$CFR_SETSID_HELPER"\n')
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_missing')
+        done = self.probe(helper_bytes=b'\x7fELF\x00invalid-machine\n')
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_exec')
+
+    def test_absolute_shell_and_actual_proc_executable_are_required(self):
+        done = self.probe(shell='sh')
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_shell_path')
+        wrong_shell = b'#!/bin/sh\n[ "$1" != true ] || exit 0\nshift 2\nexec /bin/sh "$@"\n'
+        done = self.probe(helper_bytes=wrong_shell, shell=str(Path(shutil.which('busybox')).resolve()))
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(done.stdout.strip(), 'PREREQ helper_shell_executable')
+
+    def test_native_helper_uses_expected_shell(self):
+        done = self.probe()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.strip(), 'MUTATION_BEGIN')
+
+    def test_wrong_helper_hash_refuses_before_execution_or_mutation(self):
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        functions = template[template.index('cfr_helper_verify() {'):template.index('cfr_prereq() {')]
+        with tempfile.TemporaryDirectory(prefix='couvre-feu-helper-prereq-') as temp:
+            stage = Path(temp)
+            helper = stage / 'router/lib/busybox-static'
+            helper.parent.mkdir(parents=True)
+            executed = stage / 'executed'
+            helper.write_text('#!/bin/sh\n: > ' + shlex.quote(str(executed)) + '\n')
+            helper.chmod(0o755)
+            script = ('cfr_refuse() { echo "$1 $2"; exit 10; }\n' + functions
+                      + 'CFR_STAGE=' + shlex.quote(str(stage)) + '\nCFR_SETSID_HELPER_SHA256=' + '0' * 64
+                      + '\ncfr_helper_probe PREREQ\necho MUTATION_BEGIN\n')
+            done = subprocess.run(['sh', '-c', script], text=True, capture_output=True, check=False)
+            self.assertEqual(done.returncode, 10)
+            self.assertEqual(done.stdout.strip(), 'PREREQ helper_hash')
+            self.assertFalse(executed.exists())
+
+
+class PayloadDecoderTests(unittest.TestCase):
+    # Deliberately no host PATH fallback: new extraction commands require an
+    # explicit admission here. In particular there is no base64 or openssl.
+    COMMANDS = ('awk', 'cat', 'chmod', 'date', 'id', 'mkdir', 'mktemp', 'rm',
+                'rmdir', 'sed', 'sha256sum', 'wc')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='couvre-feu-decoder-')
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.bin = self.work / 'bin'
+        self.bin.mkdir()
+        busybox, _ = helper_binary()
+        # Keep this applet symlink path: resolving it loses BusyBox dispatch.
+        self.busybox = busybox
+        self.ash = self.work / 'ash'
+        self.ash.symlink_to(self.busybox)
+        version = subprocess.run([str(self.busybox)], capture_output=True, timeout=30).stdout
+        self.assertIn(b'BusyBox v1.33.1', version)
+        for name in self.COMMANDS:
+            (self.bin / name).symlink_to(self.busybox)
+        self.assertEqual(set(path.name for path in self.bin.iterdir()), set(self.COMMANDS))
+        self.env = {'PATH': str(self.bin), 'LC_ALL': 'C'}
+        template = (REPO / 'tools/live/first-rehearsal.sh').read_text()
+        self.template = template
+        self.functions = template[:template.index('# One br-lan IPv4 row')]
+        self.tool = load_tool(REPO / 'tools/live/first-rehearsal.py')
+
+    def runtimes(self):
+        # Exercise the older NUL-dropping awk as well as the CI build when
+        # installed locally. Every admitted runtime still needs its exact pin.
+        candidates = [self.busybox, Path('/home/user/.local/bin/busybox'),
+                      Path('/home/user/.cache/cf-overnight/ci-bb/bin/busybox.static')]
+        seen = set()
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            runtime, digest = helper_binary({'CF_TEST_BUSYBOX': str(candidate)})
+            if digest not in seen:
+                seen.add(digest)
+                yield runtime
+
+    @contextlib.contextmanager
+    def runtime(self, busybox):
+        original = self.busybox
+        self.busybox = busybox
+        self.ash.unlink()
+        self.ash.symlink_to(busybox)
+        for path in self.bin.iterdir():
+            path.unlink()
+            path.symlink_to(busybox)
+        try:
+            yield
+        finally:
+            self.busybox = original
+            self.ash.unlink()
+            self.ash.symlink_to(original)
+            for path in self.bin.iterdir():
+                path.unlink()
+                path.symlink_to(original)
+
+    def region(self, data):
+        with mock.patch.object(self.tool, 'emitted_tree', return_value={
+                'lib/busybox-static': ('755', data), 'text.sh': ('644', b'# quoted $() `data`\n')}):
+            return self.tool.payload_region({})
+
+    def extract(self, region, setup=''):
+        script = (self.functions + '\n' + region + '\nCFR_FIXTURE=0\nCFR_SH='
+                  + shlex.quote(str(self.ash)) + '\n' + setup + '\n'
+                  'cfr_payload_prereq\ncfr_extract\nprintf "MUTATION_BEGIN\\n"\n')
+        done = subprocess.run([str(self.busybox), 'ash', '-s'], input=script, env=self.env,
+                              text=True, capture_output=True, timeout=30)
+        stages = re.findall(r'^INFO staging (/tmp/couvre-feu-first\.[^\n]+)$', done.stdout, re.M)
+        for stage in stages:
+            self.addCleanup(shutil.rmtree, stage, True)
+        return done, Path(stages[0]) if stages else None
+
+    def test_router_path_without_base64_preserves_production_and_all_byte_helpers(self):
+        production = (REPO / 'router/lib/busybox-static').read_bytes()
+        self.assertEqual(hashlib.sha256(production).hexdigest(),
+                         'c25f66e5ac29ea3e373b8fb2d3549a59d058fbef9ed11b67fdaba1dc37bf75f5')
+        for busybox in self.runtimes():
+            with self.runtime(busybox):
+                for data in (production, bytes(range(256)) * 4096):
+                    with self.subTest(runtime=str(busybox), bytes=len(data)):
+                        done, stage = self.extract(self.region(data))
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        extracted = (stage / 'router/lib/busybox-static').read_bytes()
+                        self.assertEqual(extracted, data)
+                        self.assertEqual(hashlib.sha256(extracted).digest(), hashlib.sha256(data).digest())
+                        self.assertEqual((stage / 'router/text.sh').read_bytes(), b'# quoted $() `data`\n')
+                        self.assertIn('MUTATION_BEGIN', done.stdout)
+
+    def test_corrupt_helper_is_refused_before_mutation(self):
+        data = bytes(range(256)) * 4096
+        region = self.region(data)
+        encoded = base64.encodebytes(data).decode()
+        for busybox in self.runtimes():
+            with self.runtime(busybox):
+                for replacement, reason in ((encoded.replace('AAEC', 'AQEC', 1), 'hash_mismatch'),
+                                            (encoded.replace('AAEC', '!AEC', 1), 'extraction_failed')):
+                    with self.subTest(runtime=str(busybox), reason=reason):
+                        done, _ = self.extract(region.replace(encoded, replacement))
+                        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                        self.assertIn('PHASE PAYLOAD FAIL ' + reason, done.stdout)
+                        self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_missing_extraction_tools_have_fixed_prereq_refusal_before_staging(self):
+        for name in self.COMMANDS:
+            with self.subTest(tool=name):
+                executable = self.bin / name
+                hidden = self.work / ('hidden-' + name)
+                executable.rename(hidden)
+                try:
+                    done, stage = self.extract(self.region(b'abc'))
+                finally:
+                    hidden.rename(executable)
+                self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                self.assertIn('PHASE PREREQ FAIL missing_tool ' + name, done.stdout)
+                self.assertIsNone(stage)
+                self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_decoder_rejects_noncanonical_truncated_and_excess_input(self):
+        for encoded, size in (('AB==\n', 1), ('AAB=\n', 2), ('AA=A\n', 1),
+                              ('AAAA\nAAAA\n', 6), ('AAAA\n', 4), ('AAAA\n', 2),
+                              ('AAAA\n\n', 3), (' AAAA\n', 3), ('AAAA\r\n', 3),
+                              ('A' * 80 + '\n', 60), ('', 1), ('AA==\nAAAA\n', 4),
+                              ('AA==\n', 0), ('AA==\n', 16777217)):
+            with self.subTest(encoded=encoded[:20], size=size):
+                script = self.functions + f"\ncfr_decode_helper {size} decoded <<'ENCODED'\n{encoded}ENCODED\n"
+                done = subprocess.run([str(self.busybox), 'ash', '-s'], input=script.encode(), env=self.env,
+                                      capture_output=True, timeout=30)
+                self.assertNotEqual(done.returncode, 0)
+
+    def test_decoder_preserves_each_padding_case(self):
+        for busybox in self.runtimes():
+            with self.runtime(busybox):
+                for data in (b'\0', b'\0\xff', b'\0\xff\x80'):
+                    with self.subTest(runtime=str(busybox), data=data):
+                        done, stage = self.extract(self.region(data))
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        self.assertEqual((stage / 'router/lib/busybox-static').read_bytes(), data)
+
+    def test_decoder_emits_only_bounded_octal_commands(self):
+        data = (REPO / 'router/lib/busybox-static').read_bytes()
+        encoded = base64.encodebytes(data).decode()
+        script = self.functions + f"\ncfr_decode_helper {len(data)} decoded <<'ENCODED'\n{encoded}ENCODED\n"
+        for busybox in self.runtimes():
+            with self.runtime(busybox), self.subTest(runtime=str(busybox)):
+                done = subprocess.run([str(busybox), 'ash', '-s'], input=script.encode(), env=self.env,
+                                      capture_output=True, timeout=30)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                decoded = bytearray()
+                for line in done.stdout.decode('ascii').splitlines():
+                    command = re.fullmatch(r"printf '((?:\\[0-3][0-7][0-7]){1,57})' >> 'decoded'", line)
+                    self.assertIsNotNone(command, line)
+                    decoded.extend(int(octal, 8) for octal in command[1].split('\\')[1:])
+                self.assertEqual(decoded, data)
+
+    def test_encoded_shell_syntax_remains_payload_data(self):
+        marker = self.work / 'payload-executed'
+        data = (b'\0\xff' + f"'; touch {marker}; #\n$(touch {marker})\n`touch {marker}`\n".encode())
+        for busybox in self.runtimes():
+            with self.runtime(busybox), self.subTest(runtime=str(busybox)):
+                done, stage = self.extract(self.region(data))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual((stage / 'router/lib/busybox-static').read_bytes(), data)
+                self.assertFalse(marker.exists())
+
+    def test_raw_awk_regression_runtime_and_selftest_cover_every_byte(self):
+        probe = re.search(r"<<'CF_FIRST_DECODER_PROBE_EOF'.*?\n(.*?)\nCF_FIRST_DECODER_PROBE_EOF",
+                          self.functions, re.S)
+        self.assertIsNotNone(probe)
+        self.assertEqual(base64.b64decode(probe[1]), bytes(range(256)))
+        for busybox in self.runtimes():
+            with self.runtime(busybox), self.subTest(runtime=str(busybox)):
+                raw = subprocess.run([str(busybox), 'awk',
+                                      'BEGIN {for(i=0;i<256;i++) printf "%c",i}'],
+                                     env=self.env, capture_output=True, check=True, timeout=30).stdout
+                _, digest = helper_binary({'CF_TEST_BUSYBOX': str(busybox)})
+                if digest == 'b9e75f97de336e3d04b7f07c2d213da779c6b2cf702ebf1935b4cd09c0b97ddb':
+                    self.assertEqual(raw, bytes(range(1, 256)))
+                else:
+                    self.assertEqual(raw, bytes(range(256)))
+                done, stage = self.extract(self.region(b'abc'))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertFalse((stage / 'decode.probe').exists())
+                self.assertFalse((stage / 'decode.commands').exists())
+
+    def test_generated_commands_are_validated_before_execution(self):
+        marker = self.work / 'commands-executed'
+        # A compromised/incorrect text encoder must never become executable
+        # shell syntax, even if it reports successful base64 validation.
+        attacks = ["printf '\\141\\142\\143' >> 'WRONG_TARGET'",
+                   "printf '\\400\\142\\143' >> '$TARGET'",
+                   "printf '\\141\\142\\143' >> '$TARGET'; : > " + shlex.quote(str(marker)),
+                   ": > " + shlex.quote(str(marker)),
+                   "printf '\\141\\142' >> '$TARGET'"]
+        for busybox in self.runtimes():
+            with self.runtime(busybox):
+                for attack in attacks:
+                    with self.subTest(runtime=str(busybox), attack=attack):
+                        prefix, separator, suffix = attack.partition('$TARGET')
+                        emit = ('command printf "%s%s%s\\n" ' + shlex.quote(prefix)
+                                + ' "$2" ' + shlex.quote(suffix) if separator else
+                                'command printf "%s\\n" ' + shlex.quote(attack))
+                        setup = ('cfr_decoder_selftest() { :; }\n'
+                                 'cfr_decode_helper() {\n' + emit + '\n}\n')
+                        done, _ = self.extract(self.region(b'abc'), setup=setup)
+                        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                        self.assertIn('PHASE PAYLOAD FAIL extraction_failed', done.stdout)
+                        self.assertNotIn('MUTATION_BEGIN', done.stdout)
+                        self.assertFalse(marker.exists())
+
+    def test_all_256_byte_selftest_rejects_corruption_before_payload(self):
+        for busybox in self.runtimes():
+            with self.runtime(busybox), self.subTest(runtime=str(busybox)):
+                setup = ('cfr_payload_extract() { printf "PAYLOAD_EXECUTED\\n"; }\n'
+                         'cfr_decode_file() { command printf wrong > "$2"; }')
+                done, _ = self.extract(self.region(b'abc'), setup=setup)
+                self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                self.assertIn('PHASE PREREQ FAIL decoder_selftest', done.stdout)
+                self.assertNotIn('PAYLOAD_EXECUTED', done.stdout)
+                self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_nul_separated_generated_commands_are_refused(self):
+        first = "printf '" + '\\141' * 57 + "' >> '"
+        last = "printf '\\141' >> '"
+        # BusyBox awk can treat NUL as a record separator. Both records pass
+        # the octal grammar, so physical line/byte framing must reject them.
+        emit = ('command printf ' + shlex.quote(r'%s%s%s\000%s%s%s' + '\n')
+                + ' ' + shlex.quote(first) + ' "$2" "\'" '
+                + shlex.quote(last) + ' "$2" "\'"')
+        setup = 'cfr_decoder_selftest() { :; }\ncfr_decode_helper() { ' + emit + '; }\n'
+        for busybox in self.runtimes():
+            with self.runtime(busybox), self.subTest(runtime=str(busybox)):
+                done, _ = self.extract(self.region(b'a' * 58), setup=setup)
+                self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                self.assertIn('PHASE PAYLOAD FAIL extraction_failed', done.stdout)
+                self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_bad_printf_builtin_refuses_before_payload_or_helper(self):
+        for busybox in self.runtimes():
+            with self.runtime(busybox):
+                for prefix, refusal in (('printf() { command printf BROKEN; }; ', 'decoder_selftest'),
+                                        ('command() { printf /external/printf; }; ', 'decoder_printf')):
+                    with self.subTest(runtime=str(busybox), refusal=refusal):
+                        shell = self.work / 'broken-shell'
+                        shell.write_text('#!' + sys.executable + '\nimport os, sys\n'
+                                         + 'os.execv(' + repr(str(busybox)) + ', [' + repr(str(busybox))
+                                         + ', "ash", sys.argv[1], ' + repr(prefix)
+                                         + ' + sys.argv[2], *sys.argv[3:]])\n')
+                        shell.chmod(0o700)
+                        setup = ('CFR_SH=' + shlex.quote(str(shell)) + '\n'
+                                 'cfr_payload_extract() { command printf "PAYLOAD_EXECUTED\\n"; }')
+                        done, _ = self.extract(self.region(b'abc'), setup=setup)
+                        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+                        self.assertIn('PHASE PREREQ FAIL ' + refusal, done.stdout)
+                        self.assertNotIn('PAYLOAD_EXECUTED', done.stdout)
+                        self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_command_allowlist_rejects_unadmitted_extraction_command(self):
+        region = self.region(b'abc').replace('cfr_payload_extract() {',
+                                           'cfr_payload_extract() {\nopenssl version || return 1')
+        done, _ = self.extract(region)
+        self.assertEqual(done.returncode, 10, done.stdout + done.stderr)
+        self.assertIn('PHASE PAYLOAD FAIL extraction_failed', done.stdout)
+        self.assertIn('openssl: not found', done.stderr)
+        self.assertNotIn('MUTATION_BEGIN', done.stdout)
+
+    def test_extraction_command_allowlist_covers_shell_ast(self):
+        # Additional whole-script audit when the parser is installed; the
+        # restricted-PATH command guard above remains mandatory everywhere.
+        shfmt = shutil.which('shfmt')
+        if not shfmt:
+            self.skipTest('shfmt unavailable for shell AST command audit')
+        source = self.tool.replace_region(self.template, 'CF_GENERATED_PAYLOAD', self.region(b'abc'))
+        done = subprocess.run([shfmt, '-tojson'], input=source, text=True,
+                              capture_output=True, check=True, timeout=30)
+        calls = set()
+        functions = set()
+
+        def visit(node):
+            if isinstance(node, dict):
+                if node.get('Type') == 'CallExpr' and node.get('Args'):
+                    word = node['Args'][0]
+                    name = source[word['Pos']['Offset']:word['End']['Offset']]
+                    calls.add(name)
+                    if name == 'exec':
+                        target = node['Args'][1]
+                        self.assertEqual(source[target['Pos']['Offset']:target['End']['Offset']],
+                                         '"$CFR_SETSID_HELPER"')
+                if node.get('Type') == 'FuncDecl':
+                    functions.add(node['Name']['Value'])
+                for value in node.values():
+                    visit(value)
+            elif isinstance(node, list):
+                for value in node:
+                    visit(value)
+
+        visit(json.loads(done.stdout))
+        external = set(self.COMMANDS) | {'cmp', 'cp', 'grep', 'ip', 'ip6tables-save', 'ipset',
+                                        'iptables-save', 'ln', 'od', 'readlink', 'sort', 'stat', 'tr', 'uci'}
+        builtins = {':', '[', 'cd', 'command', 'continue', 'exec', 'exit', 'printf', 'pwd',
+                    'read', 'return', 'set', 'trap', 'umask', 'wait'}
+        allowed = external | builtins | functions | {'"$CFR_SETSID_HELPER"', '"$CFR_SH"'}
+        self.assertTrue(calls)
+        self.assertEqual(calls - allowed, set())
 
 
 class VersionedIdentityTests(unittest.TestCase):
@@ -135,14 +533,47 @@ class VersionedIdentityTests(unittest.TestCase):
     def test_independent_live_verifier_accepts_version_two_emitted_bytes(self):
         self.tool.verify_release_identity(self.shipped)
 
+    def test_fixed_manifest_order_matches_the_freezer(self):
+        manifest_order = tuple(line.split('  ')[1] for line in
+                               self.shipped['router/release.sha256'].decode().splitlines())
+        self.assertEqual(self.tool.MANIFEST_FILES, manifest_order)
+
+    def test_freezer_does_not_execute_live_tools(self):
+        live_dir = self.root / 'tools/live'
+        live_dir.mkdir()
+        executed = self.root / 'live-tool-executed'
+        try:
+            for name in ('first-rehearsal.py', 'penn_pilot_v2.py'):
+                (live_dir / name).write_text('from pathlib import Path\nPath(' + repr(str(executed))
+                                             + ').touch()\nraise RuntimeError("live tool executed")\n')
+            done = subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), '--check'],
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertFalse(executed.exists())
+        finally:
+            shutil.rmtree(live_dir)
+
+    def test_freezer_textually_refuses_duplicate_helper_pin(self):
+        path = self.root / 'router/lib/platform-bootstrap.sh'
+        original = path.read_bytes()
+        try:
+            pin = self.tool.setsid_helper_pin(original)
+            path.write_bytes(original + ('CF_SETSID_HELPER_SHA256=' + pin + '\n').encode())
+            done = subprocess.run([sys.executable, '-I', str(self.root / 'tools/freeze-router-release.py'), '--check'],
+                                  capture_output=True, text=True, check=False)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn('exactly one well-formed CF_SETSID_HELPER_SHA256 assignment', done.stderr)
+        finally:
+            path.write_bytes(original)
+
     def test_identity_covers_direct_installer_and_bootstrap_edits_despite_consistent_pins(self):
-        for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+        for rel in ('install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             with self.subTest(rel=rel):
                 blobs = dict(self.shipped)
                 blobs['router/' + rel] += b'# direct source edit\n'
                 with self.assertRaises(self.tool.Refusal) as caught:
                     self.tool.verify_release_identity(self.repin(blobs))
-                self.assertIn('release id', str(caught.exception))
+                self.assertIn('helper hash' if rel == 'lib/busybox-static' else 'release id', str(caught.exception))
 
     def test_live_generated_fields_require_exactly_one_valid_assignment(self):
         fields = [(name, 'CF_BOOTSTRAP_PIN') for name in ('install.sh', 'uninstall.sh', 'cfctl')]
@@ -359,10 +790,28 @@ class LiveRehearsalTests(unittest.TestCase):
         # The installer alone resolves the SSH client with `ip neigh show ADDRESS`.
         return any(call['command'] == 'ip' and MGMT['ip'] in call['argv'] for call in self.fixture.calls())
 
+    def model_tmp_namespace_owner(self):
+        # Some namespaces map /tmp's owner differently from /. Model the
+        # target's root-owned sticky /tmp only in selected workflow fixtures.
+        # All other metadata and the dedicated unsafe-parent regressions stay real.
+        tmp, root = Path('/tmp').stat(), Path('/').stat()
+        if (tmp.st_uid, tmp.st_gid) != (root.st_uid, root.st_gid):
+            self.assertEqual(tmp.st_mode & 0o7777, 0o1777)
+            real_stat = shlex.quote(shutil.which('stat'))
+            stat_double = self.work / 'metadata-bin'
+            stat_double.mkdir()
+            program = stat_double / 'stat'
+            program.write_text('#!/bin/sh\n'
+                               'if [ "$#" = 3 ] && [ "$1" = -c ] && [ "$2" = "%u:%g:%a" ] && [ "$3" = /tmp ]; then\n'
+                               + f'    echo {root.st_uid}:{root.st_gid}:1777\nelse exec {real_stat} "$@"; fi\n')
+            program.chmod(0o700)
+            self.spec['env']['PATH'] = str(stat_double) + ':' + self.spec['env']['PATH']
+
     def test_happy_path_passes_and_restores_exactly(self):
+        self.model_tmp_namespace_owner()
         before = self.router_snapshot()
         code, out, err = self.execute()
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 0, out + err + (self.evidence() / 'stderr.log').read_text())
         self.assertEqual(self.router_snapshot(), before)
         run = self.evidence()
         self.assertEqual(run.stat().st_mode & 0o777, 0o700)
@@ -688,7 +1137,10 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assertEqual(self.router_snapshot(), before)
 
     def test_evidence_dir_on_volatile_storage_refused(self):
-        volatile = self.work / 'evidence'
+        # CI may point TMPDIR at persistent storage for executable helpers.
+        temporary = tempfile.TemporaryDirectory(prefix='couvre-feu-volatile-', dir='/tmp')
+        self.addCleanup(temporary.cleanup)
+        volatile = Path(temporary.name) / 'evidence'
         volatile.mkdir(mode=0o700)
         config = self.write_config(evidenceDir=str(volatile))
         code, _, err = self.invoke('execute', config, '--expect-plan-sha256', self.plan_sha(config))
@@ -867,13 +1319,13 @@ class LiveRehearsalTests(unittest.TestCase):
         self.assert_head_source_refused(copy, 'not in release.sha256')
 
     def test_manifest_must_list_exactly_the_routers_fixed_file_set(self):
-        # Mirrors platform-bootstrap.sh platform_external_closure: 15 fixed entries, nothing else.
+        # Mirrors platform-bootstrap.sh platform_external_closure: 16 fixed entries, nothing else.
         boot = (REPO / 'router/lib/platform-bootstrap.sh').read_text()
         pattern = re.search(r'\$2!~/\^\((install\.sh.*?)\)\$/', boot).group(1)
         fixed = {'install.sh', 'uninstall.sh', 'cfctl', 'cfctl-ssh', 'cfctl-scope'}
         fixed |= {'lib/' + name for name in re.search(r'lib\\/\((.*?)\)', pattern).group(1).replace('\\.', '.').split('|')}
         self.assertEqual(set(self.tool.MANIFEST_FILES), fixed)
-        self.assertEqual(len(self.tool.MANIFEST_FILES), 15)
+        self.assertEqual(len(self.tool.MANIFEST_FILES), 16)
         manifest = (SOURCE.root / 'router/release.sha256').read_text()
         extra = b'echo extra\n'
         line = hashlib.sha256(extra).hexdigest() + '  extra.sh\n'
@@ -915,7 +1367,7 @@ class LiveRehearsalTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp(prefix='couvre-feu-emit-'))
         self.addCleanup(shutil.rmtree, out, True)
         emitted = out / 'tree'
-        freezer = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+        freezer = subprocess.run([sys.executable, str(SOURCE.root / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
                                  capture_output=True, text=True, check=True, cwd=out)
         entries = {}
         for path in sorted(emitted.rglob('*')):
@@ -936,13 +1388,13 @@ class LiveRehearsalTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp(prefix='couvre-feu-emit-'))
         self.addCleanup(shutil.rmtree, out, True)
         emitted = out / 'tree'
-        freezer = subprocess.run([sys.executable, str(REPO / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
+        freezer = subprocess.run([sys.executable, str(SOURCE.root / 'tools/freeze-router-release.py'), '--emit', str(emitted)],
                                  capture_output=True, text=True, check=True, cwd=out)
         # The freezer's formula, applied to the files it wrote (not to anything the tool declares).
         sha = lambda data: hashlib.sha256(data).hexdigest()
         lines = ['couvrefeu-router-release-v2'] + [
             'lib/' + name + ':' + sha((emitted / 'lib' / name).read_bytes()) for name in self.tool.RELEASE_MODULES]
-        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh'):
+        for name in ('cfctl', 'cfctl-ssh', 'cfctl-scope', 'install.sh', 'uninstall.sh', 'lib/platform-bootstrap.sh', 'lib/busybox-static'):
             data = (emitted / name).read_bytes()
             if name in ('cfctl', 'install.sh', 'uninstall.sh'):
                 data = re.sub(rb'(?m)^CF_BOOTSTRAP_PIN=.*$', b'CF_BOOTSTRAP_PIN=', data)

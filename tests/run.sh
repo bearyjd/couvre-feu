@@ -11,6 +11,7 @@ cd "$REPO"
 preflight_suites() {
     printf '%s\n' \
         test-install-recovery-primitives.py \
+        test-pinned-helper-security.py \
         test-install.py \
         test-install-recovery.py \
         test-install-retirement-recovery.py \
@@ -20,8 +21,11 @@ preflight_suites() {
         test-os-trust.py \
         test-client-probe.py \
         test-live-rehearsal.py \
+        test-permanent-install.py \
         test-deploy-units.py \
-        test-service-key-entry.py
+        test-service-key-entry.py \
+        test-heartbeat.py \
+        test-platform-integration-partitions.py
 }
 run_preflight_suite() {
     preflight_suites | grep -Fqx -- "$1" || { printf 'unknown preflight suite: %s\n' "$1" >&2; exit 2; }

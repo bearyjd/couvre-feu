@@ -223,12 +223,12 @@ cfp_elapsed_ok() {
 # (iptables -w, ipset, uci) that would otherwise defer the child's trap. Only if the child is still alive
 # CFP_KILL_GRACE seconds later is the group KILLed (exit 137), which skips those traps and can leave
 # /tmp/couvrefeu-platform.lock behind (cfp_stale_lock_check). Busybox timeout signals only its direct child and has no
-# -k, so this shell supervises the child with real uptime and one-second polls (up to 2 s total polling slack). The child is started by `exec setsid`: in a non-interactive shell the background
+# -k, so this shell supervises the child with real uptime and one-second polls (up to 2 s total polling slack). The child is started by `exec "$helper" setsid`: in a non-interactive shell the background
 # subshell is not a process-group leader, so setsid execs in place instead of forking (checked with util-linux and
 # busybox 1.33 setsid), the child keeps the pid $! reports and the pid cfctl records in the lock ($$), and the pid is
 # also the new group id. A setsid that did fork returns 0 in the parent at once while the child runs on detached:
 # cfp_run would lose the child group and cfctl would run unbounded, so cfp_baseline refuses such a
-# setsid before any mutation (setsid_forks). The group signal is `kill -TERM -PID` with no `--` (busybox 1.33 kill
+# setsid before any mutation (helper_setsid_forks). The group signal is `kill -TERM -PID` with no `--` (busybox 1.33 kill
 # rejects `--` as an invalid number and fails although it signals, so the fallback to the bare pid would always run
 # and deliver a second TERM that cuts the child's EXIT trap); the bare-pid fallback is only for a group that does not
 # exist. The subshell resets TERM because the teardown
@@ -254,9 +254,16 @@ cfp_run() {
     cfp_run_clock_failed=0
     cfp_run_mark=$CFR_STAGE/run.signalled
     rm -f "$cfp_run_mark"
+    if ! cfr_helper_verify; then
+        if [ "$CFP_MUTATED" = 1 ]; then cfp_stop SUPERVISOR "$CFR_HELPER_ERROR"
+        else cfr_refuse SUPERVISOR "$CFR_HELPER_ERROR"; fi
+    fi
+    case $CFR_SH in /*) ;; *)
+        if [ "$CFP_MUTATED" = 1 ]; then cfp_stop SUPERVISOR helper_shell_path
+        else cfr_refuse SUPERVISOR helper_shell_path; fi;;
+    esac
     CFP_RUN_LIVE=starting
-    # shellcheck disable=SC2086
-    ( trap - TERM; exec setsid $CFR_SH "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
+    ( trap - TERM; exec "$CFR_SETSID_HELPER" setsid "$CFR_SH" "$@" ) <"$cfp_run_in" 2>>"$CFR_STAGE/child.log" 5>&- &
     cfp_run_pid=$!
     CFP_RUN_LIVE=$cfp_run_pid
     # Supervise in this shell: a watcher fork would briefly inherit default TERM before installing its trap.
@@ -362,15 +369,11 @@ cfp_dns() {
     printf '%s %s\n' "$cfp_r" "$((cfp_t1 - cfp_t0))"
 }
 cfp_baseline() {
-    for cfp_tool in ping nslookup timeout date setsid; do
+    for cfp_tool in ping nslookup timeout date; do
         command -v "$cfp_tool" >/dev/null 2>&1 || cfr_refuse BASELINE "missing_tool $cfp_tool"
     done
     cfp_cs >/dev/null || cfr_refuse BASELINE uptime_unreadable
-    # A forking setsid would let cfp_run return 0 at once with the child detached and unbounded: it must exec in place.
-    # shellcheck disable=SC2086
-    ( exec setsid $CFR_SH -c 'exit 7' ) </dev/null >/dev/null 2>&1 5>&- &
-    wait "$!"
-    [ "$?" = 7 ] || cfr_refuse BASELINE setsid_forks
+    cfr_helper_probe BASELINE
     cfp_crond_count baseline
     CFP_BASE_DNS_CS=0
     for cfp_i in 1 2 3; do
@@ -1529,8 +1532,23 @@ cfp_scope_add_2_phase() {
 # normalised (every apply may flip a/b).
 cfp_fw_shape() {
     cfp_fw_state "$CFP_DIR/fw.raw" || return 1
-    sed -e '/^slot /d' -e 's/cf2_[ab]_/cf2_X_/g' "$CFP_DIR/fw.raw" > "$1"
-    rm -f "$CFP_DIR/fw.raw"
+    # ipset member order depends on insertion history (every apply rebuilds the sets in the other slot), so the
+    # ipset lines are compared sorted (same members, any order); the iptables rule lines keep their order.
+    sed -e '/^slot /d' -e 's/cf2_[ab]_/cf2_X_/g' "$CFP_DIR/fw.raw" > "$CFP_DIR/fw.norm" || { rm -f "$CFP_DIR/fw.raw" "$CFP_DIR/fw.norm"; return 1; }
+    cfp_fw_rc=0
+    grep -E '^(create|add) ' "$CFP_DIR/fw.norm" > "$CFP_DIR/fw.sets"
+    [ $? -le 1 ] || cfp_fw_rc=1
+    LC_ALL=C sort "$CFP_DIR/fw.sets" > "$CFP_DIR/fw.sets.sorted" || cfp_fw_rc=1
+    grep -Ev '^(create|add) ' "$CFP_DIR/fw.norm" > "$CFP_DIR/fw.rules.norm"
+    [ $? -le 1 ] || cfp_fw_rc=1
+    cat "$CFP_DIR/fw.sets.sorted" "$CFP_DIR/fw.rules.norm" > "$1" || cfp_fw_rc=1
+    rm -f "$CFP_DIR/fw.raw" "$CFP_DIR/fw.norm" "$CFP_DIR/fw.sets" "$CFP_DIR/fw.sets.sorted" "$CFP_DIR/fw.rules.norm"
+    [ "$cfp_fw_rc" = 0 ]
+}
+# On a mismatch print the first differing lines (rules and set members only) so the evidence explains the stop.
+cfp_fw_mismatch_info() {
+    command -v diff >/dev/null 2>&1 || { cfr_info 'firewall_diff unavailable (no diff)'; return 0; }
+    diff "$1" "$2" 2>/dev/null | head -n 20 | sed 's/[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/<ipv4>/g' | while IFS= read -r cfp_fd_line; do cfr_info "firewall_diff $cfp_fd_line"; done
 }
 cfp_move_phase() {
     cfp_fw_shape "$CFP_DIR/fw.move0" || cfp_stop MOVE firewall_read_failed
@@ -1555,7 +1573,7 @@ cfp_move_phase() {
     if grep -Fq "$CFP_PILOT_B" "$CFP_DIR/rpc-sync.json"; then cfp_stop MOVE pilot_b_left_populated; fi
     cfp_status_settle MOVE move_back_not_observed "$CFP_REV" "\"observed\":{\"kids\":$CFP_KIDS_JSON,\"paused\":[]}" '"effectivePauses":[]'
     cfp_fw_shape "$CFP_DIR/fw.move1" || cfp_stop MOVE firewall_read_failed
-    cmp -s "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1" || cfp_stop MOVE firewall_not_restored_after_move_back
+    cmp -s "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1" || { cfp_fw_mismatch_info "$CFP_DIR/fw.move0" "$CFP_DIR/fw.move1"; cfp_stop MOVE firewall_not_restored_after_move_back; }
     cfr_out 'MEASURE move_block_follows_device measured chromebook_paused=1 phone_paused=0 adult_probe_ok moved_back=1 pilot_b_absent=1 filter_ipset_shape_unchanged'
     cfr_ok MOVE
 }

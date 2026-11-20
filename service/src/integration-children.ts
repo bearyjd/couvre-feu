@@ -38,7 +38,14 @@ export function seedChildren(store: Store, config: Pick<IntegrationManifest, 'pe
 export const activeChildren = (store: Store): ChildRow[] => store.all<ChildRow>('SELECT * FROM people WHERE active=1 ORDER BY created_at,id');
 export const devicesOf = (store: Store, person: string): DeviceRow[] => store.all<DeviceRow>('SELECT * FROM devices WHERE person_id=? ORDER BY created_at,id', person);
 /** MACs the router should hold for this child right now (pending additions excluded, pending removals included). */
-export const configuredMacs = (store: Store, person: string): string[] => devicesOf(store, person).filter(d => d.state !== 'enrolling').map(d => d.identifier).sort();
+/** An enrol the router has not answered yet. An `enrolling` row whose operation has ended (a conflict with no stored observation) is no longer in flight: it is configured, and only its removal can leave that state. */
+export const enrolInFlight = (store: Store, d: DeviceRow): boolean => d.state === 'enrolling' && Boolean(store.get("SELECT 1 FROM operations WHERE id=? AND state IN ('pending','unknown')", d.operation_id));
+/**
+ * The child's configured addresses. An `enrolling` row counts only once the router is KNOWN to hold it (`heldByRouter`: the addresses a FRESH observation
+ * shows for this child, none otherwise): an unsettled row the router does not hold must not make the whole household look unenrolled and hide the revision token.
+ */
+export const configuredMacs = (store: Store, person: string, heldByRouter: readonly string[] = []): string[] =>
+    devicesOf(store, person).filter(d => d.state !== 'enrolling' || (!enrolInFlight(store, d) && heldByRouter.includes(d.identifier))).map(d => d.identifier).sort();
 
 /**
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a
@@ -63,6 +70,17 @@ function ownerSchedules(policy: Pick<RouterPolicy, 'people'>, config: Pick<Integ
 export function withDevice(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, person: string, mac: string): RouterPolicy {
     const present = base.people.some(p => p.id === person);
     const people = present ? base.people.map(p => p.id === person ? {...p, macs: [...p.macs, mac]} : p) : [...base.people, {id: person, macs: [mac]}];
+    if (people.length > CHILD_LIMIT) throw new AppError(409, 'child_limit_reached');
+    return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownerSchedules({people}, config)}, config.protectedMacs);
+}
+/** All additions share one revision and one router operation; callers stage every device before validation. */
+export function withDevices(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, additions: readonly {person: string; mac: string}[]): RouterPolicy {
+    const people = base.people.map(p => ({...p, macs: [...p.macs]}));
+    for (const addition of additions) {
+        const person = people.find(p => p.id === addition.person);
+        if (person) person.macs.push(addition.mac);
+        else people.push({id: addition.person, macs: [addition.mac]});
+    }
     if (people.length > CHILD_LIMIT) throw new AppError(409, 'child_limit_reached');
     return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownerSchedules({people}, config)}, config.protectedMacs);
 }

@@ -95,3 +95,9 @@ export async function browserAPI(page: Page, path: string, body?: unknown, extra
     return { status: response.status, body: await response.json() };
   }, { path, body, extraHeaders });
 }
+
+/** The parent PWA shows one section at a time: open the tab that holds the panel under test, as a viewer would. */
+export async function openTab(page: Page, name: 'home' | 'kids' | 'devices' | 'alerts' | 'more') {
+  await page.locator(`#tab-${name}`).click();
+  await expect(page.locator(`#tab-${name}`)).toHaveAttribute('aria-selected', 'true');
+}
