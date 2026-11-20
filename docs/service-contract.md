@@ -261,6 +261,16 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
 - **Audit.** When `auditLog.enabled`, one `focus_start` entry (migration `012.sql`): actor = the parent, child id, operation id, result `applied` or `refused`. A replay adds no second row. Minutes and the label are not stored in the audit log.
 - **Privacy.** Ids and enums only; no reason or subject text exists.
 
+## Schedule truth in the database (roadmap item 2, S1; `schedules.editable`, off)
+
+**Unverified on this router.** Manifest key `"schedules": {"editable": true | false}` (`service/src/integration-config.ts`); absent is off, unknown keys and non-boolean values are refused. Nothing here changes the router or its bytes, and there is no HTTP route yet (the editor is S2/S3).
+
+- **Off (default):** behaviour is unchanged. The manifest `enrollment.schedules` stay the only owner of schedules and a policy with any other schedule set is refused with `owner_schedule_configuration_changed`. The `schedule_windows` table (migration `integration-009`, additive, empty) exists but is never read.
+- **On:** on first start the table is seeded once from the manifest `enrollment.schedules` (a marker row stops any later re-seed, so a parent who empties the set stays empty). From then on `validateManagedPolicy` and the policy builders read `schedule_windows` instead of the manifest; a policy that differs from the stored rows is refused with the same code.
+- **Shape:** `schedule_windows(person_id, id, weekdays, start, stop)`: clock times and a weekday set only, no free text. At most 8 windows per child (checked in code and by an insert trigger); cross-midnight is one row (`start > stop`).
+- **Atomic:** `stageScheduleWindows` runs inside the transaction of `IntegrationPolicy.queue` (its `stage` hook), so the row set and the queued policy commit together; a validation failure rolls the rows back.
+- **Privacy:** window clocks and weekday sets only; no child names, labels or text are stored here, and nothing here logs, alerts, pushes or digests them.
+
 ## Content filter manifest key (PRP-006 A2, off, nothing enforces yet)
 
 `"contentFilter": {"mode": "off" | "owner" | "parents", "apiKeyFile": "/abs/path", "defaultProfile": "<id>", "profiles": {"<personId>": "<profileId>"}}` in the private manifest (`service/src/content-filter-config.ts`). Every filter claim here is **unverified on this router**, and this section describes the manifest key; the NextDNS client, the desired-state table, the reconciler and the routes follow below. Nothing here changes the router.

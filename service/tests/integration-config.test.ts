@@ -62,6 +62,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.installReadiness, undefined);
         for (const enabled of [true, false]) { save({...manifest, installReadiness: {enabled}}); assert.deepEqual(integrationConfig(path).installReadiness, {enabled}); }
         for (const installReadiness of [{enabled: 'true'}, {}, {enabled: true, extra: 1}, true, null]) { save({...manifest, installReadiness}); assert.throws(() => integrationConfig(path)); }
+        // schedules.editable (roadmap item 2, S1): absent is OFF; strict {editable: boolean}. Unverified on this router.
+        assert.equal(c.schedules, undefined);
+        for (const editable of [true, false]) { save({...manifest, schedules: {editable}}); assert.deepEqual(integrationConfig(path).schedules, {editable}); }
+        for (const schedules of [{editable: 'true'}, {}, {editable: true, extra: 1}, true, null]) { save({...manifest, schedules}); assert.throws(() => integrationConfig(path)); }
         // push and digest (B7): absent is OFF; strict {enabled: boolean}; the digest is delivered by push, so it needs push on.
         assert.equal(c.push, undefined); assert.equal(c.digest, undefined);
         for (const enabled of [true, false]) { save({...manifest, push: {enabled}}); assert.deepEqual(integrationConfig(path).push, {enabled}); }

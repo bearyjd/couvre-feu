@@ -232,7 +232,7 @@ export class ChildBatchAdmin {
             at(additions[0].index);
             const scoped = {...actor, personIds: [...new Set([...actor.personIds, ...created.values()])]};
             op = this.policy.queue(scoped, additions[0].person, 'enroll', JSON.stringify({kind: 'child_batch', devices: additions.map(d => ({person: d.person, mac: d.mac, label: d.label})), permissionVersion: actor.permissionVersion}), randomUUID(), batch.precondition,
-                base => withDevices(base, this.store.config, additions), operation => {
+                base => withDevices(base, this.store.config, additions, this.store), operation => {
                     for (const d of additions) this.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES(?,?,?,'mac',?,'enrolling',?,?)", d.id, d.person, d.label, d.mac, operation, now);
                     at(null);
                     this.assertTotals(childCount, deviceCount, counts, seen);
