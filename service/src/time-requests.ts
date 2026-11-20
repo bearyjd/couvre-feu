@@ -5,6 +5,7 @@ import { AppError } from '../../shared/src/errors.ts';
 import type { Actor, OperationResult, PeopleDTO } from '../../shared/src/contracts.ts';
 import { applyGrant, followGrants } from './time-request-grants.ts';
 import { audited } from './parent-audit.ts';
+import { hasObligation } from './time-request-obligations.ts';
 import type { GrantContext } from './time-request-grants.ts';
 
 export const REQUEST_MINUTES = [15, 30, 60] as const;
@@ -180,7 +181,7 @@ export class TimeRequestService {
 
     /** Unfinished restore obligations: approvals still in flight, or a lifted pause not yet confirmed restored. */
     hasObligations(): boolean {
-        return Boolean(this.store.get("SELECT 1 FROM time_requests WHERE state='approving' OR (state IN ('approved','apply_failed') AND repause_state IN ('waiting','applying')) LIMIT 1"));
+        return hasObligation(this.store, {approvedRepauseOnly: true});
     }
     /** Drain-only pass for an installation whose time requests were switched off: finish owed restores, accept nothing new. */
     async drain(): Promise<{remaining: boolean; overdue: boolean}> {
