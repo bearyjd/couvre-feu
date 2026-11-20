@@ -1,7 +1,7 @@
 /** Fictional file-backed router simulator. Contains no network, SSH, or target configuration. */
 import { Store } from '../../service/src/db.ts';
 import { INITIAL_POLICY, PROTECTED_MACS } from '../../service/src/fixtures.ts';
-import { effectivePauses, normalizePolicy, policyJSON, MAX_INTEGER } from '../../shared/src/router-schema.ts';
+import { effectivePauses, normalizePolicy, policyJSON, MAX_INTEGER, MIN_VALID_ROUTER_TIME } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy, RouterStatus } from '../../shared/src/router-schema.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import { syntheticActivity } from './activity.ts';
@@ -48,7 +48,7 @@ export class FakeRouter {
     tick(): void {
         this.store.transaction(() => {
             const row = this.row(), policy = normalizePolicy(JSON.parse(row.policy)), now = this.now();
-            if (now < 1577836800 || now > MAX_INTEGER) {
+            if (now < MIN_VALID_ROUTER_TIME || now > MAX_INTEGER) {
                 throw new Error('invalid_router_clock');
             }
             const revision = row.ready_at <= now && !['pending', 'unreachable', 'failed', 'stale'].includes(row.fault) ? policy.revision : row.confirmed_revision;
