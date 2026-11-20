@@ -21,7 +21,7 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
 
 ## Common prerequisites
 
-1. Node **26.13.1** and npm **11.21.2** (`package.json` `engines`). Install from the official tarball after verifying it, or use the pinned image below:
+1. Node **26.13.1** and npm **11.21.3** (`package.json` `engines`). Install from the official tarball after verifying it, or use the pinned image below:
 
    ```sh
    V=26.13.1; T=node-v$V-linux-x64.tar.xz     # use the -linux-arm64 tarball on arm64
@@ -35,6 +35,7 @@ Related: [http-behind-proxy](http-behind-proxy.md) (manifest fields, proxy recip
    sha256sum -c --ignore-missing SHASUMS256.txt     # must report: $T: OK
    mkdir -p /opt/node-v$V && tar -xJf $T -C /opt/node-v$V --strip-components=1
    ln -sfn /opt/node-v$V/bin/node /usr/local/bin/node && node --version   # v26.13.1
+   npm install -g npm@11.21.3 && npm --version   # must print 11.21.3; Node 26.13.1 bundles an older npm
    ```
 2. A service user with a **fixed uid/gid 10001** so the systemd and Docker options are interchangeable: `useradd --system --uid 10001 --user-group --home-dir /var/lib/couvrefeu --shell /usr/sbin/nologin couvrefeu`.
 3. Private directories, owned by that user and `0700`: `/var/lib/couvrefeu` (manifest `dataDir`) and `/etc/couvrefeu` (manifest, `known_hosts`, public key). The service rejects symlinks, wrong owners, group/world access and writable ancestors (`unsafe_private_path`, `unsafe_private_ancestor`). The manifest must be outside the source tree.
