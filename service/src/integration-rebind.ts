@@ -3,6 +3,7 @@ import { policyJSON } from '../../shared/src/router-schema.ts';
 import { routerScopeOf } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
+import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 
 const refuse = (code: string): never => { throw new AppError(409, code); };
 /**
@@ -32,6 +33,10 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         const macs = store.all<{identifier: string}>("SELECT identifier FROM devices WHERE identifier_kind='mac'").map(d => d.identifier), scope = routerScopeOf(next);
         if (macs.some(m => next.protectedMacs.includes(m))) refuse('rebind_device_protected');
         if (macs.some(m => !scope.includes(m))) refuse('rebind_device_outside_scope');
+        // The schedule set the next manifest owns (with schedules.editable: the committed rows) must stay
+        // enforceable: without scheduleClock every router policy holding it, even an exact match, would be refused. The loader already
+        // checks the manifest's own enrollment schedules.
+        if (schedulesInDatabase(next) && scheduleWindows(store).length > 0 && !next.scheduleClock) refuse('rebind_schedule_clock_required');
         // Scope observed under the old generation says nothing about the new router: forget it, so the next observation re-baselines on the new floor.
         store.run('DELETE FROM router_scope_observed');
         // A request made against the old router can never be observed by the new one.

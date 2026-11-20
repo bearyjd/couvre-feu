@@ -69,8 +69,11 @@ export function validateManagedPolicy(policy: RouterPolicy, config: Pick<Integra
  */
 function schedulesOwned(policy: RouterPolicy, config: Pick<IntegrationManifest, 'enrollment' | 'schedules'>, store: Store, operationId?: string): boolean {
     const actual = JSON.stringify(policy.schedules);
-    if (!schedulesInDatabase(config)) return actual === JSON.stringify(ownerSchedules(policy, config, store));
     const present = new Set(policy.people.map(p => p.id));
+    // An outbound payload must carry the child whose windows its operation staged; otherwise the receipt would confirm windows never sent.
+    const stagedChild = operationId === undefined ? undefined : store.get<{person_id: string}>('SELECT person_id FROM schedule_staged WHERE operation_id=?', operationId)?.person_id;
+    if (stagedChild !== undefined && !present.has(stagedChild)) throw new AppError(409, 'schedule_staged_child_out_of_scope');
+    if (!schedulesInDatabase(config)) return actual === JSON.stringify(ownerSchedules(policy, config, store));
     return acceptableSchedules(store, operationId).some(rows => actual === JSON.stringify(normalizePolicy({version: 1, revision: 0, people: policy.people, pauses: [], schedules: rows.filter(s => present.has(s.person))}).schedules));
 }
 /**

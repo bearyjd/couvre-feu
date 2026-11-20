@@ -159,6 +159,9 @@ export class IntegrationPolicy {
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
         const policy = this.withStaticDoh(build(o.acceptedPolicy)), id = randomUUID(), now = this.now();
         stage?.(id);
+        // Staged windows belong to a child this operation names: they settle with its receipt, so they must sit inside its scope.
+        const stagedChild = this.store.get<{person_id: string}>('SELECT person_id FROM schedule_staged WHERE operation_id=?', id)?.person_id;
+        if (stagedChild !== undefined && !affected.includes(stagedChild)) throw new AppError(409, 'schedule_staged_child_out_of_scope');
         validateManagedPolicy(policy, this.store.config, this.store, false, id);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
         this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
@@ -203,7 +206,7 @@ export class IntegrationPolicy {
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
-                ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : schedulesInDatabase(config) ? {...config.enrollment, schedules: scheduleWindows(this.store)} : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
+                ...scheduleWithAllowance(this.scheduleState(o, enrolled, healthy, validUntil, child.id), allowance, validUntil),
                 allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
@@ -218,6 +221,16 @@ export class IntegrationPolicy {
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
+    }
+    /**
+     * The router's schedules when it holds this child. With schedules.editable on, a child the observed policy does not hold (no observation,
+     * or its last device removed, which takes its schedules off the router) shows the committed windows and its enforcement stays unknown.
+     */
+    private scheduleState(o: RPCObservation | null, enrolled: boolean, healthy: boolean, validUntil: number, child: string) {
+        const config = this.store.config;
+        if (!schedulesInDatabase(config)) return integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child);
+        const held = enrolled && o!.acceptedPolicy.people.some(p => p.id === child);
+        return integrationScheduleState(held ? o!.acceptedPolicy : {...config.enrollment, schedules: scheduleWindows(this.store)}, config, o?.routerTime ?? null, healthy && held, this.now(), validUntil, child);
     }
     /**
      * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the

@@ -84,9 +84,12 @@ export function settleScheduleWindows(store: Store, operationId: string, state: 
     const row = store.get<Staged>('SELECT * FROM schedule_staged WHERE operation_id=?', operationId);
     if (!row) return;
     const proposal = JSON.parse(row.windows_json) as ScheduleWindow[];
-    const held = observed?.schedules.filter(s => s.person === row.person_id).map(({person: _person, ...w}) => w);
+    const windowsOf = (policy: RouterPolicy | null | undefined) => policy?.schedules.filter(s => s.person === row.person_id).map(({person: _person, ...w}) => w);
+    const payload = store.get<{payload_json: string}>('SELECT payload_json FROM operations WHERE id=?', operationId);
+    // Only windows the operation's own payload carried can be promoted: a router reply never covers windows it was not sent.
+    const carried = payload !== undefined && canonical(windowsOf(JSON.parse(payload.payload_json) as RouterPolicy)) === canonical(proposal);
     const receipt = store.get<{attempt_count: number}>("SELECT attempt_count FROM operation_rpc WHERE operation_id=? AND delivery='accepted' AND receipt_json IS NOT NULL", operationId);
-    const promote = state === 'confirmed' || (state === 'conflict' && receipt !== undefined && receipt !== null && receipt.attempt_count > 0 && canonical(held) === canonical(proposal));
+    const promote = carried && (state === 'confirmed' || (state === 'conflict' && receipt !== undefined && receipt !== null && receipt.attempt_count > 0 && canonical(windowsOf(observed)) === canonical(proposal)));
     if (promote) replaceScheduleWindows(store, row.person_id, proposal);
     store.run('DELETE FROM schedule_staged WHERE operation_id=?', operationId);
 }

@@ -24,6 +24,8 @@ export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
     preparedAt: number; expiresAt: number; invocation: FrozenInvocation; script: string; scriptSha256: string;
 }
+/** validateManagedPolicy codes that mean only "this service does not own the router's schedules" (devices already validated). */
+const SCHEDULE_OWNERSHIP_FAILURES: ReadonlySet<string> = new Set(['owner_schedule_configuration_changed', 'owner_schedule_clock_required']);
 function quoted(s: string): string { return "'" + s.replace(/'/g, "'\\''") + "'"; }
 /** v1 manifests (no routerScope) keep the exact single-MAC header line; a declared scope lists every allowed MAC. */
 const scopeLine = (c: IntegrationConfig) => c.routerScope ? `# Allowed MACs: ${routerScopeOf(c).join(',')}` : `# Allowed MAC: ${c.person.device.mac}`;
@@ -156,8 +158,13 @@ export class IntegrationWorker {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
+            // Schedule ownership is NOT a reason to reject the reply: finish() must first settle an exact receipt or a proven pre-dispatch
+            // conflict, then revalidates ownership and keeps the router unhealthy. Every other policy failure rejects the reply.
             try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
-            catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
+            catch (error) {
+                const code = error instanceof AppError ? error.code : null;
+                if (!code || !SCHEDULE_OWNERSHIP_FAILURES.has(code)) throw new RouterTransportError(code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid');
+            }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
             this.finish(batchId, token, epoch, invocation, o, null);
         } catch (error) {
@@ -251,7 +258,6 @@ export class IntegrationWorker {
                 this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
                 this.activity.purgeUnenrolled();
                 this.scope.observe(o!);
-                if (o!.errors.length === 0 && healthyConfirmation(o!.status, o!.acceptedPolicy, o!.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o!.routerTime);
                 if (!active) return;
                 const e = this.policy.envelope(active), accepted = exactReceipt(o!, e), healthy = accepted && exactHealthy(o!, e);
                 if (accepted) {
@@ -279,15 +285,20 @@ export class IntegrationWorker {
                     this.store.run("UPDATE operation_rpc SET phase='uncertain' WHERE operation_id=?", active);
                 }
             } finally {
-                if (stored) this.revalidateOwnership(o!);
+                // Ownership is judged only AFTER settlement, against the rows settlement left: an unowned policy is stored (so receipts and
+                // pre-dispatch conflicts settle above) but stays unhealthy, withholds the revision token and is never a confirmation.
+                if (stored && this.revalidateOwnership(o!) && o!.errors.length === 0 && healthyConfirmation(o!.status, o!.acceptedPolicy, o!.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o!.routerTime);
                 this.store.pruneAutomaticReads();
             }
         });
     }
-    /** Settlement may have discarded the proposal the stored observation matched: if the committed rows no longer own it, claim no health. */
-    private revalidateOwnership(o: RPCObservation): void {
-        try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
-        catch { this.store.run("UPDATE integration_state SET observation_error='owner_schedule_configuration_changed' WHERE singleton=1"); }
+    /** True when the committed (and still-staged) rows own the stored observation; otherwise records why and claims no health. */
+    private revalidateOwnership(o: RPCObservation): boolean {
+        try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); return true; }
+        catch (error) {
+            this.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', error instanceof AppError ? error.code : 'router_observation_invalid');
+            return false;
+        }
     }
     /**
      * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so
