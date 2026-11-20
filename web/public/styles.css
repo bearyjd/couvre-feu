@@ -1496,7 +1496,7 @@ main :where(img,svg,video,canvas,input,select,textarea,button,table) { max-width
 
 /* Tab bar: five hash-routed sections. A pinned bar on a phone, a plain row under the masthead from 900 px. */
 .tab-panel[hidden], .tabbar[hidden], .tab[hidden], .tab-badge[hidden], .tab-empty[hidden], .more-jump[hidden], .more-jump a[hidden] { display: none; }
-html { scroll-padding-bottom: 88px; } /* a focused field scrolls clear of the pinned bar */
+html { scroll-padding-top: 72px; scroll-padding-bottom: 88px; } /* deep-link targets and scrolled-to controls clear the sticky masthead (about 64px) and the pinned tab bar */
 .tabbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: var(--glass); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); border-top: .5px solid var(--line); padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
 .tabbar.is-typing { display: none; } /* phones only: see the desktop block, which keeps the bar */
 .tablist { display: flex; max-width: 640px; margin: 0 auto; padding: 4px 4px 2px; gap: 2px; }
