@@ -11,6 +11,7 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
+import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
@@ -202,7 +203,7 @@ export class IntegrationPolicy {
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
-                ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
+                ...scheduleWithAllowance(this.scheduleState(o, enrolled, healthy, validUntil, child.id), allowance, validUntil),
                 allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
@@ -217,6 +218,17 @@ export class IntegrationPolicy {
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
+    }
+    /**
+     * Flag off: main's schedule view. Flag schedules.editable on (unverified on this router): always the committed windows, never the
+     * manifest or the observation; their state is known only while the router holds the child in a healthy observation (an unowned
+     * observation is never stored and sets observation_error, so it is never healthy).
+     */
+    private scheduleState(o: RPCObservation | null, enrolled: boolean, healthy: boolean, validUntil: number, child: string) {
+        const config = this.store.config;
+        if (!schedulesInDatabase(config)) return integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child);
+        const held = o?.acceptedPolicy.people.some(p => p.id === child) === true;
+        return integrationScheduleState({...config.enrollment, schedules: scheduleWindows(this.store)}, config, o?.routerTime ?? null, healthy && held, this.now(), validUntil, child);
     }
     /**
      * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the

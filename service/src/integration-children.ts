@@ -1,8 +1,9 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
-import type { RouterPolicy } from '../../shared/src/router-schema.ts';
+import type { RouterPolicy, Schedule } from '../../shared/src/router-schema.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { Store } from './db.ts';
+import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 
 /** The router's own policy limits (router/lib/json.awk, shared/src/router-schema.ts); not product limits of this service. */
 export const CHILD_LIMIT = 64;
@@ -49,32 +50,37 @@ export const configuredMacs = (store: Store, person: string, heldByRouter: reado
 
 /**
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a
- * queued change are admitted), never a protected MAC, and exactly the manifest-owned schedules of the children present.
+ * queued change are admitted), never a protected MAC, and exactly the owned schedules (ownedSchedules) of the children present.
  */
-export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock'>, store: Store, allowEmpty = true): void {
+export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true): void {
     normalizePolicy(policy, config.protectedMacs);
     if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
     // A moving device is admitted under both its source and its target child, so a policy on either side of the change validates.
     const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
         .flatMap(d => [`${d.person_id}\n${d.identifier}`, ...(d.move_to ? [`${d.move_to}\n${d.identifier}`] : [])]));
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
-    if (JSON.stringify(policy.schedules) !== JSON.stringify(ownerSchedules(policy, config))) throw new AppError(409, 'owner_schedule_configuration_changed');
+    const owned = ownedSchedules(config, store, new Set(policy.people.map(p => p.id)));
+    // Flag off: main's literal comparison. Flag on: a pure canonical comparison with the committed rows (never normalizes, so never a limit error).
+    if (schedulesInDatabase(config) ? canonicalSchedules(policy.schedules) !== canonicalSchedules(owned) : JSON.stringify(policy.schedules) !== JSON.stringify(owned)) throw new AppError(409, 'owner_schedule_configuration_changed');
     if (policy.schedules.length > 0 && !config.scheduleClock) throw new AppError(409, 'owner_schedule_clock_required');
 }
-/** Schedules stay owner-configured in the manifest; they apply to whichever of their children are on the router. */
-function ownerSchedules(policy: Pick<RouterPolicy, 'people'>, config: Pick<IntegrationManifest, 'enrollment'>) {
-    const present = new Set(policy.people.map(p => p.id));
-    return normalizePolicy(config.enrollment).schedules.filter(s => present.has(s.person));
+/**
+ * The schedules this service owns for the children present on the router. Flag off: the manifest enrollment schedules, as on main.
+ * Flag schedules.editable on (unverified on this router): the committed schedule_windows rows; in S1 they change only through the one-time seed.
+ */
+export function ownedSchedules(config: Pick<IntegrationManifest, 'enrollment' | 'schedules'>, store: Store, present: ReadonlySet<string>): Schedule[] {
+    if (!schedulesInDatabase(config)) return normalizePolicy(config.enrollment).schedules.filter(s => present.has(s.person));
+    return scheduleWindows(store).filter(s => present.has(s.person));
 }
-/** Next policy with one MAC added to a child. Built from the router's accepted policy, never from the database. */
-export function withDevice(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, person: string, mac: string): RouterPolicy {
+/** Next policy with one MAC added to a child. Built from the router's accepted policy; only its schedules come from ownedSchedules. */
+export function withDevice(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'schedules'>, person: string, mac: string, store: Store): RouterPolicy {
     const present = base.people.some(p => p.id === person);
     const people = present ? base.people.map(p => p.id === person ? {...p, macs: [...p.macs, mac]} : p) : [...base.people, {id: person, macs: [mac]}];
     if (people.length > CHILD_LIMIT) throw new AppError(409, 'child_limit_reached');
-    return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownerSchedules({people}, config)}, config.protectedMacs);
+    return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownedSchedules(config, store, new Set(people.map(p => p.id)))}, config.protectedMacs);
 }
 /** All additions share one revision and one router operation; callers stage every device before validation. */
-export function withDevices(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, additions: readonly {person: string; mac: string}[]): RouterPolicy {
+export function withDevices(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'schedules'>, additions: readonly {person: string; mac: string}[], store: Store): RouterPolicy {
     const people = base.people.map(p => ({...p, macs: [...p.macs]}));
     for (const addition of additions) {
         const person = people.find(p => p.id === addition.person);
@@ -82,20 +88,20 @@ export function withDevices(base: RouterPolicy, config: Pick<IntegrationManifest
         else people.push({id: addition.person, macs: [addition.mac]});
     }
     if (people.length > CHILD_LIMIT) throw new AppError(409, 'child_limit_reached');
-    return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownerSchedules({people}, config)}, config.protectedMacs);
+    return normalizePolicy({...base, revision: base.revision + 1, people, schedules: ownedSchedules(config, store, new Set(people.map(p => p.id)))}, config.protectedMacs);
 }
 /** Next policy with one MAC removed; a child left without devices leaves the router with its pause, allowance and schedules. */
-export function withoutDevice(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, person: string, mac: string): RouterPolicy {
+export function withoutDevice(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'schedules'>, person: string, mac: string, store: Store): RouterPolicy {
     const people = base.people.map(p => p.id === person ? {...p, macs: p.macs.filter(m => m !== mac)} : p).filter(p => p.macs.length > 0);
     const gone = !people.some(p => p.id === person);
     return normalizePolicy({...base, revision: base.revision + 1, people, pauses: gone ? base.pauses.filter(p => p.person !== person) : base.pauses,
         ...(base.allowances ? {allowances: gone ? base.allowances.filter(a => a.person !== person) : base.allowances} : {}),
-        schedules: ownerSchedules({people}, config)}, config.protectedMacs);
+        schedules: ownedSchedules(config, store, new Set(people.map(p => p.id)))}, config.protectedMacs);
 }
 /** withoutDevice(A) then withDevice(B), as ONE revision: the router sees a single step, so there is never a state with the device nowhere. */
-export function movePolicy(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment'>, from: string, to: string, mac: string): RouterPolicy {
+export function movePolicy(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'schedules'>, from: string, to: string, mac: string, store: Store): RouterPolicy {
     if (from === to) throw new AppError(409, 'device_move_same_child');
     if (!base.people.some(p => p.id === from && p.macs.includes(mac))) throw new AppError(409, 'device_not_on_router');
-    const next = withDevice(withoutDevice(base, config, from, mac), config, to, mac);
+    const next = withDevice(withoutDevice(base, config, from, mac, store), config, to, mac, store);
     return normalizePolicy({...next, revision: base.revision + 1}, config.protectedMacs);
 }
