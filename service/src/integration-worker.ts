@@ -228,6 +228,7 @@ export class IntegrationWorker {
     }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {
         this.store.transaction(() => {
+            let stored = false;
             try {
                 const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
                 if (!step || step.claim_token !== token || step.state !== 'consumed' || s.dispatch_epoch !== epoch || s.generation !== this.store.config.router.generation || s.dispatch_stopped || step.lease_until < this.now()) return;
@@ -245,6 +246,7 @@ export class IntegrationWorker {
                     }
                     return;
                 }
+                stored = true;
                 this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
                 this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
                 this.activity.purgeUnenrolled();
@@ -277,9 +279,15 @@ export class IntegrationWorker {
                     this.store.run("UPDATE operation_rpc SET phase='uncertain' WHERE operation_id=?", active);
                 }
             } finally {
+                if (stored) this.revalidateOwnership(o!);
                 this.store.pruneAutomaticReads();
             }
         });
+    }
+    /** Settlement may have discarded the proposal the stored observation matched: if the committed rows no longer own it, claim no health. */
+    private revalidateOwnership(o: RPCObservation): void {
+        try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
+        catch { this.store.run("UPDATE integration_state SET observation_error='owner_schedule_configuration_changed' WHERE singleton=1"); }
     }
     /**
      * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so

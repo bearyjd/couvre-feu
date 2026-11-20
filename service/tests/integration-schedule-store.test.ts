@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { integrationFixture, actor, observation } from './fixtures/integration.ts';
+import { integrationFixture, actor } from './fixtures/integration.ts';
 import { validateManagedPolicy, withDevice } from '../src/integration-children.ts';
-import { MAX_WINDOWS_PER_CHILD, policyWithWindows, replaceScheduleWindows, scheduleWindows, seedScheduleWindows, stageScheduleWindows } from '../src/integration-schedule-store.ts';
+import { MAX_WINDOWS_PER_CHILD, policyWithWindows, replaceScheduleWindows, scheduleWindows, seedScheduleWindows, settleScheduleWindows, stageScheduleWindows } from '../src/integration-schedule-store.ts';
 import { IntegrationStore } from '../src/integration-db.ts';
 import { AutomaticDispatch } from '../src/integration-automatic.ts';
 import { RouterTransportError } from '../src/router-transport.ts';
@@ -179,6 +179,10 @@ test('flag on: a never-dispatched operation whose base went stale discards its s
         // Out-of-band router change that happens to equal the staged proposal, on a newer revision (stale base).
         f.router.policy = normalizePolicy({...f.router.policy, revision: f.router.policy.revision + 1, schedules: [{person: 'pilot', ...night}]});
         await f.automatic.tick();
+        // After the settling tick the cached observation holds windows the committed rows do not own: no health claim and no revision token.
+        const dto = f.policy.people(actor);
+        assert.equal(dto.revisionToken, null);
+        assert.notEqual(dto.people[0]!.observationHealth, 'healthy');
         await f.automatic.tick();
         assert.notEqual(f.policy.operation(actor, op.id).state, 'confirmed');
         assert.deepEqual(scheduleWindows(f.store), []);
@@ -198,5 +202,51 @@ test('flag on at construction seeds from the manifest; reopening does not seed a
         } finally { reopened.close(); }
         const again = new IntegrationStore(config);
         try { assert.deepEqual(scheduleWindows(again), []); } finally { again.close(); }
+    } finally { f.cleanup(); }
+});
+
+test('flag on: historical receipt recovery matches the held windows regardless of input order', async () => {
+    const f = integrationFixture();
+    try {
+        const config = setup(f, true);
+        await f.observe();
+        const zed = {...night, id: 'zed'}, alpha = {...night, id: 'alpha', start: '13:00', stop: '14:00'};
+        const op = queueWindows(f, [zed, alpha]); // proposal in input order [zed, alpha]
+        f.store.run("UPDATE operation_rpc SET delivery='accepted',receipt_json='{}',attempt_count=1 WHERE operation_id=?", op.id);
+        const held = normalizePolicy({...config.enrollment, revision: 1, schedules: [alpha, zed].map(w => ({person: 'pilot', ...w}))}); // the router reports sorted by id
+        assert.deepEqual(held.schedules.map(s => s.id), ['alpha', 'zed']);
+        f.store.transaction(() => settleScheduleWindows(f.store, op.id, 'conflict', held));
+        assert.deepEqual(scheduleWindows(f.store).map(s => s.id), ['alpha', 'zed']);
+        assert.deepEqual(staged(f), []);
+    } finally { f.cleanup(); }
+});
+
+test('flag on: with no router observation of the child, people() shows the committed windows, not the manifest, and enforcement stays unknown', () => {
+    const f = integrationFixture();
+    try {
+        const config = setup(f, true, [{person: 'pilot', id: 'manifest', weekdays: ['Sat'], start: '10:00', stop: '11:00'}]);
+        f.store.transaction(() => replaceScheduleWindows(f.store, 'pilot', [night]));
+        const child = f.policy.people(actor).people[0]!;
+        assert.match(child.scheduleExplanation, /night/);
+        assert.doesNotMatch(child.scheduleExplanation, /manifest/);
+        assert.equal(child.scheduleBlocked, null);
+        f.store.transaction(() => replaceScheduleWindows(f.store, 'pilot', []));
+        assert.equal(f.policy.people(actor).people[0]!.scheduleExplanation, 'No owner-configured schedule.');
+        assert.ok(config);
+    } finally { f.cleanup(); }
+});
+
+test('migration integration-009: weekday and clock CHECKs and the owner-update cap hold under direct SQL', () => {
+    const f = integrationFixture();
+    try {
+        setup(f, true);
+        const ins = (id: string, days: string, start: string, stop: string, person = 'pilot') => f.store.run('INSERT INTO schedule_windows(person_id,id,weekdays,start,stop) VALUES(?,?,?,?,?)', person, id, days, start, stop);
+        for (const days of ['Foo', 'MonTue', 'Mon,,Tue', ',Mon,Tue', 'Mon,Tue,', 'Mo,nMon', 'mon']) assert.throws(() => ins('bad', days, '10:00', '11:00'), /CHECK/, days);
+        for (const t of ['24:00', '29:59', '10:60']) { assert.throws(() => ins('bad', 'Mon', t, '11:00'), /CHECK/, t); assert.throws(() => ins('bad', 'Mon', '10:00', t), /CHECK/, t); }
+        ins('ok1', 'Mon,Tue,Wed,Thu,Fri,Sat,Sun', '00:00', '23:59');
+        // A ninth window cannot arrive by moving a row between owners.
+        f.store.run("INSERT INTO people(id,name,kind,active,created_at) VALUES('other','Other','child',1,0)");
+        for (let i = 0; i < 8; i++) ins(`w${i}`, 'Mon', '10:00', '11:00', 'other');
+        assert.throws(() => f.store.run("UPDATE schedule_windows SET person_id='other' WHERE person_id='pilot' AND id='ok1'"), /schedule_window_limit/);
     } finally { f.cleanup(); }
 });

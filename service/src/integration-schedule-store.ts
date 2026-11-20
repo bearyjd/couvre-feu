@@ -59,6 +59,8 @@ export function stageScheduleWindows(store: Store, person: string, windows: read
     if (!store.db.isTransaction) throw new Error('schedule_stage_requires_transaction');
     store.run('INSERT INTO schedule_staged(operation_id,person_id,windows_json) VALUES(?,?,?)', operationId, id(person), JSON.stringify(checkedSet(windows)));
 }
+/** Order-independent form for comparing window sets: sorted by id, keys in a fixed order. */
+const canonical = (windows: readonly ScheduleWindow[] | undefined): string => JSON.stringify([...(windows ?? [])].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(w => ({id: w.id, weekdays: w.weekdays, start: w.start, stop: w.stop})));
 interface Staged { operation_id: string; person_id: string; windows_json: string }
 /**
  * Every schedule set reconciliation may meet: the committed rows (base) and, per staged operation, the rows with that proposal applied.
@@ -84,7 +86,7 @@ export function settleScheduleWindows(store: Store, operationId: string, state: 
     const proposal = JSON.parse(row.windows_json) as ScheduleWindow[];
     const held = observed?.schedules.filter(s => s.person === row.person_id).map(({person: _person, ...w}) => w);
     const receipt = store.get<{attempt_count: number}>("SELECT attempt_count FROM operation_rpc WHERE operation_id=? AND delivery='accepted' AND receipt_json IS NOT NULL", operationId);
-    const promote = state === 'confirmed' || (state === 'conflict' && receipt !== undefined && receipt !== null && receipt.attempt_count > 0 && JSON.stringify(held) === JSON.stringify(proposal));
+    const promote = state === 'confirmed' || (state === 'conflict' && receipt !== undefined && receipt !== null && receipt.attempt_count > 0 && canonical(held) === canonical(proposal));
     if (promote) replaceScheduleWindows(store, row.person_id, proposal);
     store.run('DELETE FROM schedule_staged WHERE operation_id=?', operationId);
 }
