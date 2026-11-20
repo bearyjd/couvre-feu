@@ -14,3 +14,10 @@ WHEN (SELECT count(*) FROM schedule_windows WHERE person_id = NEW.person_id) >= 
 BEGIN SELECT RAISE(ABORT, 'schedule_window_limit'); END;
 -- One-time manifest seed marker: a parent who empties the set is never re-seeded from the manifest.
 CREATE TABLE IF NOT EXISTS schedule_seed (singleton INTEGER PRIMARY KEY CHECK(singleton = 1)) STRICT;
+-- Windows a queued schedule change proposes, tied to its operation. They become schedule_windows only when the router confirms; a failed or
+-- conflicted operation discards them. Not the truth until then, so a refused or undelivered change leaves nothing behind.
+CREATE TABLE IF NOT EXISTS schedule_staged (
+ operation_id TEXT NOT NULL PRIMARY KEY,
+ person_id TEXT NOT NULL REFERENCES people(id),
+ windows_json TEXT NOT NULL
+) STRICT;

@@ -37,17 +37,50 @@ function checked(value: unknown): ScheduleWindow {
     if (start === stop) throw new AppError(400, 'invalid_schedule_window');
     return {id: id(w.id), weekdays: DAYS.filter(d => days.includes(d)), start, stop};
 }
-/**
- * Replaces one child's window set inside the caller's transaction (the same one that queues the policy; see
- * IntegrationPolicy.queue `stage`). A throw anywhere rolls the rows back with the operation.
- */
-export function stageScheduleWindows(store: Store, person: string, windows: readonly ScheduleWindow[]): void {
-    if (!store.db.isTransaction) throw new Error('schedule_stage_requires_transaction');
+/** Validates a window set (count, shape, unique ids) without writing it. */
+function checkedSet(windows: readonly ScheduleWindow[]): ScheduleWindow[] {
     if (windows.length > MAX_WINDOWS_PER_CHILD) throw new AppError(409, 'schedule_window_limit');
     const next = windows.map(checked);
     if (new Set(next.map(w => w.id)).size !== next.length) throw new AppError(400, 'invalid_schedule_window');
+    return next;
+}
+/** Replaces one child's committed window set inside the caller's transaction. */
+export function replaceScheduleWindows(store: Store, person: string, windows: readonly ScheduleWindow[]): void {
+    if (!store.db.isTransaction) throw new Error('schedule_replace_requires_transaction');
+    const next = checkedSet(windows);
     store.run('DELETE FROM schedule_windows WHERE person_id=?', id(person));
     for (const w of next) insert(store, person, w);
+}
+/**
+ * Records a child's proposed window set against the operation that queues it (the same transaction as IntegrationPolicy.queue `stage`).
+ * The committed rows are untouched until settleScheduleWindows sees the router confirm; a throw anywhere rolls the staged row back.
+ */
+export function stageScheduleWindows(store: Store, person: string, windows: readonly ScheduleWindow[], operationId: string): void {
+    if (!store.db.isTransaction) throw new Error('schedule_stage_requires_transaction');
+    store.run('INSERT INTO schedule_staged(operation_id,person_id,windows_json) VALUES(?,?,?)', operationId, id(person), JSON.stringify(checkedSet(windows)));
+}
+interface Staged { operation_id: string; person_id: string; windows_json: string }
+/** Every schedule set reconciliation may meet: the committed rows (base) and, per staged operation, the rows with that proposal applied. */
+export function acceptableSchedules(store: Store): Schedule[][] {
+    const committed = scheduleWindows(store);
+    const proposals = store.all<Staged>('SELECT * FROM schedule_staged ORDER BY operation_id').map(row => [...committed.filter(s => s.person !== row.person_id),
+        ...(JSON.parse(row.windows_json) as ScheduleWindow[]).map(w => ({person: row.person_id, ...w}))]);
+    return [committed, ...proposals];
+}
+/**
+ * Settles an operation's staged windows with it, in the caller's transaction. Confirmed promotes them to the committed rows; failed discards
+ * them; unknown keeps them pending. A conflict may follow an accepted receipt that was later superseded, so it promotes only when the stored
+ * observation holds exactly the proposed windows for that child.
+ */
+export function settleScheduleWindows(store: Store, operationId: string, state: 'confirmed' | 'unknown' | 'failed' | 'conflict', observed: RouterPolicy | null): void {
+    if (state === 'unknown') return;
+    const row = store.get<Staged>('SELECT * FROM schedule_staged WHERE operation_id=?', operationId);
+    if (!row) return;
+    const proposal = JSON.parse(row.windows_json) as ScheduleWindow[];
+    const held = observed?.schedules.filter(s => s.person === row.person_id).map(({person: _person, ...w}) => w);
+    const promote = state === 'confirmed' || (state === 'conflict' && JSON.stringify(held) === JSON.stringify(proposal));
+    if (promote) replaceScheduleWindows(store, row.person_id, proposal);
+    store.run('DELETE FROM schedule_staged WHERE operation_id=?', operationId);
 }
 /** Next policy with one child's windows replaced; every other child's schedules are kept as the router holds them. */
 export function policyWithWindows(base: RouterPolicy, person: string, windows: readonly ScheduleWindow[]): RouterPolicy {

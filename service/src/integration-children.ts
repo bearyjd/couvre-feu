@@ -3,7 +3,7 @@ import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { Store } from './db.ts';
-import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { acceptableSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 
 /** The router's own policy limits (router/lib/json.awk, shared/src/router-schema.ts); not product limits of this service. */
 export const CHILD_LIMIT = 64;
@@ -59,8 +59,15 @@ export function validateManagedPolicy(policy: RouterPolicy, config: Pick<Integra
     const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
         .flatMap(d => [`${d.person_id}\n${d.identifier}`, ...(d.move_to ? [`${d.move_to}\n${d.identifier}`] : [])]));
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
-    if (JSON.stringify(policy.schedules) !== JSON.stringify(ownerSchedules(policy, config, store))) throw new AppError(409, 'owner_schedule_configuration_changed');
+    if (!schedulesOwned(policy, config, store)) throw new AppError(409, 'owner_schedule_configuration_changed');
     if (policy.schedules.length > 0 && !config.scheduleClock) throw new AppError(409, 'owner_schedule_clock_required');
+}
+/** With the flag on, a policy is owned when its schedules equal the committed rows or a queued operation's proposed rows, and nothing else. */
+function schedulesOwned(policy: RouterPolicy, config: Pick<IntegrationManifest, 'enrollment' | 'schedules'>, store: Store): boolean {
+    const actual = JSON.stringify(policy.schedules);
+    if (!schedulesInDatabase(config)) return actual === JSON.stringify(ownerSchedules(policy, config, store));
+    const present = new Set(policy.people.map(p => p.id));
+    return acceptableSchedules(store).some(rows => actual === JSON.stringify(normalizePolicy({version: 1, revision: 0, people: policy.people, pauses: [], schedules: rows.filter(s => present.has(s.person))}).schedules));
 }
 /**
  * Schedules stay owner-configured in the manifest; they apply to whichever of their children are on the router. With schedules.editable

@@ -15,6 +15,7 @@ import { DEFAULT_INVENTORY_RETENTION_DAYS, InventoryStore, dropDecisionOnEnrol, 
 import type { RouterInventory } from '../../shared/src/router-inventory.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-children.ts';
+import { settleScheduleWindows } from './integration-schedule-store.ts';
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
@@ -311,6 +312,7 @@ export class IntegrationWorker {
         const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id)!;
         if (op.state === state && op.error === error && (confirmedAt === null || op.confirmed_at === confirmedAt)) return;
         const drift = this.settleDevices(op, state);
+        settleScheduleWindows(this.store, id, state, state === 'conflict' ? this.store.observation().value?.acceptedPolicy ?? null : null);
         this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, drift ?? error, confirmedAt, this.now(), id);
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, id, op.action, op.revision, this.now(), state);
     }
