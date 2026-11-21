@@ -271,8 +271,50 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
 - **Shape:** `schedule_windows(person_id, id, weekdays, start, stop)` (migration `integration-009`, additive): clock times and a weekday set only, no free text, strict CHECKs on weekday tokens (each at most once), clocks and embedded NULs. At most 8 windows per child: insert and owner-update triggers, and with the flag on the loader refuses a manifest with more than 8 windows for a child (`invalid_schedules`) so the seed cannot fail at startup. Cross-midnight is one row (`start > stop`).
 - **People reads:** with the flag on, a child always shows the committed windows; their state is known only while a healthy observation holds the child. A child the router does not hold (no observation, last device removed) or an unowned observation shows them with enforcement unknown.
 - **Rebind:** the manifest digest is the hash of the file, so every flag flip passes through `rebindIntegration`. on->on: refused with `409 rebind_schedule_clock_required` when committed windows exist and the next manifest has no `scheduleClock`. on->off: refused with `409 rebind_schedules_diverge` unless the committed rows equal the next manifest's `enrollment.schedules`. off->on: in the same transaction the rows and the seed marker are deleted, so the next open seeds once from the next manifest. off->off: the tables are not touched.
-- **S2 handoff:** edits arrive with `scheduleMutate` and receipt-based settlement: one `settleSchedule(op, evidence)` function that never reads `acceptedPolicy` contents or the devices table, runs before ownership decides health or the revision token, and on an exact historical receipt promotes the payload's windows even if the child is no longer on the router.
+- **S2 handoff:** edits arrive with `scheduleMutate` (S2m, not built) and settle through the S2a core below. The S2a core is refuse-on-doubt: it does not promote on a historical receipt, and it never admits staged windows.
 - **Privacy:** window clocks and weekday sets only; no child names, labels or text are stored here, and nothing here logs, alerts, pushes or digests them.
+
+### Schedule settlement core (roadmap item 2, S2a; `schedules.editable`, off)
+
+**Unverified on this router.** The consumer lands before any producer. Nothing creates a schedule operation yet, and HTTP still answers `schedule_editing_unavailable` for integration installs. Migration `integration-010` (marker: the `operations.action` CHECK) lets `operations.action` hold `schedule_create`, `schedule_update` and `schedule_delete`. Code: `service/src/integration-schedule-settle.ts` (`admitScheduleOperation`, `decideSchedule`, `applyScheduleDecision`).
+
+- **Flag off (default):** every path is main's code, unchanged. The new code sits behind three checks: one gate in the worker's `finish`, one claim-time check and one `deferOwnership` boolean on `validateManagedPolicy`. Each is false whenever the flag is off. A parity test pins this. It compares the store against a golden dump generated at main, compares the key absent with the key `false`, and counts `decideSchedule` calls, which must be 0. A positive control shows the same script with the flag on gives different rows.
+- **Admission before dispatch (I4).** The claim runs `admitScheduleOperation` before anything is sent. It refuses the operation as `failed`/`schedule_payload_inadmissible`, and the router is never called, unless all of these hold:
+  - the envelope normalizes, with the router's own limits (256 expanded windows included);
+  - it names this operation, the installation generation and the stored request digest;
+  - the child row exists and gets at most 8 windows;
+  - every other child present in the payload carries exactly its committed windows.
+
+  An envelope the router normalizer refuses cannot be dispatched at all (`prepare` throws). The next observation then fails it the same way. Because admission is checked first, a later promotion cannot fail.
+- **Settlement (I2, rules E0-E8, first match wins).** `decideSchedule` is pure. Its inputs are the admission result, the current observation, the transport error, `attempt_count`, and whether this reply is our own apply. It never reads the stored `receipt_json`.
+
+  | Rule | Evidence | Outcome |
+  |---|---|---|
+  | E0 | Inadmissible | `failed`/`schedule_payload_inadmissible` (`conflict` if an attempt already happened) |
+  | E1 | Transport error on our own apply | Not delivered: `failed`/`router_apply_not_delivered`. Otherwise `unknown`/`router_outcome_unknown`. A failed read of another kind changes nothing. |
+  | E2 | Exact, current and healthy receipt | Promote and `confirmed` |
+  | E3 | Exact, current but unhealthy receipt | Promote and `unknown`/`accepted_router_runtime_unconfirmed` |
+  | E4 | Exact but historical receipt | `conflict`/`router_receipt_historical`, nothing new promoted |
+  | E5 | Our apply refused before write | `failed`/`router_refused_before_write` |
+  | E6 | No receipt, no attempt, base changed | `conflict`/`router_base_changed_before_dispatch` |
+  | E7 | No receipt, no attempt, base unchanged | No change |
+  | E8 | No receipt, one attempt | `unknown`/`receipt_missing_remote_outcome_unknown` (waits) |
+
+  - "Exact" is `exactReceipt`, which binds operation id, generation, request digest, base and accepted revision and digest.
+  - A terminal step clears the active operation.
+  - The operation row and one audit row are written only when state, error or `confirmed_at` change.
+- **Promotion (I3)** replaces only that child's `schedule_windows` rows, and only when they differ, so repeating it changes nothing. People rows are never deleted, so an inactive child promotes normally.
+- **Ownership follows settlement (I5).** While a schedule operation is active with the flag on, the transport check only normalizes the observation; ownership is deferred. After settlement the full `validateManagedPolicy` runs against the **committed** windows. If it fails, the observation is not stored, `observation_sequence` does not move, and `observation_error` is set to the check's fixed code (for example `owner_schedule_configuration_changed`), so no health or revision token is published. Staged windows are never admitted.
+- **Errors (I6):** operation errors are the fixed codes above, never `o.errors[0]` or other router text. Known gap, main's behaviour for every operation kind and unchanged here: `GET /people` top-level `errors` lists the published observation's router error codes.
+- **Cut from S2a (deferred), and what each cut means:**
+  - **Staged-window admission.** A router that already holds the payload without our receipt is refused. The owner sees "configuration changed" and nothing is promoted, which is what main does for any foreign writer.
+  - **Promotion on a historical receipt.** This is a conflict instead, and nothing is promoted.
+  - **The DTO field `scheduleCommitted`.** Not needed.
+  - **Changes to health and revision-token publishing.** These move to S2m, which builds on I5.
+  - **A service-side expansion count (`SCHEDULE_EXPANSION_LIMIT`).** The router normalizer already enforces the limit at admission.
+  - **The `schedule_promotion_failed` stuck state.** I4 makes it impossible.
+  - **Inherited from main, not fixed:** an operation with no receipt and one attempt waits in `unknown` (E8). Leaving that state without evidence needs a separate operator abandon command.
+- **Privacy:** codes only; no windows, addresses, names or router diagnostic text are logged, alerted, pushed, digested or put in a DTO by this core.
 
 ## Content filter manifest key (PRP-006 A2, off, nothing enforces yet)
 
