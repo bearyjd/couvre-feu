@@ -278,14 +278,16 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
 
 **Unverified on this router.** The consumer lands before any producer. Nothing creates a schedule operation yet, and HTTP still answers `schedule_editing_unavailable` for integration installs. Migration `integration-010` (marker: the `operations.action` CHECK) lets `operations.action` hold `schedule_create`, `schedule_update` and `schedule_delete`. Code: `service/src/integration-schedule-settle.ts` (`admitScheduleOperation`, `decideSchedule`, `applyScheduleDecision`).
 
-- **Flag off (default):** every path is main's code, unchanged. The new code sits behind three checks: one gate in the worker's `finish`, one claim-time check and one `deferOwnership` boolean on `validateManagedPolicy`. Each is false whenever the flag is off. A parity test pins this. It compares the store against a golden dump generated at main, compares the key absent with the key `false`, and counts `decideSchedule` calls, which must be 0. A positive control shows the same script with the flag on gives different rows.
-- **Admission before dispatch (I4).** The claim runs `admitScheduleOperation` before anything is sent. It refuses the operation as `failed`/`schedule_payload_inadmissible`, and the router is never called, unless all of these hold:
+- **Flag off (default):** every path is main's code, unchanged. The new code sits behind these checks: one gate in the worker's `finish`, one admission check in `prepare` and at the claim, one `deferOwnership` boolean on `validateManagedPolicy`, and the operation DTO's envelope read (main's throwing read with the flag off). Each is false whenever the flag is off. A parity test pins this. It compares the store against a golden dump generated at main, compares the key absent with the key `false`, and counts `decideSchedule` calls, which must be 0. A positive control shows the same script with the flag on gives different rows.
+- **Admission before dispatch (I4).** `prepare` for an apply runs `admitScheduleOperation` before anything parses the envelope, and the claim runs it again before anything is sent. A refused, still-queued operation becomes `failed`/`schedule_payload_inadmissible` and stops being active (`prepare` then answers 409 `schedule_payload_inadmissible`); the router is never called. Admission requires all of these:
   - the envelope normalizes, with the router's own limits (256 expanded windows included);
   - it names this operation, the installation generation and the stored request digest;
+  - the operation's `base_json` normalizes to the envelope's expected revision and digest; the routed children come from that base, never from the payload;
+  - the payload routes exactly the base's children and devices (an edit for one child cannot drop another child or device);
   - the child row exists and gets at most 8 windows;
-  - every other child present in the payload carries exactly its committed windows.
+  - every routed child other than this one carries exactly its committed windows.
 
-  An envelope the router normalizer refuses cannot be dispatched at all (`prepare` throws). The next observation then fails it the same way. Because admission is checked first, a later promotion cannot fail.
+  Because admission is checked first, a later promotion cannot fail. With the flag on, the operation DTO and `GET /people` read an operation whose envelope no longer parses as neither healthy nor superseded instead of throwing.
 - **Settlement (I2, rules E0-E8, first match wins).** `decideSchedule` is pure. Its inputs are the admission result, the current observation, the transport error, `attempt_count`, and whether this reply is our own apply. It never reads the stored `receipt_json`.
 
   | Rule | Evidence | Outcome |
@@ -295,7 +297,7 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
   | E2 | Exact, current and healthy receipt | Promote and `confirmed` |
   | E3 | Exact, current but unhealthy receipt | Promote and `unknown`/`accepted_router_runtime_unconfirmed` |
   | E4 | Exact but historical receipt | `conflict`/`router_receipt_historical`, nothing new promoted |
-  | E5 | Our apply refused before write | `failed`/`router_refused_before_write` |
+  | E5 | Our apply refused before write: a pre-write rejection with the base unchanged, or `policy_conflict` (no receipt for this request, base moved under the router lock) | `failed`/`router_refused_before_write` |
   | E6 | No receipt, no attempt, base changed | `conflict`/`router_base_changed_before_dispatch` |
   | E7 | No receipt, no attempt, base unchanged | No change |
   | E8 | No receipt, one attempt | `unknown`/`receipt_missing_remote_outcome_unknown` (waits) |
@@ -305,7 +307,7 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
   - The operation row and one audit row are written only when state, error or `confirmed_at` change.
 - **Promotion (I3)** replaces only that child's `schedule_windows` rows, and only when they differ, so repeating it changes nothing. People rows are never deleted, so an inactive child promotes normally.
 - **Ownership follows settlement (I5).** While a schedule operation is active with the flag on, the transport check only normalizes the observation; ownership is deferred. After settlement the full `validateManagedPolicy` runs against the **committed** windows. If it fails, the observation is not stored, `observation_sequence` does not move, and `observation_error` is set to the check's fixed code (for example `owner_schedule_configuration_changed`), so no health or revision token is published. Staged windows are never admitted. With the flag on, main's path in `finish` repeats the same full check before publishing, so an observation whose ownership was deferred is never published unchecked even if the schedule operation stopped being active between the transport check and `finish`.
-- **Errors (I6):** operation errors are the fixed codes above, never `o.errors[0]` or other router text. Known gap, main's behaviour for every operation kind and unchanged here: `GET /people` top-level `errors` lists the published observation's router error codes.
+- **Errors (I6):** operation errors are the fixed codes above, never `o.errors[0]` or other router text. An observation published while a schedule operation settles is stored with every `errors` and `status.errors` entry mapped, one for one, to a code this service reads (the pre-write rejections, `policy_conflict`, `previous_apply_failed`, `invalid_clock`, `inventory_row_dropped`) or `router_error_unrecognized`, so `GET /people` top-level `errors` repeats no router text from it and an unhealthy observation stays unhealthy. Observations published on main's path (no schedule operation active) keep main's behaviour.
 - **Cut from S2a (deferred), and what each cut means:**
   - **Staged-window admission.** A router that already holds the payload without our receipt is refused. The owner sees "configuration changed" and nothing is promoted, which is what main does for any foreign writer.
   - **Promotion on a historical receipt.** This is a conflict instead, and nothing is promoted.

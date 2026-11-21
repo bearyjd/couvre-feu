@@ -19,7 +19,7 @@ import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
 import { schedulesInDatabase } from './integration-schedule-store.ts';
-import { SCHEDULE_INADMISSIBLE, admitScheduleOperation, applyScheduleDecision, scheduleSeam } from './integration-schedule-settle.ts';
+import { SCHEDULE_INADMISSIBLE, admitScheduleOperation, applyScheduleDecision, scheduleSeam, withFixedErrorCodes } from './integration-schedule-settle.ts';
 
 export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
@@ -51,6 +51,8 @@ export class IntegrationWorker {
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
         if ((kind === 'apply' || kind === 'receipt') && !operationId) throw new AppError(400, 'operation_id_required');
         if (kind === 'receipt' && !this.store.get('SELECT id FROM operations WHERE id=?', operationId!)) throw new AppError(404, 'operation_not_found');
+        // S2a, flag on: a schedule operation is admitted before anything parses its envelope (E0), so a refused one fails here, never dispatched.
+        if (kind === 'apply') this.refuseInadmissibleSchedule(operationId!);
         const invocation = this.router.invocation(kind, kind === 'apply' ? this.policy.envelope(operationId!) : undefined, kind === 'receipt' ? operationId : undefined);
         const c = this.store.config, now = this.now();
         const base: Omit<PreparedDispatch, 'script' | 'scriptSha256'> = {version: 1, targetDigest: c.targetDigest, manifestDigest: c.manifestDigest,
@@ -135,9 +137,7 @@ export class IntegrationWorker {
                 }
                 // S2a, flag on: a schedule payload that could not be promoted later is refused before any dispatch (I4, rule E0).
                 if (schedulesInDatabase(this.store.config) && this.scheduleAction(op.action) && !admitScheduleOperation(this.store, op).ok) {
-                    this.updateOperation(id, 'failed', SCHEDULE_INADMISSIBLE);
-                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
-                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+                    this.failInadmissible(id);
                     return;
                 }
                 if (!this.policy.fresh()) throw new AppError(503, 'approved_router_observation_required');
@@ -297,6 +297,29 @@ export class IntegrationWorker {
         });
     }
     private scheduleAction(action: IntegrationOperation['action']): boolean { return action === 'schedule_create' || action === 'schedule_update' || action === 'schedule_delete'; }
+    /** Rule E0 before any dispatch: the operation fails with the fixed code and frees the active slot. Inside the caller's transaction. */
+    private failInadmissible(id: string): void {
+        this.updateOperation(id, 'failed', SCHEDULE_INADMISSIBLE);
+        this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
+        this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+    }
+    /**
+     * Flag on, apply of a schedule operation: admission runs before prepare parses the envelope, so a malformed or inadmissible payload can
+     * never leave the operation active behind a parse error. A still-queued, never-attempted active operation fails (E0); either way the
+     * apply cannot be prepared. Flag off: returns without reading anything.
+     */
+    private refuseInadmissibleSchedule(id: string): void {
+        if (!schedulesInDatabase(this.store.config)) return;
+        const refused = this.store.transaction(() => {
+            this.store.assertIdentity();
+            const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
+            if (!op || !this.scheduleAction(op.action) || admitScheduleOperation(this.store, op).ok) return false;
+            const rpc = this.store.get<{phase: string; attempt_count: number}>('SELECT phase,attempt_count FROM operation_rpc WHERE operation_id=?', id);
+            if (rpc?.phase === 'queued' && rpc.attempt_count === 0 && op.state === 'pending' && this.store.integrationState().active_operation_id === id) this.failInadmissible(id);
+            return true;
+        });
+        if (refused) throw new AppError(409, SCHEDULE_INADMISSIBLE);
+    }
     /** Flag schedules.editable on and the active operation is a schedule action. Flag off: false without reading anything. */
     private scheduleActive(active: string | null): boolean {
         if (!schedulesInDatabase(this.store.config) || !active) return false;
@@ -323,11 +346,13 @@ export class IntegrationWorker {
             ownApply: invocation.kind === 'apply' && invocation.operationId === active, attemptCount: rpc?.attempt_count ?? 0});
         applyScheduleDecision(this.store, op, decision, this.now());
         if (error || !o || !this.ownedAfterSettlement(o)) return;
-        this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
+        // Only fixed codes are stored and served (I6): router text in errors or status.errors becomes one fixed code, entry for entry.
+        const stored = withFixedErrorCodes(o);
+        this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(stored), this.now());
         this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
         this.activity.purgeUnenrolled();
-        this.scope.observe(o);
-        if (o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o.routerTime);
+        this.scope.observe(stored);
+        if (stored.errors.length === 0 && healthyConfirmation(stored.status, stored.acceptedPolicy, stored.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', stored.routerTime);
     }
     /**
      * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so

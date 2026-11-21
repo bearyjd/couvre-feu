@@ -1,9 +1,11 @@
-import { exactHealthy, exactReceipt, normalizeEnvelope, requestDigest } from '../../shared/src/router-rpc.ts';
+import { exactHealthy, exactReceipt, normalizeEnvelope, policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope, RPCObservation, RPCReceipt } from '../../shared/src/router-rpc.ts';
+import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { Schedule } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
 import { PRE_WRITE_REJECTIONS } from './integration-children.ts';
+import { BENIGN_ROUTER_ERRORS } from './inventory-store.ts';
 import { MAX_WINDOWS_PER_CHILD, canonicalSchedules, scheduleWindows } from './integration-schedule-store.ts';
 
 /**
@@ -20,8 +22,10 @@ interface RpcRow { generation: string; request_digest: string; envelope_json: st
 
 /**
  * Total: never throws. The envelope must normalize (the router's own limits, 256 expanded windows included), name this operation, the
- * installation generation and the stored request digest; the child must exist and get at most 8 windows; every other child present in the
- * payload must carry exactly its committed windows. Together these make a later promotion unable to fail.
+ * installation generation and the stored request digest; the child must exist and get at most 8 windows. The routed children come from
+ * the operation's base (operations.base_json, bound to the envelope's expected revision and digest), never from the payload: the payload
+ * must route exactly the base's children and devices, and every routed child other than this one must carry exactly its committed
+ * windows. Together these make a later promotion unable to fail, and an edit for one child can never drop another child's enforcement.
  */
 export function admitScheduleOperation(store: IntegrationStore, op: IntegrationOperation): Admission {
     try {
@@ -29,10 +33,12 @@ export function admitScheduleOperation(store: IntegrationStore, op: IntegrationO
         if (!rpc) return REFUSED;
         const e = normalizeEnvelope(JSON.parse(rpc.envelope_json));
         if (e.operation_id !== op.id || e.generation !== rpc.generation || e.generation !== store.config.router.generation || requestDigest(e) !== rpc.request_digest) return REFUSED;
+        const base = normalizePolicy(JSON.parse(op.base_json));
+        if (base.revision !== e.expected_revision || policyDigest(base) !== e.expected_digest || JSON.stringify(e.policy.people) !== JSON.stringify(base.people)) return REFUSED;
         if (!store.get('SELECT id FROM people WHERE id=?', op.person_id)) return REFUSED;
         if (e.policy.schedules.filter(s => s.person === op.person_id).length > MAX_WINDOWS_PER_CHILD) return REFUSED;
-        const present = new Set(e.policy.people.map(p => p.id));
-        const others = (set: readonly Schedule[]) => canonicalSchedules(set.filter(s => s.person !== op.person_id && present.has(s.person)));
+        const routed = new Set(base.people.map(p => p.id).filter(id => id !== op.person_id));
+        const others = (set: readonly Schedule[]) => canonicalSchedules(set.filter(s => routed.has(s.person)));
         return others(e.policy.schedules) === others(scheduleWindows(store)) ? {ok: true, envelope: e} : REFUSED;
     } catch {
         return REFUSED;
@@ -52,6 +58,12 @@ const step = (state: ScheduleState, error: string | null, terminal: boolean, ext
     ({state, error, confirmedAt: null, terminal, phase: terminal ? 'resolved' : 'uncertain', delivery: null, receipt: null, promote: null, ...extra});
 const refusedBeforeWrite = (o: RPCObservation, e: RPCEnvelope): boolean => o.receipt === null && o.currentOperationId !== e.operation_id && o.generation === e.generation &&
     o.acceptedPolicy.revision === e.expected_revision && o.policyDigest === e.expected_digest && o.errors.length > 0 && o.errors.every(code => PRE_WRITE_REJECTIONS.has(code));
+/**
+ * The router's reply to our single apply attempt when its base check failed under the lock (router/lib/rpc.sh: no receipt for this
+ * request, base revision or digest moved, `policy_conflict`): it refused before writing anything, so the change failed (E5).
+ */
+const conflictBeforeWrite = (o: RPCObservation, e: RPCEnvelope): boolean => o.receipt === null && o.currentOperationId !== e.operation_id && o.generation === e.generation &&
+    (o.acceptedPolicy.revision !== e.expected_revision || o.policyDigest !== e.expected_digest) && o.errors.length === 1 && o.errors[0] === 'policy_conflict';
 
 /** Pure: rules E0-E8 of the S2a design, first match wins. */
 export function decideSchedule(input: ScheduleInput): ScheduleStep | null {
@@ -69,7 +81,7 @@ export function decideSchedule(input: ScheduleInput): ScheduleStep | null {
         const promote = e.policy.schedules.filter(s => s.person === input.person);
         return exactHealthy(o, e) ? step('confirmed', null, true, {...accepted, promote, confirmedAt: o.routerTime}) : step('unknown', 'accepted_router_runtime_unconfirmed', false, {...accepted, promote});
     }
-    if (input.ownApply && refusedBeforeWrite(o, e)) return step('failed', 'router_refused_before_write', true);
+    if (input.ownApply && (refusedBeforeWrite(o, e) || conflictBeforeWrite(o, e))) return step('failed', 'router_refused_before_write', true);
     if (input.attemptCount === 0) return o.acceptedPolicy.revision !== e.expected_revision || o.policyDigest !== e.expected_digest ? step('conflict', 'router_base_changed_before_dispatch', true) : null;
     return step('unknown', 'receipt_missing_remote_outcome_unknown', false);
 }
@@ -94,6 +106,17 @@ export function applyScheduleDecision(store: IntegrationStore, op: IntegrationOp
         store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, op.id, op.action, op.revision, now, d.state);
     }
     if (d.terminal) store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+}
+/** Router error codes this service reads; any other router string is diagnostic text and is never stored while a schedule operation settles. */
+const KNOWN_ROUTER_CODES: ReadonlySet<string> = new Set([...PRE_WRITE_REJECTIONS, ...BENIGN_ROUTER_ERRORS, 'policy_conflict', 'previous_apply_failed']);
+export const ROUTER_ERROR_UNRECOGNIZED = 'router_error_unrecognized';
+/**
+ * The observation as it may be stored and served (I6): every router error entry is a known code or ROUTER_ERROR_UNRECOGNIZED. Entries are
+ * mapped one for one, never dropped, so an observation with errors stays unhealthy.
+ */
+export function withFixedErrorCodes(o: RPCObservation): RPCObservation {
+    const fixed = (codes: readonly string[]) => codes.map(code => KNOWN_ROUTER_CODES.has(code) ? code : ROUTER_ERROR_UNRECOGNIZED);
+    return {...o, errors: fixed(o.errors), status: {...o.status, errors: fixed(o.status.errors)}};
 }
 /** The worker calls decideSchedule through this object, so a test can count calls (flag off must read 0). */
 export const scheduleSeam = {decideSchedule};

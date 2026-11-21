@@ -65,10 +65,18 @@ export class IntegrationPolicy {
     }
     /** Visibility is "any row": a viewer sees an operation through any child they manage. */
     private visibleTo(actor: Actor, op: IntegrationOperation): boolean { return this.affectedPeople(op).some(person => actor.personIds.includes(person)); }
+    /**
+     * Flag off: main's envelope read (it throws on a malformed row, which no producer writes). Flag schedules.editable on: total, so a
+     * schedule operation refused for a malformed envelope (E0) stays readable; it is then neither healthy nor superseded.
+     */
+    private readableEnvelope(id: string): RPCEnvelope | null {
+        if (!schedulesInDatabase(this.store.config)) return this.envelope(id);
+        try { return this.envelope(id); } catch { return null; }
+    }
     private dto(op: IntegrationOperation, viewer?: Actor): OperationDTO {
         const r = this.store.get<{phase: string; delivery: string}>('SELECT phase,delivery FROM operation_rpc WHERE operation_id=?', op.id)!;
-        const o = this.store.observation().value, e = this.envelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && exactHealthy(o, e);
-        const superseded = fresh && o !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
+        const o = this.store.observation().value, e = this.readableEnvelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && e !== null && exactHealthy(o, e);
+        const superseded = fresh && o !== null && e !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
         const uncertainClaim = r.phase === 'claimed' && (this.store.get<{lease_until: number}>('SELECT lease_until FROM operation_rpc WHERE operation_id=?', op.id)!.lease_until <= this.now());
         const state: OperationState = uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state;
         // A bulk operation's representative child may be outside the viewer's scope: name one they can see instead.
