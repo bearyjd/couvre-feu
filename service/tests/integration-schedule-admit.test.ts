@@ -90,6 +90,16 @@ test('T11 possibly delivered: unknown, nothing promoted, still active; another r
         assert.equal(JSON.stringify(op(f, id)), row); assert.equal(active(f), id);
     } finally { f.cleanup(); }
 });
+test('T11 a failed observe while the schedule operation is still queued changes nothing (E1 applies to our own apply only)', async () => {
+    const f = world(true);
+    try {
+        await f.observe(); const id = queue(f, [night]), row = JSON.stringify(op(f, id));
+        f.advance(1); f.router.failure = new RouterTransportError('test_read_failed'); await f.observe();
+        assert.equal(JSON.stringify(op(f, id)), row); assert.equal(op(f, id).state, 'pending'); assert.equal(active(f), id);
+        f.router.failure = null; f.advance(1); await f.observe(); await applyOp(f, id);
+        assert.equal(op(f, id).state, 'confirmed'); assert.deepEqual(committed(f), [night]);
+    } finally { f.cleanup(); }
+});
 test('T11 an inactive child promotes normally; a later delete promotes the empty set (I3)', async () => {
     const f = world(true);
     try {
