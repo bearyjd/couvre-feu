@@ -24,7 +24,7 @@ export const FOCUS_MINUTES: readonly number[] = [15, 30, 45, 60, 90, 120];
 /** How a pause ends: 'manual' takes the caller's `until`; 'focus' runs `minutes` from router time (F5). */
 type PauseSpec = {kind: 'manual'} | {kind: 'focus'; minutes: number};
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow' | 'schedule_create' | 'schedule_update' | 'schedule_delete'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
 }
