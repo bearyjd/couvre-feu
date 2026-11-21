@@ -13,6 +13,7 @@ import { policyDigest, sha256 } from '../../shared/src/router-rpc.ts';
 // {editable: false} and {editable: true} (rows seeded from, so equal to, the manifest), and must leave identical stores.
 const VARIANTS: readonly (readonly [string, FixtureOptions])[] = [['absent', {}], ['editable false', {schedules: {editable: false}}], ['editable true', {schedules: {editable: true}}]];
 let variant: FixtureOptions = {};
+const CROSS: FixtureOptions = {crossMidnight: true};
 const dumps = new Map<string, Map<string, string[]>>();
 const test = (name: string, fn: () => Promise<void> | void) => {
     for (const [label, options] of VARIANTS) base(`${name} [schedules ${label}]`, async () => {
@@ -276,6 +277,18 @@ test('S3: an observation whose scope holds a protected MAC, or misses a floor MA
             assert.equal(f.policy.fresh(), false);
             assert.equal(observedScope(), before);
         }
+    } finally { f.cleanup(); }
+});
+
+test('nonempty cross-midnight manifest schedule: observe and one exact pause dispatch leave the same store with the flag absent, false or true', async () => {
+    const f = integrationFixture({...variant, ...CROSS});
+    try {
+        await f.observe();
+        const result = f.pause(f.now() + 60);
+        assert.equal(result.status, 202);
+        assert.equal(f.router.calls.length, 1);
+        if (variant.schedules?.editable) assert.deepEqual(f.store.all<{id: string; weekdays: string}>('SELECT id,weekdays FROM schedule_windows').map(r => `${r.id}/${r.weekdays}`), ['night/Mon,Tue']);
+        assert.deepEqual(f.policy.envelope(result.result.operation.id).policy.schedules.map(s => [s.id, s.start, s.stop]), [['night', '20:30', '07:00']]);
     } finally { f.cleanup(); }
 });
 

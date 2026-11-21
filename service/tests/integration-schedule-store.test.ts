@@ -454,3 +454,37 @@ test('schedules.editable on: the child and drain obligation callers answer as wi
         } finally { f.cleanup(); }
     }
 });
+
+test('seed identity recheck: a seed for an old identity refuses and writes nothing after the marker moved (A->off->C)', async () => {
+    const f = integrationFixture();
+    try {
+        const on = await offToOn(f);
+        // Process A holds the flag-on manifest and has not seeded yet (its identity check and its seed are separate transactions).
+        const a = new IntegrationStore(on, {seedSchedules: false});
+        try {
+            const c = later(on, {schedules: {editable: false}});
+            const b = new IntegrationStore(on, {seedSchedules: false});
+            try { rebindIntegration(b, c, on.manifestDigest, c.manifestDigest, f.now()); } finally { b.close(); }
+            assert.equal(boundDigest(a), c.manifestDigest);
+            const after = seeded(a);
+            assert.throws(() => a.transaction(() => seedScheduleWindows(a, on)), /integration_database_identity_mismatch/);
+            assert.deepEqual(seeded(a), after);
+            // Opening with seeding on refuses and closes rather than seeding for the old identity.
+            assert.throws(() => new IntegrationStore(on), /integration_database_identity_mismatch/);
+        } finally { a.close(); }
+    } finally { f.cleanup(); }
+});
+
+test('seed identity recheck: a matching identity still seeds once and the flag-off path never reads the marker', async () => {
+    const f = integrationFixture();
+    try {
+        const on = await offToOn(f);
+        const a = new IntegrationStore(on, {seedSchedules: false});
+        try {
+            a.transaction(() => seedScheduleWindows(a, on));
+            assert.deepEqual(seeded(a), {rows: [{person: 'pilot', ...night}], marker: true});
+        } finally { a.close(); }
+        f.store.run('UPDATE integration_state SET manifest_digest=?', 'a'.repeat(64));
+        f.store.transaction(() => seedScheduleWindows(f.store, {...on, schedules: {editable: false}}));
+    } finally { f.cleanup(); }
+});

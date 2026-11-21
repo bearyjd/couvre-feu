@@ -126,18 +126,19 @@ const RANDOMISH = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|
 /**
  * Every table's rows (natural order) as text, with the temporary data directory and per-run values replaced by first-seen indices, so
  * two runs of one scenario compare equal exactly when they stored the same rows with the same equalities. The one-time schedule seed
- * marker is left out: it is the one row the schedules.editable flag adds by design.
+ * marker and the seeded schedule_windows rows (asserted equal to the manifest where it matters) are left out: they are the rows the schedules.editable flag adds by design.
  */
 export function storeDump(store: IntegrationStore): string {
-    const tables = store.all<{name: string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name <> 'schedule_seed' ORDER BY name");
+    const tables = store.all<{name: string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schedule_seed','schedule_windows') ORDER BY name");
     const text = JSON.stringify(tables.map(t => [t.name, store.all(`SELECT * FROM "${t.name}"`)])).replaceAll(store.config.dataDir, '<dataDir>');
     const seen = new Map<string, number>();
     return text.replace(RANDOMISH, u => `#${seen.get(u) ?? seen.set(u, seen.size).size - 1}`);
 }
 /** Optional schedules manifest key (absent by default) and a hook that sees the store just before it closes (schedule parity tests). */
-export interface FixtureOptions { schedules?: {editable: boolean}; beforeClose?: (store: IntegrationStore) => void }
+export interface FixtureOptions { schedules?: {editable: boolean}; /** Manifest enrollment carries one nonempty cross-midnight window (and a scheduleClock). */ crossMidnight?: boolean; beforeClose?: (store: IntegrationStore) => void }
+const crossMidnightManifest = () => ({scheduleClock: {timezone: 'UTC'}, enrollment: normalizePolicy({version: 1, revision: 0, people: [{id: 'pilot', macs: ['02:10:20:30:40:50']}], pauses: [], schedules: [{person: 'pilot', id: 'night', weekdays: ['Mon' as const, 'Tue' as const], start: '20:30', stop: '07:00'}]})});
 export function integrationFixture(options: FixtureOptions = {}) {
-    const dir = mkdtempSync(join(tmpdir(), 'cf-integration-test-')), config: IntegrationConfig = {...testConfig(dir), ...(options.schedules ? {schedules: options.schedules} : {})}, store = new IntegrationStore(config);
+    const dir = mkdtempSync(join(tmpdir(), 'cf-integration-test-')), config: IntegrationConfig = {...testConfig(dir), ...(options.schedules ? {schedules: options.schedules} : {}), ...(options.crossMidnight ? crossMidnightManifest() : {})}, store = new IntegrationStore(config);
     let clock = 1791691200;
     const now = () => clock, policy = new IntegrationPolicy(store, now), router = new TestRouter(store, now), worker = new IntegrationWorker(store, router, now);
     router.elapse = seconds => { clock += seconds; };

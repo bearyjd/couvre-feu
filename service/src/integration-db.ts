@@ -76,7 +76,9 @@ export class IntegrationStore extends Store {
         this.transaction(() => seedChildren(this, config, 0));
         // integration-009 (schedules.editable, S1): additive schedule_windows and schedule_seed tables; applied once (marker: the schedule_seed table). Seeded once, only with the flag on.
         if (!this.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedule_seed'")) this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/integration-009.sql', import.meta.url), 'utf8')));
-        if (options.seedSchedules !== false) this.transaction(() => seedScheduleWindows(this, config));
+        if (options.seedSchedules !== false) {
+            try { this.transaction(() => seedScheduleWindows(this, config)); } catch (error) { this.close(); throw error; }
+        }
         // Separate additive state keeps existing manifest-bound databases readable.
         this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_dispatch (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL,
