@@ -89,9 +89,13 @@ export function settleSchedule(store: Store, op: IntegrationOperation, evidence:
             else if (canonicalSchedules(scheduleWindows(store)) !== canonicalSchedules(windows)) code = 'schedule_set_unverified';
         }
     }
+    // An accepted receipt whose promotion failed is NOT settled: the router holds windows the committed set lacks. The operation stays
+    // unknown (the worker keeps it active), so the next exact receipt read retries the promotion and no health claim is made meanwhile.
+    const stuck = code === 'schedule_promotion_failed';
+    const state = stuck ? 'unknown' : evidence.state;
     const withheld = code !== null && evidence.state === 'confirmed';
-    store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', evidence.state, evidence.error ?? code, withheld ? null : evidence.confirmedAt, evidence.now, op.id);
-    store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, op.id, op.action, op.revision, evidence.now, evidence.state);
+    store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, stuck ? code : evidence.error ?? code, withheld ? null : evidence.confirmedAt, evidence.now, op.id);
+    store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, op.id, op.action, op.revision, evidence.now, state);
 }
 /** Staged state: the active schedule operation's payload windows, or null when none is in flight. Reads the operation row only. */
 export function stagedScheduleWindows(store: Store): Schedule[] | null {

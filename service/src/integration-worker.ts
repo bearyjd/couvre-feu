@@ -18,7 +18,8 @@ import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-child
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
-import { settleSchedule } from './integration-schedule-settle.ts';
+import { settleSchedule, stagedScheduleWindows } from './integration-schedule-settle.ts';
+import { schedulesInDatabase } from './integration-schedule-store.ts';
 
 export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
@@ -156,7 +157,7 @@ export class IntegrationWorker {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
-            try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
+            try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, true, this.scheduleOperationActive()); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
             this.finish(batchId, token, epoch, invocation, o, null);
@@ -245,41 +246,58 @@ export class IntegrationWorker {
                     }
                     return;
                 }
-                this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
-                this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
-                this.activity.purgeUnenrolled();
-                this.scope.observe(o!);
-                if (o!.errors.length === 0 && healthyConfirmation(o!.status, o!.acceptedPolicy, o!.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o!.routerTime);
-                if (!active) return;
-                const e = this.policy.envelope(active), accepted = exactReceipt(o!, e), healthy = accepted && exactHealthy(o!, e);
-                if (accepted) {
-                    this.store.run("UPDATE operation_rpc SET delivery='accepted',receipt_json=?,phase=? WHERE operation_id=?", JSON.stringify(o!.receipt), healthy || !o!.receipt!.current ? 'resolved' : 'uncertain', active);
-                    this.updateOperation(active, healthy ? 'confirmed' : o!.receipt!.current ? 'unknown' : 'conflict', healthy ? null : o!.receipt!.current ? 'accepted_router_runtime_unconfirmed' : 'router_receipt_historical', healthy ? o!.routerTime : null);
-                    if (healthy || !o!.receipt!.current) this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+                if (active && this.scheduleOperationActive()) {
+                    // A schedule operation settles on its exact receipt before anything is published; the observation is then owned or withheld
+                    // against the POST-settlement committed set, so a router already holding staged (or a third set of) windows is never healthy.
+                    this.settleActive(o!, active, invocation);
+                    try { validateManagedPolicy(o!.acceptedPolicy, this.store.config, this.store); }
+                    catch (failure) { this.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', failure instanceof AppError ? failure.code : 'router_observation_invalid'); return; }
+                    this.publish(o!);
                     return;
                 }
-                const rpc = this.store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active)!;
-                if (invocation.kind === 'apply' && invocation.operationId === active && this.refusedBeforeWrite(o!, e)) {
-                    // The router's own reply to this single attempt: refused under its lock before any policy write (a refused
-                    // transition still records runtime/error), base unchanged and no receipt. Nothing can apply later
-                    // (attempt_count is capped at 1), so the change failed; it is not unknown.
-                    this.updateOperation(active, 'failed', o!.errors[0]);
-                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
-                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
-                } else if (rpc.attempt_count === 0 && (o!.acceptedPolicy.revision !== e.expected_revision || o!.policyDigest !== e.expected_digest)) {
-                    // Positive local no-dispatch witness allows resolving a stale queued intent.
-                    this.updateOperation(active, 'conflict', 'router_base_changed_before_dispatch');
-                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
-                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
-                } else if (rpc.attempt_count > 0) {
-                    // Even receipt absence under lock cannot drain a delayed earlier SSH command.
-                    this.updateOperation(active, 'unknown', 'receipt_missing_remote_outcome_unknown');
-                    this.store.run("UPDATE operation_rpc SET phase='uncertain' WHERE operation_id=?", active);
-                }
+                this.publish(o!);
+                if (active) this.settleActive(o!, active, invocation);
             } finally {
                 this.store.pruneAutomaticReads();
             }
         });
+    }
+    private scheduleOperationActive(): boolean { return schedulesInDatabase(this.store.config) && stagedScheduleWindows(this.store) !== null; }
+    private publish(o: RPCObservation): void {
+        this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
+        this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
+        this.activity.purgeUnenrolled();
+        this.scope.observe(o);
+        if (o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o.routerTime);
+    }
+    private settleActive(o: RPCObservation, active: string, invocation: FrozenInvocation): void {
+        const e = this.policy.envelope(active), accepted = exactReceipt(o, e), healthy = accepted && exactHealthy(o, e);
+        if (accepted) {
+            this.store.run("UPDATE operation_rpc SET delivery='accepted',receipt_json=?,phase=? WHERE operation_id=?", JSON.stringify(o.receipt), healthy || !o.receipt!.current ? 'resolved' : 'uncertain', active);
+            this.updateOperation(active, healthy ? 'confirmed' : o.receipt!.current ? 'unknown' : 'conflict', healthy ? null : o.receipt!.current ? 'accepted_router_runtime_unconfirmed' : 'router_receipt_historical', healthy ? o.routerTime : null);
+            // An accepted receipt whose schedule promotion failed stays active and uncertain: the next exact receipt read retries it.
+            if (this.store.get('SELECT 1 FROM operations WHERE id=? AND state=? AND error=?', active, 'unknown', 'schedule_promotion_failed')) { this.store.run("UPDATE operation_rpc SET phase='uncertain' WHERE operation_id=?", active); return; }
+            if (healthy || !o.receipt!.current) this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+            return;
+        }
+        const rpc = this.store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active)!;
+        if (invocation.kind === 'apply' && invocation.operationId === active && this.refusedBeforeWrite(o, e)) {
+            // The router's own reply to this single attempt: refused under its lock before any policy write (a refused
+            // transition still records runtime/error), base unchanged and no receipt. Nothing can apply later
+            // (attempt_count is capped at 1), so the change failed; it is not unknown.
+            this.updateOperation(active, 'failed', o.errors[0]);
+            this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
+            this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+        } else if (rpc.attempt_count === 0 && (o.acceptedPolicy.revision !== e.expected_revision || o.policyDigest !== e.expected_digest)) {
+            // Positive local no-dispatch witness allows resolving a stale queued intent.
+            this.updateOperation(active, 'conflict', 'router_base_changed_before_dispatch');
+            this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", active);
+            this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+        } else if (rpc.attempt_count > 0) {
+            // Even receipt absence under lock cannot drain a delayed earlier SSH command.
+            this.updateOperation(active, 'unknown', 'receipt_missing_remote_outcome_unknown');
+            this.store.run("UPDATE operation_rpc SET phase='uncertain' WHERE operation_id=?", active);
+        }
     }
     /**
      * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so

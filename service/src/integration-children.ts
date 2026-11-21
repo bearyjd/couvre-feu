@@ -53,13 +53,15 @@ export const configuredMacs = (store: Store, person: string, heldByRouter: reado
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a
  * queued change are admitted), never a protected MAC, and exactly the owned schedules (ownedSchedules) of the children present.
  */
-export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true): void {
+export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true, deferScheduleOwnership = false): void {
     normalizePolicy(policy, config.protectedMacs);
     if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
     // A moving device is admitted under both its source and its target child, so a policy on either side of the change validates.
     const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
         .flatMap(d => [`${d.person_id}\n${d.identifier}`, ...(d.move_to ? [`${d.move_to}\n${d.identifier}`] : [])]));
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
+    // The worker defers this one check while a schedule operation is active, then re-runs it against the post-settlement committed set (never the staged one).
+    if (deferScheduleOwnership) return;
     const owned = ownedSchedules(config, store, new Set(policy.people.map(p => p.id)));
     // Flag off: main's literal comparison. Flag on: a pure canonical comparison with the committed rows (never normalizes, so never a limit error).
     // An in-flight schedule operation's payload (the only staged state) is admitted as well: the router may already carry it before settlement promotes it.

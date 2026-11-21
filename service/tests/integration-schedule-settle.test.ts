@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { integrationFixture, storeDump } from './fixtures/integration.ts';
+import { integrationFixture, storeDump, actor } from './fixtures/integration.ts';
 import { RouterTransportError } from '../src/router-transport.ts';
 import { expandedWindows, settleSchedule } from '../src/integration-schedule-settle.ts';
 import { scheduleWindows } from '../src/integration-schedule-store.ts';
@@ -208,5 +208,41 @@ test('flag on: a non-schedule operation never reaches the seam', async () => {
     try {
         await f.observe(); const id = f.pause(f.now() + 60).result.operation.id; await apply(f, id);
         assert.equal(op(f, id).state, 'confirmed'); assert.deepEqual(committed(f), []);
+    } finally { f.cleanup(); }
+});
+
+const other: Window = {id: 'other', weekdays: ['Fri'], start: '21:00', stop: '23:00'};
+const state = (f: Fixture) => f.store.integrationState();
+test('exact historical receipt settles even when a third schedule set now sits on the router; health and token are withheld', async () => {
+    const f = world();
+    try {
+        await f.observe(); const id = queue(f, [night]);
+        f.router.afterApplyFailure = new RouterTransportError('test_lost_response'); await apply(f, id);
+        f.router.afterApplyFailure = null; f.advance(70);
+        f.router.policy = withWindows(withWindows(f.router.policy, [night]), [other]);
+        await receipt(f, id);
+        assert.equal(op(f, id).state, 'conflict'); assert.equal(op(f, id).error, 'router_receipt_historical');
+        assert.deepEqual(committed(f), [night]); assert.equal(active(f), null);
+        assert.notEqual(state(f).observation_error, null); assert.equal(f.policy.people(actor).revisionToken, null);
+        assert.equal(f.policy.people(actor).people[0]!.observationHealth, 'unreachable');
+    } finally { f.cleanup(); }
+});
+test('router already holding the staged windows before dispatch never publishes health or a token over the old committed set', async () => {
+    const f = world();
+    try {
+        await f.observe(); const id = queue(f, [night]);
+        f.router.policy = withWindows(f.router.policy, [night]);
+        f.advance(1); await f.observe();
+        assert.equal(op(f, id).state, 'conflict'); assert.deepEqual(committed(f), []); assert.equal(active(f), null);
+        assert.notEqual(state(f).observation_error, null); assert.equal(f.policy.people(actor).revisionToken, null);
+    } finally { f.cleanup(); }
+});
+test('an accepted receipt whose promotion fails stays recoverable: not confirmed, still active, no health, no token', async () => {
+    const f = world();
+    try {
+        await f.observe(); const id = queue(f, plain(9)); await apply(f, id);
+        assert.deepEqual(committed(f), []); assert.notEqual(op(f, id).state, 'confirmed'); assert.equal(op(f, id).confirmed_at, null);
+        assert.equal(op(f, id).error, 'schedule_promotion_failed'); assert.equal(active(f), id);
+        const people = f.policy.people(actor); assert.equal(people.revisionToken, null); assert.equal(people.people[0]!.latestOperation?.currentHealthy, false);
     } finally { f.cleanup(); }
 });

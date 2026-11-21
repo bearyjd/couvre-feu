@@ -11,7 +11,7 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
-import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow } from './integration-children.ts';
@@ -65,9 +65,13 @@ export class IntegrationPolicy {
     }
     /** Visibility is "any row": a viewer sees an operation through any child they manage. */
     private visibleTo(actor: Actor, op: IntegrationOperation): boolean { return this.affectedPeople(op).some(person => actor.personIds.includes(person)); }
+    /** Flag on (unverified on this router): a schedule operation is current enforcement only while the committed windows are exactly its payload's. */
+    private scheduleCommitted(op: IntegrationOperation, payload: RouterPolicy): boolean {
+        return !schedulesInDatabase(this.store.config) || !op.action.startsWith('schedule_') || canonicalSchedules(scheduleWindows(this.store)) === canonicalSchedules(payload.schedules);
+    }
     private dto(op: IntegrationOperation, viewer?: Actor): OperationDTO {
         const r = this.store.get<{phase: string; delivery: string}>('SELECT phase,delivery FROM operation_rpc WHERE operation_id=?', op.id)!;
-        const o = this.store.observation().value, e = this.envelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && exactHealthy(o, e);
+        const o = this.store.observation().value, e = this.envelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && exactHealthy(o, e) && this.scheduleCommitted(op, e.policy);
         const superseded = fresh && o !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
         const uncertainClaim = r.phase === 'claimed' && (this.store.get<{lease_until: number}>('SELECT lease_until FROM operation_rpc WHERE operation_id=?', op.id)!.lease_until <= this.now());
         const state: OperationState = uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state;
