@@ -18,6 +18,8 @@ import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-child
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
+import { schedulesInDatabase } from './integration-schedule-store.ts';
+import { SCHEDULE_INADMISSIBLE, admitScheduleOperation, applyScheduleDecision, scheduleSeam } from './integration-schedule-settle.ts';
 
 export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
@@ -131,6 +133,13 @@ export class IntegrationWorker {
                     this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
                     return;
                 }
+                // S2a, flag on: a schedule payload that could not be promoted later is refused before any dispatch (I4, rule E0).
+                if (schedulesInDatabase(this.store.config) && this.scheduleAction(op.action) && !admitScheduleOperation(this.store, op).ok) {
+                    this.updateOperation(id, 'failed', SCHEDULE_INADMISSIBLE);
+                    this.store.run("UPDATE operation_rpc SET phase='resolved' WHERE operation_id=?", id);
+                    this.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1');
+                    return;
+                }
                 if (!this.policy.fresh()) throw new AppError(503, 'approved_router_observation_required');
                 const o = this.store.observation().value!, e = this.policy.envelope(id);
                 if (o.generation !== e.generation || o.acceptedPolicy.revision !== e.expected_revision || o.policyDigest !== e.expected_digest || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(409, 'router_base_or_runtime_changed');
@@ -155,6 +164,8 @@ export class IntegrationWorker {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
+            // S2a, flag on with a schedule operation active: ownership waits for settlement; finishSchedule re-checks it in full before publishing (I5).
+            if (this.scheduleActive(this.store.integrationState().active_operation_id)) validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, true, true); else
             try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
@@ -235,6 +246,8 @@ export class IntegrationWorker {
                 this.store.run('UPDATE integration_state SET dispatch_stopped=1,observation_error=? WHERE singleton=1', error?.code ?? null);
                 if (this.store.get('SELECT batch_id FROM automatic_read_polls WHERE batch_id=?', batchId)) this.store.run('UPDATE automatic_read_summary SET completed_at=?,outcome=? WHERE kind=?', this.now(), error?.code ?? 'observed', invocation.kind);
                 const active = s.active_operation_id;
+                // S2a: the one gate. Flag off, or no schedule operation active, everything below is main's code unchanged (I1).
+                if (this.scheduleActive(active)) { this.finishSchedule(invocation, o, error, active!); return; }
                 if (error) {
                     if (invocation.kind === 'apply' && active === invocation.operationId) {
                         const neverDelivered = error.delivery === 'not_delivered';
@@ -279,6 +292,36 @@ export class IntegrationWorker {
                 this.store.pruneAutomaticReads();
             }
         });
+    }
+    private scheduleAction(action: IntegrationOperation['action']): boolean { return action === 'schedule_create' || action === 'schedule_update' || action === 'schedule_delete'; }
+    /** Flag schedules.editable on and the active operation is a schedule action. Flag off: false without reading anything. */
+    private scheduleActive(active: string | null): boolean {
+        if (!schedulesInDatabase(this.store.config) || !active) return false;
+        const op = this.store.get<{action: IntegrationOperation['action']}>('SELECT action FROM operations WHERE id=?', active);
+        return Boolean(op && this.scheduleAction(op.action));
+    }
+    /**
+     * S2a settlement of the active schedule operation, inside finish's transaction: admission first (before anything reads the envelope),
+     * then decideSchedule on this observation alone, then the observation is published only if the full ownership check passes against
+     * the COMMITTED windows after settlement (I5); otherwise it is withheld with a fixed observation_error code.
+     */
+    private finishSchedule(invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null, active: string): void {
+        const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', active)!;
+        const rpc = this.store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active);
+        const decision = scheduleSeam.decideSchedule({admission: admitScheduleOperation(this.store, op), person: op.person_id, observation: o, transport: error && {delivery: error.delivery},
+            ownApply: invocation.kind === 'apply' && invocation.operationId === active, attemptCount: rpc?.attempt_count ?? 0});
+        applyScheduleDecision(this.store, op, decision, this.now());
+        if (error || !o) return;
+        try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
+        catch (failure) {
+            this.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', failure instanceof AppError ? failure.code : 'router_observation_invalid');
+            return;
+        }
+        this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
+        this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
+        this.activity.purgeUnenrolled();
+        this.scope.observe(o);
+        if (o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) this.store.run('UPDATE service_state SET last_confirmation_at=MAX(COALESCE(last_confirmation_at,0),?) WHERE singleton=1', o.routerTime);
     }
     /**
      * A `moving` row leaves that state only on evidence: an unknown outcome keeps it; a failed one never reached the router, so

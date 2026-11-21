@@ -52,8 +52,11 @@ export const configuredMacs = (store: Store, person: string, heldByRouter: reado
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a
  * queued change are admitted), never a protected MAC, and exactly the owned schedules (ownedSchedules) of the children present.
  */
-export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true): void {
+export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true, deferOwnership = false): void {
     normalizePolicy(policy, config.protectedMacs);
+    // S2a (flag schedules.editable on, a schedule operation active): the transport defers ownership; the worker re-runs this check in full,
+    // against the committed windows only, before it publishes the observation.
+    if (deferOwnership) return;
     if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
     // A moving device is admitted under both its source and its target child, so a policy on either side of the change validates.
     const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
