@@ -291,7 +291,7 @@ export function createBulk({ gate = () => null, session, people, revisionToken, 
       el('p', { class: 'fine-print', 'data-bulk-reason': '', hidden: !reason }, reason),
       el('div', { class: 'bulk-actions' },
         ...Object.entries(BULK).map(([action, spec]) => el('button', { class: action === 'pause_all' ? 'button primary' : 'button secondary', type: 'button', disabled: locked,
-          'data-action': action, onclick: () => { confirming = action; notice = ''; focus = '.bulk-confirm .button'; draw(); } }, spec.button))),
+          'data-action': action, ...(action === 'pause_all' ? { 'data-risk': 'destructive' } : {}), onclick: () => { confirming = action; notice = ''; focus = '.bulk-confirm .button'; draw(); } }, spec.button))),
       ...(confirming ? [confirmBox()] : []));
     root.hidden = false;
     if (focus) { root.querySelector(focus)?.focus(); focus = ''; }
