@@ -21,6 +21,14 @@ const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (character) =>
 const now = () => Math.floor(Date.now() / 1000);
 const time = (value) => value ? new Date(value * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Not yet observed';
 const duration = (seconds) => seconds < 60 ? `${Math.max(0, seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+// Presentation only: publish the sticky masthead's rendered height so scroll-padding-top (styles.css) clears it even when a long account name wraps it taller.
+const trackMastheadHeight = (masthead) => {
+  if (!masthead) return;
+  const publish = () => document.documentElement.style.setProperty('--masthead-h', `${Math.ceil(masthead.getBoundingClientRect().height)}px`);
+  publish();
+  if ('ResizeObserver' in window) new ResizeObserver(publish).observe(masthead);
+};
+trackMastheadHeight($('.masthead'));
 const FRESH_SECONDS = 30;
 const WELCOME_SECONDS = 6;
 let alertStorage;

@@ -6,7 +6,7 @@
 .schedule-item { display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; align-items:flex-start; padding:12px 0; border-bottom:.5px solid var(--line) }
 .schedule-summary { display:grid; gap:4px; min-width:0; flex:1 1 220px; overflow-wrap:anywhere }
 .schedule-summary span { color:var(--muted); font-size:14px }
-.schedule-summary summary { font-size:13px; color:var(--blue); cursor:pointer; min-height:32px; display:flex; align-items:center }
+.schedule-summary summary { font-size:13px; color:var(--blue); cursor:pointer; min-height:32px; padding:4px 0; line-height:24px; display:list-item } /* list-item keeps the native disclosure marker */
 .window-list li { font-size:13px; padding:2px 0 }
 .schedule-actions,.schedule-buttons { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px }
 .schedule-form { margin-top:16px; padding:16px; border-radius:var(--radius-sm); background:var(--surface-2) }
