@@ -71,6 +71,8 @@ export class IntegrationStore extends Store {
         this.runMigration('integration-007.sql', 'operations', "'allow'");
         // integration-008 (content filtering A5): parent_alerts admits `filter_drift`. Marker: the kind CHECK.
         this.runMigration('integration-008.sql', 'parent_alerts', "'filter_drift'");
+        // integration-010 (schedules.editable, S2a): operations.action admits schedule_create/update/delete. Marker: the action CHECK. Nothing creates such a row yet.
+        this.runMigration('integration-010.sql', 'operations', "'schedule_delete'");
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));

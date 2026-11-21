@@ -18,6 +18,7 @@ import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-child
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
+import { settleSchedule } from './integration-schedule-settle.ts';
 
 export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
@@ -310,6 +311,7 @@ export class IntegrationWorker {
     private updateOperation(id: string, state: 'confirmed' | 'unknown' | 'failed' | 'conflict', error: string | null, confirmedAt: number | null = null): void {
         const op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id)!;
         if (op.state === state && op.error === error && (confirmedAt === null || op.confirmed_at === confirmedAt)) return;
+        if (this.store.config.schedules?.editable === true && op.action.startsWith('schedule_')) return settleSchedule(this.store, op, {state, error, confirmedAt, now: this.now()});
         const drift = this.settleDevices(op, state);
         this.store.run('UPDATE operations SET state=?,error=?,confirmed_at=COALESCE(?,confirmed_at),updated_at=? WHERE id=?', state, drift ?? error, confirmedAt, this.now(), id);
         this.store.run('INSERT INTO audit(actor_id,operation_id,action,revision,timestamp,outcome) VALUES(?,?,?,?,?,?)', op.actor_id, id, op.action, op.revision, this.now(), state);

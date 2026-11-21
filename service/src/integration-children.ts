@@ -4,6 +4,7 @@ import type { RouterPolicy, Schedule } from '../../shared/src/router-schema.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { Store } from './db.ts';
 import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { stagedScheduleWindows } from './integration-schedule-settle.ts';
 
 /** The router's own policy limits (router/lib/json.awk, shared/src/router-schema.ts); not product limits of this service. */
 export const CHILD_LIMIT = 64;
@@ -61,7 +62,9 @@ export function validateManagedPolicy(policy: RouterPolicy, config: Pick<Integra
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
     const owned = ownedSchedules(config, store, new Set(policy.people.map(p => p.id)));
     // Flag off: main's literal comparison. Flag on: a pure canonical comparison with the committed rows (never normalizes, so never a limit error).
-    if (schedulesInDatabase(config) ? canonicalSchedules(policy.schedules) !== canonicalSchedules(owned) : JSON.stringify(policy.schedules) !== JSON.stringify(owned)) throw new AppError(409, 'owner_schedule_configuration_changed');
+    // An in-flight schedule operation's payload (the only staged state) is admitted as well: the router may already carry it before settlement promotes it.
+    const matches = (set: readonly Schedule[]) => canonicalSchedules(policy.schedules) === canonicalSchedules(set);
+    if (schedulesInDatabase(config) ? !matches(owned) && !matches(stagedScheduleWindows(store)?.filter(w => policy.people.some(p => p.id === w.person)) ?? owned) : JSON.stringify(policy.schedules) !== JSON.stringify(owned)) throw new AppError(409, 'owner_schedule_configuration_changed');
     if (policy.schedules.length > 0 && !config.scheduleClock) throw new AppError(409, 'owner_schedule_clock_required');
 }
 /**
