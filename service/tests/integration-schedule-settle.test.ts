@@ -48,6 +48,25 @@ test('T2 router at the payload before dispatch: conflict, nothing promoted, not 
         assert.equal(g.policy.people(actor).revisionToken, null);
     } finally { g.cleanup(); }
 });
+test('I5 an observation checked with ownership deferred is not published when the schedule operation is no longer active at finish', async () => {
+    const f = world(true);
+    try {
+        await f.observe(); const id = queue(f, [night]), before = sequence(f);
+        // The worker's first clock read after the reply is the staleness check, which follows the transport ownership check:
+        // the operation stops being active exactly between that check and finish.
+        let armed = false;
+        const clock = f.worker.now;
+        Object.defineProperty(f.worker, 'now', {value: () => {
+            if (armed) { armed = false; f.store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1'); }
+            return clock();
+        }});
+        f.router.afterApply = () => { armed = true; };
+        await applyOp(f, id);
+        assert.equal(armed, false);
+        assert.equal(sequence(f), before); assert.equal(f.store.integrationState().observation_error, 'owner_schedule_configuration_changed');
+        assert.deepEqual(committed(f), []); assert.equal(f.policy.people(actor).revisionToken, null);
+    } finally { f.cleanup(); }
+});
 test('T3 a receipt for another operation, request digest or policy never promotes', async () => {
     for (const tamper of [{operationId: randomUUID()}, {requestDigest: 'f'.repeat(64)}, {acceptedDigest: 'e'.repeat(64)}]) {
         const f = world(true);

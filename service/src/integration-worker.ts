@@ -248,6 +248,9 @@ export class IntegrationWorker {
                 const active = s.active_operation_id;
                 // S2a: the one gate. Flag off, or no schedule operation active, everything below is main's code unchanged (I1).
                 if (this.scheduleActive(active)) { this.finishSchedule(invocation, o, error, active!); return; }
+                // Flag on only: an observation whose ownership was deferred never reaches main's publish lines unchecked, even if the
+                // schedule operation stopped being active between the transport check and here (I5). Otherwise a repeat of the same check.
+                if (!error && schedulesInDatabase(this.store.config) && !this.ownedAfterSettlement(o!)) return;
                 if (error) {
                     if (invocation.kind === 'apply' && active === invocation.operationId) {
                         const neverDelivered = error.delivery === 'not_delivered';
@@ -300,6 +303,14 @@ export class IntegrationWorker {
         const op = this.store.get<{action: IntegrationOperation['action']}>('SELECT action FROM operations WHERE id=?', active);
         return Boolean(op && this.scheduleAction(op.action));
     }
+    /** The full ownership check against the COMMITTED windows; on failure the observation is withheld with the check's fixed code. */
+    private ownedAfterSettlement(o: RPCObservation): boolean {
+        try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); return true; }
+        catch (failure) {
+            this.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', failure instanceof AppError ? failure.code : 'router_observation_invalid');
+            return false;
+        }
+    }
     /**
      * S2a settlement of the active schedule operation, inside finish's transaction: admission first (before anything reads the envelope),
      * then decideSchedule on this observation alone, then the observation is published only if the full ownership check passes against
@@ -311,12 +322,7 @@ export class IntegrationWorker {
         const decision = scheduleSeam.decideSchedule({admission: admitScheduleOperation(this.store, op), person: op.person_id, observation: o, transport: error && {delivery: error.delivery},
             ownApply: invocation.kind === 'apply' && invocation.operationId === active, attemptCount: rpc?.attempt_count ?? 0});
         applyScheduleDecision(this.store, op, decision, this.now());
-        if (error || !o) return;
-        try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
-        catch (failure) {
-            this.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', failure instanceof AppError ? failure.code : 'router_observation_invalid');
-            return;
-        }
+        if (error || !o || !this.ownedAfterSettlement(o)) return;
         this.store.run('UPDATE service_state SET observation_json=?,observed_at=? WHERE singleton=1', JSON.stringify(o), this.now());
         this.store.run('UPDATE integration_state SET observation_sequence=observation_sequence+1 WHERE singleton=1');
         this.activity.purgeUnenrolled();
