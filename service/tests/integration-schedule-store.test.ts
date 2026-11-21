@@ -9,6 +9,10 @@ import { IntegrationPolicy } from '../src/integration-policy.ts';
 import { IntegrationWorker } from '../src/integration-worker.ts';
 import { rebindIntegration } from '../src/integration-rebind.ts';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
+import { hasObligation } from '../src/time-request-obligations.ts';
+import { Auth } from '../src/auth.ts';
+import { ChildAdmin } from '../src/admin-children.ts';
+import { TimeRequestService } from '../src/time-requests.ts';
 import type { Schedule } from '../../shared/src/router-schema.ts';
 
 const night: Omit<Schedule, 'person'> = {id: 'night', weekdays: ['Mon', 'Tue'], start: '20:30', stop: '07:00'};
@@ -302,4 +306,151 @@ test('migration integration-009: weekday and clock CHECKs, the 8-window cap and 
         assert.deepEqual(f.store.all<{name: string}>("SELECT name FROM pragma_table_info('schedule_windows')").map(c => c.name), ['person_id', 'id', 'weekdays', 'start', 'stop']);
         assert.equal(f.store.get("SELECT 1 FROM sqlite_master WHERE name='schedule_staged'"), undefined); // S1 has no staging table
     } finally { f.cleanup(); }
+});
+
+// ---- Combined guards: rebind, time-request obligations and the schedule flag ------------------------------------------------
+const seeded = (store: IntegrationStore) => ({rows: scheduleWindows(store), marker: store.get('SELECT 1 FROM schedule_seed') !== undefined});
+const later = (config: Fixture['config'], change: object) => ({...config, router: {...config.router, generation: 'd'.repeat(64)}, manifestDigest: 'c'.repeat(64), targetDigest: '8'.repeat(64), ...change});
+const request = (store: IntegrationStore, state: string, repause: string) => {
+    if (!store.get("SELECT 1 FROM request_links WHERE id='link1'")) store.run("INSERT INTO request_links(id,person_id,token_hash,created_by,created_at) VALUES('link1','pilot','h','operator',1)");
+    store.run('DELETE FROM time_requests');
+    store.run("INSERT INTO time_requests(id,link_id,person_id,minutes,reason,state,created_at,expires_at,repause_state) VALUES('r1','link1','pilot',15,'',?,1,2,?)", state, repause);
+};
+/** An off->on rebind: the fixture store stays open on the old (flag-off) manifest; the returned flag-on manifest is now bound. */
+async function offToOn(f: Fixture) {
+    const config = setup(f, false);
+    await f.observe(); f.store.stopDispatch(f.now());
+    const on = nextManifest(config, {schedules: {editable: true}, enrollment: normalizePolicy({...config.enrollment, schedules: [{person: 'pilot', ...night}]})});
+    rebindIntegration(f.store, on, config.manifestDigest, on.manifestDigest, f.now());
+    return on;
+}
+const boundDigest = (store: IntegrationStore) => store.get<{manifest_digest: string}>('SELECT manifest_digest FROM integration_state')!.manifest_digest;
+
+test('rebind CLI open: the store opens without seeding; a refused second rebind after off->on commits no seed', async () => {
+    const f = integrationFixture();
+    try {
+        const on = await offToOn(f);
+        const store = new IntegrationStore(on, {seedSchedules: false});
+        try {
+            assert.deepEqual(seeded(store), {rows: [], marker: false});
+            const run = (n: ReturnType<typeof later>, oldDigest = on.manifestDigest) => rebindIntegration(store, n, oldDigest, n.manifestDigest, f.now());
+            assert.throws(() => run(later(on, {}), 'a'.repeat(64)), /rebind_digest_mismatch/);
+            request(store, 'approving', 'none');
+            assert.throws(() => run(later(on, {})), /rebind_time_request_obligation/);
+            assert.deepEqual(seeded(store), {rows: [], marker: false});
+            store.run('DELETE FROM time_requests');
+            // With no seed, the guards judge the old manifest's windows (what the next open would seed), not an empty table.
+            assert.throws(() => run(later(on, {scheduleClock: undefined})), /rebind_schedule_clock_required/);
+            const off = (schedules: Schedule[]) => later(on, {schedules: {editable: false}, enrollment: normalizePolicy({...on.enrollment, schedules})});
+            assert.throws(() => run(off([])), /rebind_schedules_diverge/);
+            assert.deepEqual(seeded(store), {rows: [], marker: false});
+            assert.equal(boundDigest(store), on.manifestDigest);
+        } finally { store.close(); }
+        // The service opening the bound manifest still seeds exactly once.
+        const service = new IntegrationStore(on);
+        try { assert.deepEqual(seeded(service), {rows: [{person: 'pilot', ...night}], marker: true}); } finally { service.close(); }
+    } finally { f.cleanup(); }
+});
+
+test('rebind CLI open: a successful on->on rebind with no seed commits the old manifest seed inside its own transaction', async () => {
+    const f = integrationFixture();
+    try {
+        const on = await offToOn(f);
+        const store = new IntegrationStore(on, {seedSchedules: false});
+        try {
+            const n = later(on, {enrollment: normalizePolicy({...on.enrollment, schedules: []})});
+            rebindIntegration(store, n, on.manifestDigest, n.manifestDigest, f.now());
+            assert.equal(boundDigest(store), n.manifestDigest);
+            assert.deepEqual(seeded(store), {rows: [{person: 'pilot', ...night}], marker: true});
+        } finally { store.close(); }
+    } finally { f.cleanup(); }
+});
+
+test('rebind CLI open: an on->off rebind with no seed is accepted when the next manifest equals the old manifest windows', async () => {
+    const f = integrationFixture();
+    try {
+        const on = await offToOn(f);
+        const store = new IntegrationStore(on, {seedSchedules: false});
+        try {
+            const n = later(on, {schedules: {editable: false}});
+            rebindIntegration(store, n, on.manifestDigest, n.manifestDigest, f.now());
+            assert.equal(boundDigest(store), n.manifestDigest);
+        } finally { store.close(); }
+    } finally { f.cleanup(); }
+});
+
+test('rebind: competing obligation and schedule refusals, resolved in either order, leave every row and the marker untouched', async () => {
+    for (const order of ['obligation-first', 'schedules-first'] as const) {
+        const f = integrationFixture();
+        try {
+            const config = setup(f, true, [{person: 'pilot', ...night}]);
+            f.store.transaction(() => seedScheduleWindows(f.store, f.config));
+            f.router.policy = config.enrollment;
+            await f.observe(); f.store.stopDispatch(f.now());
+            const before = {seed: seeded(f.store), digest: digest(f)};
+            const run = (n: ReturnType<typeof nextManifest>) => rebindIntegration(f.store, n, config.manifestDigest, n.manifestDigest, f.now());
+            const off = (schedules: Schedule[]) => nextManifest(config, {schedules: {editable: false}, enrollment: normalizePolicy({...config.enrollment, schedules})});
+            const diverging = off([]), equal = off([{person: 'pilot', ...night}]), clockless = nextManifest(config, {scheduleClock: undefined});
+            request(f.store, 'approved', 'waiting');
+            assert.throws(() => run(diverging), /rebind_time_request_obligation/, order);
+            assert.throws(() => run(clockless), /rebind_time_request_obligation/, order);
+            if (order === 'obligation-first') {
+                f.store.run("UPDATE time_requests SET repause_state='done'");
+                assert.throws(() => run(diverging), /rebind_schedules_diverge/, order);
+                assert.throws(() => run(clockless), /rebind_schedule_clock_required/, order);
+            } else {
+                // The schedule conflict is resolved first: the obligation alone still refuses.
+                assert.throws(() => run(equal), /rebind_time_request_obligation/, order);
+                f.store.run("UPDATE time_requests SET repause_state='done'");
+            }
+            assert.deepEqual({seed: seeded(f.store), digest: digest(f)}, before, order);
+            run(equal);
+            assert.equal(digest(f), 'f'.repeat(64), order);
+        } finally { f.cleanup(); }
+    }
+});
+
+test('rebind off->on: a write failure after the deletes rolls back the rows, the seed marker and the identity marker', async () => {
+    const f = integrationFixture();
+    try {
+        const config = setup(f, false);
+        commit(f, 'pilot', [{id: 'stale', weekdays: ['Sat'], start: '10:00', stop: '11:00'}]);
+        f.store.run('INSERT INTO schedule_seed(singleton) VALUES(1)');
+        await f.observe(); f.store.stopDispatch(f.now());
+        const before = {seed: seeded(f.store), state: f.store.integrationState(), digest: digest(f)};
+        assert.deepEqual(before.seed, {rows: [{person: 'pilot', id: 'stale', weekdays: ['Sat'], start: '10:00', stop: '11:00'}], marker: true});
+        // The audit insert is the transaction's last write, after the schedule deletes and the marker update.
+        f.store.db.exec("CREATE TEMP TRIGGER forced_rebind_failure BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT,'forced_write_failure'); END");
+        const next = nextManifest(config, {schedules: {editable: true}, enrollment: normalizePolicy({...config.enrollment, schedules: [{person: 'pilot', ...night}]})});
+        assert.throws(() => rebindIntegration(f.store, next, config.manifestDigest, next.manifestDigest, f.now()), /forced_write_failure/);
+        assert.deepEqual({seed: seeded(f.store), state: f.store.integrationState(), digest: digest(f)}, before);
+    } finally { f.cleanup(); }
+});
+
+test('schedules.editable on: the child and drain obligation callers answer as with the flag off and never touch schedule rows', () => {
+    const cases: {state: string; repause: string; child: boolean; drain: boolean; rebind: boolean}[] = [
+        {state: 'approving', repause: 'none', child: true, drain: true, rebind: true},
+        {state: 'pending', repause: 'none', child: true, drain: false, rebind: false},
+        {state: 'approved', repause: 'waiting', child: true, drain: true, rebind: true},
+        {state: 'declined', repause: 'waiting', child: true, drain: false, rebind: true},
+        {state: 'approved', repause: 'done', child: false, drain: false, rebind: false},
+    ];
+    for (const flag of [false, true]) {
+        const f = integrationFixture(flag ? {schedules: {editable: true}} : {});
+        try {
+            commit(f, 'pilot', [night]);
+            const auth = new Auth(f.store, 'http://localhost:4273', f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
+            const child = new ChildAdmin(auth, f.policy) as unknown as {obligations(person: string): boolean};
+            const drain = new TimeRequestService(f.store, f.policy, f.now);
+            for (const c of cases) {
+                request(f.store, c.state, c.repause);
+                const label = `${flag ? 'on' : 'off'} ${c.state}/${c.repause}`;
+                assert.equal(child.obligations('pilot'), c.child, `${label} child`);
+                assert.equal(child.obligations('other'), false, `${label} other child`);
+                assert.equal(drain.hasObligations(), c.drain, `${label} drain`);
+                assert.equal(hasObligation(f.store), c.rebind, `${label} rebind`);
+            }
+            assert.deepEqual(scheduleWindows(f.store), [{person: 'pilot', ...night}]);
+        } finally { f.cleanup(); }
+    }
 });
