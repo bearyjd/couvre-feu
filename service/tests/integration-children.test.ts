@@ -86,7 +86,7 @@ test('an existing integration database with a live operation migrates in place: 
         db.close(); chmodSync(path, 0o600);
         const store = new IntegrationStore(config);
         try {
-            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 14, '016 adds the counts tables');
+            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 15, '016 adds the counts tables');
             assert.equal(store.integrationState().active_operation_id, 'op1');
             assert.equal(store.all('PRAGMA foreign_key_check').length, 0);
             assert.equal(store.get<{n: number}>('PRAGMA foreign_keys' as string) !== undefined, true);
