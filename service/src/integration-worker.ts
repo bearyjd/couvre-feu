@@ -157,7 +157,7 @@ export class IntegrationWorker {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
-            try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, true, this.scheduleOperationActive()); }
+            try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, true, this.scheduleOperationActive() ? 'deferred' : 'all'); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
             this.finish(batchId, token, epoch, invocation, o, null);
@@ -250,7 +250,7 @@ export class IntegrationWorker {
                     // A schedule operation settles on its exact receipt before anything is published; the observation is then owned or withheld
                     // against the POST-settlement committed set, so a router already holding staged (or a third set of) windows is never healthy.
                     this.settleActive(o!, active, invocation);
-                    try { validateManagedPolicy(o!.acceptedPolicy, this.store.config, this.store); }
+                    try { validateManagedPolicy(o!.acceptedPolicy, this.store.config, this.store, true, 'committed'); }
                     catch (failure) { this.store.run('UPDATE integration_state SET observation_error=? WHERE singleton=1', failure instanceof AppError ? failure.code : 'router_observation_invalid'); return; }
                     this.publish(o!);
                     return;

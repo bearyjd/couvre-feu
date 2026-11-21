@@ -244,5 +244,23 @@ test('an accepted receipt whose promotion fails stays recoverable: not confirmed
         assert.deepEqual(committed(f), []); assert.notEqual(op(f, id).state, 'confirmed'); assert.equal(op(f, id).confirmed_at, null);
         assert.equal(op(f, id).error, 'schedule_promotion_failed'); assert.equal(active(f), id);
         const people = f.policy.people(actor); assert.equal(people.revisionToken, null); assert.equal(people.people[0]!.latestOperation?.currentHealthy, false);
+        // The staged windows are not committed: the observation is never published, so no health and no confirmed revision.
+        assert.notEqual(state(f).observation_error, null); assert.equal(people.people[0]!.observationHealth, 'unreachable');
+        assert.equal(f.store.observation().value?.acceptedPolicy.schedules.length ?? 0, 0); assert.equal(f.policy.people(actor).routerConfirmedRevision, null);
+    } finally { f.cleanup(); }
+});
+test('exact historical receipt settles before device ownership: a later router policy with a foreign device still promotes, but is not published', async () => {
+    const f = world();
+    try {
+        await f.observe(); const id = queue(f, [night]);
+        f.router.afterApplyFailure = new RouterTransportError('test_lost_response'); await apply(f, id);
+        assert.equal(op(f, id).state, 'unknown');
+        f.router.afterApplyFailure = null; f.advance(70);
+        const mine = withWindows(f.router.policy, [night]);
+        f.router.policy = normalizePolicy({...mine, revision: mine.revision + 1, people: [{id: 'pilot', macs: [...mine.people[0]!.macs, '02:10:20:30:41:ee']}]});
+        await receipt(f, id);
+        assert.notEqual(op(f, id).state, 'unknown'); assert.deepEqual(committed(f), [night]); assert.equal(active(f), null);
+        assert.notEqual(state(f).observation_error, null); assert.equal(f.policy.people(actor).revisionToken, null);
+        assert.equal(f.policy.people(actor).people[0]!.observationHealth, 'unreachable');
     } finally { f.cleanup(); }
 });
