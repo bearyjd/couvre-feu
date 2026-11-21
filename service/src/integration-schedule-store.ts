@@ -15,10 +15,16 @@ export function scheduleWindows(store: Store): Schedule[] {
     return store.all<Row>('SELECT person_id,id,weekdays,start,stop FROM schedule_windows ORDER BY person_id,id')
         .map(r => ({person: r.person_id, id: r.id, weekdays: DAYS.filter(d => r.weekdays.split(',').includes(d)), start: r.start, stop: r.stop}));
 }
-/** Seeds the table once from the manifest enrollment schedules; only when the flag is on. The marker row makes a later empty set stay empty. */
-export function seedScheduleWindows(store: Store, config: Pick<IntegrationManifest, 'schedules' | 'enrollment'>): void {
+/**
+ * Seeds the table once from the manifest enrollment schedules; only when the flag is on. The marker row makes a later empty set stay empty.
+ * The identity marker is re-checked inside the seeding transaction: a rebind that moved the database to another manifest after this
+ * store's open check must not receive rows from the old one (it throws integration_database_identity_mismatch and writes nothing).
+ */
+export function seedScheduleWindows(store: Store & {assertIdentity(): void}, config: Pick<IntegrationManifest, 'schedules' | 'enrollment'>): void {
     if (!store.db.isTransaction) throw new Error('seed_requires_transaction');
-    if (!schedulesInDatabase(config) || store.get('SELECT 1 FROM schedule_seed')) return;
+    if (!schedulesInDatabase(config)) return;
+    store.assertIdentity();
+    if (store.get('SELECT 1 FROM schedule_seed')) return;
     for (const s of normalizePolicy(config.enrollment).schedules) store.run('INSERT INTO schedule_windows(person_id,id,weekdays,start,stop) VALUES(?,?,?,?,?)', s.person, s.id, s.weekdays.join(','), s.start, s.stop);
     store.run('INSERT INTO schedule_seed(singleton) VALUES(1)');
 }
