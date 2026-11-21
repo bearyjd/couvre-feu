@@ -195,7 +195,7 @@ export class ChildAdmin {
             }
             const device = id('d');
             const op = this.policy.queue(actor, target, 'enroll', request({label: params.label, mac}), id('enroll'), params.precondition as string,
-                base => withDevice(base, config, target, mac),
+                base => withDevice(base, config, target, mac, this.store),
                 operation => this.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES(?,?,?,'mac',?,'enrolling',?,?)", device, target, params.label as string, mac, operation, now));
             return {op, audit: device};
         }
@@ -214,7 +214,7 @@ export class ChildAdmin {
         if (devicesOf(this.store, row.person_id).length === 1 && this.obligations(row.person_id)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
         if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
         const op = this.policy.queue(actor, row.person_id, 'unenroll', request({device: row.id}), id('unenroll'), params.precondition as string,
-            base => withoutDevice(base, config, row.person_id, row.identifier),
+            base => withoutDevice(base, config, row.person_id, row.identifier, this.store),
             operation => this.store.run("UPDATE devices SET state='removing',operation_id=? WHERE id=?", operation, row.id));
         return {op, audit: row.id};
     }
@@ -234,7 +234,7 @@ export class ChildAdmin {
         if (devicesOf(this.store, row.person_id).length === 1 && this.obligations(row.person_id)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
         if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
         const op = this.policy.queue(actor, row.person_id, 'move', request({device: row.id, to}), id('move'), params.precondition as string,
-            base => movePolicy(base, this.store.config, row.person_id, to, row.identifier),
+            base => movePolicy(base, this.store.config, row.person_id, to, row.identifier, this.store),
             operation => this.store.run("UPDATE devices SET state='moving',move_to=?,operation_id=? WHERE id=?", to, operation, row.id), [row.person_id, to]);
         return {op, audit: `${row.id}:${row.person_id}:${to}`};
     }

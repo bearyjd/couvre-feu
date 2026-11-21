@@ -346,10 +346,10 @@ test('move refuses a full target (409), the same child, a busy device, a protect
         await assert.rejects(f.move(op, 'd_kid2', 'pilot', {precondition}), (e: {code?: string}) => ['device_change_in_progress', 'operation_in_progress', 'revision_conflict'].includes(e.code!));
         assert.equal(ok.status, 202);
         // Pure build: the MAC appears exactly once and the router MAC list stays unique.
-        const moved = movePolicy(f.policyOf(1), f.config, 'kid2', 'kid3', K2);
+        const moved = movePolicy(f.policyOf(1), f.config, 'kid2', 'kid3', K2, f.store);
         assert.equal(moved.people.flatMap(p => p.macs).filter(m => m === K2).length, 1);
         assert.equal(moved.revision, 2);
-        assert.throws(() => movePolicy(f.policyOf(1), f.config, 'kid2', 'kid2', K2), code('device_move_same_child'));
+        assert.throws(() => movePolicy(f.policyOf(1), f.config, 'kid2', 'kid2', K2, f.store), code('device_move_same_child'));
     } finally { f.cleanup(); }
 });
 
