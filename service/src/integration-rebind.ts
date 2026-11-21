@@ -3,7 +3,7 @@ import { normalizePolicy, policyJSON } from '../../shared/src/router-schema.ts';
 import { routerScopeOf } from './integration-config.ts';
 import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
-import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { canonicalSchedules, scheduleWindows, schedulesInDatabase, seedScheduleWindows } from './integration-schedule-store.ts';
 import { hasObligation } from './time-request-obligations.ts';
 
 const refuse = (code: string): never => { throw new AppError(409, code); };
@@ -38,6 +38,9 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         // off->off reads nothing. on->on: the committed rows stay the truth and must stay enforceable (without scheduleClock every router
         // policy holding them, even an exact match, would be refused). on->off: the manifest becomes the owner again, so it must own exactly
         // the committed rows. off->on: forget any earlier rows and the seed marker, so the next open seeds once from this manifest.
+        // The rebind CLI opens without seeding. With the flag on and no seed yet (right after an off->on rebind), the rows the next open
+        // would seed from the old manifest are seeded here: the guards judge them, and they commit only if this transaction does.
+        seedScheduleWindows(store, old);
         const was = schedulesInDatabase(old), will = schedulesInDatabase(next);
         if (was && will && scheduleWindows(store).length > 0 && !next.scheduleClock) refuse('rebind_schedule_clock_required');
         if (was && !will && canonicalSchedules(scheduleWindows(store)) !== canonicalSchedules(normalizePolicy(next.enrollment).schedules)) refuse('rebind_schedules_diverge');
