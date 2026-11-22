@@ -6,6 +6,7 @@ import type { ScheduleAction, ScheduleChange } from '../../shared/src/schedule-e
 import type { Actor, OperationResult } from '../../shared/src/contracts.ts';
 import type { IntegrationOperation, IntegrationPolicy } from './integration-policy.ts';
 import { CLIENT_KEY, TOKEN } from './integration-children.ts';
+import { isLoosening, windowSetDigest } from './schedule-loosening.ts';
 import { scheduleBuild } from './integration-schedule-request.ts';
 import { scheduleWindows } from './integration-schedule-store.ts';
 import { audited } from './parent-audit.ts';
@@ -20,25 +21,14 @@ type Outcome = {status: number; result: OperationResult};
 const byId = (a: Schedule, b: Schedule): number => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 
 /** The child's committed windows with the change applied, in the canonical form scheduleRequestWindows produces. */
-function fold(committed: readonly Schedule[], person: string, change: ScheduleChange): Schedule[] {
+export function fold(committed: readonly Schedule[], person: string, change: ScheduleChange): Schedule[] {
     return applyScheduleChange([...committed], person, change)
         .map(w => ({person, id: w.id, weekdays: DAYS.filter(d => w.weekdays.includes(d)), start: w.start, stop: w.stop})).sort(byId);
 }
-const minutes = (clock: string): number => Number(clock.slice(0, 2)) * 60 + Number(clock.slice(3));
-/** Every minute of the week (Mon=0) that some window blocks; a window that crosses midnight runs into the next day. */
-function covered(windows: readonly Schedule[]): Set<number> {
-    const set = new Set<number>(), week = 7 * 1440;
-    for (const w of windows) for (const day of w.weekdays) {
-        const from = DAYS.indexOf(day) * 1440 + minutes(w.start), to = DAYS.indexOf(day) * 1440 + minutes(w.stop) + (minutes(w.stop) > minutes(w.start) ? 0 : 1440);
-        for (let m = from; m < to; m++) set.add(m % week);
-    }
-    return set;
-}
-/** schedule_loosened when the change frees any minute that was blocked before; otherwise schedule_set. Best effort: a failure reads as schedule_set. */
+/** schedule_loosened when isLoosening says so (a deleted window or a freed minute); otherwise schedule_set. Best effort: a failure reads as schedule_set. */
 function auditAction(committed: readonly Schedule[], person: string, change: ScheduleChange): AuditAction {
     try {
-        const before = covered(committed), after = covered(fold(committed, person, change));
-        for (const m of before) if (!after.has(m)) return 'schedule_loosened';
+        if (isLoosening(committed, fold(committed, person, change))) return 'schedule_loosened';
     } catch { /* the work itself refuses; the label stays schedule_set */ }
     return 'schedule_set';
 }
@@ -51,7 +41,14 @@ function storedIdentity(op: IntegrationOperation): string | null {
     } catch { return null; }
 }
 
-export function scheduleMutate(policy: IntegrationPolicy, actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined): Outcome {
+/**
+ * S2b: the HTTP route always passes a gate. `verified` is the step-up the caller already checked (its bound window-set digest and the commit
+ * that spends the passkey use inside this transaction), or null when none was needed or given. Without a gate (direct callers, S2m tests)
+ * nothing is required.
+ */
+export interface ScheduleGate { verified: {digest: string; commit: () => void} | null }
+
+export function scheduleMutate(policy: IntegrationPolicy, actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined, gate?: ScheduleGate): Outcome {
     const store = policy.store;
     policy.authorized(actor, person);
     const label = (): AuditAction => {
@@ -70,7 +67,14 @@ export function scheduleMutate(policy: IntegrationPolicy, actor: Actor, person: 
             if (prior) { if (storedIdentity(prior) !== mine) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
             // Folded here, refused inside queue()'s build so a stale token or a busy router is reported before a fold error.
             let windows: Schedule[] = [], failure: unknown = null;
-            try { windows = fold(scheduleWindows(store).filter(w => w.person === person), person, change); } catch (error) { failure = error; }
+            const committed = scheduleWindows(store).filter(w => w.person === person);
+            try { windows = fold(committed, person, change); } catch (error) { failure = error; }
+            // S2b: judged again inside the write transaction. Before queue(), so a refusal here queues, settles and audits nothing (403 leaves no audit row).
+            if (gate && !failure && isLoosening(committed, windows)) {
+                if (!gate.verified) throw new AppError(403, 'step_up_required');
+                if (gate.verified.digest !== windowSetDigest(windows)) throw new AppError(403, 'step_up_mismatch');
+                gate.verified.commit();
+            }
             const request = JSON.stringify({person, action: 'schedule_update', windows, change, precondition, permissionVersion: actor.permissionVersion});
             return policy.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, store.config, person, windows, failure), undefined, [person], {person, windows});
         });

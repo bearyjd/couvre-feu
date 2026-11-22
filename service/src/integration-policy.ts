@@ -19,6 +19,7 @@ import { scheduleBuild, scheduleRequestWindows } from './integration-schedule-re
 import { isScheduleAction } from './integration-schedule-admit.ts';
 import { audited } from './parent-audit.ts';
 import { scheduleMutate } from './integration-schedule-mutate.ts';
+import type { ScheduleGate } from './integration-schedule-mutate.ts';
 import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
 import type { ScheduleWindowDTO } from '../../shared/src/contracts.ts';
 
@@ -217,7 +218,7 @@ export class IntegrationPolicy {
      * Schedule create/update/delete (roadmap item 2, S2m; unverified on this router). Present only while schedules.editable is on, so the HTTP
      * route keeps answering 403 schedule_editing_unavailable with the flag off.
      */
-    get scheduleMutate(): ((actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined) => {status: number; result: OperationResult}) | undefined {
+    get scheduleMutate(): ((actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined, gate?: ScheduleGate) => {status: number; result: OperationResult}) | undefined {
         return schedulesInDatabase(this.store.config) ? (...args) => scheduleMutate(this, ...args) : undefined;
     }
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
