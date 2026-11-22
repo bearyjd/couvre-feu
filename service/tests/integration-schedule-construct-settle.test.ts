@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { RouterTransportError } from '../src/router-transport.ts';
 import { AutomaticDispatch } from '../src/integration-automatic.ts';
-import { requestDigest } from '../../shared/src/router-rpc.ts';
+import { policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import { normalizePolicy, policyJSON } from '../../shared/src/router-schema.ts';
 import { actor } from './fixtures/integration.ts';
-import { active, applies, apply, applyLease, at, committed, editId, night, op, openSteps, rebind, receipt, routerChange, rpcPhase, world } from './fixtures/schedule-settle.ts';
+import { active, applies, apply, applyLease, at, committed, editId, night, op, openSteps, rebind, receipt, routerChange, rpcPhase, sha, study, world } from './fixtures/schedule-settle.ts';
 import type { World } from './fixtures/schedule-settle.ts';
 
 // Roadmap item 2, S2a (schedules.editable, off; unverified on this router): settlement S0, S1, S1g, S2 (historical), S6, S7 and the fixed codes.
@@ -57,6 +57,8 @@ test('T12 S2: a historical exact receipt is a conflict and promotes nothing', as
         f.advance(5); await receipt(f, id);
         assert.deepEqual([op(f, id).state, op(f, id).error], ['conflict', 'router_receipt_historical']);
         assert.deepEqual(committed(f), []); assert.equal(active(f), null);
+        assert.equal(openSteps(f, id), 0); assert.equal(rpcPhase(f, id), 'resolved');
+        rebind(f);
     } finally { f.cleanup(); }
 });
 test('T13 S6: a queued edit that was never dispatched fails after the dispatch TTL, not before', async () => {
@@ -96,19 +98,27 @@ test('T14 admission before validate(plan): corrupt rows fail the operation befor
         } finally { f.cleanup(); }
     }
 });
-const rebinding: Record<string, (e: Record<string, unknown>) => Record<string, unknown>> = {
-    'other operation id': e => ({...e, operation_id: randomUUID()}),
-    'other base digest': e => ({...e, expected_digest: 'f'.repeat(64)}),
-    'other generation': e => ({...e, generation: 'f'.repeat(64)}),
+type Envelope = Record<string, unknown> & {policy: {schedules: Array<Record<string, unknown>>}};
+/** Each case names the envelope it stores; the rpc row's request_digest defaults to a recomputed valid one and its generation column is kept. */
+const rebinding: Record<string, (e: Envelope) => {e: Envelope; digest?: string; generation?: string}> = {
+    'other operation id': e => ({e: {...e, operation_id: randomUUID()}}),
+    'other base digest': e => ({e: {...e, expected_digest: 'f'.repeat(64)}}),
+    'other generation (envelope and rpc row)': e => ({e: {...e, generation: 'f'.repeat(64)}, generation: 'f'.repeat(64)}),
+    'other envelope generation (rpc row kept)': e => ({e: {...e, generation: 'f'.repeat(64)}}),
+    'other policy (same revision, pilot\'s windows rewritten)': e => ({e: {...e, policy: {...e.policy, schedules: e.policy.schedules.map(s => s.person === 'pilot' ? {person: 'pilot', ...study} : s)}}}),
+    'stale request digest (envelope unchanged)': e => ({e, digest: 'f'.repeat(64)}),
 };
-test('T15 binding: an envelope for another id, base digest or generation is refused even with a recomputed valid request digest', async () => {
+test('T15 binding: an envelope for another id, base digest, generation or policy is refused even with a recomputed valid request digest, and so is a stale digest', async () => {
     for (const [name, change] of Object.entries(rebinding)) {
         const f = world(true);
         try {
             await f.observe();
-            const id = editId(f, [night]), row = f.store.get<{envelope_json: string}>('SELECT envelope_json FROM operation_rpc WHERE operation_id=?', id)!;
-            const e = change(JSON.parse(row.envelope_json));
-            f.store.run('UPDATE operation_rpc SET envelope_json=?,request_digest=?,generation=? WHERE operation_id=?', JSON.stringify(e), requestDigest(e as never), String(e.generation), id);
+            const id = editId(f, [night]), row = f.store.get<{envelope_json: string; request_digest: string; generation: string}>('SELECT envelope_json,request_digest,generation FROM operation_rpc WHERE operation_id=?', id)!;
+            const stored = JSON.parse(row.envelope_json) as Envelope;
+            // Independent of requestDigest: the stored digest binds generation, id, base revision, base digest and policy digest (rpc.sh's rpc1 line).
+            assert.equal(row.request_digest, sha(`rpc1\n${stored.generation}\n${id}\n${stored.expected_revision}\n${stored.expected_digest}\n${policyDigest(stored.policy as never)}\n`), name);
+            const changed = change(stored), e = changed.e;
+            f.store.run('UPDATE operation_rpc SET envelope_json=?,request_digest=?,generation=? WHERE operation_id=?', JSON.stringify(e), changed.digest ?? requestDigest(e as never), changed.generation ?? row.generation, id);
             assert.throws(() => f.worker.prepare('apply', id), /schedule_payload_inadmissible/, name);
             assert.deepEqual([op(f, id).state, op(f, id).error], ['failed', 'schedule_payload_inadmissible'], name);
             assert.equal(applies(f), 0);
@@ -194,5 +204,7 @@ test('T21 S7: a lookup of an earlier receipt while the router names our edit cur
         f.advance(5); await receipt(f, id);
         assert.deepEqual([op(f, id).state, op(f, id).error], ['confirmed', null]);
         assert.deepEqual(committed(f), [night]); assert.equal(active(f), null); assert.equal(applies(f), 2);
+        assert.equal(openSteps(f, id), 0); assert.equal(rpcPhase(f, id), 'resolved');
+        rebind(f);
     } finally { f.cleanup(); }
 });
