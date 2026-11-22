@@ -173,3 +173,26 @@ test('T19 closed codes: main\'s claim scope refusal and stopDispatch write membe
         assert.deepEqual([op(stopped, other).state, op(stopped, other).error], ['unknown', 'dispatch_stopped_remote_outcome_unknown']);
     } finally { scope.cleanup(); stopped.cleanup(); }
 });
+test('T21 S7: a lookup of an earlier receipt while the router names our edit current keeps the edit active; our exact receipt then promotes it', async () => {
+    const f = world(true);
+    try {
+        await f.observe();
+        const earlier = f.pause(0).result.operation.id;
+        await apply(f, earlier);
+        assert.equal(op(f, earlier).state, 'confirmed');
+        f.advance(5); await f.observe();
+        const id = editId(f, [night]);
+        f.router.afterApplyFailure = new RouterTransportError('test_lost_response');
+        await apply(f, id); f.router.afterApplyFailure = null;
+        assert.deepEqual([op(f, id).state, op(f, id).error], ['unknown', 'router_outcome_unknown']);
+        f.advance(5); await receipt(f, earlier);
+        assert.deepEqual([op(f, id).state, op(f, id).error], ['unknown', 'receipt_missing_remote_outcome_unknown']);
+        assert.equal(active(f), id); assert.deepEqual(committed(f), []); assert.notEqual(rpcPhase(f, id), 'resolved');
+        at(f, applyLease(f, id) + 600); await receipt(f, earlier);
+        assert.equal(op(f, id).state, 'unknown', 'the fence never ends an edit the router names current');
+        assert.equal(active(f), id);
+        f.advance(5); await receipt(f, id);
+        assert.deepEqual([op(f, id).state, op(f, id).error], ['confirmed', null]);
+        assert.deepEqual(committed(f), [night]); assert.equal(active(f), null); assert.equal(applies(f), 2);
+    } finally { f.cleanup(); }
+});

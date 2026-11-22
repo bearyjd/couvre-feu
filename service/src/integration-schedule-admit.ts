@@ -5,7 +5,7 @@ import { normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { Schedule } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
-import { childrenSeam, staticDoh } from './integration-children.ts';
+import { childrenSeam } from './integration-children.ts';
 import { MAX_WINDOWS_PER_CHILD, schedulesInDatabase } from './integration-schedule-store.ts';
 import { scheduleSeam } from './integration-schedule-settle.ts';
 import { applyScheduleDecision, applyLeaseUntil } from './integration-schedule-apply.ts';
@@ -30,7 +30,8 @@ export function admitSchedule(store: IntegrationStore, op: IntegrationOperation)
         const request = JSON.parse(op.request_json) as ScheduleRequest;
         if (request.action !== op.action || request.person !== op.person_id || !Array.isArray(request.windows) || request.windows.length > MAX_WINDOWS_PER_CHILD) return null;
         if (request.windows.some(w => w.person !== op.person_id)) return null;
-        const rebuilt = staticDoh(childrenSeam.withScheduleWindows(base, config, op.person_id, request.windows), config).policy;
+        // No static DoH reconciliation: queue() copies DoH from the base for every schedule action, so the rebuild does too.
+        const rebuilt = childrenSeam.withScheduleWindows(base, config, op.person_id, request.windows);
         if (policyDigest(rebuilt) !== policyDigest(e.policy)) return null;
         if (e.policy.schedules.length > 0 && !config.scheduleClock) return null;
         return e;

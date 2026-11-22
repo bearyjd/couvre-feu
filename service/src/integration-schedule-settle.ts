@@ -101,6 +101,9 @@ export function decideSchedule(input: ScheduleEvidence): ScheduleDecision | null
         if (refused) return refused;
         if (operationIdConflict(o, e)) return decision('conflict', 'router_operation_id_conflict', true);
     }
+    // S7a: the router names this operation current, but the reply holds no exact receipt for it (a lookup that targeted another
+    // operation's receipt). Our apply landed: no moved base or fence may end it; only an exact targeted or current receipt settles it.
+    if (o.currentOperationId === e.operation_id) return decision('unknown', 'receipt_missing_remote_outcome_unknown', false);
     if (input.attemptCount === 0) {
         // S5 / S6: attempt_count 0 is the local witness that nothing was dispatched.
         if (baseMoved(o, e)) return decision('conflict', 'router_base_changed_before_dispatch', true);

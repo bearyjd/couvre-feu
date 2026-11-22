@@ -145,3 +145,23 @@ test('T9 S7 fence: a reply-shaped failure on our apply stays unknown until the f
         rebind(f);
     } finally { f.cleanup(); }
 });
+test('T20 DoH: a schedule edit never reconciles the static DoH list, with dnsHardening.dohList on or explicitly off; queue and admission agree', async () => {
+    for (const dohList of [true, false]) {
+        const f = world(true);
+        try {
+            (f.config as unknown as {dnsHardening: unknown}).dnsHardening = {dohList};
+            // On: the base lacks the static list. Off: the base holds one list address and one retired address.
+            const held = dohList ? {ipv4: ['192.0.2.53'], ipv6: []} : {ipv4: ['1.0.0.1', '192.0.2.53', '194.242.2.2'], ipv6: []};
+            routerChange(f, () => ({doh: held}));
+            await f.observe();
+            const base = f.router.policy.doh, id = editId(f, [night]);
+            const e = JSON.parse(f.store.get<{envelope_json: string}>('SELECT envelope_json FROM operation_rpc WHERE operation_id=?', id)!.envelope_json);
+            assert.deepEqual(e.policy.doh, base, `dohList=${dohList} envelope`);
+            assert.deepEqual(JSON.parse(op(f, id).payload_json).doh, base, `dohList=${dohList} payload`);
+            await apply(f, id);
+            assert.deepEqual([op(f, id).state, op(f, id).error], ['confirmed', null], `dohList=${dohList}`);
+            assert.deepEqual(f.router.policy.doh, base, `dohList=${dohList} router`);
+            assert.deepEqual(committed(f), [night]);
+        } finally { f.cleanup(); }
+    }
+});

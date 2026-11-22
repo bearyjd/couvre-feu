@@ -16,6 +16,7 @@ import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts
 import { CLIENT_KEY, TOKEN, activeChildren, childrenSeam, configuredMacs, devicesOf, staticDoh, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
 import { scheduleRequestWindows } from './integration-schedule-request.ts';
+import { isScheduleAction } from './integration-schedule-admit.ts';
 import { audited } from './parent-audit.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
@@ -168,7 +169,9 @@ export class IntegrationPolicy {
         if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
         if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
-        const doh = staticDoh(build(o.acceptedPolicy), this.store.config), policy = doh.policy, id = randomUUID(), now = this.now();
+        // S2a: a schedule edit copies DoH from the base as it is; static DoH reconciliation is never part of a schedule action.
+        const built = build(o.acceptedPolicy), doh = isScheduleAction(action) ? {policy: built, tag: null} : staticDoh(built, this.store.config);
+        const policy = doh.policy, id = randomUUID(), now = this.now();
         if (doh.tag) process.stderr.write(`${doh.tag}\n`);
         stage?.(id);
         validateManagedPolicy(policy, this.store.config, this.store, false, overlay);
