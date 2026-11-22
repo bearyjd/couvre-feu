@@ -3,6 +3,7 @@ import { BulkOps, bulkPost } from './integration-bulk.ts';
 import { ScheduleStepUp, scheduleStepUpPost } from './integration-schedule-stepup.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
 import { IntegrationGrants } from './integration-allowance.ts';
+import { scheduleAllowance } from './integration-schedule-allowance.ts';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -293,6 +294,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 const reward = /^\/people\/([a-z][a-z0-9_]{0,31})\/reward$/.exec(path);
                 if (reward && grants && rewardOn(session.dto.actor)) {
                     const result = grants.reward(session.dto.actor, reward[1], object(payload, ['minutes']).minutes, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
+                const scheduleTime = /^\/people\/([a-z][a-z0-9_]{0,31})\/schedule-(extra-time|skip-tonight)$/.exec(path);
+                if (scheduleTime && grants) {
+                    const result = scheduleAllowance(grants.policy, session.dto.actor, scheduleTime[1], scheduleTime[2] === 'extra-time' ? 'schedule_extra_time' : 'schedule_skip_tonight',
+                        payload, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;

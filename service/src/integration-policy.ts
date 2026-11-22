@@ -169,7 +169,7 @@ export class IntegrationPolicy {
      * records local intent (e.g. a device row) under the new operation id before the result is validated.
      */
     queue(actor: Actor, person: string, action: IntegrationOperation['action'], request: string, key: string, precondition: string | null,
-        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person], overlay?: ScheduleOverlay): IntegrationOperation {
+        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person], overlay?: ScheduleOverlay, options?: {preserveDoh: true}): IntegrationOperation {
         if (!this.store.db.isTransaction) throw new Error('queue_requires_transaction');
         if (!this.fresh()) throw new AppError(503, 'approved_router_observation_required');
         const o = this.store.observation().value!;
@@ -177,8 +177,8 @@ export class IntegrationPolicy {
         if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
         if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
-        // S2a: a schedule edit copies DoH from the base as it is; static DoH reconciliation is never part of a schedule action.
-        const built = build(o.acceptedPolicy), doh = isScheduleAction(action) ? {policy: built, tag: null} : staticDoh(built, this.store.config);
+        // Schedule edits and schedule allowances each copy DoH from the accepted base.
+        const built = build(o.acceptedPolicy), doh = isScheduleAction(action) || options?.preserveDoh ? {policy: built, tag: null} : staticDoh(built, this.store.config);
         const policy = doh.policy, id = randomUUID(), now = this.now();
         if (doh.tag) process.stderr.write(`${doh.tag}\n`);
         stage?.(id);
