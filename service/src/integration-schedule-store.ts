@@ -1,19 +1,34 @@
 import { DAYS, normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { Schedule } from '../../shared/src/router-schema.ts';
+import type { ScheduleKind, ScheduleWindowDTO } from '../../shared/src/contracts.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { Store } from './db.ts';
 
 /** Product cap, also enforced by the schedule_windows insert trigger (migration integration-009) and the manifest loader. */
 export const MAX_WINDOWS_PER_CHILD = 8;
 interface Row { person_id: string; id: string; weekdays: string; start: string; stop: string }
+const windowFields = (row: Omit<Row, 'person_id'>) =>
+    ({id: row.id, weekdays: DAYS.filter(d => row.weekdays.split(',').includes(d)), start: row.start, stop: row.stop});
 
 /** Flag schedules.editable (absent = off, unverified on this router): the database, not the manifest, owns the schedule set. */
 export const schedulesInDatabase = (config: Pick<IntegrationManifest, 'schedules'>): boolean => config.schedules?.editable === true;
+export const recurringFocusEnabled = (config: Pick<IntegrationManifest, 'schedules' | 'focus'>): boolean =>
+    schedulesInDatabase(config) && config.focus?.enabled === true;
 
 /** Every committed window as router schedules (window clocks and weekday sets only). */
 export function scheduleWindows(store: Store): Schedule[] {
     return store.all<Row>('SELECT person_id,id,weekdays,start,stop FROM schedule_windows ORDER BY person_id,id')
-        .map(r => ({person: r.person_id, id: r.id, weekdays: DAYS.filter(d => r.weekdays.split(',').includes(d)), start: r.start, stop: r.stop}));
+        .map(r => ({person: r.person_id, ...windowFields(r)}));
+}
+/** Service metadata for one child. Wire-facing readers use scheduleWindows. */
+export function scheduleKinds(store: Store, person: string): Map<string, ScheduleKind> {
+    return new Map(store.all<{id: string; kind: ScheduleKind}>('SELECT id,kind FROM schedule_windows WHERE person_id=? ORDER BY id', person).map(row => [row.id, row.kind]));
+}
+/** Read a child's committed windows and, when requested, labels from the same database snapshot. */
+export function scheduleWindowsForDTO(store: Store, person: string, labels: boolean): ScheduleWindowDTO[] {
+    const columns = labels ? 'id,weekdays,start,stop,kind' : 'id,weekdays,start,stop';
+    return store.all<Omit<Row, 'person_id'> & {kind?: ScheduleKind}>(`SELECT ${columns} FROM schedule_windows WHERE person_id=? ORDER BY id`, person)
+        .map(row => ({...windowFields(row), ...(labels ? {kind: row.kind} : {})}));
 }
 /**
  * Seeds the table once from the manifest enrollment schedules; only when the flag is on. The marker row makes a later empty set stay empty.

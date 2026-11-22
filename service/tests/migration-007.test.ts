@@ -57,7 +57,7 @@ test('migration 007 upgrades a populated manifest-bound integration database wit
         const store = new IntegrationStore(config);
         try {
             // 008 follows in the same open: the manifest child and device are seeded, the manifest admin gets scope_all.
-            assertMigrated(store, 16);
+            assertMigrated(store, 17);
             assert.deepEqual(store.all<{id: string; scope_all: number}>('SELECT id,scope_all FROM accounts ORDER BY id').map(r => [r.id, r.scope_all]), [['other', 0], ['owner', 1]]);
             assert.deepEqual(store.all<{id: string; kind: string}>('SELECT id,kind FROM people').map(r => [r.id, r.kind]), [['pilot', 'child']]);
             assert.deepEqual({...store.get('SELECT target_digest,manifest_digest,generation FROM integration_state')!}, {target_digest: config.targetDigest, manifest_digest: config.manifestDigest, generation: config.router.generation});

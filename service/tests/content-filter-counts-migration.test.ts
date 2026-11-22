@@ -84,12 +84,12 @@ test('migration 016 on an integration database: fresh, and an existing database 
     const dir = mkdtempSync(join(tmpdir(), 'cf-m016-int-')), config = testConfig(dir), path = join(dir, 'integration.sqlite');
     try {
         let store = new IntegrationStore(config);
-        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16); assertMigrated(store); } finally { store.close(); }
+        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 17); assertMigrated(store); } finally { store.close(); }
         const db = new DatabaseSync(path);
         db.exec('DROP TABLE content_filter_day_class'); db.exec('DROP TABLE content_filter_day'); db.exec('PRAGMA user_version=13');
         db.close(); chmodSync(path, 0o600);
         store = new IntegrationStore(config);
-        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16); assertMigrated(store); } finally { store.close(); }
+        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 17); assertMigrated(store); } finally { store.close(); }
     } finally { rmSync(dir, {recursive: true, force: true}); }
 });
 

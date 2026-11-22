@@ -1,16 +1,16 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
-import { parseScheduleChange } from '../../shared/src/schedule-edit.ts';
 import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
-import type { Schedule } from '../../shared/src/router-schema.ts';
 import type { Actor } from '../../shared/src/contracts.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
 import { CLIENT_KEY, TOKEN } from './integration-children.ts';
 import type { IntegrationPolicy } from './integration-policy.ts';
-import { fold } from './integration-schedule-mutate.ts';
+import { planScheduleChange } from './integration-schedule-mutate.ts';
+import { parseIntegrationScheduleChange } from './integration-schedule-request.ts';
+import { labeledWindowDigest } from './integration-schedule-kind.ts';
 import { scheduleWindows } from './integration-schedule-store.ts';
-import { isLoosening, windowSetDigest } from './schedule-loosening.ts';
+import { isLoosening } from './schedule-loosening.ts';
 import type { Routed } from './time-requests-http.ts';
 
 /**
@@ -23,23 +23,21 @@ const SCHEDULE_ACTIONS: readonly string[] = ['schedule_create', 'schedule_update
 const PERSON = /^[a-z][a-z0-9_]{0,31}$/;
 
 /** What a step-up is bound to: the child, the exact resulting window set, and the revision token the change is made against. */
-export const scheduleBinding = (person: string, windows: readonly Schedule[], precondition: string): string =>
-    digest(JSON.stringify(['schedule', person, windowSetDigest(windows), precondition]));
+const scheduleBinding = (person: string, windowDigest: string, precondition: string): string =>
+    digest(JSON.stringify(['schedule', person, windowDigest, precondition]));
 
-interface Judged { windows: Schedule[]; loosening: boolean }
+interface Judged { digest: string; loosening: boolean }
 
 export class ScheduleStepUp {
     readonly auth: Auth;
     readonly policy: IntegrationPolicy;
     constructor(auth: Auth, policy: IntegrationPolicy) { this.auth = auth; this.policy = policy; }
 
-    /** The committed set and the folded set for one change, or null when it cannot be folded (the normal path then refuses it, in its own order). */
-    private judge(person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined): Judged | null {
-        try {
-            const committed = scheduleWindows(this.policy.store).filter(w => w.person === person);
-            const windows = fold(committed, person, parseScheduleChange(action, input, scheduleId));
-            return {windows, loosening: isLoosening(committed, windows)};
-        } catch { return null; }
+    private judge(person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined): Judged {
+        const store = this.policy.store;
+        const committed = scheduleWindows(store).filter(w => w.person === person);
+        const {windows, windowKinds} = planScheduleChange(store, committed, person, parseIntegrationScheduleChange(store.config, action, input, scheduleId));
+        return {digest: labeledWindowDigest(windows, windowKinds), loosening: isLoosening(committed, windows)};
     }
     private flagged() {
         const mutate = this.policy.scheduleMutate;
@@ -56,11 +54,10 @@ export class ScheduleStepUp {
         if (body.scheduleId !== undefined && typeof body.scheduleId !== 'string') throw new AppError(400, 'invalid_action');
         this.policy.authorized(session.dto.actor, body.person);
         const action = body.scheduleAction as ScheduleAction, id = body.scheduleId as string | undefined;
-        const committed = scheduleWindows(this.policy.store).filter(w => w.person === body.person);
         // An unfoldable change throws its own refusal (duplicate id, unknown id, bad body); no challenge is minted for it.
-        const windows = fold(committed, body.person, parseScheduleChange(action, body.change, id));
-        if (!isLoosening(committed, windows)) throw new AppError(409, 'step_up_not_required');
-        return this.auth.stepUpChallenge(session, scheduleBinding(body.person, windows, body.precondition));
+        const judged = this.judge(body.person, action, body.change, id);
+        if (!judged.loosening) throw new AppError(409, 'step_up_not_required');
+        return this.auth.stepUpChallenge(session, scheduleBinding(body.person, judged.digest, body.precondition));
     }
     /**
      * The route's entry. A stepUp field is stripped from the body. A replay whose operation already exists needs no second step-up (and spends
@@ -69,14 +66,16 @@ export class ScheduleStepUp {
     async mutate(session: AuthSession, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined) {
         const mutate = this.flagged(), actor: Actor = session.dto.actor;
         const {rest, stepUp} = split(input);
-        const judged = this.judge(person, action, rest, scheduleId);
+        let judged: Judged | null = null;
+        // The normal mutation path reports parsing and fold failures in its existing order.
+        try { judged = this.judge(person, action, rest, scheduleId); } catch {}
         const replay = key !== undefined && CLIENT_KEY.test(key) && this.policy.store.get('SELECT 1 FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key) !== undefined;
         let verified: {digest: string; commit: () => void} | null = null;
         if (judged?.loosening && !replay) {
             this.policy.authorized(actor, person);
             if (!precondition || !TOKEN.test(precondition)) throw new AppError(428, 'revision_precondition_required');
-            const proof = await this.auth.stepUpVerify(session, stepUp, scheduleBinding(person, judged.windows, precondition));
-            verified = {digest: windowSetDigest(judged.windows), commit: () => { this.auth.commitStepUp(session, proof); }};
+            const proof = await this.auth.stepUpVerify(session, stepUp, scheduleBinding(person, judged.digest, precondition));
+            verified = {digest: judged.digest, commit: () => { this.auth.commitStepUp(session, proof); }};
         }
         return mutate(actor, person, action, rest, scheduleId, precondition, key, {verified});
     }

@@ -152,6 +152,55 @@ test('S6 wrong binding: another change, another precondition and a changed commi
         assert.equal(o.status, 404);
     } finally { h.close(); }
 });
+test('A recurring-focus step-up binds the resulting kind even when the exact blocked minutes are the same', async () => {
+    const h = await harness(true);
+    h.f.config.focus = {enabled: true};
+    try {
+        const change = patch({...study, start: '17:00'}), before = dump(h.f), counter = h.counter();
+        const proof = await h.proof('schedule_update', {...change, kind: 'focus'}, study.id);
+        const wrong = await h.send(SHRINK, {...change, kind: 'bedtime', stepUp: proof});
+        assert.equal(wrong.status, 403);
+        assert.equal(wrong.json.error?.code ?? wrong.json.code, 'step_up_mismatch');
+        assert.equal(dump(h.f), before);
+        assert.equal(h.counter(), counter);
+        const correctProof = await h.proof('schedule_update', {...change, kind: 'focus'}, study.id);
+        const right = await h.send(SHRINK, {...change, kind: 'focus', stepUp: correctProof});
+        assert.equal(right.status, 202);
+        assert.ok(h.counter() > counter);
+        await apply(h.f, right.json.operation.id);
+        assert.equal(h.f.policy.people(actor).people[0].schedules?.find(w => w.id === study.id)?.kind, 'focus');
+    } finally { h.close(); }
+});
+test('With recurring focus off, an omitted kind cannot retain the target label, but conversion, deletion and unrelated edits work', async () => {
+    const other: Window = {id: 'other', weekdays: ['Fri'], start: '20:00', stop: '21:00'};
+    const h = await harness(true, [night, study, other]);
+    h.f.config.focus = {enabled: false};
+    try {
+        h.f.store.run("UPDATE schedule_windows SET kind='focus' WHERE id IN ('night','study')");
+        const narrower = patch({...study, start: '17:00'}), precondition = token(h.f);
+        const options = await h.post('/step-up/options', {action: 'schedule_change', person: 'pilot', scheduleAction: 'schedule_update',
+            scheduleId: study.id, precondition, change: narrower});
+        assert.equal(options.status, 409);
+        assert.equal(options.json.error?.code ?? options.json.code, 'recurring_focus_unavailable');
+        const refused = await h.send(SHRINK, narrower);
+        assert.equal(refused.status, 409);
+        assert.equal(refused.json.error?.code ?? refused.json.code, 'recurring_focus_unavailable');
+        assert.equal(operations(h.f), 0);
+
+        const enlarged = await h.send('/people/pilot/schedules/other', patch({...other, stop: '21:30'}));
+        assert.equal(enlarged.status, 202);
+        await apply(h.f, enlarged.json.operation.id);
+        const converted = await h.send(SHRINK, {...patch(study), kind: 'bedtime'});
+        assert.equal(converted.status, 202);
+        await apply(h.f, converted.json.operation.id);
+        assert.equal(h.f.store.get<{kind: string}>("SELECT kind FROM schedule_windows WHERE id='study'")?.kind, 'bedtime');
+        const proof = await h.proof('schedule_delete', {}, night.id);
+        const deleted = await h.send('/people/pilot/schedules/night/delete', {stepUp: proof});
+        assert.equal(deleted.status, 202);
+        await apply(h.f, deleted.json.operation.id);
+        assert.equal(h.f.store.get("SELECT kind FROM schedule_windows WHERE id='night'"), undefined);
+    } finally { h.close(); }
+});
 test('S7 idempotent replay of a stepped-up request needs no second step-up and spends none; a different payload on that key is a conflict', async () => {
     const h = await harness(true);
     try {

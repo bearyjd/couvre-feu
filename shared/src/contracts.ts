@@ -28,11 +28,14 @@ export interface SessionInfoDTO extends SessionDTO {
     lastInventoryOkAgeSeconds?: number | null;
 }
 export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow';
+export type ScheduleKind = 'bedtime' | 'focus';
 export interface ScheduleWindowDTO {
     id: string;
     weekdays: string[];
     start: string;
     stop: string;
+    /** Service-only label, filled on integrations with recurring focus enabled. */
+    kind?: ScheduleKind;
 }
 export type OperationState = 'pending' | 'confirmed' | 'unknown' | 'failed' | 'conflict';
 export interface OperationDTO extends Provenance {
