@@ -47,19 +47,23 @@ test('R1 a failed read resolves its own step and keeps the observation error, so
         rebind(f);
     } finally { f.cleanup(); }
 });
-test('R2 a lost operation_rpc row after the claim still counts as an attempt (conflict, not a pre-dispatch failure), on observe and on prepare', async () => {
+test('R2 a lost operation_rpc row after the claim still counts as an attempt: the claim is kept until the fence, then conflict, on observe and on prepare', async () => {
     for (const path of ['observe', 'prepare'] as const) {
         const f = world(true);
         try {
             await f.observe();
             const id = editId(f, [night]);
             await unseenApply(f, id);
+            const lease = applyLease(f, id);
             f.store.run('DELETE FROM operation_rpc WHERE operation_id=?', id);
             f.advance(5);
             if (path === 'observe') await f.observe();
             else assert.throws(() => f.worker.prepare('apply', id), /schedule_payload_inadmissible/);
-            assert.deepEqual([op(f, id).state, op(f, id).error], ['conflict', 'schedule_payload_inadmissible'], path);
-            assert.equal(active(f), null);
+            assert.deepEqual([op(f, id).state, op(f, id).error, active(f)], ['unknown', 'schedule_payload_inadmissible', id], path);
+            at(f, lease + 600); await f.observe();
+            assert.deepEqual([op(f, id).state, op(f, id).error, active(f)], ['conflict', 'schedule_payload_inadmissible', null], path);
+            assert.equal(applies(f), 1);
+            rebind(f);
         } finally { f.cleanup(); }
     }
 });

@@ -57,6 +57,16 @@ export function scheduleClaimRefusal(store: IntegrationStore, id: unknown, now: 
     return d?.error ?? null;
 }
 /**
+ * Flag on (else false without a read): a schedule operation whose apply was claimed by EITHER record (operation_rpc's counter or its apply
+ * dispatch step). A crash or restore that reverts the rpc row to queued leaves the step, so this still refuses a second claim and still
+ * selects the operation's own receipt for automatic polling.
+ */
+export function scheduleAttempted(store: IntegrationStore, id: string): boolean {
+    if (!schedulesInDatabase(store.config)) return false;
+    const op = store.get<{action: string}>('SELECT action FROM operations WHERE id=?', id);
+    return Boolean(op && isScheduleAction(op.action)) && attemptEvidence(store, id).attemptCount > 0;
+}
+/**
  * Before any dispatch (prepare, and the top of run() before the plan is validated): scheduleClaimRefusal in its own committed transaction,
  * then the refusal. The claim transaction repeats it, so rows changed in between are refused too. Flag off: returns at once.
  */

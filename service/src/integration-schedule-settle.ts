@@ -100,11 +100,22 @@ function afterDispatch(input: ScheduleEvidence, o: RPCObservation, e: RPCEnvelop
     if (fence !== null && input.now >= fence && o.routerTime >= fence) return decision('failed', 'router_apply_unobserved_after_fence', true);
     return decision('unknown', 'receipt_missing_remote_outcome_unknown', false);
 }
+/**
+ * S0: the stored rows do not bind together; nothing is promoted. With no attempt nothing was dispatched: failed. After an attempt the
+ * write may still be in flight, so the claim is kept (unknown, not terminal: the slot, the rpc row and the apply step stay) until router
+ * evidence that no write of the old generation can land (rpc.sh:168), or the S7 fence after the apply lease in service time AND router time.
+ */
+function inadmissible(input: ScheduleEvidence): ScheduleDecision {
+    if (input.attemptCount === 0) return decision('failed', 'schedule_payload_inadmissible', true);
+    if (input.transport?.code === 'router_generation_changed') return decision('conflict', 'schedule_payload_inadmissible', true);
+    const fence = input.applyLeaseUntil === null ? null : input.applyLeaseUntil + APPLY_FENCE_SECONDS, o = input.observation;
+    if (fence !== null && o && input.now >= fence && o.routerTime >= fence) return decision('conflict', 'schedule_payload_inadmissible', true);
+    return decision('unknown', 'schedule_payload_inadmissible', false);
+}
 /** One settlement step; null means the evidence changes nothing. */
 export function decideSchedule(input: ScheduleEvidence): ScheduleDecision | null {
     const e = input.envelope, o = input.observation;
-    // S0: the stored rows do not bind together; nothing is promoted.
-    if (!e) return decision(input.attemptCount > 0 ? 'conflict' : 'failed', 'schedule_payload_inadmissible', true);
+    if (!e) return inadmissible(input);
     if (input.transport) return transportStep(input, input.transport);
     // No reply at all (the check before a claim): only the local S6 witness can decide.
     if (!o) return expired(input) ? decision('failed', 'schedule_not_dispatched', true) : null;

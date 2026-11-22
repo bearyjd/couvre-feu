@@ -72,7 +72,9 @@ export class IntegrationPolicy {
      */
     private rpcView(op: IntegrationOperation): {phase: string; delivery: string; lease_until: number | null; e: RPCEnvelope | null} {
         const r = this.store.get<{phase: string; delivery: string; lease_until: number | null}>('SELECT phase,delivery,lease_until FROM operation_rpc WHERE operation_id=?', op.id);
-        if (!schedulesInDatabase(this.store.config)) return {...r!, e: this.envelope(op.id)};
+        // A stored schedule action stays tolerant across flag changes: an S0-settled edit may keep a missing or malformed rpc row after a
+        // permitted rebind to flag off. Every other action keeps main's reads.
+        if (!schedulesInDatabase(this.store.config) && !isScheduleAction(op.action)) return {...r!, e: this.envelope(op.id)};
         let e: RPCEnvelope | null = null;
         try { e = this.envelope(op.id); } catch { e = null; }
         // Bound to this operation before any confirmation or acceptance is derived from it: an envelope naming another id is no envelope.
