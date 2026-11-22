@@ -58,10 +58,11 @@ function settle(w: ScheduleWorker, invocation: FrozenInvocation, o: RPCObservati
     const store = w.store, id = store.integrationState().active_operation_id;
     const op = id ? store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id) : undefined;
     if (!op || !isScheduleAction(op.action)) return null;
-    const decision = scheduleSeam.decideSchedule({envelope: admitSchedule(store, op), person: op.person_id, ...attemptEvidence(store, op.id),
+    const admitted = admitSchedule(store, op);
+    const decision = scheduleSeam.decideSchedule({envelope: admitted?.envelope ?? null, person: op.person_id, ...attemptEvidence(store, op.id),
         ownApply: invocation.kind === 'apply' && invocation.operationId === op.id, transport: failure && {code: failure.code, delivery: failure.delivery},
         observation: o, now: w.now(), createdAt: op.created_at});
-    applyScheduleDecision(store, op, decision, w.now());
+    applyScheduleDecision(store, op, decision, w.now(), admitted?.kinds ?? null);
     return decision;
 }
 /** Main's publication, after main's full ownership check; a refused observation leaves only a fixed code in observation_error. */

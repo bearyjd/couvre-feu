@@ -1,10 +1,28 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
+import { parseScheduleChange } from '../../shared/src/schedule-edit.ts';
+import type { ScheduleAction, ScheduleChange } from '../../shared/src/schedule-edit.ts';
+import type { ScheduleKind } from '../../shared/src/contracts.ts';
 import { DAYS } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy, Schedule } from '../../shared/src/router-schema.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import { childrenSeam } from './integration-children.ts';
-import { MAX_WINDOWS_PER_CHILD } from './integration-schedule-store.ts';
+import { MAX_WINDOWS_PER_CHILD, recurringFocusEnabled } from './integration-schedule-store.ts';
+import { isScheduleKind } from './integration-schedule-kind.ts';
+
+export type IntegrationScheduleChange = ScheduleChange & {kind?: ScheduleKind};
+
+/** Kind is an integration-only label; the shared router-window parser never sees it. */
+export function parseIntegrationScheduleChange(config: Pick<IntegrationManifest, 'schedules' | 'focus'>, action: ScheduleAction,
+    input: unknown, scheduleId?: string): IntegrationScheduleChange {
+    if (action === 'schedule_delete' || !input || typeof input !== 'object' || Array.isArray(input) || !Object.hasOwn(input, 'kind')) {
+        return parseScheduleChange(action, input, scheduleId);
+    }
+    const {kind, ...window} = input as Record<string, unknown>;
+    if (!isScheduleKind(kind)) throw new AppError(400, 'invalid_schedule_kind');
+    if (kind === 'focus' && !recurringFocusEnabled(config)) throw new AppError(409, 'recurring_focus_unavailable');
+    return {...parseScheduleChange(action, window, scheduleId), kind};
+}
 
 /**
  * The windows of one schedule edit (roadmap item 2, S2a; flag schedules.editable, off; unverified on this router), in canonical form: sorted

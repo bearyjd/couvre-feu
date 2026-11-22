@@ -303,7 +303,7 @@ test('migration integration-009: weekday and clock CHECKs, the 8-window cap and 
         for (let i = 0; i < 8; i++) ins(`w${i}`, 'Mon', '10:00', '11:00', 'other');
         assert.throws(() => ins('w8', 'Mon', '10:00', '11:00', 'other'), /schedule_window_limit/);
         assert.throws(() => f.store.run("UPDATE schedule_windows SET person_id='other' WHERE person_id='pilot' AND id='ok1'"), /schedule_window_limit/);
-        assert.deepEqual(f.store.all<{name: string}>("SELECT name FROM pragma_table_info('schedule_windows')").map(c => c.name), ['person_id', 'id', 'weekdays', 'start', 'stop']);
+        assert.deepEqual(f.store.all<{name: string}>("SELECT name FROM pragma_table_info('schedule_windows')").map(c => c.name), ['person_id', 'id', 'weekdays', 'start', 'stop', 'kind']);
         assert.equal(f.store.get("SELECT 1 FROM sqlite_master WHERE name='schedule_staged'"), undefined); // S1 has no staging table
     } finally { f.cleanup(); }
 });

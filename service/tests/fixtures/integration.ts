@@ -126,10 +126,10 @@ const RANDOMISH = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|
 /**
  * Every table's rows (natural order) as text, with the temporary data directory and per-run values replaced by first-seen indices, so
  * two runs of one scenario compare equal exactly when they stored the same rows with the same equalities. The one-time schedule seed
- * marker and the seeded schedule_windows rows (asserted equal to the manifest where it matters) are left out: they are the rows the schedules.editable flag adds by design.
+ * marker and the seeded schedule_windows rows are left out. An empty label-intent table is also omitted; unexpected rows still change the snapshot.
  */
 export function storeDump(store: IntegrationStore): string {
-    const tables = store.all<{name: string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schedule_seed','schedule_windows') ORDER BY name");
+    const tables = store.all<{name: string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schedule_seed','schedule_windows') AND (name <> 'schedule_kind_intents' OR EXISTS (SELECT 1 FROM schedule_kind_intents)) ORDER BY name");
     const text = JSON.stringify(tables.map(t => [t.name, store.all(`SELECT * FROM "${t.name}"`)])).replaceAll(store.config.dataDir, '<dataDir>');
     const seen = new Map<string, number>();
     return text.replace(RANDOMISH, u => `#${seen.get(u) ?? seen.set(u, seen.size).size - 1}`);

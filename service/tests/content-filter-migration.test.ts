@@ -69,7 +69,7 @@ test('migration 014 on an integration database: fresh, and an existing database 
     const dir = mkdtempSync(join(tmpdir(), 'cf-m014-int-')), config = testConfig(dir), path = join(dir, 'integration.sqlite');
     try {
         let store = new IntegrationStore(config);
-        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16); assertMigrated(store); } finally { store.close(); }
+        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 17); assertMigrated(store); } finally { store.close(); }
         // Put the database back exactly where 013 left it: no content_filter_desired, the 013 audit table with live rows, user_version 11.
         const db = new DatabaseSync(path);
         db.exec('DROP TABLE content_filter_day_class'); db.exec('DROP TABLE content_filter_day'); db.exec('DROP TABLE content_filter_desired'); db.exec('DROP TABLE inventory_decisions'); db.exec('DELETE FROM parent_audit'); seed(db); db.exec(sql('013.sql')); db.exec('PRAGMA user_version=11');
@@ -77,7 +77,7 @@ test('migration 014 on an integration database: fresh, and an existing database 
         db.close(); chmodSync(path, 0o600);
         store = new IntegrationStore(config);
         try {
-            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16);
+            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 17);
             assert.deepEqual(store.all<{action: string}>('SELECT action FROM parent_audit ORDER BY id').map(r => r.action), ['pause', 'focus_start']);
             assertMigrated(store);
         } finally { store.close(); }

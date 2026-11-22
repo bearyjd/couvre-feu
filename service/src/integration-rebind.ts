@@ -43,6 +43,7 @@ export function rebindIntegration(store: IntegrationStore, next: IntegrationConf
         seedScheduleWindows(store, old);
         const was = schedulesInDatabase(old), will = schedulesInDatabase(next);
         if (was && will && scheduleWindows(store).length > 0 && !next.scheduleClock) refuse('rebind_schedule_clock_required');
+        if (was && !will && store.get("SELECT 1 FROM schedule_windows WHERE kind='focus' LIMIT 1")) refuse('rebind_focus_schedules_present');
         if (was && !will && canonicalSchedules(scheduleWindows(store)) !== canonicalSchedules(normalizePolicy(next.enrollment).schedules)) refuse('rebind_schedules_diverge');
         if (!was && will) { store.run('DELETE FROM schedule_windows'); store.run('DELETE FROM schedule_seed'); }
         // Scope observed under the old generation says nothing about the new router: forget it, so the next observation re-baselines on the new floor.

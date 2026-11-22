@@ -1,14 +1,18 @@
 import { AppError } from '../../shared/src/errors.ts';
 import { DAYS } from '../../shared/src/router-schema.ts';
 import type { Schedule } from '../../shared/src/router-schema.ts';
-import { applyScheduleChange, parseScheduleChange } from '../../shared/src/schedule-edit.ts';
+import { applyScheduleChange } from '../../shared/src/schedule-edit.ts';
 import type { ScheduleAction, ScheduleChange } from '../../shared/src/schedule-edit.ts';
 import type { Actor, OperationResult } from '../../shared/src/contracts.ts';
 import type { IntegrationOperation, IntegrationPolicy } from './integration-policy.ts';
 import { CLIENT_KEY, TOKEN } from './integration-children.ts';
-import { isLoosening, windowSetDigest } from './schedule-loosening.ts';
-import { scheduleBuild } from './integration-schedule-request.ts';
-import { scheduleWindows } from './integration-schedule-store.ts';
+import { isLoosening } from './schedule-loosening.ts';
+import { labeledWindowDigest, planWindowKinds, saveScheduleKindIntent } from './integration-schedule-kind.ts';
+import type { WindowKinds } from './integration-schedule-kind.ts';
+import { parseIntegrationScheduleChange, scheduleBuild } from './integration-schedule-request.ts';
+import type { IntegrationScheduleChange } from './integration-schedule-request.ts';
+import type { IntegrationStore } from './integration-db.ts';
+import { recurringFocusEnabled, scheduleWindows } from './integration-schedule-store.ts';
 import { audited } from './parent-audit.ts';
 import type { AuditAction } from './parent-audit.ts';
 
@@ -24,6 +28,17 @@ const byId = (a: Schedule, b: Schedule): number => a.id < b.id ? -1 : a.id > b.i
 export function fold(committed: readonly Schedule[], person: string, change: ScheduleChange): Schedule[] {
     return applyScheduleChange([...committed], person, change)
         .map(w => ({person, id: w.id, weekdays: DAYS.filter(d => w.weekdays.includes(d)), start: w.start, stop: w.stop})).sort(byId);
+}
+/** The same folded window and label set is used by both the step-up and the write transaction. */
+export function planScheduleChange(store: IntegrationStore, committed: readonly Schedule[], person: string, change: IntegrationScheduleChange) {
+    const windows = fold(committed, person, change);
+    const override = change.action !== 'schedule_delete' && change.kind ? [change.window.id, change.kind] as const : undefined;
+    const windowKinds = planWindowKinds(store, person, windows, override);
+    if (change.action !== 'schedule_delete' && !recurringFocusEnabled(store.config) &&
+        windowKinds.some(([id, kind]) => id === change.window.id && kind === 'focus')) {
+        throw new AppError(409, 'recurring_focus_unavailable');
+    }
+    return {windows, windowKinds};
 }
 /** schedule_loosened when isLoosening says so (a deleted window or a freed minute); otherwise schedule_set. Best effort: a failure reads as schedule_set. */
 function auditAction(committed: readonly Schedule[], person: string, change: ScheduleChange): AuditAction {
@@ -55,28 +70,31 @@ export function scheduleMutate(policy: IntegrationPolicy, actor: Actor, person: 
         // A replay keeps the label its first call was recorded under, whatever the rows say now.
         const first = key ? store.get<{action: AuditAction}>('SELECT action FROM parent_audit WHERE operation_id=(SELECT id FROM operations WHERE actor_id=? AND idempotency_key=?) LIMIT 1', actor.id, key) : undefined;
         if (first) return first.action;
-        try { return auditAction(scheduleWindows(store).filter(w => w.person === person), person, parseScheduleChange(action, input, scheduleId)); } catch { return 'schedule_set'; }
+        try { return auditAction(scheduleWindows(store).filter(w => w.person === person), person, parseIntegrationScheduleChange(store.config, action, input, scheduleId)); } catch { return 'schedule_set'; }
     };
     return audited(store, {actor: actor.id, action: label(), now: policy.now, people: () => [person], done: r => ({operationId: r.result.operation.id})}, () => {
         if (!key || !CLIENT_KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !TOKEN.test(precondition)) throw new AppError(428, 'revision_precondition_required');
-        const change = parseScheduleChange(action, input, scheduleId), mine = identity(person, change, precondition, actor.permissionVersion);
+        const change = parseIntegrationScheduleChange(store.config, action, input, scheduleId), mine = identity(person, change, precondition, actor.permissionVersion);
         const op = store.transaction(() => {
             store.assertIdentity();
             const prior = store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
             if (prior) { if (storedIdentity(prior) !== mine) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
             // Folded here, refused inside queue()'s build so a stale token or a busy router is reported before a fold error.
             let windows: Schedule[] = [], failure: unknown = null;
+            let windowKinds: WindowKinds = [];
             const committed = scheduleWindows(store).filter(w => w.person === person);
-            try { windows = fold(committed, person, change); } catch (error) { failure = error; }
+            try { ({windows, windowKinds} = planScheduleChange(store, committed, person, change)); } catch (error) { failure = error; }
             // S2b: judged again inside the write transaction. Before queue(), so a refusal here queues, settles and audits nothing (403 leaves no audit row).
             if (gate && !failure && isLoosening(committed, windows)) {
                 if (!gate.verified) throw new AppError(403, 'step_up_required');
-                if (gate.verified.digest !== windowSetDigest(windows)) throw new AppError(403, 'step_up_mismatch');
+                if (gate.verified.digest !== labeledWindowDigest(windows, windowKinds)) throw new AppError(403, 'step_up_mismatch');
                 gate.verified.commit();
             }
-            const request = JSON.stringify({person, action: 'schedule_update', windows, change, precondition, permissionVersion: actor.permissionVersion});
-            return policy.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, store.config, person, windows, failure), undefined, [person], {person, windows});
+            const request = JSON.stringify({person, action: 'schedule_update', windows, change, precondition, permissionVersion: actor.permissionVersion, windowKinds});
+            const queued = policy.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, store.config, person, windows, failure), undefined, [person], {person, windows});
+            saveScheduleKindIntent(store, queued.id, request);
+            return queued;
         });
         return policy.result(op);
     });

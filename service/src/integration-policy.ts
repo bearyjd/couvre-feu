@@ -11,7 +11,8 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
-import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { recurringFocusEnabled, scheduleWindows, scheduleWindowsForDTO, schedulesInDatabase } from './integration-schedule-store.ts';
+import { planWindowKinds, saveScheduleKindIntent } from './integration-schedule-kind.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { CLIENT_KEY, TOKEN, activeChildren, childrenSeam, configuredMacs, devicesOf, staticDoh, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
@@ -205,12 +206,21 @@ export class IntegrationPolicy {
         if (!key || !CLIENT_KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
         if (!precondition || !TOKEN.test(precondition)) throw new AppError(428, 'revision_precondition_required');
         const windows = scheduleRequestWindows(person, input), config = this.store.config;
-        const request = JSON.stringify({person, action: 'schedule_update', windows, precondition, permissionVersion: actor.permissionVersion});
+        const intent = {person, action: 'schedule_update', windows, precondition, permissionVersion: actor.permissionVersion};
         const op = this.store.transaction(() => {
             this.store.assertIdentity();
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
-            if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
-            return this.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, config, person, windows), undefined, [person], {person, windows});
+            if (prior) {
+                try {
+                    const {windowKinds: _kinds, ...saved} = JSON.parse(prior.request_json);
+                    if (JSON.stringify(saved) === JSON.stringify(intent)) return prior;
+                } catch { /* A damaged prior request cannot match. */ }
+                throw new AppError(409, 'idempotency_payload_conflict');
+            }
+            const request = JSON.stringify({...intent, windowKinds: planWindowKinds(this.store, person, windows)});
+            const queued = this.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, config, person, windows), undefined, [person], {person, windows});
+            saveScheduleKindIntent(this.store, queued.id, request);
+            return queued;
         });
         return this.result(op);
     }
@@ -264,7 +274,7 @@ export class IntegrationPolicy {
     /** Flag on: the child's committed windows and the editable marker, so the existing schedule editor works; flag off: nothing is added. */
     private scheduleList(child: string): {schedules?: ScheduleWindowDTO[]; schedulesEditable?: boolean} {
         if (!schedulesInDatabase(this.store.config)) return {};
-        return {schedules: scheduleWindows(this.store).filter(s => s.person === child).map(({id, weekdays, start, stop}) => ({id, weekdays, start, stop})), schedulesEditable: true};
+        return {schedules: scheduleWindowsForDTO(this.store, child, recurringFocusEnabled(this.store.config)), schedulesEditable: true};
     }
     /**
      * Flag off: main's schedule view. Flag schedules.editable on (unverified on this router): always the committed windows, never the

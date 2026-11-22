@@ -68,13 +68,13 @@ test('migration 017 on an integration database at the previous version', () => {
     const dir = mkdtempSync(join(tmpdir(), 'cf-m017-int-')), config = testConfig(dir), path = join(dir, 'integration.sqlite');
     try {
         let store = new IntegrationStore(config);
-        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16); assertMigrated(store); } finally { store.close(); }
+        try { assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 17); assertMigrated(store); } finally { store.close(); }
         const db = new DatabaseSync(path);
         db.exec("DELETE FROM parent_audit; DELETE FROM sqlite_sequence WHERE name='parent_audit'"); seed(db); db.exec(audit015()); db.exec('PRAGMA user_version=14');
         db.close(); chmodSync(path, 0o600);
         store = new IntegrationStore(config);
         try {
-            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 16);
+            assert.equal(store.get<{user_version: number}>('PRAGMA user_version')!.user_version, 17);
             assert.deepEqual(store.all<Record<string, unknown>>(AUDIT).map(r => ({...r})), EXPECTED);
             assertMigrated(store);
         } finally { store.close(); }
