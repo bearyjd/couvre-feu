@@ -18,6 +18,11 @@ import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-child
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
+// Roadmap item 2, S2a (flag schedules.editable, off; unverified on this router): every use below is gated on the flag and adds lines only.
+import { refuseInadmissibleSchedule, scheduleAttempted, scheduleClaimRefusal } from './integration-schedule-admit.ts';
+import { lateScheduleApply, runScheduleDispatch, scheduleOperationActive } from './integration-schedule-dispatch.ts';
+import { withFixedErrorCodes } from './integration-router-codes.ts';
+import { schedulesInDatabase } from './integration-schedule-store.ts';
 
 export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
@@ -49,6 +54,8 @@ export class IntegrationWorker {
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
         if ((kind === 'apply' || kind === 'receipt') && !operationId) throw new AppError(400, 'operation_id_required');
         if (kind === 'receipt' && !this.store.get('SELECT id FROM operations WHERE id=?', operationId!)) throw new AppError(404, 'operation_not_found');
+        // S2a, flag on: an active schedule operation whose rows do not bind is settled (failed) before its envelope is read.
+        if (kind === 'apply') refuseInadmissibleSchedule(this.store, operationId, this.now());
         const invocation = this.router.invocation(kind, kind === 'apply' ? this.policy.envelope(operationId!) : undefined, kind === 'receipt' ? operationId : undefined);
         const c = this.store.config, now = this.now();
         const base: Omit<PreparedDispatch, 'script' | 'scriptSha256'> = {version: 1, targetDigest: c.targetDigest, manifestDigest: c.manifestDigest,
@@ -96,13 +103,19 @@ export class IntegrationWorker {
         }
     }
     private async run(plan: PreparedDispatch, owner: {token: string; epoch: number} | null): Promise<void> {
+        // S2a, flag on: admission in its own committed transaction, before validate(plan) reads the envelope.
+        refuseInadmissibleSchedule(this.store, plan?.invocation?.kind === 'apply' ? plan.invocation.operationId : null, this.now());
         const invocation = this.validate(plan);
         // Inventory has no operator-approved form: it is a generated, finite, read-only poll under a live owner session.
         if (invocation.kind === 'inventory' && !owner) throw new AppError(403, 'inventory_requires_automatic_permit');
         const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now(), lease = now + (invocation.kind === 'inventory' ? 10 : 17);
         const invocationDigest = owner ? sha256(plan.script + '\n' + batchId) : plan.scriptSha256;
+        let scheduleRefusal: string | null = null;
         this.store.transaction(() => {
             this.store.assertIdentity();
+            // S2a, flag on (else null, no read): admission and the S6 TTL again inside the claim, BEFORE validate(plan) reads the envelope, so
+            // rows lost or malformed since the pre-claim check are settled here too; the refusal commits, then is thrown.
+            if ((scheduleRefusal = scheduleClaimRefusal(this.store, plan?.invocation?.kind === 'apply' ? plan.invocation.operationId : null, now))) return;
             this.validate(plan);
             const automatic = this.store.get<{enabled: number; epoch: number; owner_token: string}>('SELECT * FROM automatic_dispatch WHERE singleton=1');
             if (owner ? !this.store.config.dispatch?.enabled || !automatic?.enabled || automatic.epoch !== owner.epoch || owner.epoch !== epoch || automatic.owner_token !== owner.token : automatic?.enabled) throw new AppError(409, 'automatic_dispatch_authority_required');
@@ -113,7 +126,7 @@ export class IntegrationWorker {
             if (invocation.kind === 'apply') {
                 const id = invocation.operationId!, op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
                 const rpc = this.store.get<{phase: string; attempt_count: number}>('SELECT * FROM operation_rpc WHERE operation_id=?', id);
-                if (!op || !rpc || rpc.phase !== 'queued' || rpc.attempt_count !== 0 || op.state !== 'pending' || this.store.integrationState().active_operation_id !== id) throw new AppError(409, 'operation_dispatch_not_eligible');
+                if (!op || !rpc || rpc.phase !== 'queued' || rpc.attempt_count !== 0 || op.state !== 'pending' || this.store.integrationState().active_operation_id !== id || scheduleAttempted(this.store, id)) throw new AppError(409, 'operation_dispatch_not_eligible');
                 const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
                 // The actor must (still) manage EVERY child the operation names, and every one must still exist; the representative alone proves nothing.
                 // This holds for an operator-approved dispatch as much as for an automatic one: the approval covers the script, not a narrowed scope.
@@ -147,14 +160,18 @@ export class IntegrationWorker {
                     ON CONFLICT(kind) DO UPDATE SET dispatch_count=dispatch_count+1,dispatched_at=excluded.dispatched_at,outcome=excluded.outcome`, invocation.kind, now);
             } else if (owner) this.store.run("INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES('operator',?,?,?,'claimed_once')", invocation.operationId, 'automatic_apply', now);
         });
+        if (scheduleRefusal) throw new AppError(409, scheduleRefusal);
         if (!this.store.get('SELECT id FROM dispatch_batches WHERE id=?', batchId)) return;
         if (invocation.kind === 'activity') { await this.runActivity(batchId, token, epoch, invocation); return; }
         if (invocation.kind === 'inventory') { await this.runInventory(batchId, token, epoch, invocation); return; }
+        // S2a, flag on and a schedule operation active: the transport keeps the observation and the schedule settlement decides.
+        if (scheduleOperationActive(this.store)) { await runScheduleDispatch(this, batchId, token, epoch, invocation); return; }
         // A crash here is deliberately possible delivery. Restart must not replay the operation.
         try {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
+            if (lateScheduleApply(this.store, o)) throw new RouterTransportError('router_late_schedule_apply');
             try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
@@ -226,11 +243,17 @@ export class IntegrationWorker {
         }
     }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {
+        // S2a, flag on: the published observation carries only known router codes (entry for entry).
+        if (o && schedulesInDatabase(this.store.config)) o = withFixedErrorCodes(o);
         this.store.transaction(() => {
             try {
                 const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
                 if (!step || step.claim_token !== token || step.state !== 'consumed' || s.dispatch_epoch !== epoch || s.generation !== this.store.config.router.generation || s.dispatch_stopped || step.lease_until < this.now()) return;
-                this.store.run("UPDATE dispatch_steps SET state=? WHERE batch_id=? AND ordinal=1 AND claim_token=?", error ? 'uncertain' : 'resolved', batchId, token);
+                // S2a, flag on (the code exists only then): a read that reports a late schedule apply has no remote effect, so its step is
+                // resolved and the code stays in observation_error; otherwise that step would block every later rebind. A failed apply, and
+                // every other failed read (main's flag-on parity), stays uncertain.
+                const uncertain = error !== null && (invocation.kind === 'apply' || error.code !== 'router_late_schedule_apply');
+                this.store.run("UPDATE dispatch_steps SET state=? WHERE batch_id=? AND ordinal=1 AND claim_token=?", uncertain ? 'uncertain' : 'resolved', batchId, token);
                 this.store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
                 this.store.run('UPDATE integration_state SET dispatch_stopped=1,observation_error=? WHERE singleton=1', error?.code ?? null);
                 if (this.store.get('SELECT batch_id FROM automatic_read_polls WHERE batch_id=?', batchId)) this.store.run('UPDATE automatic_read_summary SET completed_at=?,outcome=? WHERE kind=?', this.now(), error?.code ?? 'observed', invocation.kind);
