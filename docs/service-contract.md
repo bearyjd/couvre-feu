@@ -353,7 +353,7 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
   - no change to the revision token or health;
   - no router change.
 - **Consequences for later steps:**
-  - S2m adds the route, body validation and `parent_audit` (`schedule_set`/`schedule_loosened`), then calls `scheduleEdit`. It builds no policy and changes no settlement. It must decide whether edits for unrouted children are local-only.
+  - S2m (built, below) adds the HTTP route seam, body validation and `parent_audit` (`schedule_set`/`schedule_loosened`), then calls the same `queue()` admission as `scheduleEdit`. It builds no policy and changes no settlement. Decision: a child the router does not hold stays refused (409 `person_has_no_enrolled_device`), not local-only.
   - S2b adds the step-up check before `scheduleEdit`.
   - S4 Extra time and Skip tonight stay allow operations through `queue()`, with schedules copied from the base; they are never schedule operations.
   - Recurring focus would be a window kind passed through `withScheduleWindows`, with the same admission and fence.
@@ -512,3 +512,14 @@ All routes are admin only (a parent gets 403 `admin_required` before any lookup)
 
 **Audit and privacy.** Every effective change writes, in the same transaction, a legacy `audit` row (`action`, actor, outcome `inventory_row:<id>`) and, with `auditLog.enabled`, a `parent_audit` row with `action` `inventory_classify`, `inventory_undo`, `inventory_link`, `inventory_unlink` or `inventory_stable`, the actor, no child and `operation_id` `inventory_row:<id>`; if either write fails the change rolls back. The activity page words them as "Sorted a device" and so on. A label, MAC, hostname, vendor or address never reaches an audit row, an alert, a log or stdout/stderr (a leak test pins this); the label lives only in the decision row and is shown only to admins.
 
+## Schedule create/update/delete for integration installs (roadmap item 2, S2m; `schedules.editable`, off)
+
+**Unverified on this router.** With the flag off nothing here runs: `IntegrationPolicy.scheduleMutate` is absent, so `POST /people/:id/schedules`, `/schedules/:sid` and `/schedules/:sid/delete` keep answering `403 schedule_editing_unavailable`, `GET /people` is byte-identical to main (no `schedules` or `schedulesEditable` key), and `parent_audit` gets no schedule rows.
+
+- **Request:** the body is validated by the shared `parseScheduleChange` (same bounds as the demo service). `If-Match` and `Idempotency-Key` are required as for `scheduleEdit` (428 / 400).
+- **Fold:** the single change is applied to the child's committed `schedule_windows` rows (never the router) inside the queue transaction, then the whole set goes through `queue()` as one `schedule_update` with the S2a admission (child on the router, at most 8 windows, router limits, main's validation). The empty set (delete of the last window) is admitted. Order of refusals: the S2a queue checks (stale token 409 `revision_conflict`, `operation_in_progress`, router unconfirmed), then 409 `person_has_no_enrolled_device`, then the fold error (404 `schedule_not_found`, 409 `schedule_id_exists`), then the cap (409 `schedule_payload_inadmissible`).
+- **Replay:** identity is the person, the single change, the token and the permission version (stored beside the planned windows). A replay returns the first operation even after it settled and the committed rows changed; the same key with another body is 409 `idempotency_payload_conflict`. A key first used by `scheduleEdit` conflicts.
+- **Unrouted child:** refused (409 `person_has_no_enrolled_device`), not stored locally. A child outside the actor's scope or unknown is 404 `person_not_found`.
+- **Audit:** with `auditLog.enabled`, one `parent_audit` row per call: person id, operation id, closed action type and result only, no window times, ids, names or reason text. `schedule_loosened` when the change frees any minute of the week that was blocked before (a delete, or an update that shrinks coverage); otherwise `schedule_set`. A refused call is recorded under the label computed from the committed rows (`schedule_set` when it cannot be computed); 404s leave no row. The S2b step-up will gate on `schedule_loosened`; it is not part of S2m.
+- **People:** with the flag on, `GET /people` adds `schedules` (committed id, weekdays, start, stop of that child only) and `schedulesEditable: true` per child, so `web/public/schedule-editor.js` works unchanged. A child the router does not hold still shows the editor and is refused on save.
+- **Known gaps:** step-up for loosening (S2b), staged windows, router-side proof of any of this.

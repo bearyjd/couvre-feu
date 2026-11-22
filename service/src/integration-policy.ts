@@ -11,13 +11,16 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
-import { MAX_WINDOWS_PER_CHILD, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
 import { CLIENT_KEY, TOKEN, activeChildren, childrenSeam, configuredMacs, devicesOf, staticDoh, validateManagedPolicy } from './integration-children.ts';
 import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
-import { scheduleRequestWindows } from './integration-schedule-request.ts';
+import { scheduleBuild, scheduleRequestWindows } from './integration-schedule-request.ts';
 import { isScheduleAction } from './integration-schedule-admit.ts';
 import { audited } from './parent-audit.ts';
+import { scheduleMutate } from './integration-schedule-mutate.ts';
+import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
+import type { ScheduleWindowDTO } from '../../shared/src/contracts.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 /** Focus window (F5): the minutes a parent may start. */
@@ -206,13 +209,16 @@ export class IntegrationPolicy {
             this.store.assertIdentity();
             const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
             if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
-            return this.queue(actor, person, 'schedule_update', request, key, precondition, base => {
-                if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
-                if (windows.length > MAX_WINDOWS_PER_CHILD) throw new AppError(409, 'schedule_payload_inadmissible');
-                try { return childrenSeam.withScheduleWindows(base, config, person, windows); } catch { throw new AppError(409, 'schedule_payload_inadmissible'); }
-            }, undefined, [person], {person, windows});
+            return this.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, config, person, windows), undefined, [person], {person, windows});
         });
         return this.result(op);
+    }
+    /**
+     * Schedule create/update/delete (roadmap item 2, S2m; unverified on this router). Present only while schedules.editable is on, so the HTTP
+     * route keeps answering 403 schedule_editing_unavailable with the flag off.
+     */
+    get scheduleMutate(): ((actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined) => {status: number; result: OperationResult}) | undefined {
+        return schedulesInDatabase(this.store.config) ? (...args) => scheduleMutate(this, ...args) : undefined;
     }
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
     private enrolled(o: RPCObservation | null, child: string): boolean {
@@ -237,6 +243,7 @@ export class IntegrationPolicy {
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
+                ...this.scheduleList(child.id),
                 ...scheduleWithAllowance(this.scheduleState(o, enrolled, healthy, validUntil, child.id), allowance, validUntil),
                 allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
@@ -252,6 +259,11 @@ export class IntegrationPolicy {
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
+    }
+    /** Flag on: the child's committed windows and the editable marker, so the existing schedule editor works; flag off: nothing is added. */
+    private scheduleList(child: string): {schedules?: ScheduleWindowDTO[]; schedulesEditable?: boolean} {
+        if (!schedulesInDatabase(this.store.config)) return {};
+        return {schedules: scheduleWindows(this.store).filter(s => s.person === child).map(({id, weekdays, start, stop}) => ({id, weekdays, start, stop})), schedulesEditable: true};
     }
     /**
      * Flag off: main's schedule view. Flag schedules.editable on (unverified on this router): always the committed windows, never the
