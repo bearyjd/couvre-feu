@@ -271,8 +271,88 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
 - **Shape:** `schedule_windows(person_id, id, weekdays, start, stop)` (migration `integration-009`, additive): clock times and a weekday set only, no free text, strict CHECKs on weekday tokens (each at most once), clocks and embedded NULs. At most 8 windows per child: insert and owner-update triggers, and with the flag on the loader refuses a manifest with more than 8 windows for a child (`invalid_schedules`) so the seed cannot fail at startup. Cross-midnight is one row (`start > stop`).
 - **People reads:** with the flag on, a child always shows the committed windows; their state is known only while a healthy observation holds the child. A child the router does not hold (no observation, last device removed) or an unowned observation shows them with enforcement unknown.
 - **Rebind:** the manifest digest is the hash of the file, so every flag flip passes through `rebindIntegration`. on->on: refused with `409 rebind_schedule_clock_required` when committed windows exist and the next manifest has no `scheduleClock`. on->off: refused with `409 rebind_schedules_diverge` unless the committed rows equal the next manifest's `enrollment.schedules`. off->on: in the same transaction the rows and the seed marker are deleted, so the next open seeds once from the next manifest. off->off: the tables are not touched.
-- **S2 handoff:** edits arrive with `scheduleMutate` and receipt-based settlement: one `settleSchedule(op, evidence)` function that never reads `acceptedPolicy` contents or the devices table, runs before ownership decides health or the revision token, and on an exact historical receipt promotes the payload's windows even if the child is no longer on the router.
+- **S2 handoff:** S2a (below) builds schedule edits for integration installs. It replaces the earlier sketch (one `settleSchedule` that promoted on a historical receipt): a historical receipt now promotes nothing.
 - **Privacy:** window clocks and weekday sets only; no child names, labels or text are stored here, and nothing here logs, alerts, pushes or digests them.
+
+## Schedule edits for integration installs (roadmap item 2, S2a; `schedules.editable`, off)
+
+**Unverified on this router.** With the flag off nothing here runs. `scheduleEdit` answers `404 route_not_found`, and every line added to the worker is gated on the flag. A parity test checks that a dump of the stored rows, with the key absent or `false`, equals a golden generated at main `ab561b8`. It also checks that the schedule builder and settlement are never called. There is **no HTTP route** in S2a: only tests call `IntegrationPolicy.scheduleEdit(actor, person, windows, precondition, key)`. No router change; the router release id is unchanged.
+
+- **Construct, don't validate.** An edit is one `schedule_update` operation through the existing `queue()` (revision token, idempotency key, one change in flight). It replaces the whole window set of ONE child; an empty array deletes them all. `schedule_create` and `schedule_delete` stay reserved in the action CHECK of migration `integration-010`. The next policy is `withScheduleWindows(base, ...)`: the router base with only that child's windows replaced. People, devices, pauses, allowances, DoH and every other child's windows are copied from the base unchanged. The static DoH list is then applied as for every other change (`staticDoh`, now a pure exported function).
+- **Stored rows.** `request_json` holds `{person, action, windows, precondition, permissionVersion}`, with the windows in canonical form (sorted by id, weekdays in week order). Payload, base and envelope are as on main: the envelope carries the built policy, and `expected_revision`/`expected_digest` are the base's.
+- **Admission at queue time** (inside the queue transaction):
+  - The child must be on the router base, else `409 person_has_no_enrolled_device`. So an empty set can never replace the windows of a child the router does not hold.
+  - At most 8 windows.
+  - The router limits, through `normalizePolicy`. For example, 17 addresses x 8 cross-midnight windows = 272 expanded entries, over the 256 limit.
+  - The window cap and the router limits both map to `409 schedule_payload_inadmissible`; window shape errors are `400 invalid_schedules`.
+  - Then main's `validateManagedPolicy` runs on the built policy, with this child's planned windows in place of its committed rows, so device ownership and `owner_schedule_clock_required` apply.
+- **Admission before dispatch.** `admitSchedule` never throws. It runs at `prepare`, at the top of `run()` before the plan is validated, and in every settlement. It never reads `schedule_windows`. It requires:
+  - the rpc row exists;
+  - the envelope normalizes and names this operation;
+  - the stored generation equals both the envelope's and the installation's;
+  - the request digest matches;
+  - `base_json` gives the envelope's expected revision and digest;
+  - rebuilding the policy from the request and the base gives the envelope's policy digest.
+
+  A refusal before dispatch writes `failed schedule_payload_inadmissible` in its own committed transaction: the slot is cleared and the operation's dispatch steps are resolved. The dispatch is then refused with the same code. With the flag on, operation reads (`/operations/:id`, `/people`) never throw: a missing rpc row or a malformed envelope shows the stored state and error.
+- **Settlement** (flag on, a schedule operation active). The transport keeps the normalized observation even when ownership fails. The decision reads only fields the router binds by digest: receipt, revision, digest, generation and current operation id. Then main's full ownership check runs against the committed rows (after any promotion). The observation is published only if that check passes; otherwise `observation_error` is set to a fixed code. The first matching rule wins:
+  - **S0, admission fails:** `failed` (no attempt) or `conflict` (after an attempt), `schedule_payload_inadmissible`. Nothing is promoted.
+  - **S1, transport error on our own apply:** `not_delivered` (built before any spawn) gives `failed router_apply_not_delivered`; anything else gives `unknown router_outcome_unknown`.
+  - **S1g, changed router generation on any read:** a terminal `conflict` (`router_generation_changed_before_dispatch` or `_after_dispatch`). rpc.sh refuses every request from an old generation, and the terminal state keeps rebind possible.
+  - **Other read errors** change nothing.
+  - **S2, exact receipt:**
+    - current and healthy: `confirmed`, and the envelope's windows for this child replace its committed rows;
+    - current and unhealthy: `unknown accepted_router_runtime_unconfirmed`, rows promoted;
+    - historical: `conflict router_receipt_historical`, nothing promoted.
+
+    Rows and the audit row are written only when something changes.
+  - **S3, proven pre-write:** our own apply was answered in full, with no receipt and exactly one error.
+    - `policy_conflict` with a moved base: `conflict router_base_changed_before_write`.
+    - Any other code with the unchanged base: `failed router_refused_before_write`.
+    - Our id recorded with another digest, plus `operation_conflict`: `conflict router_operation_id_conflict`.
+
+    Anything else on our own apply is ambiguous and goes to S7, reject-shaped replies included.
+  - **S5/S6, no attempt** (`attempt_count` 0): a moved base gives `conflict router_base_changed_before_dispatch`. With the base unchanged, the operation fails as `schedule_not_dispatched` once 120 s have passed since it was queued.
+  - **S7, an attempt but no exact receipt.** Read-only; there is never a second apply.
+    - A moved base gives `conflict router_base_changed_after_dispatch` at once.
+    - With the base unchanged, once service time AND router time both reach the apply step's `lease_until` + 600 s, it is `failed router_apply_unobserved_after_fence`; before that it is `unknown receipt_missing_remote_outcome_unknown`.
+    - A crash after the claim and before the spawn lands here and resolves after the fence.
+  - Every terminal step clears the slot, sets the rpc row to `resolved` and resolves the operation's open dispatch steps, so a rebind is not blocked.
+- **Revision writers.** Within one generation the router revision only rises, so a moved base never returns:
+  - rpc.sh:185 sets base + 1;
+  - core.sh:743 and :751 (local pause and resume) add 1;
+  - core.sh:897 (`cf_sync_read`) refuses a lower revision (`stale_revision`) and an equal revision with another policy (`conflicting_revision`);
+  - core.sh:935 resets only a local variable inside the read-only `cf_check`;
+  - install.sh:225 writes `R 0` only when the state file is missing, and a fresh activation (install.sh:244-255) always draws a new random generation.
+
+  Not proven: the rollback of a failed reinstall restores the pre-install bytes under the old generation. We assume it never interleaves with an rpc-sync (unverified on this router).
+- **Fixed codes.**
+  - Schedule operation errors come from the closed `SCHEDULE_CODES` union. A test checks every stored error in every test world.
+  - Router error strings pass through `withFixedErrorCodes`, which maps them entry for entry (so counts and health are kept) against the closed `KNOWN_ROUTER_CODES` set. Anything else becomes `router_error_unrecognized`. A static test checks that each member of the set is a literal failure code in `router/`.
+  - With the flag on, the mapping applies when an observation is published (pause and allow operations included) AND when it is served. A rebind keeps `observation_json`, so text cached before the flag flip is never served.
+  - No names, MACs, domains or router diagnostic text reach operations, audit, logs, alerts, pushes, DTOs or digests.
+- **Residual (S7, base unchanged): the fence is a safety margin, not a proof.** Both router locks are non-blocking, but nothing limits how long a stalled router process can run before its write. If our apply lands after the fence, the router holds exactly the policy the parent asked for while the committed rows stay old. In that case:
+  - main's ownership check withholds the observation;
+  - `observation_error` is `router_late_schedule_apply` when the router's current operation is a schedule operation the service already ended;
+  - later changes stay refused, and nothing is promoted late.
+
+  Closing this gap needs a router release: a `not_after` field, checked under the lock before the write. That is not part of S2a.
+- **Cut from S2a:**
+  - no HTTP route;
+  - no staged-window admission;
+  - no late promotion;
+  - no edits for a child the router does not hold (refused);
+  - no operator abandon command (the fence replaces it);
+  - no pre-spawn marker;
+  - no `parent_audit` rows;
+  - no DTO `scheduleCommitted`;
+  - no change to the revision token or health;
+  - no router change.
+- **Consequences for later steps:**
+  - S2m adds the route, body validation and `parent_audit` (`schedule_set`/`schedule_loosened`), then calls `scheduleEdit`. It builds no policy and changes no settlement. It must decide whether edits for unrouted children are local-only.
+  - S2b adds the step-up check before `scheduleEdit`.
+  - S4 Extra time and Skip tonight stay allow operations through `queue()`, with schedules copied from the base; they are never schedule operations.
+  - Recurring focus would be a window kind passed through `withScheduleWindows`, with the same admission and fence.
 
 ## Content filter manifest key (PRP-006 A2, off, nothing enforces yet)
 
