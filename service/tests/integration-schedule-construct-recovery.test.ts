@@ -182,6 +182,21 @@ test('R10 S7a holds only while the router\'s current policy is our envelope\'s: 
         assert.equal(active(f), null); assert.deepEqual(committed(f), []);
     } finally { f.cleanup(); }
 });
+test('R12 a read whose reply lands after its lease (its step later swept uncertain) does not block rebind once the edit settles', async () => {
+    const f = world(true);
+    try {
+        await f.observe();
+        const id = editId(f, [night]);
+        f.router.afterApplyFailure = new RouterTransportError('test_lost_response');
+        await apply(f, id); f.router.afterApplyFailure = null;
+        f.router.spend = {observe: 20}; f.router.elapse = s => f.advance(s);
+        f.advance(5); await f.observe();
+        f.router.spend = {};
+        f.advance(5); await receipt(f, id);
+        assert.deepEqual([op(f, id).state, op(f, id).error], ['confirmed', null]);
+        rebind(f);
+    } finally { f.cleanup(); }
+});
 test('R11 flag on: the scope-change audit holds counts and request ids, never addresses (the scope tables keep them)', async () => {
     const f = world(true);
     try {

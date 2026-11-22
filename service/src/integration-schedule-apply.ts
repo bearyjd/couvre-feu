@@ -27,7 +27,7 @@ function promote(store: IntegrationStore, person: string, windows: readonly Sche
 }
 /**
  * Inside the caller's transaction. Rows (and one audit row) change only when the decision changes them. A terminal decision clears the
- * slot, resolves the rpc row and resolves this operation's open dispatch steps, so a later rebind is not blocked.
+ * slot, resolves the rpc row and resolves this operation's open dispatch steps and every uncertain read step, so a later rebind is not blocked.
  */
 export function applyScheduleDecision(store: IntegrationStore, op: IntegrationOperation, d: ScheduleDecision | null, now: number): void {
     if (!store.db.isTransaction) throw new Error('schedule_settlement_requires_transaction');
@@ -44,4 +44,7 @@ export function applyScheduleDecision(store: IntegrationStore, op: IntegrationOp
     if (!d.terminal) return;
     store.run('UPDATE integration_state SET active_operation_id=NULL WHERE singleton=1 AND active_operation_id=?', op.id);
     store.run("UPDATE dispatch_steps SET state='resolved' WHERE operation_id=? AND state IN ('consumed','uncertain')", op.id);
+    // A read step left uncertain (a late reply swept by a claim, or a crash) has no remote effect, whatever operation it names; another
+    // operation's uncertain APPLY step is left alone.
+    store.run("UPDATE dispatch_steps SET state='resolved' WHERE kind<>'apply' AND state='uncertain'");
 }

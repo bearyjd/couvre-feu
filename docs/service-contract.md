@@ -313,14 +313,14 @@ A parent starts a timed pause for a child, labelled `focus` so the parent view c
     - Our id recorded with another digest, plus `operation_conflict`: `conflict router_operation_id_conflict`.
 
     Anything else on our own apply is ambiguous and goes to S7, reject-shaped replies included.
-  - **S4, our id under another request (any reply, reads included):** a receipt naming our operation id with another request digest is `conflict router_operation_id_conflict`. rpc.sh keeps one receipt per id (:171) and writes it in the same rename as the policy, so ours was never written.
+  - **S3b, our id under another request (any reply, reads included):** a receipt naming our operation id with another request digest is `conflict router_operation_id_conflict`. rpc.sh keeps one receipt per id (:171) and writes it in the same rename as the policy, so ours was never written.
   - **S5/S6, no attempt** (`attempt_count` 0): a moved base gives `conflict router_base_changed_before_dispatch`. With the base unchanged, the operation fails as `schedule_not_dispatched` once 120 s have passed since it was queued.
   - **S7, an attempt but no exact receipt.** Read-only; there is never a second apply.
     - The router names our operation current (`currentOperationId`) AND its current revision and policy digest are our envelope's, but the reply holds no exact receipt for it (a lookup that targeted another operation's receipt): `unknown receipt_missing_remote_outcome_unknown`, the slot stays ours, and neither a moved base nor the fence ends it. Only an exact targeted or current receipt (S2) settles it.
     - A moved base gives `conflict router_base_changed_after_dispatch` at once.
     - With the base unchanged, once service time AND router time both reach the apply step's `lease_until` + 600 s, it is `failed router_apply_unobserved_after_fence`; before that it is `unknown receipt_missing_remote_outcome_unknown`.
     - A crash after the claim and before the spawn lands here and resolves after the fence.
-  - Every terminal step clears the slot, sets the rpc row to `resolved` and resolves the operation's open dispatch steps, so a rebind is not blocked.
+  - Every terminal step clears the slot, sets the rpc row to `resolved` and resolves the operation's open dispatch steps and every uncertain read step (a late reply swept by a claim, or a crash during a read; reads have no remote effect), so a rebind is not blocked. Another operation's uncertain apply step is left alone.
 - **Revision writers.** Within one generation the router revision only rises, so a moved base never returns:
   - rpc.sh:185 sets base + 1;
   - core.sh:743 and :751 (local pause and resume) add 1;
