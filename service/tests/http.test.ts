@@ -121,6 +121,10 @@ test('genuine authenticated HTTP controls enforce Host, identity, scope, CSRF, o
         assert.deepEqual(people.body.people.map((p: {
             id: string;
         }) => p.id), ['alex']);
+        // Demo (non-integration) installs keep their schedule dispatch: it reaches the policy, not the S2b step-up gate.
+        const demoSchedule = await request('/people/alex/schedules', {id: 'x', weekdays: ['Mon'], start: '25:00', stop: '06:30'}, {'Idempotency-Key': 'demo-schedule-route-0001'});
+        assert.notEqual(demoSchedule.body.error?.code ?? demoSchedule.body.code, 'schedule_editing_unavailable');
+        assert.equal(demoSchedule.status, 400);
         assert.equal((await request('/devices')).status, 403);
         assert.equal((await request('/people/blair/pause', {
             until: 0
