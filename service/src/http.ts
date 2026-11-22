@@ -314,12 +314,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const schedule = /^\/people\/([a-z][a-z0-9_]{0,31})\/schedules(?:\/([a-z][a-z0-9_]{0,31})(\/delete)?)?$/.exec(path);
                 if (schedule) {
-                    // S2b: the only path to scheduleMutate; a loosening or deleting edit needs a passkey step-up first.
-                    if (!policy.scheduleMutate || !scheduleStepUp) {
+                    // Integration installs (S2b): a loosening or deleting edit needs a passkey step-up first. Demo installs keep the direct dispatch.
+                    if (!policy.scheduleMutate) {
                         throw new AppError(403, 'schedule_editing_unavailable', 'Schedules are owner-configured in this installation.');
                     }
                     const action = !schedule[2] ? 'schedule_create' : schedule[3] ? 'schedule_delete' : 'schedule_update';
-                    const result = await scheduleStepUp.mutate(session, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    const result = scheduleStepUp
+                        ? await scheduleStepUp.mutate(session, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']))
+                        : await policy.scheduleMutate(session.dto.actor, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;
