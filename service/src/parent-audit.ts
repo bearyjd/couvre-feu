@@ -14,7 +14,7 @@ const SCOPE_MAX = 64;
 const REFUSED_MAX = 20;
 const REFUSED_WINDOW_SECONDS = 60;
 
-export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end', 'reward_add', 'focus_start', 'owner_guard_refused', 'content_filter_set', 'content_filter_loosened', 'inventory_classify', 'inventory_undo', 'inventory_link', 'inventory_unlink', 'inventory_stable', 'schedule_set', 'schedule_loosened'] as const;
+export const AUDIT_ACTIONS = ['pause', 'resume', 'pause_all', 'resume_all', 'device_assign', 'device_move', 'device_remove', 'grant_approve', 'grant_decline', 'grant_end', 'reward_add', 'focus_start', 'owner_guard_refused', 'content_filter_set', 'content_filter_loosened', 'inventory_classify', 'inventory_undo', 'inventory_link', 'inventory_unlink', 'inventory_stable', 'schedule_set', 'schedule_loosened', 'schedule_extra_time', 'schedule_skip_tonight'] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 /** applied: accepted and queued (the router's own outcome stays on the operation). refused: rejected before anything was queued. failed: could not be carried out. */
 export type AuditResult = 'applied' | 'failed' | 'refused';
