@@ -55,6 +55,9 @@ export function scheduleMutate(policy: IntegrationPolicy, actor: Actor, person: 
     const store = policy.store;
     policy.authorized(actor, person);
     const label = (): AuditAction => {
+        // A replay keeps the label its first call was recorded under, whatever the rows say now.
+        const first = key ? store.get<{action: AuditAction}>('SELECT action FROM parent_audit WHERE operation_id=(SELECT id FROM operations WHERE actor_id=? AND idempotency_key=?) LIMIT 1', actor.id, key) : undefined;
+        if (first) return first.action;
         try { return auditAction(scheduleWindows(store).filter(w => w.person === person), person, parseScheduleChange(action, input, scheduleId)); } catch { return 'schedule_set'; }
     };
     return audited(store, {actor: actor.id, action: label(), now: policy.now, people: () => [person], done: r => ({operationId: r.result.operation.id})}, () => {

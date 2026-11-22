@@ -142,7 +142,8 @@ test('M12 audit: schedule_set / schedule_loosened by coverage, ids and enums onl
         f.advance(5); await f.observe();
         const shrink = update(f, {...study, start: '16:00', stop: '18:00'}).result.operation.id; await apply(f, shrink);
         f.advance(5); await f.observe();
-        const del = remove(f, 'study').result.operation.id; await apply(f, del);
+        const delPre = token(f), del = remove(f, 'study', {key: 'mutate_audit_key_002', precondition: delPre}).result.operation.id; await apply(f, del);
+        remove(f, 'study', {key: 'mutate_audit_key_002', precondition: delPre}); // replay after settle: still one loosened row
         f.advance(5); await f.observe();
         assert.throws(() => create(f, night), /schedule_id_exists/);
         assert.throws(() => remove(f, 'study'), /schedule_not_found/); // a 404 leaves no audit row
