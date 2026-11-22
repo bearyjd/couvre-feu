@@ -19,7 +19,7 @@ import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
 // Roadmap item 2, S2a (flag schedules.editable, off; unverified on this router): every use below is gated on the flag and adds lines only.
-import { refuseInadmissibleSchedule } from './integration-schedule-admit.ts';
+import { refuseInadmissibleSchedule, scheduleClaimRefusal } from './integration-schedule-admit.ts';
 import { lateScheduleApply, runScheduleDispatch, scheduleOperationActive } from './integration-schedule-dispatch.ts';
 import { withFixedErrorCodes } from './integration-router-codes.ts';
 import { schedulesInDatabase } from './integration-schedule-store.ts';
@@ -110,6 +110,7 @@ export class IntegrationWorker {
         if (invocation.kind === 'inventory' && !owner) throw new AppError(403, 'inventory_requires_automatic_permit');
         const batchId = randomUUID(), token = randomUUID(), epoch = plan.dispatchEpoch, now = this.now(), lease = now + (invocation.kind === 'inventory' ? 10 : 17);
         const invocationDigest = owner ? sha256(plan.script + '\n' + batchId) : plan.scriptSha256;
+        let scheduleRefusal: string | null = null;
         this.store.transaction(() => {
             this.store.assertIdentity();
             this.validate(plan);
@@ -120,7 +121,9 @@ export class IntegrationWorker {
             if (this.store.get("SELECT batch_id FROM dispatch_steps WHERE state='consumed' AND lease_until>? LIMIT 1", now)) throw new AppError(409, 'dispatch_in_progress');
             this.store.run("UPDATE dispatch_steps SET state='uncertain' WHERE state='consumed' AND lease_until<=?", now);
             if (invocation.kind === 'apply') {
-                const id = invocation.operationId!, op = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
+                // S2a, flag on (else null, no read): admission and the S6 TTL again inside the claim; the refusal commits, then is thrown.
+                if ((scheduleRefusal = scheduleClaimRefusal(this.store, invocation.operationId, now))) return;
+                const id = invocation.operationId!, op =this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
                 const rpc = this.store.get<{phase: string; attempt_count: number}>('SELECT * FROM operation_rpc WHERE operation_id=?', id);
                 if (!op || !rpc || rpc.phase !== 'queued' || rpc.attempt_count !== 0 || op.state !== 'pending' || this.store.integrationState().active_operation_id !== id) throw new AppError(409, 'operation_dispatch_not_eligible');
                 const actor = this.store.get<{active: number; person_ids: string; permission_version: number; role: string}>('SELECT * FROM accounts WHERE id=?', op.actor_id);
@@ -156,6 +159,7 @@ export class IntegrationWorker {
                     ON CONFLICT(kind) DO UPDATE SET dispatch_count=dispatch_count+1,dispatched_at=excluded.dispatched_at,outcome=excluded.outcome`, invocation.kind, now);
             } else if (owner) this.store.run("INSERT INTO audit(actor_id,operation_id,action,timestamp,outcome) VALUES('operator',?,?,?,'claimed_once')", invocation.operationId, 'automatic_apply', now);
         });
+        if (scheduleRefusal) throw new AppError(409, scheduleRefusal);
         if (!this.store.get('SELECT id FROM dispatch_batches WHERE id=?', batchId)) return;
         if (invocation.kind === 'activity') { await this.runActivity(batchId, token, epoch, invocation); return; }
         if (invocation.kind === 'inventory') { await this.runInventory(batchId, token, epoch, invocation); return; }

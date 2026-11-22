@@ -1,5 +1,5 @@
 import { AppError } from '../../shared/src/errors.ts';
-import { normalizeObservation } from '../../shared/src/router-rpc.ts';
+import { FORMAT_ONLY, normalizeObservation } from '../../shared/src/router-rpc.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { healthyConfirmation, normalizePolicy } from '../../shared/src/router-schema.ts';
 import type { IntegrationStore } from './integration-db.ts';
@@ -14,7 +14,7 @@ import { schedulesInDatabase } from './integration-schedule-store.ts';
 import { scheduleSeam } from './integration-schedule-settle.ts';
 import type { ScheduleDecision } from './integration-schedule-settle.ts';
 import { admitSchedule, isScheduleAction } from './integration-schedule-admit.ts';
-import { applyScheduleDecision, applyLeaseUntil } from './integration-schedule-apply.ts';
+import { applyScheduleDecision, attemptEvidence } from './integration-schedule-apply.ts';
 import { withFixedErrorCodes } from './integration-router-codes.ts';
 
 /**
@@ -42,8 +42,10 @@ export async function runScheduleDispatch(w: ScheduleWorker, batchId: string, to
     let o: RPCObservation | null = null, failure: RouterTransportError | null = null;
     try {
         if (w.store.db.isTransaction) throw new Error('network_inside_transaction');
-        const config = w.store.config, seen = normalizeObservation(await w.router.invoke(invocation), {protectedMacs: config.protectedMacs, floor: routerScopeOf(config)});
-        if (seen.generation !== config.router.generation) throw new RouterTransportError('router_generation_changed');
+        // The generation is read from the format-checked reply first: a new generation answers to its own manifest, not to the old floor.
+        const config = w.store.config, raw = normalizeObservation(await w.router.invoke(invocation), FORMAT_ONLY);
+        if (raw.generation !== config.router.generation) throw new RouterTransportError('router_generation_changed');
+        const seen = normalizeObservation(raw, {protectedMacs: config.protectedMacs, floor: routerScopeOf(config)});
         normalizePolicy(seen.acceptedPolicy, config.protectedMacs);
         if (seen.routerTime > w.now() + 1 || w.now() - seen.routerTime > STALE_SECONDS) throw new RouterTransportError('router_clock_or_observation_stale');
         o = seen;
@@ -56,10 +58,9 @@ function settle(w: ScheduleWorker, invocation: FrozenInvocation, o: RPCObservati
     const store = w.store, id = store.integrationState().active_operation_id;
     const op = id ? store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id) : undefined;
     if (!op || !isScheduleAction(op.action)) return null;
-    const rpc = store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', op.id);
-    const decision = scheduleSeam.decideSchedule({envelope: admitSchedule(store, op), person: op.person_id, attemptCount: rpc?.attempt_count ?? 0,
+    const decision = scheduleSeam.decideSchedule({envelope: admitSchedule(store, op), person: op.person_id, ...attemptEvidence(store, op.id),
         ownApply: invocation.kind === 'apply' && invocation.operationId === op.id, transport: failure && {code: failure.code, delivery: failure.delivery},
-        observation: o, now: w.now(), createdAt: op.created_at, applyLeaseUntil: applyLeaseUntil(store, op.id)});
+        observation: o, now: w.now(), createdAt: op.created_at});
     applyScheduleDecision(store, op, decision, w.now());
     return decision;
 }
@@ -86,13 +87,13 @@ export function finishSchedule(w: ScheduleWorker, batchId: string, token: string
         try {
             const s = store.integrationState(), step = store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
             if (!step || step.claim_token !== token || step.state !== 'consumed' || s.dispatch_epoch !== epoch || s.generation !== store.config.router.generation || s.dispatch_stopped || step.lease_until < w.now()) return;
-            store.run('UPDATE dispatch_steps SET state=? WHERE batch_id=? AND ordinal=1 AND claim_token=?', failure ? 'uncertain' : 'resolved', batchId, token);
+            // Only a failed WRITE leaves its step uncertain. A read has no remote effect: its step is resolved and the failure stays in
+            // observation_error, so a lingering read step never blocks a rebind that a later confirmation allows.
+            store.run('UPDATE dispatch_steps SET state=? WHERE batch_id=? AND ordinal=1 AND claim_token=?', failure && invocation.kind === 'apply' ? 'uncertain' : 'resolved', batchId, token);
             store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
             store.run('UPDATE integration_state SET dispatch_stopped=1,observation_error=? WHERE singleton=1', failure?.code ?? null);
             if (store.get('SELECT batch_id FROM automatic_read_polls WHERE batch_id=?', batchId)) store.run('UPDATE automatic_read_summary SET completed_at=?,outcome=? WHERE kind=?', w.now(), failure?.code ?? 'observed', invocation.kind);
-            const decision = settle(w, invocation, o, failure);
-            // A failed READ that ended the operation (S1g) is settled too: a read has no remote effect, and an uncertain step would block rebind.
-            if (decision?.terminal && failure && invocation.kind !== 'apply') store.run("UPDATE dispatch_steps SET state='resolved' WHERE batch_id=? AND ordinal=1 AND claim_token=?", batchId, token);
+            settle(w, invocation, o, failure);
             if (o) publish(w, o);
         } finally {
             store.pruneAutomaticReads();

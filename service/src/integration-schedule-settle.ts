@@ -1,4 +1,4 @@
-import { exactHealthy, exactReceipt } from '../../shared/src/router-rpc.ts';
+import { exactHealthy, exactReceipt, policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope, RPCObservation, RPCReceipt } from '../../shared/src/router-rpc.ts';
 import type { Schedule } from '../../shared/src/router-schema.ts';
 
@@ -34,7 +34,7 @@ export interface ScheduleEvidence {
     transport: {code: string; delivery: 'not_delivered' | 'possible'} | null;
     observation: RPCObservation | null;
     now: number; createdAt: number;
-    /** lease_until of this operation's apply step; null when there was no attempt. */
+    /** The later lease of the two claim records (attemptEvidence); null when neither shows a claim. */
     applyLeaseUntil: number | null;
 }
 export interface ScheduleDecision {
@@ -66,14 +66,27 @@ function refusedBeforeWrite(o: RPCObservation, e: RPCEnvelope): ScheduleDecision
     if (o.errors[0] === 'policy_conflict') return baseMoved(o, e) ? decision('conflict', 'router_base_changed_before_write', true) : null;
     return baseMoved(o, e) ? null : decision('failed', 'router_refused_before_write', true);
 }
-/** Our id is already recorded with another request digest (rpc.sh:173). */
+/** Our id is already recorded with another request digest (rpc.sh:173), as our own apply's refusal. */
 const operationIdConflict = (o: RPCObservation, e: RPCEnvelope): boolean =>
     o.receipt !== null && o.receipt.operationId === e.operation_id && o.errors.length === 1 && o.errors[0] === 'operation_conflict';
+
+/**
+ * Any reply (a read included) whose receipt names our id with another request digest. rpc.sh keeps one receipt per id (:171) and writes it
+ * in the same rename as the policy (:186-193), so ours was never written and never can be (attempt_count is capped at 1).
+ */
+const otherRequestUnderOurId = (o: RPCObservation, e: RPCEnvelope): boolean =>
+    o.receipt !== null && o.receipt.operationId === e.operation_id && o.receipt.requestDigest !== requestDigest(e);
+/** The router names our id current AND holds our envelope's policy: a local edit clears the current id (core.sh:1041), so this is ours. */
+const oursCurrent = (o: RPCObservation, e: RPCEnvelope): boolean =>
+    o.currentOperationId === e.operation_id && o.acceptedPolicy.revision === e.policy.revision && o.policyDigest === policyDigest(e.policy);
+/** S6: attempt_count 0 (from both claim records) is the local witness that nothing was dispatched. */
+const expired = (input: ScheduleEvidence): boolean => input.attemptCount === 0 && input.now >= input.createdAt + DISPATCH_TTL_SECONDS;
 
 function transportStep(input: ScheduleEvidence, t: NonNullable<ScheduleEvidence['transport']>): ScheduleDecision | null {
     // S1g: rpc.sh:168 refuses every request of an old generation, so nothing of ours can land later; terminal, which keeps rebind possible.
     if (t.code === 'router_generation_changed') return decision('conflict', input.attemptCount > 0 ? 'router_generation_changed_after_dispatch' : 'router_generation_changed_before_dispatch', true);
-    if (!input.ownApply) return null;
+    // S6 during an outage: a failed read cannot show a dispatch, and the local witness says there was none.
+    if (!input.ownApply) return expired(input) ? decision('failed', 'schedule_not_dispatched', true) : null;
     // S1: not_delivered is constructed before any spawn (ssh-router.ts); anything else may have reached the router.
     return t.delivery === 'not_delivered' ? decision('failed', 'router_apply_not_delivered', true, {delivery: 'not_delivered'})
         : decision('unknown', 'router_outcome_unknown', false, {delivery: 'possible'});
@@ -93,7 +106,8 @@ export function decideSchedule(input: ScheduleEvidence): ScheduleDecision | null
     // S0: the stored rows do not bind together; nothing is promoted.
     if (!e) return decision(input.attemptCount > 0 ? 'conflict' : 'failed', 'schedule_payload_inadmissible', true);
     if (input.transport) return transportStep(input, input.transport);
-    if (!o) return null;
+    // No reply at all (the check before a claim): only the local S6 witness can decide.
+    if (!o) return expired(input) ? decision('failed', 'schedule_not_dispatched', true) : null;
     if (o.generation !== e.generation) return decision('conflict', input.attemptCount > 0 ? 'router_generation_changed_after_dispatch' : 'router_generation_changed_before_dispatch', true);
     if (exactReceipt(o, e)) return exact(o, e, input.person);
     if (input.ownApply) {
@@ -101,13 +115,15 @@ export function decideSchedule(input: ScheduleEvidence): ScheduleDecision | null
         if (refused) return refused;
         if (operationIdConflict(o, e)) return decision('conflict', 'router_operation_id_conflict', true);
     }
+    if (otherRequestUnderOurId(o, e)) return decision('conflict', 'router_operation_id_conflict', true);
     // S7a: the router names this operation current, but the reply holds no exact receipt for it (a lookup that targeted another
-    // operation's receipt). Our apply landed: no moved base or fence may end it; only an exact targeted or current receipt settles it.
-    if (o.currentOperationId === e.operation_id) return decision('unknown', 'receipt_missing_remote_outcome_unknown', false);
+    // operation's receipt) and its current policy is our envelope's. Our apply landed: no moved base or fence may end it; only an exact
+    // targeted or current receipt settles it. Our id current under another policy is another request under our id, so S5-S7 decide.
+    if (oursCurrent(o, e)) return decision('unknown', 'receipt_missing_remote_outcome_unknown', false);
     if (input.attemptCount === 0) {
         // S5 / S6: attempt_count 0 is the local witness that nothing was dispatched.
         if (baseMoved(o, e)) return decision('conflict', 'router_base_changed_before_dispatch', true);
-        return input.now >= input.createdAt + DISPATCH_TTL_SECONDS ? decision('failed', 'schedule_not_dispatched', true) : null;
+        return expired(input) ? decision('failed', 'schedule_not_dispatched', true) : null;
     }
     return afterDispatch(input, o, e);
 }

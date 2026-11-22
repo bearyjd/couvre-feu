@@ -6,9 +6,18 @@ import type { ScheduleDecision } from './integration-schedule-settle.ts';
 
 /** Roadmap item 2, S2a (flag schedules.editable, off; unverified on this router): the writes of one settlement decision. */
 
-/** lease_until of the operation's apply step (claim time + 17 s); null when no apply was claimed. */
-export function applyLeaseUntil(store: IntegrationStore, id: string): number | null {
-    return store.get<{lease_until: number}>("SELECT lease_until FROM dispatch_steps WHERE operation_id=? AND kind='apply' ORDER BY rowid DESC LIMIT 1", id)?.lease_until ?? null;
+/** The local evidence of an apply attempt, read from BOTH claim records so losing either one keeps it. */
+export interface AttemptEvidence { attemptCount: number; applyLeaseUntil: number | null }
+/**
+ * attemptCount is 1 when operation_rpc counts an attempt OR an apply step exists. applyLeaseUntil is the later of the apply step's lease and
+ * the claim's own lease on operation_rpc (both are claim time + 17 s); null when neither record shows a claim.
+ */
+export function attemptEvidence(store: IntegrationStore, id: string): AttemptEvidence {
+    const step = store.get<{lease_until: number}>("SELECT lease_until FROM dispatch_steps WHERE operation_id=? AND kind='apply' ORDER BY rowid DESC LIMIT 1", id);
+    const rpc = store.get<{attempt_count: number; lease_until: number | null}>('SELECT attempt_count,lease_until FROM operation_rpc WHERE operation_id=?', id);
+    const claimed = rpc && rpc.attempt_count > 0 ? rpc.lease_until : null;
+    const leases = [step?.lease_until ?? null, claimed].filter((n): n is number => typeof n === 'number');
+    return {attemptCount: step || (rpc?.attempt_count ?? 0) > 0 ? 1 : 0, applyLeaseUntil: leases.length ? Math.max(...leases) : null};
 }
 /** Replaces only this child's committed rows, and only when they differ, so a repeated promotion writes nothing. */
 function promote(store: IntegrationStore, person: string, windows: readonly Schedule[]): void {

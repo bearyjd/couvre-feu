@@ -3,6 +3,7 @@ import { AppError } from '../../shared/src/errors.ts';
 import { scopeDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { routerScopeOf } from './integration-config.ts';
+import { schedulesInDatabase } from './integration-schedule-store.ts';
 import type { IntegrationStore } from './integration-db.ts';
 import type { ParentAlerts } from './parent-alerts.ts';
 
@@ -97,7 +98,9 @@ export class ScopeTracker {
         const id = Number(this.store.run('INSERT INTO scope_changes(observed_at,sha_before,sha_after,added_json,removed_json,matched_request_id) VALUES(?,?,?,?,?,?)',
             now, beforeSha, afterSha, JSON.stringify(added), JSON.stringify(removed), matched ? requests.find(r => r.mac === added[0])!.id : null).lastInsertRowid);
         // The audit table is never pruned: it keeps the full account of what changed, who asked and which requests it resolved (scope_changes links only the first).
-        const outcome = {result: matched ? 'matched' : 'unmatched', before: beforeSha, after: afterSha, added, removed, requests: requests.map(r => ({id: r.id, mac: r.mac, requestedBy: r.requested_by}))};
+        // schedules.editable on (S2a, unverified on this router): counts and opaque request ids only; the addresses stay in scope_changes.
+        const outcome = schedulesInDatabase(this.store.config) ? {result: matched ? 'matched' : 'unmatched', before: beforeSha, after: afterSha, added: added.length, removed: removed.length, requests: requests.map(r => r.id), changeId: id}
+            : {result: matched ? 'matched' : 'unmatched', before: beforeSha, after: afterSha, added, removed, requests: requests.map(r => ({id: r.id, mac: r.mac, requestedBy: r.requested_by}))};
         this.store.run('INSERT INTO audit(actor_id,action,timestamp,outcome) VALUES(?,?,?,?)', 'operator', 'router_scope_change', now, JSON.stringify(outcome));
         // Every change is told to the admins: information when explained, critical when unexplained growth, warning for removal. Counts only: the MACs live in scope_changes and audit.
         this.alerts.raise({kind: 'router_scope_change', personId: null, severity: matched ? 'info' : added.length > 0 ? 'critical' : 'warning', details: {added: added.length, removed: removed.length, matched, changeId: id}});

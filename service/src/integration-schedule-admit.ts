@@ -8,7 +8,8 @@ import type { IntegrationOperation } from './integration-policy.ts';
 import { childrenSeam } from './integration-children.ts';
 import { MAX_WINDOWS_PER_CHILD, schedulesInDatabase } from './integration-schedule-store.ts';
 import { scheduleSeam } from './integration-schedule-settle.ts';
-import { applyScheduleDecision, applyLeaseUntil } from './integration-schedule-apply.ts';
+import type { ScheduleCode } from './integration-schedule-settle.ts';
+import { applyScheduleDecision, attemptEvidence } from './integration-schedule-apply.ts';
 
 /** Roadmap item 2, S2a (flag schedules.editable, off; unverified on this router). */
 export const isScheduleAction = (action: string): boolean => action === 'schedule_create' || action === 'schedule_update' || action === 'schedule_delete';
@@ -40,20 +41,27 @@ export function admitSchedule(store: IntegrationStore, op: IntegrationOperation)
     }
 }
 /**
- * Before any dispatch (prepare, and the top of run() before the plan is validated): an active schedule operation whose rows do not bind is
- * settled in its own committed transaction (S0: failed, slot cleared, step resolved) and the dispatch is refused. Flag off: returns at once.
+ * Inside the caller's transaction, for an apply about to be prepared or claimed (flag on; else null without a read). An active schedule
+ * operation whose rows do not bind (S0), or that is past the dispatch TTL with no attempt in either claim record (S6), is settled here and
+ * its code returned; the caller commits that settlement and then refuses the dispatch with the code.
+ */
+export function scheduleClaimRefusal(store: IntegrationStore, id: unknown, now: number): ScheduleCode | null {
+    if (!store.db.isTransaction) throw new Error('schedule_claim_requires_transaction');
+    if (!schedulesInDatabase(store.config) || typeof id !== 'string') return null;
+    const op = store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
+    if (!op || !isScheduleAction(op.action) || store.integrationState().active_operation_id !== id || !['pending', 'unknown'].includes(op.state)) return null;
+    // With no reply, decideSchedule settles only S0 (rows do not bind) and S6 (no attempt, TTL passed); anything else returns null.
+    const d = scheduleSeam.decideSchedule({envelope: admitSchedule(store, op), person: op.person_id, ...attemptEvidence(store, id), ownApply: false,
+        transport: null, observation: null, now, createdAt: op.created_at});
+    applyScheduleDecision(store, op, d, now);
+    return d?.error ?? null;
+}
+/**
+ * Before any dispatch (prepare, and the top of run() before the plan is validated): scheduleClaimRefusal in its own committed transaction,
+ * then the refusal. The claim transaction repeats it, so rows changed in between are refused too. Flag off: returns at once.
  */
 export function refuseInadmissibleSchedule(store: IntegrationStore, id: unknown, now: number): void {
     if (!schedulesInDatabase(store.config) || typeof id !== 'string') return;
-    const refused = store.transaction(() => {
-        store.assertIdentity();
-        const op = store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id);
-        if (!op || !isScheduleAction(op.action) || store.integrationState().active_operation_id !== id || !['pending', 'unknown'].includes(op.state)) return false;
-        if (admitSchedule(store, op)) return false;
-        const rpc = store.get<RpcRow>('SELECT * FROM operation_rpc WHERE operation_id=?', id);
-        applyScheduleDecision(store, op, scheduleSeam.decideSchedule({envelope: null, person: op.person_id, attemptCount: rpc?.attempt_count ?? 0, ownApply: false,
-            transport: null, observation: null, now, createdAt: op.created_at, applyLeaseUntil: applyLeaseUntil(store, id)}), now);
-        return true;
-    });
-    if (refused) throw new AppError(409, 'schedule_payload_inadmissible');
+    const refused = store.transaction(() => { store.assertIdentity(); return scheduleClaimRefusal(store, id, now); });
+    if (refused) throw new AppError(409, refused);
 }

@@ -75,6 +75,8 @@ export class IntegrationPolicy {
         if (!schedulesInDatabase(this.store.config)) return {...r!, e: this.envelope(op.id)};
         let e: RPCEnvelope | null = null;
         try { e = this.envelope(op.id); } catch { e = null; }
+        // Bound to this operation before any confirmation or acceptance is derived from it: an envelope naming another id is no envelope.
+        if (e && e.operation_id !== op.id) e = null;
         return {...(r ?? {phase: 'resolved', delivery: 'not_dispatched', lease_until: null}), e};
     }
     private dto(op: IntegrationOperation, viewer?: Actor): OperationDTO {
