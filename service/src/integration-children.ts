@@ -4,6 +4,7 @@ import type { RouterPolicy, Schedule } from '../../shared/src/router-schema.ts';
 import type { IntegrationManifest } from './integration-config.ts';
 import type { Store } from './db.ts';
 import { canonicalSchedules, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
 
 /** The router's own policy limits (router/lib/json.awk, shared/src/router-schema.ts); not product limits of this service. */
 export const CHILD_LIMIT = 64;
@@ -52,14 +53,17 @@ export const configuredMacs = (store: Store, person: string, heldByRouter: reado
  * Router policy accepted by this service: only database children and their known devices (any state, so both sides of a
  * queued change are admitted), never a protected MAC, and exactly the owned schedules (ownedSchedules) of the children present.
  */
-export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true): void {
+/** S2a (flag schedules.editable on): one child's planned windows, checked in place of its committed rows (queue()'s second validation only). */
+export interface ScheduleOverlay { person: string; windows: readonly Schedule[] }
+export function validateManagedPolicy(policy: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs' | 'enrollment' | 'scheduleClock' | 'schedules'>, store: Store, allowEmpty = true, overlay?: ScheduleOverlay): void {
     normalizePolicy(policy, config.protectedMacs);
     if (allowEmpty && policy.people.length === 0 && policy.pauses.length === 0 && policy.schedules.length === 0) return;
     // A moving device is admitted under both its source and its target child, so a policy on either side of the change validates.
     const known = new Set(store.all<{person_id: string; identifier: string; move_to: string | null}>("SELECT person_id,identifier,move_to FROM devices WHERE identifier_kind='mac'")
         .flatMap(d => [`${d.person_id}\n${d.identifier}`, ...(d.move_to ? [`${d.move_to}\n${d.identifier}`] : [])]));
     if (policy.people.some(person => person.macs.length === 0 || person.macs.some(m => !known.has(`${person.id}\n${m}`)))) throw new AppError(502, 'router_policy_foreign');
-    const owned = ownedSchedules(config, store, new Set(policy.people.map(p => p.id)));
+    const present = new Set(policy.people.map(p => p.id)), committed = ownedSchedules(config, store, present);
+    const owned = overlay && schedulesInDatabase(config) ? [...committed.filter(s => s.person !== overlay.person), ...(present.has(overlay.person) ? overlay.windows : [])] : committed;
     // Flag off: main's literal comparison. Flag on: a pure canonical comparison with the committed rows (never normalizes, so never a limit error).
     if (schedulesInDatabase(config) ? canonicalSchedules(policy.schedules) !== canonicalSchedules(owned) : JSON.stringify(policy.schedules) !== JSON.stringify(owned)) throw new AppError(409, 'owner_schedule_configuration_changed');
     if (policy.schedules.length > 0 && !config.scheduleClock) throw new AppError(409, 'owner_schedule_clock_required');
@@ -104,4 +108,23 @@ export function movePolicy(base: RouterPolicy, config: Pick<IntegrationManifest,
     if (!base.people.some(p => p.id === from && p.macs.includes(mac))) throw new AppError(409, 'device_not_on_router');
     const next = withDevice(withoutDevice(base, config, from, mac, store), config, to, mac, store);
     return normalizePolicy({...next, revision: base.revision + 1}, config.protectedMacs);
+}
+/**
+ * S2a (flag schedules.editable on; unverified on this router): the next policy with ONE child's windows replaced. Everything else (people,
+ * pauses, allowances, DoH and every other child's windows) is copied from the router base as it is; normalizePolicy enforces the router limits.
+ */
+export function withScheduleWindows(base: RouterPolicy, config: Pick<IntegrationManifest, 'protectedMacs'>, person: string, windows: readonly Schedule[]): RouterPolicy {
+    return normalizePolicy({...base, revision: base.revision + 1, schedules: [...base.schedules.filter(s => s.person !== person), ...windows]}, config.protectedMacs);
+}
+/** Callers go through this object so a test can count builder calls (flag off must read 0). */
+export const childrenSeam = {withScheduleWindows};
+/**
+ * Flag dnsHardening.dohList: true adds the static public DoH list (and strips retired entries); an explicit false removes the list and
+ * retired entries from the policy being submitted. An absent key returns the policy untouched. Pure: the refusal tag is returned, and
+ * only queue() writes it, so a rebuild (schedule admission) logs nothing.
+ */
+export function staticDoh(policy: RouterPolicy, config: Pick<IntegrationManifest, 'dnsHardening' | 'protectedMacs' | 'router' | 'listen' | 'trustedProxies'>): {policy: RouterPolicy; tag: string | null} {
+    if (config.dnsHardening === undefined) return {policy, tag: null};
+    const merged = reconcileStaticDoh(policy.doh, config.dnsHardening.dohList, protectedAddressesOf(config));
+    return {policy: normalizePolicy({...policy, doh: merged.doh}, config.protectedMacs), tag: merged.refused > 0 ? merged.tag : null};
 }

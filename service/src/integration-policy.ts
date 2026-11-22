@@ -11,12 +11,12 @@ import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { integrationScheduleState } from './integration-schedules.ts';
-import { scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
+import { MAX_WINDOWS_PER_CHILD, scheduleWindows, schedulesInDatabase } from './integration-schedule-store.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
-import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
-import type { ChildRow } from './integration-children.ts';
+import { CLIENT_KEY, TOKEN, activeChildren, childrenSeam, configuredMacs, devicesOf, staticDoh, validateManagedPolicy } from './integration-children.ts';
+import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
+import { scheduleRequestWindows } from './integration-schedule-request.ts';
 import { audited } from './parent-audit.ts';
-import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 /** Focus window (F5): the minutes a parent may start. */
@@ -24,7 +24,7 @@ export const FOCUS_MINUTES: readonly number[] = [15, 30, 45, 60, 90, 120];
 /** How a pause ends: 'manual' takes the caller's `until`; 'focus' runs `minutes` from router time (F5). */
 type PauseSpec = {kind: 'manual'} | {kind: 'focus'; minutes: number};
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow' | 'schedule_create' | 'schedule_update' | 'schedule_delete'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
 }
@@ -65,11 +65,22 @@ export class IntegrationPolicy {
     }
     /** Visibility is "any row": a viewer sees an operation through any child they manage. */
     private visibleTo(actor: Actor, op: IntegrationOperation): boolean { return this.affectedPeople(op).some(person => actor.personIds.includes(person)); }
+    /**
+     * Flag off: main's reads (they throw on a missing rpc row or a malformed envelope, which no producer writes). Flag schedules.editable on:
+     * total, so a schedule operation refused for corrupt rows (S0) stays readable with its stored state and error.
+     */
+    private rpcView(op: IntegrationOperation): {phase: string; delivery: string; lease_until: number | null; e: RPCEnvelope | null} {
+        const r = this.store.get<{phase: string; delivery: string; lease_until: number | null}>('SELECT phase,delivery,lease_until FROM operation_rpc WHERE operation_id=?', op.id);
+        if (!schedulesInDatabase(this.store.config)) return {...r!, e: this.envelope(op.id)};
+        let e: RPCEnvelope | null = null;
+        try { e = this.envelope(op.id); } catch { e = null; }
+        return {...(r ?? {phase: 'resolved', delivery: 'not_dispatched', lease_until: null}), e};
+    }
     private dto(op: IntegrationOperation, viewer?: Actor): OperationDTO {
-        const r = this.store.get<{phase: string; delivery: string}>('SELECT phase,delivery FROM operation_rpc WHERE operation_id=?', op.id)!;
-        const o = this.store.observation().value, e = this.envelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && exactHealthy(o, e);
-        const superseded = fresh && o !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
-        const uncertainClaim = r.phase === 'claimed' && (this.store.get<{lease_until: number}>('SELECT lease_until FROM operation_rpc WHERE operation_id=?', op.id)!.lease_until <= this.now());
+        const {e, ...r} = this.rpcView(op);
+        const o = this.store.observation().value, fresh = this.fresh(), healthy = fresh && o !== null && e !== null && exactHealthy(o, e);
+        const superseded = fresh && o !== null && e !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
+        const uncertainClaim = r.phase === 'claimed' && (r.lease_until ?? 0) <= this.now();
         const state: OperationState = uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state;
         // A bulk operation's representative child may be outside the viewer's scope: name one they can see instead.
         const personId = viewer ? this.affectedPeople(op).find(person => viewer.personIds.includes(person)) ?? op.person_id : op.person_id;
@@ -149,7 +160,7 @@ export class IntegrationPolicy {
      * records local intent (e.g. a device row) under the new operation id before the result is validated.
      */
     queue(actor: Actor, person: string, action: IntegrationOperation['action'], request: string, key: string, precondition: string | null,
-        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person]): IntegrationOperation {
+        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person], overlay?: ScheduleOverlay): IntegrationOperation {
         if (!this.store.db.isTransaction) throw new Error('queue_requires_transaction');
         if (!this.fresh()) throw new AppError(503, 'approved_router_observation_required');
         const o = this.store.observation().value!;
@@ -157,9 +168,10 @@ export class IntegrationPolicy {
         if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
         if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
-        const policy = this.withStaticDoh(build(o.acceptedPolicy)), id = randomUUID(), now = this.now();
+        const doh = staticDoh(build(o.acceptedPolicy), this.store.config), policy = doh.policy, id = randomUUID(), now = this.now();
+        if (doh.tag) process.stderr.write(`${doh.tag}\n`);
         stage?.(id);
-        validateManagedPolicy(policy, this.store.config, this.store, false);
+        validateManagedPolicy(policy, this.store.config, this.store, false, overlay);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
         this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
         for (const child of new Set(affected)) this.store.run('INSERT INTO operation_people(operation_id,person_id) VALUES(?,?)', id, child);
@@ -170,15 +182,30 @@ export class IntegrationPolicy {
         return this.row(id)!;
     }
     /**
-     * Flag dnsHardening.dohList: true adds the static public DoH list (and strips retired entries); an explicit false removes the
-     * list and retired entries from the policy being submitted. An absent key returns the policy untouched.
+     * Schedule edit (roadmap item 2, S2a; flag schedules.editable, off: 404 route_not_found; unverified on this router). No HTTP route in S2a.
+     * One schedule_update operation through queue(): a whole-set replace of ONE child's windows (an empty array deletes them all), built from
+     * the router base by withScheduleWindows, so every other child's windows, pauses, allowances, DoH, people and devices are copied as they are.
+     * Admission inside the transaction: the child must be on the router (check 1), at most 8 windows (check 2), the router limits (check 3, via
+     * normalizePolicy), and main's validation of the built policy with this child's planned windows in place of its committed rows (check 4).
      */
-    private withStaticDoh(policy: RouterPolicy): RouterPolicy {
-        const config = this.store.config;
-        if (config.dnsHardening === undefined) return policy;
-        const merged = reconcileStaticDoh(policy.doh, config.dnsHardening.dohList, protectedAddressesOf(config));
-        if (merged.refused > 0) process.stderr.write(`${merged.tag}\n`);
-        return normalizePolicy({...policy, doh: merged.doh}, config.protectedMacs);
+    scheduleEdit(actor: Actor, person: string, input: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
+        if (!schedulesInDatabase(this.store.config)) throw new AppError(404, 'route_not_found');
+        this.authorized(actor, person);
+        if (!key || !CLIENT_KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
+        if (!precondition || !TOKEN.test(precondition)) throw new AppError(428, 'revision_precondition_required');
+        const windows = scheduleRequestWindows(person, input), config = this.store.config;
+        const request = JSON.stringify({person, action: 'schedule_update', windows, precondition, permissionVersion: actor.permissionVersion});
+        const op = this.store.transaction(() => {
+            this.store.assertIdentity();
+            const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
+            if (prior) { if (prior.request_json !== request) throw new AppError(409, 'idempotency_payload_conflict'); return prior; }
+            return this.queue(actor, person, 'schedule_update', request, key, precondition, base => {
+                if (!base.people.some(p => p.id === person)) throw new AppError(409, 'person_has_no_enrolled_device');
+                if (windows.length > MAX_WINDOWS_PER_CHILD) throw new AppError(409, 'schedule_payload_inadmissible');
+                try { return childrenSeam.withScheduleWindows(base, config, person, windows); } catch { throw new AppError(409, 'schedule_payload_inadmissible'); }
+            }, undefined, [person], {person, windows});
+        });
+        return this.result(op);
     }
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
     private enrolled(o: RPCObservation | null, child: string): boolean {

@@ -18,6 +18,11 @@ import { PRE_WRITE_REJECTIONS, validateManagedPolicy } from './integration-child
 import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, DispatchKind, FrozenInvocation } from './router-transport.ts';
 import type { IntegrationOperation } from './integration-policy.ts';
+// Roadmap item 2, S2a (flag schedules.editable, off; unverified on this router): every use below is gated on the flag and adds lines only.
+import { refuseInadmissibleSchedule } from './integration-schedule-admit.ts';
+import { lateScheduleApply, runScheduleDispatch, scheduleOperationActive } from './integration-schedule-dispatch.ts';
+import { withFixedErrorCodes } from './integration-router-codes.ts';
+import { schedulesInDatabase } from './integration-schedule-store.ts';
 
 export interface PreparedDispatch {
     version: 1; targetDigest: string; manifestDigest: string; generation: string; dispatchEpoch: number;
@@ -49,6 +54,8 @@ export class IntegrationWorker {
     prepare(kind: DispatchKind, operationId?: string): PreparedDispatch {
         if ((kind === 'apply' || kind === 'receipt') && !operationId) throw new AppError(400, 'operation_id_required');
         if (kind === 'receipt' && !this.store.get('SELECT id FROM operations WHERE id=?', operationId!)) throw new AppError(404, 'operation_not_found');
+        // S2a, flag on: an active schedule operation whose rows do not bind is settled (failed) before its envelope is read.
+        if (kind === 'apply') refuseInadmissibleSchedule(this.store, operationId, this.now());
         const invocation = this.router.invocation(kind, kind === 'apply' ? this.policy.envelope(operationId!) : undefined, kind === 'receipt' ? operationId : undefined);
         const c = this.store.config, now = this.now();
         const base: Omit<PreparedDispatch, 'script' | 'scriptSha256'> = {version: 1, targetDigest: c.targetDigest, manifestDigest: c.manifestDigest,
@@ -96,6 +103,8 @@ export class IntegrationWorker {
         }
     }
     private async run(plan: PreparedDispatch, owner: {token: string; epoch: number} | null): Promise<void> {
+        // S2a, flag on: admission in its own committed transaction, before validate(plan) reads the envelope.
+        refuseInadmissibleSchedule(this.store, plan?.invocation?.kind === 'apply' ? plan.invocation.operationId : null, this.now());
         const invocation = this.validate(plan);
         // Inventory has no operator-approved form: it is a generated, finite, read-only poll under a live owner session.
         if (invocation.kind === 'inventory' && !owner) throw new AppError(403, 'inventory_requires_automatic_permit');
@@ -150,11 +159,14 @@ export class IntegrationWorker {
         if (!this.store.get('SELECT id FROM dispatch_batches WHERE id=?', batchId)) return;
         if (invocation.kind === 'activity') { await this.runActivity(batchId, token, epoch, invocation); return; }
         if (invocation.kind === 'inventory') { await this.runInventory(batchId, token, epoch, invocation); return; }
+        // S2a, flag on and a schedule operation active: the transport keeps the observation and the schedule settlement decides.
+        if (scheduleOperationActive(this.store)) { await runScheduleDispatch(this, batchId, token, epoch, invocation); return; }
         // A crash here is deliberately possible delivery. Restart must not replay the operation.
         try {
             if (this.store.db.isTransaction) throw new Error('network_inside_transaction');
             const o = normalizeObservation(await this.router.invoke(invocation), {protectedMacs: this.store.config.protectedMacs, floor: routerScopeOf(this.store.config)});
             if (o.generation !== this.store.config.router.generation) throw new RouterTransportError('router_generation_changed');
+            if (lateScheduleApply(this.store, o)) throw new RouterTransportError('router_late_schedule_apply');
             try { validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store); }
             catch (error) { throw new RouterTransportError(error instanceof AppError && error.code === 'router_policy_foreign' ? 'router_policy_foreign' : 'router_observation_invalid'); }
             if (o.routerTime > this.now() + 1 || this.now() - o.routerTime > 30) throw new RouterTransportError('router_clock_or_observation_stale');
@@ -226,6 +238,8 @@ export class IntegrationWorker {
         }
     }
     private finish(batchId: string, token: string, epoch: number, invocation: FrozenInvocation, o: RPCObservation | null, error: RouterTransportError | null): void {
+        // S2a, flag on: the published observation carries only known router codes (entry for entry).
+        if (o && schedulesInDatabase(this.store.config)) o = withFixedErrorCodes(o);
         this.store.transaction(() => {
             try {
                 const s = this.store.integrationState(), step = this.store.get<{claim_token: string; state: string; lease_until: number}>('SELECT claim_token,state,lease_until FROM dispatch_steps WHERE batch_id=? AND ordinal=1', batchId);
