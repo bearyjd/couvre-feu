@@ -153,6 +153,23 @@ test('T18 S1g: a changed router generation ends the operation, before and after 
             f.advance(5); await f.observe();
             assert.deepEqual([op(f, id).state, op(f, id).error], ['conflict', dispatched ? 'router_generation_changed_after_dispatch' : 'router_generation_changed_before_dispatch']);
             assert.equal(active(f), null); assert.equal(openSteps(f, id), 0);
+            rebind(f);
         } finally { f.cleanup(); }
     }
+});
+test('T19 closed codes: main\'s claim scope refusal and stopDispatch write members of SCHEDULE_CODES on a schedule operation', async () => {
+    const scope = world(true), stopped = world(true);
+    try {
+        await scope.observe();
+        const id = editId(scope, [night]);
+        scope.store.run("UPDATE accounts SET person_ids='[]' WHERE id='operator'");
+        await apply(scope, id);
+        assert.deepEqual([op(scope, id).state, op(scope, id).error], ['failed', 'actor_permission_changed_before_dispatch']);
+        assert.equal(active(scope), null); assert.equal(applies(scope), 0);
+        await stopped.observe();
+        const other = editId(stopped, [night]);
+        await unseenApply(stopped, other);
+        stopped.store.stopDispatch(stopped.now());
+        assert.deepEqual([op(stopped, other).state, op(stopped, other).error], ['unknown', 'dispatch_stopped_remote_outcome_unknown']);
+    } finally { scope.cleanup(); stopped.cleanup(); }
 });

@@ -9,6 +9,8 @@ import type { Schedule } from '../../shared/src/router-schema.ts';
  */
 export const SCHEDULE_CODES = [
     'awaiting_operator_dispatch', 'awaiting_automatic_dispatch', 'awaiting_exact_router_receipt',
+    // Written by main's paths that also reach a schedule operation: the apply claim's scope check, and stopDispatch.
+    'actor_permission_changed_before_dispatch', 'dispatch_stopped_remote_outcome_unknown',
     'schedule_payload_inadmissible', 'router_apply_not_delivered', 'router_outcome_unknown',
     'router_generation_changed_before_dispatch', 'router_generation_changed_after_dispatch',
     'accepted_router_runtime_unconfirmed', 'router_receipt_historical',

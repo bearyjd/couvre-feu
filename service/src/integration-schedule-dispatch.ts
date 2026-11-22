@@ -12,6 +12,7 @@ import { RouterTransportError } from './router-transport.ts';
 import type { AsyncRouter, FrozenInvocation } from './router-transport.ts';
 import { schedulesInDatabase } from './integration-schedule-store.ts';
 import { scheduleSeam } from './integration-schedule-settle.ts';
+import type { ScheduleDecision } from './integration-schedule-settle.ts';
 import { admitSchedule, isScheduleAction } from './integration-schedule-admit.ts';
 import { applyScheduleDecision, applyLeaseUntil } from './integration-schedule-apply.ts';
 import { withFixedErrorCodes } from './integration-router-codes.ts';
@@ -51,15 +52,16 @@ export async function runScheduleDispatch(w: ScheduleWorker, batchId: string, to
     }
     finishSchedule(w, batchId, token, epoch, invocation, o, failure);
 }
-function settle(w: ScheduleWorker, invocation: FrozenInvocation, o: RPCObservation | null, failure: RouterTransportError | null): void {
+function settle(w: ScheduleWorker, invocation: FrozenInvocation, o: RPCObservation | null, failure: RouterTransportError | null): ScheduleDecision | null {
     const store = w.store, id = store.integrationState().active_operation_id;
     const op = id ? store.get<IntegrationOperation>('SELECT * FROM operations WHERE id=?', id) : undefined;
-    if (!op || !isScheduleAction(op.action)) return;
+    if (!op || !isScheduleAction(op.action)) return null;
     const rpc = store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', op.id);
     const decision = scheduleSeam.decideSchedule({envelope: admitSchedule(store, op), person: op.person_id, attemptCount: rpc?.attempt_count ?? 0,
         ownApply: invocation.kind === 'apply' && invocation.operationId === op.id, transport: failure && {code: failure.code, delivery: failure.delivery},
         observation: o, now: w.now(), createdAt: op.created_at, applyLeaseUntil: applyLeaseUntil(store, op.id)});
     applyScheduleDecision(store, op, decision, w.now());
+    return decision;
 }
 /** Main's publication, after main's full ownership check; a refused observation leaves only a fixed code in observation_error. */
 function publish(w: ScheduleWorker, o: RPCObservation): void {
@@ -88,7 +90,9 @@ export function finishSchedule(w: ScheduleWorker, batchId: string, token: string
             store.run("UPDATE dispatch_batches SET state='spent' WHERE id=?", batchId);
             store.run('UPDATE integration_state SET dispatch_stopped=1,observation_error=? WHERE singleton=1', failure?.code ?? null);
             if (store.get('SELECT batch_id FROM automatic_read_polls WHERE batch_id=?', batchId)) store.run('UPDATE automatic_read_summary SET completed_at=?,outcome=? WHERE kind=?', w.now(), failure?.code ?? 'observed', invocation.kind);
-            settle(w, invocation, o, failure);
+            const decision = settle(w, invocation, o, failure);
+            // A failed READ that ended the operation (S1g) is settled too: a read has no remote effect, and an uncertain step would block rebind.
+            if (decision?.terminal && failure && invocation.kind !== 'apply') store.run("UPDATE dispatch_steps SET state='resolved' WHERE batch_id=? AND ordinal=1 AND claim_token=?", batchId, token);
             if (o) publish(w, o);
         } finally {
             store.pruneAutomaticReads();
