@@ -31,4 +31,4 @@ Trust boundaries
 Maps: [backend](backend.md) [frontend](frontend.md) [data](data.md) [dependencies](dependencies.md) [router](router.md) [live-tools](live-tools.md)
 
 Layout: router/ service/ (migrations 001..019 + admin-batches.sql + integration-001..010 + integration-019-version) shared/src (contracts, router-rpc/-schema/-activity/-inventory, activity-evidence, schedule-edit, inventory-hints, oui, json, errors) web/public tools/ (freeze, strip-test-mode, gen-oui, live/) deploy/ (CT107: docker, systemd, backup, heartbeat) tests/ docs/ demo-router/src.
-CI: `fixture_preflight` -> `preflight_suites` + 42 `fixture_shards` -> `fixtures` gate; `local-demo` job runs typecheck, service tests, Playwright ([dependencies](dependencies.md)).
+CI: `fixture_preflight` -> `preflight_suites` + 43 `fixture_shards` -> `fixtures` gate; `local-demo` job runs typecheck, service tests, Playwright ([dependencies](dependencies.md)).

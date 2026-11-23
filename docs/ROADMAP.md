@@ -234,7 +234,7 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 
 ## Follow-ups
 
-- Longest CI shard is now `test-transition.py` (four partitions, about 904 s predicted, 50% of the 1800 s lane budget), then `test-rpc.py` (about 861 s); a fifth partition each would bring both under about 730 s.
+- RPC job durations reached 1,227 s in run 45112488488 and 1,372 s in run 45105254648 with four partitions. With five RPC partitions the stored case weights predict a maximum of 688 s, down from 861 s. Compare the next green CI run with these measurements. Transition still uses four partitions.
 - Close fd 9 for `timeout` children, a stderr warning when buffered output is lost, and the remaining full-pipe/signal tests (tracked in [tier1-rpc §9](contracts/tier1-rpc.md)).
 - The iOS restyle (#80) still needs the owner’s iPhone check. Check changed web paths before starting another browser slice. The owner decisions draft (#182) covers product choices separately.
 
