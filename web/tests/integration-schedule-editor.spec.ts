@@ -364,13 +364,17 @@ test('integration create is direct and the editor shows the configured timezone 
   expect(calls.options).toHaveLength(0);
 });
 
-test('an owner-reviewed clock shows its configured timezone without an unverified label', async ({ page, integration: f }) => {
+test('an owner-reviewed clock shows its timezone for scheduled children and no clock claim for an empty card', async ({ page, integration: f }) => {
   await openEditor(page, f, 1, { timezone: 'UTC', conformance: {
     utcOffsetMinutes: 0, verifiedAt: f.now() - 1, validUntil: f.now() + 60, evidenceSha256: 'e'.repeat(64),
   } });
   const card = editor(page).locator('[data-schedule-person="pilot"]');
   await expect(card).toContainText('Configured router timezone: UTC.');
   await expect(card).not.toContainText('Router clock unverified.');
+  const emptyCard = editor(page).locator('[data-schedule-person="kid2"]');
+  await expect(emptyCard).toContainText('No weekly schedule windows.');
+  await expect(emptyCard).not.toContainText(/Configured router timezone|Router clock unverified/);
+  await expect(emptyCard.getByRole('button', { name: /Add a schedule/ })).toBeEnabled();
 });
 
 test('a child with eight integration windows can edit but cannot add another', async ({ page, integration: f }) => {

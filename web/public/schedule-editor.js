@@ -139,9 +139,9 @@ export function createScheduleEditor(deps) {
   function cardMarkup(entry, enabled) {
     const key = escape(entry.id), name = escape(entry.name);
     const atIntegrationLimit = integration() && entry.schedules.length >= MAX_INTEGRATION_WINDOWS;
-    const clock = integration() ? [
+    const clock = integration() && entry.schedules.length ? [
       entry.scheduleTimezone && `Configured router timezone: ${escape(entry.scheduleTimezone)}.`,
-      entry.scheduleWitness !== 'owner-reviewed-clock' && 'Router clock unverified.',
+      entry.scheduleWitness === 'unverified' && 'Router clock unverified.',
     ].filter(Boolean).join(' ') : '';
     const open = view.open?.person === entry.id, confirming = view.confirm?.person === entry.id;
     const items = entry.schedules.map((schedule) => {
