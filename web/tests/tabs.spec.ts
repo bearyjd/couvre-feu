@@ -12,6 +12,18 @@ test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' })
 const ADMIN_TABS = ['home', 'kids', 'devices', 'alerts', 'more'];
 const tab = (page: Page, name: string) => page.locator(`#tab-${name}`);
 const panel = (page: Page, name: string) => page.locator(`#panel-${name}`);
+// The target's top sits at or below the sticky masthead, and its heading is what a hit test finds there.
+async function expectClearOfMasthead(page: Page, selector: string) {
+  await expect.poll(() => page.evaluate((sel) => {
+    const el = document.querySelector(sel); const bar = document.querySelector('.masthead');
+    if (!el || !bar) return 'missing';
+    const top = el.getBoundingClientRect().top; const barBottom = bar.getBoundingClientRect().bottom;
+    if (top < barBottom - 1 || top > barBottom + 40) return `top ${Math.round(top)} vs masthead bottom ${Math.round(barBottom)}`;
+    const h = el.querySelector('h2, h3') ?? el; const r = h.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + 4, r.top + r.height / 2);
+    return hit && (h === hit || h.contains(hit)) ? 'ok' : `covered by ${hit?.tagName}.${hit?.className}`;
+  }, selector)).toBe('ok');
+}
 const hash = (page: Page) => page.evaluate(() => location.hash);
 const selected = (page: Page) => page.locator('[role="tab"][aria-selected="true"]');
 const visiblePanels = (page: Page) => page.evaluate(() => [...document.querySelectorAll('[role="tabpanel"]')].filter((p) => !(p as HTMLElement).hidden).map((p) => p.id));
@@ -99,10 +111,10 @@ test('sub-hash #more/accounts opens More and scrolls that panel to the top; an u
   await page.goto(`${f.origin}/#more/accounts`);
   await expect(tab(page, 'more')).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#accounts-panel')).toBeVisible();
-  await expect.poll(() => page.evaluate(() => Math.round(document.querySelector('#accounts-panel')!.getBoundingClientRect().top))).toBeLessThanOrEqual(2);
+  await expectClearOfMasthead(page, '#accounts-panel');
   await page.goto('about:blank'); // a fresh load (no restored scroll): the late-loading target is scrolled to as well
   await page.goto(`${f.origin}/#more/accounts`);
-  await expect.poll(() => page.evaluate(() => Math.round(document.querySelector('#accounts-panel')?.getBoundingClientRect().top ?? 999))).toBeLessThanOrEqual(2);
+  await expectClearOfMasthead(page, '#accounts-panel');
   await page.goto(`${f.origin}/#more/nonsense`);
   await expect(tab(page, 'more')).toHaveAttribute('aria-selected', 'true');
   await expect(panel(page, 'more')).toBeVisible();
@@ -384,7 +396,7 @@ test('More is ordered Schedules, Activity, Audit log, Accounts, About, with a ju
   await page.setViewportSize({ width: 390, height: 500 });
   await page.locator('#more-jump').getByRole('link', { name: 'Accounts' }).click();
   expect(await hash(page)).toBe('#more/accounts');
-  await expect.poll(() => page.evaluate(() => Math.round(document.querySelector('#accounts-panel')!.getBoundingClientRect().top))).toBeLessThanOrEqual(2);
+  await expectClearOfMasthead(page, '#accounts-panel');
 });
 
 const luminance = ([r, g, b]: number[]) => { const c = [r, g, b].map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
@@ -447,4 +459,25 @@ test('signing out resets the tab state: a later sign-in with an unknown hash lan
   await expect(tab(page, 'home')).toHaveAttribute('aria-selected', 'true');
   expect(await visiblePanels(page)).toEqual(['panel-home']);
   expect(await page.locator('[role="tab"][aria-selected="true"]').count()).toBe(1);
+});
+
+test('mobile: the PWA update Reload button is clickable after scrolling down and back', async ({ page, demo }) => {
+  await page.setViewportSize({ width: 390, height: 500 });
+  await enroll(page, demo);
+  await page.route('**/auth/session', async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: { ...(await response.json()), version: 'next-build' } });
+  });
+  await page.locator('#refresh').click();
+  const reload = page.locator('#update-banner').getByRole('button', { name: 'Reload' });
+  await expect(reload).toBeVisible();
+  await page.evaluate(() => window.scrollTo(0, 400));
+  await page.evaluate(() => document.querySelector('#update-reload')!.scrollIntoView({ block: 'start' }));
+  const covered = await page.evaluate(() => {
+    const r = document.querySelector('#update-reload')!.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return hit?.id === 'update-reload' ? 'ok' : `covered by ${hit?.tagName}.${hit?.className}`;
+  });
+  expect(covered).toBe('ok');
+  await Promise.all([page.waitForEvent('load'), reload.click({ timeout: 5000 })]);
 });

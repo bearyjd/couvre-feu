@@ -376,3 +376,13 @@ test('Kids tab, flag off: Add device opens the add form and never the sheet', as
   await expect(page.locator('#children-panel form[data-add-device="kid2"]')).toBeVisible();
   await expect(sheet(page)).toHaveCount(0);
 });
+
+test('phone safe area: with a 34 px bottom inset the sheet\'s last button, scrolled to the end, stays above the inset', async ({ page, integration: f }) => {
+  wizardOn(f); seed(f);
+  await page.setViewportSize({ width: 390, height: 600 });
+  await openSheet(page, f);
+  // Chromium cannot emulate env(safe-area-inset-*): set the --safe-b token every bottom inset goes through.
+  await page.evaluate(() => document.documentElement.style.setProperty('--safe-b', '34px'));
+  const bottom = await sheet(page).evaluate((s) => { s.scrollTop = s.scrollHeight; const buttons = s.querySelectorAll('button'); return buttons[buttons.length - 1].getBoundingClientRect().bottom; });
+  expect(bottom).toBeLessThanOrEqual(600 - 34);
+});

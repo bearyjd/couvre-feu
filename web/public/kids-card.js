@@ -56,7 +56,7 @@ function rowMenu(device, locked, h) {
 function sentence({ kind, name, text, extra = [], yes, h }) {
   const group = el('div', { class: 'confirm-sentence', role: 'group', 'aria-labelledby': `confirm-text-${name}`, 'data-confirm': kind, onkeydown: (event) => { if (event.key === 'Escape') { event.preventDefault(); h.onCancel(); } } },
     el('p', { id: `confirm-text-${name}`, tabIndex: -1, 'data-confirm-text': '', dir: 'auto' }, text), ...extra);
-  const yesButton = el('button', { class: 'button primary', type: 'button', 'data-fk': `yes-${name}`, disabled: yes.disabled, onclick: yes.onclick }, yes.label);
+  const yesButton = el('button', { class: 'button primary', type: 'button', 'data-fk': `yes-${name}`, disabled: yes.disabled, ...(yes.destructive ? { 'data-risk': 'destructive' } : {}), onclick: yes.onclick }, yes.label);
   group.append(el('div', { class: 'inventory-actions' }, yesButton, el('button', { class: 'button secondary', type: 'button', 'data-fk': `cancel-${name}`, onclick: () => h.onCancel() }, 'Cancel')));
   return { group, yesButton };
 }
@@ -74,7 +74,7 @@ function moveSentence(ctx, device) {
 function removeSentence(ctx, device) {
   const { entry, busy, h } = ctx;
   return sentence({ kind: 'remove', name: device.id, h, text: `Remove ${device.label} from ${entry.name}? The router stops managing it. Your passkey is asked next.`,
-    yes: { label: 'Yes, remove it', disabled: busy || device.state !== 'active', onclick: () => h.onRemove(device) } }).group;
+    yes: { label: 'Yes, remove it', disabled: busy || device.state !== 'active', destructive: true, onclick: () => h.onRemove(device) } }).group;
 }
 
 function deviceRow(ctx, device) {
@@ -120,9 +120,9 @@ function removeChild(ctx) {
   const { entry, busy, h } = ctx, kind = (KIND_LABEL[entry.kind] ?? 'Child').toLowerCase();
   if (ctx.confirm?.kind === 'child_remove' && ctx.confirm.id === entry.id) {
     return sentence({ kind: 'child_remove', name: entry.id, h, text: `Remove ${entry.name}? It has no devices. Your passkey is asked next.`,
-      yes: { label: 'Yes, remove it', disabled: busy, onclick: () => h.onRemoveChild(entry) } }).group;
+      yes: { label: 'Yes, remove it', disabled: busy, destructive: true, onclick: () => h.onRemoveChild(entry) } }).group;
   }
-  return el('button', { class: 'button secondary', type: 'button', disabled: busy, 'data-remove-child': entry.id, 'data-fk': `remove-child-${entry.id}`, 'aria-label': `Remove ${entry.name}`,
+  return el('button', { class: 'button secondary', type: 'button', disabled: busy, 'data-remove-child': entry.id, 'data-risk': 'destructive', 'data-fk': `remove-child-${entry.id}`, 'aria-label': `Remove ${entry.name}`,
     onclick: () => h.onChoose('child_remove', entry) }, `Remove ${kind}`);
 }
 /** `ctx` = { entry, pending, approved, replaced:Set, labels:Map, confirm, prefill, moveChoice, others, busy, h }. */

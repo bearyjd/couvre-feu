@@ -1,7 +1,7 @@
 // Only public, same-origin shell assets. No auth/API cache and no queued writes.
 // The service replaces this placeholder at startup with cf-shell-<content hash> (service/src/sw-shell.ts); never bump it by hand.
 const SHELL = 'cf-shell-dev';
-const ASSETS = ['/', '/styles.css', '/app.js', '/auth-client.js', '/status-cache.js', '/operational-alerts.js', '/parent-alerts.js', '/activity.js', '/schedule-editor.js', '/schedule-editor.css', '/time-requests.js', '/reward-time.js', '/focus-window.js', '/audit.js', '/content-filter.js', '/accounts.js', '/children.js', '/kids-card.js', '/kids-model.js', '/install-readiness.js', '/tabs.js', '/inventory-triage.js', '/inventory-wizard.js', '/inventory-wizard-model.js', '/pwa-update.js', '/manifest.webmanifest', '/icon.svg'];
+const ASSETS = ['/', '/styles.css', '/app.js', '/auth-client.js', '/status-cache.js', '/operational-alerts.js', '/parent-alerts.js', '/activity.js', '/schedule-editor.js', '/schedule-editor.css', '/time-requests.js', '/reward-time.js', '/focus-window.js', '/audit.js', '/content-filter.js', '/accounts.js', '/children.js', '/kids-card.js', '/kids-model.js', '/install-readiness.js', '/tabs.js', '/inventory-triage.js', '/inventory-wizard.js', '/inventory-wizard-model.js', '/pwa-update.js', '/manifest.webmanifest', '/icon.svg', '/apple-touch-icon.png'];
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(SHELL).then((cache) => cache.addAll(ASSETS)));
 });
