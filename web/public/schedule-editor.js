@@ -231,7 +231,8 @@ export function createScheduleEditor(deps) {
     const attempt = { generation, controller: new AbortController(), posting: false }, intentView = view;
     const originalWindow = mode === 'delete' ? view.confirm.snapshot : view.open.snapshot;
     const scheduleAction = SCHEDULE_ACTION[mode];
-    const operationAction = integration() ? 'schedule_update' : scheduleAction;
+    const isIntegration = integration();
+    const operationAction = isIntegration ? 'schedule_update' : scheduleAction;
     const sameIntent = () => active === attempt && generation === state.generation && intentView === view;
     const sameSession = () => generation === state.generation && beforeSession === sessionKey(state.session);
     const headers = { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken };
@@ -255,6 +256,16 @@ export function createScheduleEditor(deps) {
       deps.announce(message, true);
       if (mode !== 'delete') fail(null, message);
     };
+    function writeSessionCurrent() {
+      if (sameSession()) return true;
+      // Keep old-session operation details out of the new scope, but require observation before another write.
+      if (generation === state.generation) {
+        state.needsRefresh = true;
+        state.localUnknown = true;
+        deps.announce('Outcome unknown. The session changed while the schedule request was pending. Refresh status before another action.', true);
+      }
+      return false;
+    }
     async function refreshIntent() {
       const refreshed = await deps.refresh({ quiet: true });
       if (!sameIntent()) return false;
@@ -271,7 +282,11 @@ export function createScheduleEditor(deps) {
         notice('The window changed since you opened it. Close this draft or confirmation and open the current window before trying again.');
         return false;
       }
-      return deps.canControl() && Boolean(entry);
+      if (!deps.canControl() || !entry) {
+        notice('Schedule controls are unavailable after refreshing status. No change was queued.');
+        return false;
+      }
+      return true;
     }
     active = attempt;
     render();
@@ -285,8 +300,8 @@ export function createScheduleEditor(deps) {
       try {
         result = await send(body);
       } catch (error) {
-        if (error?.status !== 403 || error?.code !== 'step_up_required') throw error;
-        if (!sameIntent() || !sameSession()) return;
+        if (!isIntegration || error?.status !== 403 || error?.code !== 'step_up_required') throw error;
+        if (!writeSessionCurrent() || !sameIntent()) return;
         deps.announce('Confirm with your passkey to continue.');
         phase = 'options';
         const requestedAt = performance.now();
@@ -294,14 +309,24 @@ export function createScheduleEditor(deps) {
           headers: { 'X-CSRF-Token': headers['X-CSRF-Token'] },
           body: { action: 'schedule_change', person: personId, scheduleAction, precondition: beforeRevision, change: body, ...(scheduleId ? { scheduleId } : {}) } });
         if (!sameIntent() || !sameSession()) return;
+        const timeout = options?.timeout;
+        if (!Number.isFinite(timeout) || timeout <= 0) {
+          notice('The service did not provide a valid passkey timeout. No schedule change was queued.');
+          return;
+        }
+        if (performance.now() - requestedAt >= timeout) {
+          notice('Passkey confirmation expired. Review the schedule and save again.');
+          return;
+        }
         phase = 'prompt';
         const response = await getPasskey(options, attempt.controller.signal);
         if (!sameIntent() || !sameSession()) return;
-        // Refresh is blocked while the app is busy. The editor's own lock still prevents another schedule submission.
+        // Refresh takes the app's control lock synchronously, before this turn yields to other input.
+        // The editor keeps its own lock across refresh and proof submission.
         deps.setBusy(false); busy = false;
         phase = 'status';
         if (!await refreshIntent()) return;
-        if (performance.now() - requestedAt >= options.timeout) {
+        if (performance.now() - requestedAt >= timeout) {
           notice('Passkey confirmation expired. Review the schedule and save again.');
           return;
         }
@@ -309,7 +334,7 @@ export function createScheduleEditor(deps) {
         phase = 'proof';
         result = await send({ ...body, stepUp: { challengeId, response } });
       }
-      if (!sameSession()) return;
+      if (!writeSessionCurrent()) return;
       const operation = result?.operation;
       if (typeof operation?.id !== 'string' || !operation.id || operation.personId !== personId || operation.action !== operationAction ||
           !['pending', 'unknown', 'confirmed', 'failed', 'conflict'].includes(operation.state)) {
@@ -324,31 +349,39 @@ export function createScheduleEditor(deps) {
       if (['pending', 'unknown'].includes(operation.state)) void deps.followOperation(operation.id, generation);
       else await deps.refresh({ quiet: true });
     } catch (error) {
-      if (!sameSession()) return;
+      const write = phase === 'request' || phase === 'proof';
+      if (write ? !writeSessionCurrent() : !sameSession()) return;
       const status = error?.status, code = error?.code;
+      // Demo routes retain their existing HTTP refusal semantics. Integration requires a known pre-write code.
+      const demoRefusal = !isIntegration && write && typeof status === 'number';
       if (phase === 'prompt') {
         notice(['NotAllowedError', 'AbortError'].includes(error?.name)
           ? 'Passkey confirmation was cancelled. No schedule change was queued.'
           : 'The passkey could not be read. No schedule change was queued.');
       } else if (phase === 'proof' && [401, 403].includes(status) && PASSKEY_REFUSALS.has(code)) {
         notice('The service refused the passkey confirmation. Review the schedule and save again.');
-      } else if ((status === 401 && SESSION_REFUSALS.has(code)) || (status === 403 && code === 'csrf_rejected')) {
+      } else if ((demoRefusal && [401, 403].includes(status)) ||
+          (status === 401 && SESSION_REFUSALS.has(code)) || (status === 403 && code === 'csrf_rejected')) {
         deps.unauthorized();
       } else if (phase === 'options' || phase === 'status') {
         notice('Could not complete schedule confirmation. No change was queued.');
-      } else if ((status === 409 && code === 'revision_conflict') || (status === 404 && code === 'schedule_not_found')) {
+      } else if ((status === 409 && (code === 'revision_conflict' || demoRefusal && code !== 'schedule_id_exists')) ||
+          (status === 404 && code === 'schedule_not_found')) {
         state.needsRefresh = true;
         deps.setBusy(false); busy = false;
         const refreshed = await deps.refresh({ quiet: true });
         if (!sameSession()) return;
-        const reason = code === 'revision_conflict' ? 'Revision conflict. Schedules changed elsewhere.' : 'That schedule no longer exists.';
+        const reason = status === 409 ? 'Revision conflict. Schedules changed elsewhere.' : 'That schedule no longer exists.';
         notice(`${reason} ${refreshed ? 'Review the current schedules before trying again.' : 'Refresh status before trying again.'}`);
-      } else if (WRITE_REFUSALS[status]?.includes(code)) {
-        if (['operation_in_progress', 'person_has_no_enrolled_device', 'approved_router_observation_required', 'router_runtime_unconfirmed'].includes(code)) {
+        if (demoRefusal && (status === 404 || mode === 'delete') && sameIntent()) { reset(); lastKey = ''; }
+      } else if (demoRefusal || WRITE_REFUSALS[status]?.includes(code)) {
+        if (demoRefusal || ['operation_in_progress', 'person_has_no_enrolled_device', 'approved_router_observation_required', 'router_runtime_unconfirmed'].includes(code)) {
           state.needsRefresh = true;
         }
-        deps.announce(REFUSAL_TEXT[code] ?? `The service refused the schedule change. ${error.message}`, true);
-        if (mode !== 'delete') fail(code, REFUSAL_TEXT[code] ?? error.message);
+        const message = demoRefusal ? error.message : REFUSAL_TEXT[code] ?? error.message;
+        deps.announce(demoRefusal ? `The schedule request failed: ${message} Nothing was changed.`
+          : REFUSAL_TEXT[code] ?? `The service refused the schedule change. ${message}`, true);
+        if (mode !== 'delete') fail(code, message);
       } else {
         state.needsRefresh = true;
         state.localUnknown = true;

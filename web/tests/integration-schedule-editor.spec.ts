@@ -1,6 +1,6 @@
 import type { Page, Request } from '@playwright/test';
 import { normalizePolicy } from '../../shared/src/router-schema.ts';
-import { openTab } from './browser-fixture.ts';
+import { enroll, openTab, test as demoTest } from './browser-fixture.ts';
 import { dispatchPending, expect, signIn, test, type World } from './bulk-fixture.ts';
 
 const editor = (page: Page) => page.locator('#schedule-editor');
@@ -8,9 +8,9 @@ const schedulesPath = '/people/pilot/schedules';
 const schedulePath = schedulesPath + '/bedtime';
 const schedule = { person: 'pilot', id: 'bedtime', weekdays: ['Mon' as const], start: '20:00', stop: '23:00' };
 
-async function openEditor(page: Page, f: World, count = 1) {
+async function openEditor(page: Page, f: World, count = 1, clock?: World['config']['scheduleClock']) {
   f.config.schedules = { editable: true };
-  f.config.scheduleClock = { timezone: 'America/New_York' };
+  f.config.scheduleClock = clock ?? { timezone: 'America/New_York' };
   const schedules = [schedule, ...Array.from({ length: count - 1 }, (_, index) => ({ ...schedule, id: `window_${index + 1}` }))];
   for (const window of schedules) {
     f.store.run('INSERT INTO schedule_windows(person_id,id,weekdays,start,stop) VALUES(?,?,?,?,?)', window.person, window.id, window.weekdays.join(','), window.start, window.stop);
@@ -169,6 +169,99 @@ for (const change of ['revision', 'session'] as const) {
   });
 }
 
+for (const outcome of ['accepted', 'lost'] as const) {
+  test(`a session key rotation while the proof POST is ${outcome} requires a fresh observation`, async ({ page, integration: f }) => {
+    // App refresh is blocked during a write. Expose state in this fixture to exercise same-generation key rotation directly.
+    await page.route('**/schedule-editor.js', async (route) => {
+      const response = await route.fetch();
+      const body = (await response.text()).replace('const { root, state } = deps;', 'const { root, state } = deps; window.fixtureScheduleState = state;');
+      await route.fulfill({ response, body });
+    });
+    await openEditor(page, f);
+    const calls = requests(page);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route('**' + schedulePath, async (route) => {
+      if (!route.request().postDataJSON().stepUp) return route.continue();
+      await held;
+      if (outcome === 'lost') return route.abort('connectionreset');
+      return route.continue();
+    });
+    await editStart(page, '21:00');
+    try {
+      await expect.poll(() => calls.attempts.length).toBe(2);
+      await page.evaluate(() => {
+        const { fixtureScheduleState: state } = window as unknown as { fixtureScheduleState: { session: { csrfToken: string } } };
+        state.session = { ...state.session, csrfToken: 'rotated-fixture-session' };
+      });
+    } finally {
+      release();
+    }
+    await expect(page.locator('#notice')).toContainText('Outcome unknown');
+    await expect(editor(page).getByRole('button', { name: 'Save schedule' })).toBeDisabled();
+    const status = await page.evaluate(() => {
+      const { fixtureScheduleState: state } = window as unknown as { fixtureScheduleState: { operation: unknown; localUnknown: boolean; needsRefresh: boolean } };
+      return [state.operation, state.localUnknown, state.needsRefresh];
+    });
+    expect(status).toEqual([null, true, true]);
+    if (outcome === 'accepted') expect(f.store.integrationState().active_operation_id).not.toBeNull();
+    expect(calls.attempts).toHaveLength(2);
+  });
+}
+
+test('a challenge without a finite positive timeout never opens a passkey prompt', async ({ page, integration: f }) => {
+  await openEditor(page, f);
+  const calls = requests(page);
+  await passkeyGate(page);
+  await page.route('**/step-up/options', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    delete body.options.timeout;
+    await route.fulfill({ response, json: body });
+  });
+  await editStart(page, '21:00');
+  await expect(page.locator('#notice')).toContainText('The service did not provide a valid passkey timeout');
+  await expect(page.locator('html')).not.toHaveAttribute('data-fixture-passkey-waiting', 'true');
+  await expect(editor(page).getByLabel('Start')).toHaveValue('21:00');
+  expect(calls.attempts).toHaveLength(1);
+  expect(calls.options).toHaveLength(1);
+});
+
+test('post-passkey refresh explains when current controls are unavailable and sends no proof', async ({ page, integration: f }) => {
+  await openEditor(page, f);
+  const calls = requests(page);
+  await page.route('**/people', async (route) => {
+    const response = await route.fetch();
+    if (!calls.options.length) return route.fulfill({ response });
+    await route.fulfill({ response, json: { ...await response.json(), routerDesiredRevision: null } });
+  });
+  await editStart(page, '21:00');
+  await expect(page.locator('#notice')).toContainText('Schedule controls are unavailable');
+  await expect(editor(page).getByLabel('Start')).toHaveValue('21:00');
+  await expect(editor(page).getByRole('button', { name: 'Save schedule' })).toBeDisabled();
+  expect(calls.attempts).toHaveLength(1);
+  expect(calls.options).toHaveLength(1);
+});
+
+demoTest('a demo schedule 409 keeps its original revision-conflict feedback and draft', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  let attempts = 0;
+  await page.route('**/people/alex/schedules', async (route) => {
+    attempts += 1;
+    await route.fulfill({ status: 409, json: { error: { code: 'operation_in_progress' } } });
+  });
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  await editor(page).getByLabel('Tue', { exact: true }).check();
+  await editor(page).getByLabel('Start').fill('19:00');
+  await editor(page).getByLabel('Stop').fill('21:00');
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect(page.locator('#notice')).toContainText('Revision conflict');
+  await expect(editor(page).getByLabel('Start')).toHaveValue('19:00');
+  await expect(editor(page).getByRole('button', { name: 'Save schedule' })).toBeEnabled();
+  expect(attempts).toBe(1);
+});
+
 test('a lost proof submission stays unknown until refresh and is never resent', async ({ page, integration: f }) => {
   await openEditor(page, f);
   const calls = requests(page);
@@ -269,6 +362,15 @@ test('integration create is direct and the editor shows the configured timezone 
   await expect(editor(page).locator('[data-schedule-id=window_1]')).toContainText('19:00');
   expect(calls.attempts).toHaveLength(1);
   expect(calls.options).toHaveLength(0);
+});
+
+test('an owner-reviewed clock shows its configured timezone without an unverified label', async ({ page, integration: f }) => {
+  await openEditor(page, f, 1, { timezone: 'UTC', conformance: {
+    utcOffsetMinutes: 0, verifiedAt: f.now() - 1, validUntil: f.now() + 60, evidenceSha256: 'e'.repeat(64),
+  } });
+  const card = editor(page).locator('[data-schedule-person="pilot"]');
+  await expect(card).toContainText('Configured router timezone: UTC.');
+  await expect(card).not.toContainText('Router clock unverified.');
 });
 
 test('a child with eight integration windows can edit but cannot add another', async ({ page, integration: f }) => {
