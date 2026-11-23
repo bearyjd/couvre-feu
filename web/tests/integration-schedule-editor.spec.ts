@@ -251,9 +251,11 @@ demoTest('a demo schedule 409 keeps its original revision-conflict feedback and 
   let attempts = 0;
   await page.route('**/people/alex/schedules', async (route) => {
     attempts += 1;
+    expect(route.request().postDataJSON()).not.toHaveProperty('kind');
     await route.fulfill({ status: 409, json: { error: { code: 'operation_in_progress' } } });
   });
   await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  await expect(editor(page).getByLabel('Schedule type')).toHaveCount(0);
   await editor(page).getByLabel('Tue', { exact: true }).check();
   await editor(page).getByLabel('Start').fill('19:00');
   await editor(page).getByLabel('Stop').fill('21:00');
@@ -394,18 +396,25 @@ test('an owner-reviewed clock shows its timezone for scheduled children and no c
   await expect(emptyCard.getByRole('button', { name: /Add a schedule/ })).toBeEnabled();
 });
 
-test('a child with eight integration windows can edit but cannot add another', async ({ page, integration: f }) => {
+test('a child with eight mixed-kind integration windows can edit but cannot add another', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
   await openEditor(page, f, 8);
+  f.store.run("UPDATE schedule_windows SET kind='focus' WHERE person_id=? AND id=?", 'pilot', 'bedtime');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(editor(page).locator('[data-schedule-id="bedtime"] [data-schedule-kind="focus"]')).toBeVisible();
   await expect(editor(page).getByRole('button', { name: 'Add a schedule for Explicit test person', exact: true })).toBeDisabled();
   await expect(editor(page).getByRole('button', { name: /Edit schedule bedtime/ })).toBeEnabled();
   await expect(editor(page)).toContainText('maximum of 8 schedule windows');
 });
 
-test('integration with editable schedules off still hides the editor', async ({ page, integration: f }) => {
+test('integration with editable schedules off still hides the editor when focus is enabled', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
   const calls = requests(page);
   await signIn(page, f, 'parent');
   await openTab(page, 'more');
   await expect(editor(page)).toBeHidden();
+  const status: PeopleDTO = await (await page.request.get(f.origin + '/people')).json();
+  expect(status.people.every(person => !('recurringFocusEditable' in person))).toBe(true);
   expect(calls.options).toHaveLength(0);
   expect(calls.attempts).toHaveLength(0);
 });
@@ -586,4 +595,238 @@ test('an accepted allowance with a lost response stays unknown and cannot be ret
   expect(status).toBe(202);
   expect(f.store.integrationState().active_operation_id).not.toBeNull();
   expect(sent).toBe(1);
+});
+
+test('recurring focus capability reaches assigned empty cards and focus creation settles before showing the label', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const response = await page.request.get(f.origin + '/people');
+  expect(response.ok()).toBe(true);
+  const status: PeopleDTO = await response.json();
+  expect(status.people.map(person => [person.id, person.recurringFocusEditable])).toEqual([['pilot', true], ['kid2', true]]);
+  const empty = editor(page).locator('[data-schedule-person="kid2"]');
+  await empty.getByRole('button', { name: /Add a schedule/ }).click();
+  await expect(empty.getByLabel('Schedule type')).toHaveValue('bedtime');
+  await empty.getByRole('button', { name: 'Cancel', exact: true }).click();
+  const pilot = pilotSchedules(page);
+  await expect(pilot.locator('[data-schedule-id="bedtime"] [data-schedule-kind="bedtime"]')).toHaveText('Bedtime');
+  const calls = requests(page);
+  await pilot.getByRole('button', { name: /Add a schedule/ }).click();
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('bedtime');
+  await pilot.getByLabel('Schedule type').selectOption('focus');
+  await pilot.getByLabel('Mon', { exact: true }).check();
+  await pilot.getByLabel('Start').fill('19:00');
+  await pilot.getByLabel('Stop').fill('21:00');
+  await expect(pilot.locator('[data-preview]')).toContainText('Overlaps bedtime');
+  await pilot.getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await expect.poll(() => calls.attempts.length).toBe(1);
+  expect(calls.options).toHaveLength(0);
+  expect(calls.attempts.map(request => request.postDataJSON())).toEqual([
+    { id: 'window_1', weekdays: ['Mon'], start: '19:00', stop: '21:00', kind: 'focus' },
+  ]);
+  await expect(pilot.locator('[data-schedule-id="window_1"]')).toHaveCount(0);
+  await dispatchPending(f);
+  await expect(pilot.locator('[data-schedule-id="window_1"] [data-schedule-kind="focus"]')).toHaveText('Focus');
+});
+
+test('recurring focus label-only edit is direct and a shortening binds the selected type to one proof', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const pilot = pilotSchedules(page), calls = requests(page);
+  const row = pilot.locator('[data-schedule-id="bedtime"]');
+  const edit = () => row.getByRole('button', { name: /Edit schedule bedtime/ }).click();
+  const save = () => pilot.getByRole('button', { name: 'Save schedule' }).click();
+
+  await edit();
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('bedtime');
+  await pilot.getByLabel('Schedule type').selectOption('focus');
+  await save();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await expect.poll(() => calls.attempts.length).toBe(1);
+  expect(calls.options).toHaveLength(0);
+  expect(calls.attempts[0].postDataJSON()).toEqual({ weekdays: ['Mon'], start: '20:00', stop: '23:00', kind: 'focus' });
+  await expect(row.locator('[data-schedule-kind="bedtime"]')).toBeVisible();
+  await dispatchPending(f);
+  await expect(row.locator('[data-schedule-kind="focus"]')).toBeVisible();
+
+  await edit();
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('focus');
+  await pilot.getByLabel('Schedule type').selectOption('bedtime');
+  await pilot.getByLabel('Start').fill('21:00');
+  await save();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await expect.poll(() => calls.attempts.length).toBe(3);
+  const [, first, proof] = calls.attempts;
+  const intent = { weekdays: ['Mon'], start: '21:00', stop: '23:00', kind: 'bedtime' };
+  expect(first.postDataJSON()).toEqual(intent);
+  expect(calls.options).toHaveLength(1);
+  expect(calls.options[0].postDataJSON()).toEqual({
+    action: 'schedule_change', person: 'pilot', scheduleAction: 'schedule_update', scheduleId: 'bedtime',
+    precondition: first.headers()['if-match'], change: intent,
+  });
+  const { stepUp, ...change } = proof.postDataJSON();
+  expect(change).toEqual(intent);
+  expect(stepUp?.challengeId).toBeTruthy();
+  expect(proof.headers()['if-match']).toBe(first.headers()['if-match']);
+  expect(proof.headers()['idempotency-key']).toBe(first.headers()['idempotency-key']);
+  await expect(row.locator('[data-schedule-kind="focus"]')).toBeVisible();
+  await dispatchPending(f);
+  await expect(row.locator('[data-schedule-kind="bedtime"]')).toBeVisible();
+});
+
+for (const change of ['disabled', 'kind'] as const) {
+  test(change === 'disabled' ? 'disabling recurring focus during the passkey prompt discards the proof'
+    : 'changing the recurring schedule kind during the passkey prompt discards the proof', async ({ page, integration: f }) => {
+    f.config.focus = { enabled: true };
+    await openEditor(page, f);
+    const calls = requests(page), pilot = pilotSchedules(page);
+    await passkeyGate(page);
+    await editStart(page, '21:00');
+    await expect(page.locator('html')).toHaveAttribute('data-fixture-passkey-waiting', 'true');
+    if (change === 'disabled') {
+      f.config.focus = { enabled: false };
+    } else {
+      const before: PeopleDTO = await (await page.request.get(f.origin + '/people')).json();
+      expect(before.revisionToken).toEqual(expect.any(String));
+      f.store.run("UPDATE schedule_windows SET kind='focus' WHERE person_id=? AND id=?", 'pilot', 'bedtime');
+      const after: PeopleDTO = await (await page.request.get(f.origin + '/people')).json();
+      expect(after.revisionToken).toBe(before.revisionToken);
+    }
+    await page.evaluate(() => document.dispatchEvent(new Event('release-passkey-fixture')));
+    await expect(page.locator('#notice')).toContainText(change === 'disabled' ? 'Schedule type settings changed' : 'The window changed since you opened it');
+    await expect(pilot.getByLabel('Start')).toHaveValue('21:00');
+    if (change === 'disabled') {
+      await expect(pilot.getByLabel('Schedule type')).toHaveCount(0);
+    } else {
+      await expect(pilot.getByLabel('Schedule type')).toHaveValue('bedtime');
+      await expect(pilot.locator('[data-schedule-id="bedtime"] [data-schedule-kind="focus"]')).toBeVisible();
+    }
+    expect(calls.options).toHaveLength(1);
+    expect(calls.attempts).toHaveLength(1);
+    expect(f.store.integrationState().active_operation_id).toBeNull();
+  });
+}
+
+test('focus off preserves a retained label while legacy update omits kind and delete still needs proof', async ({ page, integration: f }) => {
+  await openEditor(page, f);
+  f.store.run("UPDATE schedule_windows SET kind='focus' WHERE person_id=? AND id=?", 'pilot', 'bedtime');
+  const status: PeopleDTO = await (await page.request.get(f.origin + '/people')).json();
+  expect(status.people.every(person => !('recurringFocusEditable' in person))).toBe(true);
+  expect(status.people[0].schedules?.[0]).not.toHaveProperty('kind');
+
+  const calls = requests(page), pilot = pilotSchedules(page);
+  await editStart(page, '19:00');
+  await expect(page.locator('#notice')).toContainText('Recurring focus is unavailable. You can delete this window');
+  await expect(pilot.getByLabel('Start')).toHaveValue('19:00');
+  await expect(pilot.getByLabel('Schedule type')).toHaveCount(0);
+  expect(calls.attempts[0].postDataJSON()).toEqual({ weekdays: ['Mon'], start: '19:00', stop: '23:00' });
+  expect(calls.options).toHaveLength(0);
+  expect(f.store.get<{kind: string}>('SELECT kind FROM schedule_windows WHERE person_id=? AND id=?', 'pilot', 'bedtime')?.kind).toBe('focus');
+  expect(f.store.integrationState().active_operation_id).toBeNull();
+
+  await pilot.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await pilot.getByRole('button', { name: /Delete schedule bedtime/ }).click();
+  await pilot.getByRole('button', { name: 'Confirm delete bedtime' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await expect.poll(() => calls.attempts.length).toBe(3);
+  expect(calls.options[0].postDataJSON().change).toEqual({});
+  expect(calls.attempts[1].postDataJSON()).toEqual({});
+  expect(Object.keys(calls.attempts[2].postDataJSON())).toEqual(['stepUp']);
+  await dispatchPending(f);
+  await expect(pilot.locator('[data-schedule-id="bedtime"]')).toHaveCount(0);
+});
+
+test('re-enabling recurring focus lets a parent relabel a retained window after a legacy refusal', async ({ page, integration: f }) => {
+  await openEditor(page, f);
+  f.store.run("UPDATE schedule_windows SET kind='focus' WHERE person_id=? AND id=?", 'pilot', 'bedtime');
+  const calls = requests(page), pilot = pilotSchedules(page);
+  await editStart(page, '19:00');
+  await expect(page.locator('#notice')).toContainText('Recurring focus is unavailable. You can delete this window');
+
+  await pilot.getByRole('button', { name: 'Cancel', exact: true }).click();
+  f.config.focus = { enabled: true };
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  const row = pilot.locator('[data-schedule-id="bedtime"]');
+  await expect(row.locator('[data-schedule-kind="focus"]')).toBeVisible();
+  await row.getByRole('button', { name: /Edit schedule bedtime/ }).click();
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('focus');
+  await pilot.getByLabel('Schedule type').selectOption('bedtime');
+  await pilot.getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await expect.poll(() => calls.attempts.length).toBe(2);
+  expect(calls.attempts[1].postDataJSON()).toEqual({ weekdays: ['Mon'], start: '20:00', stop: '23:00', kind: 'bedtime' });
+  expect(calls.options).toHaveLength(0);
+  await dispatchPending(f);
+  await expect(row.locator('[data-schedule-kind="bedtime"]')).toBeVisible();
+});
+
+test('a terminal router refusal preserves the committed recurring schedule label', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const row = pilotSchedules(page).locator('[data-schedule-id="bedtime"]');
+  await row.getByRole('button', { name: /Edit schedule bedtime/ }).click();
+  await pilotSchedules(page).getByLabel('Schedule type').selectOption('focus');
+  await pilotSchedules(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  f.router.reject = 'missing_dependencies';
+  await dispatchPending(f);
+  await expect(page.locator('#notice')).toContainText('was not delivered');
+  const status: PeopleDTO = await (await page.request.get(f.origin + '/people')).json();
+  const window = status.people.find(person => person.id === 'pilot')?.schedules?.find(schedule => schedule.id === 'bedtime');
+  expect(window?.kind).toBe('bedtime');
+  await expect(row.locator('[data-schedule-kind="bedtime"]')).toBeVisible();
+  await expect(row.locator('[data-schedule-kind="focus"]')).toHaveCount(0);
+});
+
+test('a committed recurring focus label may be displayed while enforcement is unknown', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const pilot = pilotSchedules(page);
+  await pilot.getByRole('button', { name: /Edit schedule bedtime/ }).click();
+  await pilot.getByLabel('Schedule type').selectOption('focus');
+  await pilot.getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  const id = f.store.integrationState().active_operation_id!;
+  f.router.transform = observation => ({ ...observation, status: { ...observation.status, ok: false, errors: ['previous_apply_failed'] } });
+  const plan = f.worker.prepare('apply', id);
+  await f.worker.execute(plan, plan.scriptSha256);
+  await expect(page.locator('#notice')).toContainText('outcome unknown');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(pilot.locator('[data-schedule-id="bedtime"] [data-schedule-kind="focus"]')).toBeVisible();
+  await expect(pilot.getByRole('button', { name: /Edit schedule bedtime/ })).toBeDisabled();
+});
+
+test('a malformed recurring focus kind cannot open an edit', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await page.route('**/people', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.people.find((person: { id: string }) => person.id === 'pilot').schedules[0].kind = ['focus'];
+    await route.fulfill({ response, json: body });
+  });
+  await openEditor(page, f);
+  await expect(pilotSchedules(page).locator('[data-schedule-kind]')).toHaveCount(0);
+  await pilotSchedules(page).getByRole('button', { name: /Edit schedule bedtime/ }).click();
+  await expect(page.locator('#notice')).toContainText('The schedule type is unavailable');
+  await expect(editor(page).getByLabel('Schedule type')).toHaveCount(0);
+});
+
+test('an opened recurring focus edit cannot overwrite a label changed elsewhere', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const pilot = pilotSchedules(page), calls = requests(page);
+  await pilot.getByRole('button', { name: /Edit schedule bedtime/ }).click();
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('bedtime');
+  f.store.run("UPDATE schedule_windows SET kind='focus' WHERE person_id=? AND id=?", 'pilot', 'bedtime');
+  f.router.policy = normalizePolicy({ ...f.router.policy, revision: f.router.policy.revision + 1 });
+  f.advance(1);
+  await f.observe();
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(pilot.locator('[data-schedule-id="bedtime"] [data-schedule-kind="focus"]')).toBeVisible();
+  await pilot.getByRole('button', { name: 'Save schedule' }).click();
+  await expect(page.locator('#notice')).toContainText('The window changed since you opened it');
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('bedtime');
+  expect(calls.attempts).toHaveLength(0);
+  expect(calls.options).toHaveLength(0);
 });
