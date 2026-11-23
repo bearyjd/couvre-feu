@@ -9,6 +9,9 @@ export const MAX_SCHEDULES = 256;
 export const MAX_EXPANDED_WINDOWS = 256;
 // Mirrors MAX_WINDOWS_PER_CHILD in the integration schedule store.
 const MAX_INTEGRATION_WINDOWS = 8;
+const EXTRA_MINUTES = [15, 30, 60];
+// The exclusive observation deadline is FRESH_SECONDS + 1, as in the app's schedule label.
+const MAX_SCHEDULE_CLAIM_SECONDS = 31;
 
 const crossesMidnight = (start, stop) => start > stop && stop !== '00:00';
 const minutes = (clock) => Number(clock.slice(0, 2)) * 60 + Number(clock.slice(3));
@@ -85,6 +88,19 @@ const REFUSAL_TEXT = {
   schedule_payload_inadmissible: 'These windows exceed the router’s limits. Review the draft before saving again.',
   person_has_no_enrolled_device: 'This child has no enrolled device. Refresh status before saving again.',
 };
+const ALLOWANCE_REFUSALS = {
+  400: ['invalid_minutes'],
+  404: ['route_not_found'],
+  409: ['child_paused', 'schedule_clock_unverified', 'schedule_not_active', 'schedule_allowance_cap_exceeded', 'allowance_beyond_horizon'],
+};
+const ALLOWANCE_TEXT = {
+  route_not_found: 'Schedule allowances are unavailable on this installation.',
+  child_paused: 'This child is paused. The pause takes precedence over schedule extra time.',
+  schedule_clock_unverified: 'The service could not verify the router clock for this allowance. Refresh status before trying again.',
+  schedule_not_active: 'There is no active schedule window to cover. Refresh status before trying again.',
+  schedule_allowance_cap_exceeded: 'Extra time cannot exceed 60 minutes from the router’s current time. Try a shorter extension.',
+  allowance_beyond_horizon: 'The router’s time limit prevented this allowance.',
+};
 const SCHEDULE_ACTION = { create: 'schedule_create', edit: 'schedule_update', delete: 'schedule_delete' };
 const windowSnapshot = (window) => window && JSON.stringify([orderedDays(window.weekdays), window.start, window.stop, window.kind ?? null]);
 const sessionKey = (session) => session && JSON.stringify([actorScope(session.actor), session.csrfToken, session.source, session.integrationScope]);
@@ -136,7 +152,40 @@ export function createScheduleEditor(deps) {
     </form>`;
   }
 
-  function cardMarkup(entry, enabled) {
+  function allowanceStatus(entry) {
+    const status = { available: false, until: null };
+    const basis = state.scheduleClockBasis, observedAt = state.people?.observedAt;
+    if (!integration() || !basis || !entry.schedules.length || state.offline || state.localUnknown || state.needsRefresh ||
+        entry.observationHealth !== 'healthy' || !Number.isSafeInteger(observedAt)) return status;
+    const wall = Date.now() / 1000, elapsed = Math.max(0, performance.now() / 1000 - basis.started);
+    const expected = basis.wall + elapsed, current = Math.max(wall, expected, observedAt + elapsed);
+    if (Math.abs(wall - expected) > 1 || observedAt + MAX_SCHEDULE_CLAIM_SECONDS <= current) return status;
+    const checkedAt = entry.scheduleCheckedAt, validUntil = entry.scheduleValidUntil;
+    const claimNow = Math.max(current, checkedAt + elapsed);
+    if (entry.scheduleWitness !== 'owner-reviewed-clock' || !Number.isSafeInteger(checkedAt) || !Number.isSafeInteger(validUntil) ||
+        Math.abs(basis.wall - checkedAt) > 1 || validUntil <= claimNow ||
+        validUntil > checkedAt + MAX_SCHEDULE_CLAIM_SECONDS) return status;
+    const until = entry.allowance?.until;
+    if (Number.isSafeInteger(until) && until > claimNow && until * 1000 <= 8.64e15) status.until = until;
+    const allowanceDeadline = entry.scheduleAllowanceValidUntil;
+    status.available = Number.isSafeInteger(allowanceDeadline) && allowanceDeadline > claimNow;
+    return status;
+  }
+
+  function allowanceMarkup(entry, { available, until }, enabled) {
+    if (!integration() || !entry.schedules.length) return '';
+    const key = escape(entry.id);
+    const disabled = enabled && available && !view.open && !view.confirm ? '' : 'disabled';
+    const deadline = until === null ? null : new Date(until * 1000).toISOString();
+    return `<div class="schedule-buttons" role="group" aria-label="Schedule allowances for ${escape(entry.name)}">
+      ${EXTRA_MINUTES.map(minutes => `<button class="button secondary" type="button" data-sched-action="extra" data-person-id="${key}" data-minutes="${minutes}" data-focus-key="extra-${key}-${minutes}" ${disabled}>Add ${minutes} minutes of extra time</button>`).join('')}
+      <button class="button secondary" type="button" data-sched-action="skip" data-person-id="${key}" data-focus-key="skip-${key}" ${disabled}>Skip tonight</button>
+    </div>
+    <p class="fine-print">Skip tonight covers an active schedule for up to 60 minutes. It may end before the schedule does.</p>
+    ${deadline ? `<p class="fine-print">Router reported extra time until <time datetime="${deadline}">${deadline.slice(11, 16)} UTC on ${deadline.slice(0, 10)}</time>.</p>` : ''}`;
+  }
+
+  function cardMarkup(entry, enabled, allowance) {
     const key = escape(entry.id), name = escape(entry.name);
     const atIntegrationLimit = integration() && entry.schedules.length >= MAX_INTEGRATION_WINDOWS;
     const clock = integration() && entry.schedules.length ? [
@@ -157,6 +206,7 @@ export function createScheduleEditor(deps) {
       <h3 id="sched-title-${key}">Schedules for ${name}</h3>
       ${clock ? `<p class="fine-print">${clock}</p>` : ''}
       ${entry.schedules.length ? `<ul class="schedule-list" aria-label="Schedules for ${name}">${items}</ul>` : '<p class="fine-print">No weekly schedule windows.</p>'}
+      ${allowanceMarkup(entry, allowance, enabled)}
       ${confirm}
       ${open ? formMarkup(entry, enabled) : `<button class="button secondary" type="button" data-sched-action="add" data-person-id="${key}" data-focus-key="add-${key}" ${enabled && !atIntegrationLimit ? '' : 'disabled'}>Add a schedule for ${name}</button>`}
       ${atIntegrationLimit ? `<p class="fine-print">This child has the maximum of ${MAX_INTEGRATION_WINDOWS} schedule windows.</p>` : ''}
@@ -188,14 +238,15 @@ export function createScheduleEditor(deps) {
     }
     if ((view.open && !person(view.open.person)) || (view.confirm && !person(view.confirm.person))) reset();
     const enabled = !active && deps.canControl();
-    const key = JSON.stringify([integration(), people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm, view.serverErrors]);
+    const allowances = people.map(allowanceStatus);
+    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm, view.serverErrors]);
     if (key === lastKey) return;
     lastKey = key;
     const focused = document.activeElement?.dataset?.focusKey;
     root.hidden = false;
     root.innerHTML = `<h2 id="schedules-title">Weekly schedules</h2>
       <p class="field-help">Each window blocks access on the chosen days between start and stop. A stop earlier than the start ends the next morning (for example Mon 22:00 → Tue 06:30). Times use the router clock${integration() ? '' : ' (UTC in this demo)'}. Windows may overlap; access is blocked whenever any window is active. Changes are requests until the router confirms them.</p>
-      ${people.map((entry) => cardMarkup(entry, enabled)).join('')}`;
+      ${people.map((entry, index) => cardMarkup(entry, enabled, allowances[index])).join('')}`;
     updateLive();
     if (focused) root.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus();
   }
@@ -225,22 +276,25 @@ export function createScheduleEditor(deps) {
     render();
   }
 
-  async function submit(personId, mode, scheduleId, draft) {
+  async function submit({ personId, mode, scheduleId, draft, minutes }) {
     if (active) return;
+    const allowance = mode === 'extra' || mode === 'skip';
     const generation = state.generation, beforeRevision = state.people.revisionToken, beforeSession = sessionKey(state.session);
     const attempt = { generation, controller: new AbortController(), posting: false }, intentView = view;
-    const originalWindow = mode === 'delete' ? view.confirm.snapshot : view.open.snapshot;
+    const originalWindow = mode === 'delete' ? view.confirm.snapshot : view.open?.snapshot;
     const scheduleAction = SCHEDULE_ACTION[mode];
     const isIntegration = integration();
-    const operationAction = isIntegration ? 'schedule_update' : scheduleAction;
+    const operationAction = allowance ? 'allow' : isIntegration ? 'schedule_update' : scheduleAction;
     const sameIntent = () => active === attempt && generation === state.generation && intentView === view;
     const sameSession = () => generation === state.generation && beforeSession === sessionKey(state.session);
     const headers = { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken };
-    const base = `/people/${encodeURIComponent(personId)}/schedules`;
+    const parent = `/people/${encodeURIComponent(personId)}`, base = `${parent}/schedules`;
     const window = draft && { weekdays: [...draft.weekdays], start: draft.start, stop: draft.stop };
-    const [path, body] = mode === 'create' ? [base, { id: draft.id, ...window }]
-      : mode === 'edit' ? [`${base}/${encodeURIComponent(scheduleId)}`, window]
-        : [`${base}/${encodeURIComponent(scheduleId)}/delete`, {}];
+    const [path, body] = mode === 'extra' ? [`${parent}/schedule-extra-time`, { minutes }]
+      : mode === 'skip' ? [`${parent}/schedule-skip-tonight`, {}]
+        : mode === 'create' ? [base, { id: draft.id, ...window }]
+          : mode === 'edit' ? [`${base}/${encodeURIComponent(scheduleId)}`, window]
+            : [`${base}/${encodeURIComponent(scheduleId)}/delete`, {}];
     async function send(content) {
       attempt.posting = true;
       render();
@@ -254,7 +308,7 @@ export function createScheduleEditor(deps) {
     const notice = (message) => {
       if (!sameIntent()) return;
       deps.announce(message, true);
-      if (mode !== 'delete') fail(null, message);
+      if (draft) fail(null, message);
     };
     function writeSessionCurrent() {
       if (sameSession()) return true;
@@ -286,6 +340,10 @@ export function createScheduleEditor(deps) {
         notice('Schedule controls are unavailable after refreshing status. No change was queued.');
         return false;
       }
+      if (allowance && !allowanceStatus(entry).available) {
+        notice('Schedule extra time is unavailable after refreshing status. No change was queued.');
+        return false;
+      }
       return true;
     }
     active = attempt;
@@ -294,13 +352,14 @@ export function createScheduleEditor(deps) {
     try {
       if (!await refreshIntent()) return;
       deps.setBusy(true); busy = true;
-      deps.announce(`Sending ${mode === 'delete' ? 'schedule removal' : 'schedule'} request. A request is not confirmation.`);
+      const request = allowance ? 'schedule allowance' : mode === 'delete' ? 'schedule removal' : 'schedule';
+      deps.announce(`Sending ${request} request. A request is not confirmation.`);
       phase = 'request';
       let result;
       try {
         result = await send(body);
       } catch (error) {
-        if (!isIntegration || error?.status !== 403 || error?.code !== 'step_up_required') throw error;
+        if (allowance || !isIntegration || error?.status !== 403 || error?.code !== 'step_up_required') throw error;
         if (!writeSessionCurrent() || !sameIntent()) return;
         deps.announce('Confirm with your passkey to continue.');
         phase = 'options';
@@ -374,14 +433,16 @@ export function createScheduleEditor(deps) {
         const reason = status === 409 ? 'Revision conflict. Schedules changed elsewhere.' : 'That schedule no longer exists.';
         notice(`${reason} ${refreshed ? 'Review the current schedules before trying again.' : 'Refresh status before trying again.'}`);
         if (demoRefusal && (status === 404 || mode === 'delete') && sameIntent()) { reset(); lastKey = ''; }
-      } else if (demoRefusal || WRITE_REFUSALS[status]?.includes(code)) {
-        if (demoRefusal || ['operation_in_progress', 'person_has_no_enrolled_device', 'approved_router_observation_required', 'router_runtime_unconfirmed'].includes(code)) {
+      } else if (demoRefusal || WRITE_REFUSALS[status]?.includes(code) || (allowance && ALLOWANCE_REFUSALS[status]?.includes(code))) {
+        if (demoRefusal || ['operation_in_progress', 'person_has_no_enrolled_device', 'approved_router_observation_required', 'router_runtime_unconfirmed',
+          'child_paused', 'schedule_clock_unverified', 'schedule_not_active'].includes(code)) {
           state.needsRefresh = true;
         }
-        const message = demoRefusal ? error.message : REFUSAL_TEXT[code] ?? error.message;
+        const refusal = (allowance ? ALLOWANCE_TEXT[code] : undefined) ?? REFUSAL_TEXT[code];
+        const message = refusal ?? error.message;
         deps.announce(demoRefusal ? `The schedule request failed: ${message} Nothing was changed.`
-          : REFUSAL_TEXT[code] ?? `The service refused the schedule change. ${message}`, true);
-        if (mode !== 'delete') fail(code, message);
+          : refusal ?? `The service refused the schedule change. ${message}`, true);
+        if (draft) fail(code, message);
       } else {
         state.needsRefresh = true;
         state.localUnknown = true;
@@ -408,7 +469,7 @@ export function createScheduleEditor(deps) {
     }
     if (!deps.canControl()) { view.serverErrors = { form: 'Controls are unavailable until status is refreshed. Nothing was sent.' }; lastKey = ''; render(); return; }
     const { person: personId, mode, originalId, draft } = view.open;
-    await submit(personId, mode, originalId, draft);
+    await submit({ personId, mode, scheduleId: originalId, draft });
   }
 
   root.addEventListener('input', (event) => {
@@ -439,7 +500,10 @@ export function createScheduleEditor(deps) {
     else if (action === 'cancel-delete') close();
     else if (action === 'confirm-delete' && view.confirm) {
       const { person: personId, id } = view.confirm;
-      if (deps.canControl()) void submit(personId, 'delete', id, null);
+      if (deps.canControl()) void submit({ personId, mode: 'delete', scheduleId: id });
+    } else if ((action === 'extra' || action === 'skip') && entry && !view.open && !view.confirm && deps.canControl() && allowanceStatus(entry).available) {
+      const minutes = Number(button.dataset.minutes);
+      if (action === 'skip' || EXTRA_MINUTES.includes(minutes)) void submit({ personId: entry.id, mode: action, minutes });
     }
   });
 

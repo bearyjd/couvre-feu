@@ -1,17 +1,17 @@
 import type { Page, Request } from '@playwright/test';
-import { normalizePolicy } from '../../shared/src/router-schema.ts';
+import { DAYS, normalizePolicy, type Schedule } from '../../shared/src/router-schema.ts';
 import { enroll, openTab, test as demoTest } from './browser-fixture.ts';
 import { dispatchPending, expect, signIn, test, type World } from './bulk-fixture.ts';
 
 const editor = (page: Page) => page.locator('#schedule-editor');
 const schedulesPath = '/people/pilot/schedules';
 const schedulePath = schedulesPath + '/bedtime';
-const schedule = { person: 'pilot', id: 'bedtime', weekdays: ['Mon' as const], start: '20:00', stop: '23:00' };
+const schedule: Schedule = { person: 'pilot', id: 'bedtime', weekdays: [DAYS[0]], start: '20:00', stop: '23:00' };
 
-async function openEditor(page: Page, f: World, count = 1, clock?: World['config']['scheduleClock']) {
+async function openEditor(page: Page, f: World, count = 1, clock?: World['config']['scheduleClock'], first = schedule) {
   f.config.schedules = { editable: true };
   f.config.scheduleClock = clock ?? { timezone: 'America/New_York' };
-  const schedules = [schedule, ...Array.from({ length: count - 1 }, (_, index) => ({ ...schedule, id: `window_${index + 1}` }))];
+  const schedules = [first, ...Array.from({ length: count - 1 }, (_, index) => ({ ...schedule, id: `window_${index + 1}` }))];
   for (const window of schedules) {
     f.store.run('INSERT INTO schedule_windows(person_id,id,weekdays,start,stop) VALUES(?,?,?,?,?)', window.person, window.id, window.weekdays.join(','), window.start, window.stop);
   }
@@ -246,6 +246,7 @@ test('post-passkey refresh explains when current controls are unavailable and se
 demoTest('a demo schedule 409 keeps its original revision-conflict feedback and draft', async ({ page, demo }) => {
   await enroll(page, demo);
   await openTab(page, 'more');
+  await expect(editor(page).getByRole('button', { name: 'Skip tonight', exact: true })).toHaveCount(0);
   let attempts = 0;
   await page.route('**/people/alex/schedules', async (route) => {
     attempts += 1;
@@ -391,4 +392,145 @@ test('integration with editable schedules off still hides the editor', async ({ 
   await expect(editor(page)).toBeHidden();
   expect(calls.options).toHaveLength(0);
   expect(calls.attempts).toHaveLength(0);
+});
+
+const extraPath = '/people/pilot/schedule-extra-time';
+const skipPath = '/people/pilot/schedule-skip-tonight';
+const pilotSchedules = (page: Page) => editor(page).locator('[data-schedule-person="pilot"]');
+const extraButton = (page: Page, minutes: number) => pilotSchedules(page).getByRole('button', { name: `Add ${minutes} minutes of extra time`, exact: true });
+
+async function openAllowanceEditor(page: Page, f: World, { reviewed = true, active = true, claimSeconds = 0 } = {}) {
+  // Keep the fake service's claim timestamp bound to the browser's wall clock as status is fetched.
+  await page.route('**/people', async (route) => {
+    f.advance(Math.round(Date.now() / 1000) - f.now());
+    if (!claimSeconds) return route.continue();
+    const response = await route.fetch();
+    const body = await response.json();
+    const pilot = body.people[0];
+    if (pilot.scheduleAllowanceValidUntil !== null) {
+      pilot.scheduleAllowanceValidUntil = Math.min(pilot.scheduleAllowanceValidUntil, f.now() + claimSeconds);
+    }
+    await route.fulfill({ response, json: body });
+  });
+  const time = (offset: number) => new Date((f.now() + offset * 60) * 1000).toISOString().slice(11, 16);
+  await openEditor(page, f, 1, { timezone: 'UTC', ...(reviewed ? { conformance: {
+    utcOffsetMinutes: 0, verifiedAt: f.now() - 5, validUntil: f.now() + 7200, evidenceSha256: 'e'.repeat(64),
+  } } : {}) }, { ...schedule, weekdays: [...DAYS], start: time(active ? -2 : 60), stop: time(120) });
+}
+
+test('schedule extra time waits for router confirmation, permits extension, and reports a cap refusal', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f);
+  const sent: Request[] = [];
+  page.on('request', request => {
+    if (request.method() === 'POST' && [extraPath, '/step-up/options'].includes(new URL(request.url()).pathname)) sent.push(request);
+  });
+  const started = f.store.observation().value!.routerTime;
+  await extraButton(page, 15).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await expect(page.locator('#notice')).toContainText('Extra time pending');
+  await expect(pilotSchedules(page)).not.toContainText('Router reported extra time until');
+  await expect(extraButton(page, 15)).toBeDisabled();
+  await extraButton(page, 15).dispatchEvent('click');
+  expect(sent).toHaveLength(1);
+  expect(sent[0].postDataJSON()).toEqual({ minutes: 15 });
+  expect(sent[0].headers()['if-match']).toBeTruthy();
+  expect(sent[0].headers()['idempotency-key']).toBeTruthy();
+  expect(sent[0].headers()['x-csrf-token']).toBeTruthy();
+  await dispatchPending(f);
+  await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
+  expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 900 }]);
+  await expect(pilotSchedules(page).locator('time')).toHaveAttribute('datetime', new Date((started + 900) * 1000).toISOString());
+  await extraButton(page, 30).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await dispatchPending(f);
+  await expect(extraButton(page, 60)).toBeEnabled();
+  expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 2700 }]);
+  await extraButton(page, 60).click();
+  await expect(page.locator('#notice')).toContainText('Extra time cannot exceed 60 minutes');
+  expect(f.store.integrationState().active_operation_id).toBeNull();
+  expect(sent.map(request => request.postDataJSON())).toEqual([{ minutes: 15 }, { minutes: 30 }, { minutes: 60 }]);
+});
+
+test('Skip tonight explains the cap and sends one empty allowance request', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f);
+  await expect(pilotSchedules(page)).toContainText('up to 60 minutes');
+  const started = f.store.observation().value!.routerTime;
+  const posted = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === skipPath);
+  await pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true }).click();
+  expect((await posted).postDataJSON()).toEqual({});
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  await dispatchPending(f);
+  await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
+  expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 3600 }]);
+  await expect(pilotSchedules(page).locator('time')).toHaveAttribute('datetime', new Date((started + 3600) * 1000).toISOString());
+});
+
+test('a schedule with an unverified clock has no enabled allowance controls', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f, { reviewed: false });
+  await expect(pilotSchedules(page)).toContainText('Router clock unverified');
+  await expect(extraButton(page, 15)).toBeDisabled();
+  await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
+});
+
+test('an unrelated allowance does not make an inactive schedule eligible', async ({ page, integration: f }) => {
+  f.router.policy = normalizePolicy({ ...f.router.policy, allowances: [{ person: 'pilot', until: f.now() + 1800 }] });
+  await openAllowanceEditor(page, f, { active: false });
+  await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
+  await expect(extraButton(page, 15)).toBeDisabled();
+  await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
+});
+
+test('a manual pause keeps schedule allowances unavailable during an active window', async ({ page, integration: f }) => {
+  f.router.policy = normalizePolicy({ ...f.router.policy, pauses: [{ person: 'pilot', until: 0 }],
+    allowances: [{ person: 'pilot', until: f.now() + 1800 }] });
+  await openAllowanceEditor(page, f);
+  await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
+  await expect(extraButton(page, 15)).toBeDisabled();
+  await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
+});
+
+test('schedule allowance controls expire before the overall clock witness', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f, { claimSeconds: 8 });
+  await expect(extraButton(page, 15)).toBeEnabled();
+  await page.evaluate(() => {
+    const wall = Date.now.bind(Date);
+    const monotonic = performance.now.bind(performance);
+    Date.now = () => wall() + 10000;
+    Object.defineProperty(performance, 'now', { value: () => monotonic() + 10000 });
+  });
+  await expect(extraButton(page, 15)).toBeDisabled();
+  await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
+  await expect(pilotSchedules(page).getByRole('button', { name: /Edit schedule bedtime/ })).toBeEnabled();
+});
+
+test('a refreshed revision change prevents an allowance POST', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f);
+  let sent = 0;
+  await page.route('**' + extraPath, async (route) => { sent++; await route.continue(); });
+  f.router.policy = normalizePolicy({ ...f.router.policy, revision: f.router.policy.revision + 1 });
+  const nextObservation = f.store.observation().value!.routerTime + 1;
+  f.advance(Math.max(1, nextObservation - f.now()));
+  await f.observe();
+  await extraButton(page, 15).click();
+  await expect(page.locator('#notice')).toContainText('Schedules changed elsewhere');
+  expect(sent).toBe(0);
+  expect(f.store.integrationState().active_operation_id).toBeNull();
+});
+
+test('an accepted allowance with a lost response stays unknown and cannot be retried automatically', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f);
+  let sent = 0, status: number | undefined;
+  await page.route('**' + extraPath, async (route) => {
+    sent++;
+    status = (await route.fetch()).status();
+    await route.abort('connectionreset');
+  });
+  await extraButton(page, 15).click();
+  await expect(page.locator('#notice')).toContainText('Outcome unknown');
+  await expect(extraButton(page, 15)).toBeDisabled();
+  await expect(pilotSchedules(page)).not.toContainText('Router reported extra time until');
+  await extraButton(page, 15).dispatchEvent('click');
+  expect(status).toBe(202);
+  expect(f.store.integrationState().active_operation_id).not.toBeNull();
+  expect(sent).toBe(1);
 });
