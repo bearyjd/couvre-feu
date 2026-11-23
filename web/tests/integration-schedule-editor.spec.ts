@@ -630,6 +630,38 @@ test('recurring focus capability reaches assigned empty cards and focus creation
   await expect(pilot.locator('[data-schedule-id="window_1"] [data-schedule-kind="focus"]')).toHaveText('Focus');
 });
 
+test('disabling recurring focus after create preflight keeps the refused draft', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const pilot = pilotSchedules(page), calls = requests(page);
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**' + schedulesPath, async (route) => {
+    await pending;
+    await route.continue();
+  });
+  await pilot.getByRole('button', { name: /Add a schedule/ }).click();
+  await pilot.getByLabel('Schedule type').selectOption('focus');
+  await pilot.getByLabel('Mon', { exact: true }).check();
+  await pilot.getByLabel('Start').fill('19:00');
+  await pilot.getByLabel('Stop').fill('21:00');
+  try {
+    await pilot.getByRole('button', { name: 'Save schedule' }).click();
+    await expect.poll(() => calls.attempts.length).toBe(1);
+    expect(calls.attempts[0].postDataJSON()).toMatchObject({ kind: 'focus' });
+    f.config.focus = { enabled: false };
+  } finally {
+    release();
+  }
+  await expect(page.locator('#notice')).toContainText('Recurring focus settings changed');
+  await expect(page.locator('#notice')).not.toContainText('delete this window');
+  await expect(pilot.getByLabel('Schedule type')).toHaveValue('focus');
+  await expect(pilot.getByLabel('Start')).toHaveValue('19:00');
+  await expect(pilot.getByLabel('Stop')).toHaveValue('21:00');
+  expect(calls.options).toHaveLength(0);
+  expect(f.store.integrationState().active_operation_id).toBeNull();
+});
+
 test('recurring focus label-only edit is direct and a shortening binds the selected type to one proof', async ({ page, integration: f }) => {
   f.config.focus = { enabled: true };
   await openEditor(page, f);

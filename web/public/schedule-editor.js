@@ -88,7 +88,7 @@ const WRITE_REFUSALS = {
 };
 const REFUSAL_TEXT = {
   operation_in_progress: 'Another router change is already in progress. Refresh status before saving again.',
-  recurring_focus_unavailable: 'Recurring focus is unavailable. You can delete this window or edit its type after recurring focus is re-enabled.',
+  recurring_focus_unavailable: 'Recurring focus settings changed. Refresh status, then reopen the schedule form before saving again.',
   schedule_payload_inadmissible: 'These windows exceed the router’s limits. Review the draft before saving again.',
   person_has_no_enrolled_device: 'This child has no enrolled device. Refresh status before saving again.',
 };
@@ -474,7 +474,9 @@ export function createScheduleEditor(deps) {
           'child_paused', 'schedule_clock_unverified', 'schedule_not_active'].includes(code)) {
           state.needsRefresh = true;
         }
-        const refusal = (allowance ? ALLOWANCE_TEXT[code] : undefined) ?? REFUSAL_TEXT[code];
+        const refusal = code === 'recurring_focus_unavailable' && mode === 'edit' && !beforeKindEditable
+          ? 'Recurring focus is unavailable. You can delete this window or edit its type after recurring focus is re-enabled.'
+          : (allowance ? ALLOWANCE_TEXT[code] : undefined) ?? REFUSAL_TEXT[code];
         const message = demoRefusal ? error.message : refusal ?? error.message;
         deps.announce(demoRefusal ? `The schedule request failed: ${message} Nothing was changed.`
           : refusal ?? `The service refused the schedule change. ${message}`, true);
