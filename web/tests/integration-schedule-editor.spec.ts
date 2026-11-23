@@ -1,5 +1,6 @@
 import type { Page, Request } from '@playwright/test';
 import { DAYS, normalizePolicy, type Schedule } from '../../shared/src/router-schema.ts';
+import type { PeopleDTO } from '../../shared/src/contracts.ts';
 import { enroll, openTab, test as demoTest } from './browser-fixture.ts';
 import { dispatchPending, expect, signIn, test, type World } from './bulk-fixture.ts';
 
@@ -399,7 +400,7 @@ const skipPath = '/people/pilot/schedule-skip-tonight';
 const pilotSchedules = (page: Page) => editor(page).locator('[data-schedule-person="pilot"]');
 const extraButton = (page: Page, minutes: number) => pilotSchedules(page).getByRole('button', { name: `Add ${minutes} minutes of extra time`, exact: true });
 
-async function openAllowanceEditor(page: Page, f: World, { reviewed = true, active = true, claimSeconds = 0 } = {}) {
+async function openAllowanceEditor(page: Page, f: World, { reviewed = true, active = true, claimSeconds = 0, calibrationSeconds = 7200 } = {}) {
   // Keep the fake service's claim timestamp bound to the browser's wall clock as status is fetched.
   await page.route('**/people', async (route) => {
     f.advance(Math.round(Date.now() / 1000) - f.now());
@@ -414,7 +415,7 @@ async function openAllowanceEditor(page: Page, f: World, { reviewed = true, acti
   });
   const time = (offset: number) => new Date((f.now() + offset * 60) * 1000).toISOString().slice(11, 16);
   await openEditor(page, f, 1, { timezone: 'UTC', ...(reviewed ? { conformance: {
-    utcOffsetMinutes: 0, verifiedAt: f.now() - 5, validUntil: f.now() + 7200, evidenceSha256: 'e'.repeat(64),
+    utcOffsetMinutes: 0, verifiedAt: f.now() - 5, validUntil: f.now() + calibrationSeconds, evidenceSha256: 'e'.repeat(64),
   } } : {}) }, { ...schedule, weekdays: [...DAYS], start: time(active ? -2 : 60), stop: time(120) });
 }
 
@@ -487,6 +488,15 @@ test('a manual pause keeps schedule allowances unavailable during an active wind
   await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
   await expect(extraButton(page, 15)).toBeDisabled();
   await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
+});
+
+test('allowance eligibility from the service ends when the clock review expires', async ({ page, integration: f }) => {
+  await openAllowanceEditor(page, f, { calibrationSeconds: 20 });
+  const response = await page.request.get(f.origin + '/people');
+  expect(response.ok()).toBe(true);
+  const status: PeopleDTO = await response.json();
+  const pilot = status.people.find(entry => entry.id === 'pilot');
+  expect(pilot?.scheduleAllowanceValidUntil).toBe(f.config.scheduleClock!.conformance!.validUntil);
 });
 
 test('schedule allowance controls expire before the overall clock witness', async ({ page, integration: f }) => {

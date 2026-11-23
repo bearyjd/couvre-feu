@@ -141,7 +141,7 @@ export interface PersonDTO {
     /** Weekly windows from the latest observed policy; present only where this installation allows editing them. */
     schedules?: ScheduleWindowDTO[];
     schedulesEditable?: boolean;
-    /** Editable integration only: exclusive epoch deadline for an active window's allowance eligibility, or null. */
+    /** Editable integration only: exclusive allowance eligibility deadline, bounded by window, observation, and clock review, or null. */
     scheduleAllowanceValidUntil?: number | null;
     scheduleTimezone?: string;
     scheduleWitness?: 'none' | 'unverified' | 'owner-reviewed-clock';

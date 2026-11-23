@@ -240,7 +240,7 @@ export class IntegrationPolicy {
     people(actor: Actor): PeopleDTO {
         const state = this.state(), info = this.store.integrationState(), cached = this.store.observation(), o = cached.value, config = this.store.config;
         const routerHealthy = this.fresh() && o !== null && o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime);
-        const editable = schedulesInDatabase(config), now = this.now();
+        const editable = schedulesInDatabase(config), now = this.now(), clockDeadline = config.scheduleClock?.conformance?.validUntil;
         const paused = editable && routerHealthy ? new Set(effectivePauses(o.acceptedPolicy, o.routerTime).map(p => p.person)) : null;
         const children = activeChildren(this.store).filter(child => actor.personIds.includes(child.id));
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
@@ -251,7 +251,8 @@ export class IntegrationPolicy {
             if (!enrolled) allEnrolled = false;
             const activeEnd = o && healthy && paused && !paused.has(child.id) && o.acceptedPolicy.people.some(p => p.id === child.id)
                 ? activeScheduleEnd(o.acceptedPolicy, config, child.id, o.routerTime, now) : null;
-            const allowanceDeadline = typeof activeEnd === 'number' ? Math.min(activeEnd, validUntil) : null;
+            const allowanceDeadline = typeof activeEnd === 'number' && clockDeadline !== undefined
+                ? Math.min(activeEnd, validUntil, clockDeadline) : null;
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
             if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
