@@ -153,7 +153,7 @@ export function createScheduleEditor(deps) {
   }
 
   function allowanceStatus(entry) {
-    const status = { available: false, until: null };
+    const status = { available: false, skipAvailable: false, until: null };
     const basis = state.scheduleClockBasis, observedAt = state.people?.observedAt;
     if (!integration() || !basis || !entry.schedules.length || state.offline || state.localUnknown || state.needsRefresh ||
         entry.observationHealth !== 'healthy' || !Number.isSafeInteger(observedAt)) return status;
@@ -169,17 +169,23 @@ export function createScheduleEditor(deps) {
     if (Number.isSafeInteger(until) && until > claimNow && until * 1000 <= 8.64e15) status.until = until;
     const allowanceDeadline = entry.scheduleAllowanceValidUntil;
     status.available = Number.isSafeInteger(allowanceDeadline) && allowanceDeadline > claimNow;
+    status.skipAvailable = status.available && entry.scheduleSkipTonightAvailable === true;
     return status;
   }
 
-  function allowanceMarkup(entry, { available, until }, enabled) {
+  function allowanceAvailable(entry, mode) {
+    const status = allowanceStatus(entry);
+    return mode === 'skip' ? status.skipAvailable : status.available;
+  }
+
+  function allowanceMarkup(entry, { available, skipAvailable, until }, enabled) {
     if (!integration() || !entry.schedules.length) return '';
     const key = escape(entry.id);
-    const disabled = enabled && available && !view.open && !view.confirm ? '' : 'disabled';
+    const disabled = enabled && !view.open && !view.confirm ? '' : 'disabled';
     const deadline = until === null ? null : new Date(until * 1000).toISOString();
     return `<div class="schedule-buttons" role="group" aria-label="Schedule allowances for ${escape(entry.name)}">
-      ${EXTRA_MINUTES.map(minutes => `<button class="button secondary" type="button" data-sched-action="extra" data-person-id="${key}" data-minutes="${minutes}" data-focus-key="extra-${key}-${minutes}" ${disabled}>Add ${minutes} minutes of extra time</button>`).join('')}
-      <button class="button secondary" type="button" data-sched-action="skip" data-person-id="${key}" data-focus-key="skip-${key}" ${disabled}>Skip tonight</button>
+      ${EXTRA_MINUTES.map(minutes => `<button class="button secondary" type="button" data-sched-action="extra" data-person-id="${key}" data-minutes="${minutes}" data-focus-key="extra-${key}-${minutes}" ${available ? disabled : 'disabled'}>Add ${minutes} minutes of extra time</button>`).join('')}
+      <button class="button secondary" type="button" data-sched-action="skip" data-person-id="${key}" data-focus-key="skip-${key}" ${skipAvailable ? disabled : 'disabled'}>Skip tonight</button>
     </div>
     <p class="fine-print">Skip tonight covers an active schedule for up to 60 minutes. It may end before the schedule does.</p>
     ${deadline ? `<p class="fine-print">Router reported extra time until <time datetime="${deadline}">${deadline.slice(11, 16)} UTC on ${deadline.slice(0, 10)}</time>.</p>` : ''}`;
@@ -340,8 +346,9 @@ export function createScheduleEditor(deps) {
         notice('Schedule controls are unavailable after refreshing status. No change was queued.');
         return false;
       }
-      if (allowance && !allowanceStatus(entry).available) {
-        notice('Schedule extra time is unavailable after refreshing status. No change was queued.');
+      if (allowance && !allowanceAvailable(entry, mode)) {
+        const label = mode === 'skip' ? 'Skip tonight' : 'Schedule extra time';
+        notice(`${label} is unavailable after refreshing status. No change was queued.`);
         return false;
       }
       return true;
@@ -439,7 +446,7 @@ export function createScheduleEditor(deps) {
           state.needsRefresh = true;
         }
         const refusal = (allowance ? ALLOWANCE_TEXT[code] : undefined) ?? REFUSAL_TEXT[code];
-        const message = refusal ?? error.message;
+        const message = demoRefusal ? error.message : refusal ?? error.message;
         deps.announce(demoRefusal ? `The schedule request failed: ${message} Nothing was changed.`
           : refusal ?? `The service refused the schedule change. ${message}`, true);
         if (draft) fail(code, message);
@@ -501,7 +508,7 @@ export function createScheduleEditor(deps) {
     else if (action === 'confirm-delete' && view.confirm) {
       const { person: personId, id } = view.confirm;
       if (deps.canControl()) void submit({ personId, mode: 'delete', scheduleId: id });
-    } else if ((action === 'extra' || action === 'skip') && entry && !view.open && !view.confirm && deps.canControl() && allowanceStatus(entry).available) {
+    } else if ((action === 'extra' || action === 'skip') && entry && !view.open && !view.confirm && deps.canControl() && allowanceAvailable(entry, action)) {
       const minutes = Number(button.dataset.minutes);
       if (action === 'skip' || EXTRA_MINUTES.includes(minutes)) void submit({ personId: entry.id, mode: action, minutes });
     }

@@ -264,6 +264,21 @@ demoTest('a demo schedule 409 keeps its original revision-conflict feedback and 
   expect(attempts).toBe(1);
 });
 
+demoTest('a demo schedule refusal keeps the service error message', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  await page.route('**/people/alex/schedules', route => route.fulfill({
+    status: 400, json: { error: { code: 'schedule_payload_inadmissible', message: 'The demo rejected this schedule payload.' } },
+  }));
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  await editor(page).getByLabel('Tue', { exact: true }).check();
+  await editor(page).getByLabel('Start').fill('19:00');
+  await editor(page).getByLabel('Stop').fill('21:00');
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect(page.locator('#notice')).toContainText('The demo rejected this schedule payload.');
+  await expect(editor(page).locator('[data-error="form"]')).toHaveText('The demo rejected this schedule payload.');
+});
+
 test('a lost proof submission stays unknown until refresh and is never resent', async ({ page, integration: f }) => {
   await openEditor(page, f);
   const calls = requests(page);
@@ -464,6 +479,14 @@ test('Skip tonight explains the cap and sends one empty allowance request', asyn
   await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
   expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 3600 }]);
   await expect(pilotSchedules(page).locator('time')).toHaveAttribute('datetime', new Date((started + 3600) * 1000).toISOString());
+});
+
+test('Skip tonight is unavailable when its end equals clock review expiry', async ({ page, integration: f }) => {
+  // openEditor advances the router's observation by one second before the initial read.
+  await openAllowanceEditor(page, f, { calibrationSeconds: 3601 });
+  expect(f.config.scheduleClock!.conformance!.validUntil).toBe(f.store.observation().value!.routerTime + 3600);
+  await expect(extraButton(page, 15)).toBeEnabled();
+  await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
 });
 
 test('a schedule with an unverified clock has no enabled allowance controls', async ({ page, integration: f }) => {

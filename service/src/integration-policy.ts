@@ -19,6 +19,7 @@ import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
 import { scheduleBuild, scheduleRequestWindows } from './integration-schedule-request.ts';
 import { isScheduleAction } from './integration-schedule-admit.ts';
 import { audited } from './parent-audit.ts';
+import { scheduleSkipDeadline } from './integration-schedule-allowance.ts';
 import { scheduleMutate } from './integration-schedule-mutate.ts';
 import type { ScheduleGate } from './integration-schedule-mutate.ts';
 import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
@@ -253,6 +254,8 @@ export class IntegrationPolicy {
                 ? activeScheduleEnd(o.acceptedPolicy, config, child.id, o.routerTime, now) : null;
             const allowanceDeadline = typeof activeEnd === 'number' && clockDeadline !== undefined
                 ? Math.min(activeEnd, validUntil, clockDeadline) : null;
+            const skipAvailable = o !== null && allowanceDeadline !== null && allowanceDeadline > now && typeof activeEnd === 'number' &&
+                typeof scheduleSkipDeadline(config, o.routerTime, activeEnd, o.acceptedPolicy.allowances?.find(a => a.person === child.id)?.until ?? 0) === 'number';
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
             if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
@@ -261,7 +264,10 @@ export class IntegrationPolicy {
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
                 ...this.scheduleList(child.id),
-                ...(editable ? {scheduleAllowanceValidUntil: allowanceDeadline !== null && allowanceDeadline > now ? allowanceDeadline : null} : {}),
+                ...(editable ? {
+                    scheduleAllowanceValidUntil: allowanceDeadline !== null && allowanceDeadline > now ? allowanceDeadline : null,
+                    scheduleSkipTonightAvailable: skipAvailable,
+                } : {}),
                 ...scheduleWithAllowance(this.scheduleState(o, enrolled, healthy, validUntil, child.id), allowance, validUntil),
                 allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
