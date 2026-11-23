@@ -38,6 +38,7 @@ export interface IntegrationManifest {
     push?: {enabled: boolean};
     /** Weekly counts-only digest, sent through push (so it needs push.enabled); absent is off. */
     digest?: {enabled: boolean};
+    digestPreview?: {enabled: boolean};
     /** Reward time (F4): extra minutes added to a grant, capped with it at MAX_GRANT_MINUTES; absent is off. */
     rewardTime?: {enabled: boolean};
     /** Focus window (F5): a labelled timed pause a parent starts for 15 to 120 minutes; absent is off. */
@@ -120,7 +121,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     const sourceTree = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
     if (path.startsWith(sourceTree + '/')) bad('private_manifest_must_be_outside_source_tree');
     requirePrivatePath(path, 'file'); requirePrivatePath(dirname(path), 'directory');
-    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'rewardTime', 'focus', 'dnsHardening', 'contentFilter', 'inventoryUi', 'installReadiness', 'schedules', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
+    const raw = readFileSync(path, 'utf8'), m = object(parseJSON(raw), ['version', 'mode', 'port', 'dataDir', 'router', 'person', 'protectedMacs', 'accounts', 'enrollment'], ['origin', 'dispatch', 'timeRequests', 'auditLog', 'push', 'digest', 'digestPreview', 'rewardTime', 'focus', 'dnsHardening', 'contentFilter', 'inventoryUi', 'installReadiness', 'schedules', 'ownerAccountId', 'scheduleClock', 'tls', 'listen', 'publicOrigin', 'trustedProxies', 'routerScope']);
     if (m.version !== 1 || m.mode !== 'integration' || integer(m.port) < 1024 || (m.port as number) > 65535) bad();
     const dataDir = safePath(m.dataDir); requirePrivatePath(dataDir, 'directory');
     if (dataDir === sourceTree || dataDir.startsWith(sourceTree + '/')) bad('private_database_must_be_outside_source_tree');
@@ -196,6 +197,12 @@ export function integrationConfig(path: string): IntegrationConfig {
         digest = {enabled: settings.enabled as boolean};
     }
     if (digest?.enabled && !push?.enabled) bad('digest_requires_push');
+    let digestPreview: IntegrationManifest['digestPreview'];
+    if (m.digestPreview !== undefined) {
+        const settings = object(m.digestPreview, ['enabled']);
+        if (typeof settings.enabled !== 'boolean') bad('invalid_digest_preview');
+        digestPreview = {enabled: settings.enabled as boolean};
+    }
     let focus: IntegrationManifest['focus'];
     if (m.focus !== undefined) {
         const settings = object(m.focus, ['enabled']);
@@ -220,7 +227,7 @@ export function integrationConfig(path: string): IntegrationConfig {
     if (ownerAccountId !== undefined && !accounts.some(a => a.id === ownerAccountId)) bad('invalid_owner_account');
     if ((timeRequests?.mode === 'owner' || contentFilter?.mode === 'owner') && ownerAccountId === undefined) bad('owner_account_required');
     const scheduleClock = m.scheduleClock === undefined ? undefined : normalizeScheduleClock(m.scheduleClock);
-    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(inventoryUi ? {inventoryUi} : {}), ...(installReadiness ? {installReadiness} : {}), ...(schedules ? {schedules} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
+    const manifest: IntegrationManifest = {version: 1, mode: 'integration', port: m.port as number, dataDir, router, person, protectedMacs, accounts, enrollment, ...(dispatch ? {dispatch} : {}), ...(timeRequests ? {timeRequests} : {}), ...(auditLog ? {auditLog} : {}), ...(push ? {push} : {}), ...(digest ? {digest} : {}), ...(digestPreview ? {digestPreview} : {}), ...(rewardTime ? {rewardTime} : {}), ...(focus ? {focus} : {}), ...(dnsHardening ? {dnsHardening} : {}), ...(contentFilter ? {contentFilter} : {}), ...(inventoryUi ? {inventoryUi} : {}), ...(installReadiness ? {installReadiness} : {}), ...(schedules ? {schedules} : {}), ...(ownerAccountId ? {ownerAccountId} : {}), ...(lan ?? {}), ...(scheduleClock ? {scheduleClock} : {}), ...(routerScope ? {routerScope} : {})};
     validatePilotPolicy(enrollment, manifest, false);
     validateTransportFiles(manifest);
     const targetDigest = sha256(JSON.stringify({host: router.host, user: router.user, port: router.port, hostFingerprint: router.hostFingerprint, publicKeyFingerprint: router.publicKeyFingerprint, generation: router.generation, allowedMac: person.device.mac, protectedMacs: [...protectedMacs].sort(), ...(routerScope ? {routerScope} : {})}));

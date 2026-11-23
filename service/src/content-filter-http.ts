@@ -3,6 +3,7 @@ import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
 import { digest } from './auth.ts';
 import type { Auth, AuthSession } from './auth.ts';
+import { contentFilterVisible } from './content-filter-config.ts';
 import type { ContentFilterMode } from './content-filter-config.ts';
 import type { ContentFilterReconciler } from './content-filter-reconcile.ts';
 import { desiredSha256, isLoosening, parseDesired } from './content-filter-state.ts';
@@ -50,7 +51,7 @@ export class ContentFilterRoutes {
     visibleTo(actor: Actor): boolean { return this.visible(actor); }
     private visible(actor: Actor): boolean {
         const {mode, ownerAccountId} = this.options;
-        return mode === 'parents' || (mode === 'owner' && ownerAccountId !== undefined && actor.id === ownerAccountId);
+        return contentFilterVisible(mode, ownerAccountId, actor.id);
     }
     /** Mode first (no per-child information), then scope, then the profile map: all child failures look the same. */
     private scope(actor: Actor, person: string): void {

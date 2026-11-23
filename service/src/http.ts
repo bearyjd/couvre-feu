@@ -1,3 +1,4 @@
+import { readDigestPreview } from './digest-preview.ts';
 import { ChildAdmin, childrenGet, childrenPost } from './admin-children.ts';
 import { BulkOps, bulkPost } from './integration-bulk.ts';
 import { ScheduleStepUp, scheduleStepUpPost } from './integration-schedule-stepup.ts';
@@ -377,6 +378,13 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const session = auth.session(sessionToken, jar.cf_browser);
             if (path === '/auth/session') {
                 send(response, 200, sessionInfo(session.dto));
+                return;
+            }
+            if (path === '/digest/preview') {
+                if (!(policy instanceof IntegrationPolicy) || policy.store.config.digestPreview?.enabled !== true || session.dto.actor.role !== 'admin') {
+                    throw new AppError(404, 'route_not_found');
+                }
+                send(response, 200, readDigestPreview(policy.store.config, policy.store, clock(), session.dto.actor.id));
                 return;
             }
             if (path === '/people') {
