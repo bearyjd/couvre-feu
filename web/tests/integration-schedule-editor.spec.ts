@@ -517,10 +517,30 @@ test('a refreshed revision change prevents an allowance POST', async ({ page, in
   await openAllowanceEditor(page, f);
   let sent = 0;
   await page.route('**' + extraPath, async (route) => { sent++; await route.continue(); });
-  f.router.policy = normalizePolicy({ ...f.router.policy, revision: f.router.policy.revision + 1 });
-  const nextObservation = f.store.observation().value!.routerTime + 1;
-  f.advance(Math.max(1, nextObservation - f.now()));
-  await f.observe();
+  // Tag only the status read initiated by this click, so periodic refresh cannot consume the change first.
+  await page.evaluate(() => {
+    const fetch = window.fetch.bind(window);
+    let preflight = false;
+    document.addEventListener('click', event => {
+      if ((event.target as HTMLElement).closest('[data-sched-action="extra"][data-minutes="15"]')) preflight = true;
+    }, true);
+    window.fetch = (input, init) => {
+      if (!preflight || input !== '/people') return fetch(input, init);
+      preflight = false;
+      const headers = new Headers(init?.headers);
+      headers.set('X-Fixture-Schedule-Preflight', '1');
+      return fetch(input, { ...init, headers });
+    };
+  });
+  await page.route('**/people', async (route) => {
+    if (route.request().headers()['x-fixture-schedule-preflight']) {
+      f.router.policy = normalizePolicy({ ...f.router.policy, revision: f.router.policy.revision + 1 });
+      const nextObservation = f.store.observation().value!.routerTime + 1;
+      f.advance(Math.max(1, nextObservation - f.now()));
+      await f.observe();
+    }
+    await route.fallback();
+  });
   await extraButton(page, 15).click();
   await expect(page.locator('#notice')).toContainText('Schedules changed elsewhere');
   expect(sent).toBe(0);
