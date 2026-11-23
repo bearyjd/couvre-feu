@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-29 (items 11-13 added 2026-11-08); planned additions added 2026-10-27. This is the current plan; the original proposal was an internal planning note that is no longer kept in the repository. "Built" means code merged and tested in CI. It does **not** mean proven on a real router: nothing here has been run live yet (see [Live proof](#live-proof)).
+Updated 2026-11-22. The planned additions date to 2026-10-27, with items 11–13 added on 2026-11-08. “Built” means merged and tested in CI. [Live proof](#live-proof) records which behavior was observed on hardware and which acceptance checks remain.
 
 ## Planned additions at a glance
 
@@ -10,10 +10,10 @@ Ten additions picked from the comparable-products research (PR #90), plus three 
 |---|---|---|---|
 | 1 | Ask for time: web UI + parent one-tap approve | 1 | Built and merged, all behind `timeRequests.mode` (off by default): service (PR #86, #88), per-account gate off/owner/parents (F1, PR #92), parent card with Grant, Grant less, Decline and End extra time (F3, PR #94). Unverified on this router: live proof remains |
 | 5 | Reward Time (extra minutes on a grant) | 1 | Service built and merged (F4, PR #95) behind `rewardTime.enabled` (off; unverified on this router); parent UI built (PR #107) behind `rewardTime.enabled`, shown per viewer via the `rewardTime` field of `GET /people` (unverified on this router) |
-| 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | One-shot service built and merged (F5, PR #104) behind `focus.enabled` (off; unverified on this router); parent web buttons built; recurring not started (depends on item 2) |
+| 7 | Focus / homework window (one-shot in 1, recurring in 3) | 1 and 3 | The one-shot service (#104) and parent controls and status chip (#176) are merged behind `focus.enabled`. The recurring-focus service (#193) stores a weekly window kind behind both `schedules.editable` and `focus.enabled`. Recurring controls and hardware proof remain. |
 | 6 | Audit log of parent actions (1); weekly digest, counts only (2) | 1 and 2 | Audit log built and merged (F2, PR #93) behind `auditLog.enabled` (off; unverified on this router; web "Activity log" view built behind `auditLog.enabled` (unverified on this router), shown per viewer via the `auditLog` field of `GET /people`); B5 follow-up: refused owner-guard attempts audited as `owner_guard_refused` (migration 013, admin-visible only); weekly counts-only digest built behind `digest.enabled` (B7, off, service-only, unverified; see [service contract](service-contract.md#push-and-weekly-digest-b7-service-only-off)) |
 | 4 | Push notifications (self-hosted ntfy or Web Push) | 2 | Service side built behind `push.enabled` (B7: ntfy adapter, content-free, admin topic; off, unverified, no web UI or Web Push); settings screen and subscriptions not started ([service contract](service-contract.md#push-and-weekly-digest-b7-service-only-off)) |
-| 2 | Weekly schedules / bedtime with age-band templates | 3 | S1 built behind `schedules.editable` (off; unverified on this router): schedule truth read from the service DB, seeded once from the manifest, no edits; the seed re-checks the database identity inside its own transaction, so a rebind interleaved with an open cannot receive rows for the old manifest (no staging or receipt settlement; those come with `scheduleMutate` in S2), see [service contract](service-contract.md#schedule-truth-in-the-database-roadmap-item-2-s1-scheduleseditable-off). S2 prerequisite built: migration `017.sql` (`user_version` 17 demo, 15 integration) admits audit action types `schedule_set` and `schedule_loosened` (closed enums, no writer yet, audit still gated by `auditLog.enabled`; unverified on this router). S2a built behind the same flag (unverified on this router; no HTTP route, no router change): `scheduleEdit` builds one child's windows from the router base through `queue()`, admission rebinds request, base and envelope by rebuilding them, and settlement (exact receipt, proven pre-write refusal, a read-only fence 600 s after the apply lease) stores fixed codes only, see [service contract](service-contract.md#schedule-edits-for-integration-installs-roadmap-item-2-s2a-scheduleseditable-off). S2m built behind the same flag (unverified on this router; service only, no web file touched): `scheduleMutate` folds one create/update/delete into the committed windows and calls the S2a admission, `parent_audit` `schedule_set`/`schedule_loosened` (counts and enums only), `GET /people` fills `schedules`/`schedulesEditable`; a child the router does not hold stays refused, see [service contract](service-contract.md#schedule-createupdatedelete-for-integration-installs-roadmap-item-2-s2m-scheduleseditable-off). S2b built behind the same flag (unverified on this router; service only): a loosening or deleting edit (a pure classifier: a window gone or any blocked minute freed) needs a fresh passkey step-up bound to person, canonical window-set digest and revision token before `scheduleMutate` queues anything; tightening needs none; refusals write nothing; a replay of an existing operation needs no second step-up; settlement, admission and the fence are unchanged, see [service contract](service-contract.md#step-up-before-a-loosening-or-deleting-edit-roadmap-item-2-s2b-scheduleseditable-off). Cut in S2a: step-up (built in S2b), staged windows, late promotion, edits for unrouted children (refused), operator abandon, DTO `scheduleCommitted`. Residual: the fence is a margin, not a proof, until a router release adds a `not_after` check. S4 service routes built behind the same flag. S3 and the S4 parent controls remain web work. |
+| 2 | Weekly schedules / bedtime with age-band templates | 3 | Merged behind `schedules.editable`: database schedule truth (#177, #185), queued admission and receipt settlement (#189), create/update/delete with audit and schedule DTOs (#190), passkey step-up for loosening or deletion (#191), and Extra time / Skip tonight routes (#192). The existing browser editor still needs full integration wiring. The S4 parent controls, age-band templates and scoped hardware proof remain. See [Phase 3](#phase-3-schedules-and-age-band-templates-items-2-7-recurring). |
 | 3 | Unknown-device alerts + new devices default to restricted | 4 | Alerts, device list and admin web panel built and merged (service: `inventory-store.ts`, `inventory-http.ts`, router `rpc-inventory`; web: "Devices on the network"; `new_device` and `inventory_stalled` alerts). Unverified on this router. Default-restricted for unassigned devices not started |
 | 10 | Guest / visitor profile (internet only, no LAN) | 4 | Not started |
 | 8 | Per-child daily online time, labelled an estimate | 5 | Not started |
@@ -22,20 +22,20 @@ Ten additions picked from the comparable-products research (PR #90), plus three 
 | 12 | Filter delivery: NextDNS CLI on the router, child MAC → profile, strict default | B (router; needs exception E1 to `AGENTS.md:39`) | Proposal only; blocked on E1 and a read-only inspection |
 | 13 | Device coverage matrix and bypass detection (traffic without DNS, single long flow, per-child DNS-reject attribution), counts only | C (service first; attribution rides the Phase 4 release) | Daily blocked-lookup counts built (PRP-006 C1-C4, flag off, unverified); coverage matrix, bypass detection and the C5 alert not started; C0 measurement probe pending owner approval |
 
-Phase 0 (prove what already exists) comes before all of them.
+Phase 0 gates live rollout. Eligible offline feature work can merge behind flags while hardware acceptance continues.
 
-## Tier 1: basics (built, not yet proven live)
+## Tier 1: basics and live acceptance
 
 Block or unblock one child, block or unblock all children, assign and move devices, parent sign-in with passkeys, and router-local timed pauses.
 
-Open before the first live use:
+Earlier hardware evidence and remaining rollout gates:
 
 | Item | State |
 |---|---|
-| First live rehearsal, then permanent install | Not run. Needs the owner at home and approval of the exact plan hash ([runbook](runbooks/live-first-rehearsal.md)). |
-| Install watchdog (bound the install step) | Not merged. The bound must come from a measured install time on a quiet host or the real router; the first measurement under load exceeded the 80 s stop rule. A clean TERM at the `intent` phase leaves the router needing `recover-install-lock`, so the teardown outcome needs a redesign. |
-| M4b evidence receipt | Template exists; not filled or signed. |
-| Service key entry on the router, confinement probes, dispatch, live pause/resume/expiry/reboot tests | Follow the live rehearsal. |
+| Empty-policy rehearsal, one-device pilot and permanent install | The earlier empty-policy rehearsal and one-device pilot passed with restoration. Permanent installation on the approved MVP scope remains a separately authorized live step. See [Live proof](#live-proof) and the [rehearsal runbook](runbooks/live-first-rehearsal.md). |
+| Install watchdog (bound the install step) | Deferred. A measurement under load exceeded the 80-second stop rule, and a TERM at the `intent` phase can leave the router needing `recover-install-lock`. The owner accepted an unbounded INSTALL for the reviewed rollout on 2026-11-08. |
+| M4b evidence receipt | The unsigned receipt was waived for the reviewed rollout on 2026-11-08. Each exact live invocation still requires approval. |
+| Service key entry, confinement and dispatch | The pilot exercised direct router controls. Permanent-install service key entry, confinement, appliance dispatch and current-release hardware checks remain. |
 | Fixed Wi-Fi address for children's devices | Household rule: scope and protection are MAC-based, so a device that rotates its address escapes them. |
 
 ## Tier 2: next
@@ -43,14 +43,14 @@ Open before the first live use:
 | Item | State |
 |---|---|
 | Ask for time (child requests, parent one-tap approval as timed grants) | Built behind `timeRequests.mode` (off by default; legacy `enabled` reads as `parents`): service in PR #86 and follow-up PR #88, per-account gate in PR #92, parent card in PR #94 (all merged). Grants are router allowances, 60 min cap, lift pauses and schedules, a parent's Pause ends a grant. Live proof remains: [Planned additions](#planned-additions) item 1, Phase 1. The design is in the maintainer's local planning notes (not in this repository). |
-| Weekly schedules / bedtime per child | Designed; builds after ask-for-time. Item 2, Phase 3. The first four steps need no router change and can merge behind an off-by-default flag; live proof of the time windows (flow offload off) needs the owner at home. The design is in the maintainer's local planning notes (not in this repository). |
+| Weekly schedules / bedtime per child | The integration service supports committed weekly windows, audited changes and step-up on loosening or deletion. Parent-editor integration, schedule allowance controls and current-release packet checks remain. See item 2 and [Phase 3](#phase-3-schedules-and-age-band-templates-items-2-7-recurring). |
 | Device recognition and unknown-device alerts | Built and merged on the service side (`service/src/inventory-store.ts`, `service/src/inventory-http.ts`, read-only `rpc-inventory`, [tier1-rpc §2](contracts/tier1-rpc.md)) with the admin "Devices on the network" web panel and `new_device` / `inventory_stalled` alerts; unverified on this router. Item 3, Phase 4. "New devices default to restricted" is not started and is the only part that needs a router change. |
-| DNS enforcement | Partly shipped, all unproven on a live router: kids' IPv4 port 53 redirect (IPv6 port 53 rejected), kids' DoT/DoQ block (TCP/UDP 853, UDP 784 and 8853, unconditional: `router/lib/firewall.sh:53-58`), and a DoH reject set filled from the policy `doh` arrays (at most 256 per family; the service ships a flagged-off list of seven providers, 32 IPv4 + 28 IPv6; explicit `dnsHardening.dohList` true or false strips twelve retired Mullvad resolver addresses, while an absent flag preserves existing entries). See [enforcement contract](enforcement-contract.md#dns-enforcement-today). Item 9, Phase 5: wider DoH list (VPN/Tor list not built, see Do not build). The owner lifted the "no DNS changes" rule on 2026-10-27 for the kids' firewall DNS rules only. `AGENTS.md:39` still forbids changing dnsmasq or the WAN zone; DHCP and adult/management traffic stay out of scope because the lift covered only those rules. The DNS baseline still has to be re-measured. |
+| DNS enforcement | Shipped in part. The earlier one-device pilot observed scoped DNS behavior. Shipped controls include kids' IPv4 port 53 redirect (IPv6 port 53 rejected), kids' DoT/DoQ block (TCP/UDP 853, UDP 784 and 8853, unconditional: `router/lib/firewall.sh:53-58`), and a DoH reject set filled from the policy `doh` arrays (up to 256 per family). The service ships a flagged-off list of seven providers, with 32 IPv4 and 28 IPv6 addresses. Setting `dnsHardening.dohList` to true or false strips twelve retired Mullvad resolver addresses. An absent flag preserves existing entries. See [enforcement contract](enforcement-contract.md#dns-enforcement-today). Item 9, Phase 5: wider DoH list (VPN/Tor list not built, see Do not build). The owner lifted the "no DNS changes" rule on 2026-10-27 for the kids' firewall DNS rules only. `AGENTS.md:39` still forbids changing dnsmasq or the WAN zone. DHCP and adult/management traffic stay out of scope. The DNS baseline still has to be re-measured. |
 | Per-child AdGuard profiles | Not recommended: on the GL firmware it likely breaks GL's own filtering, and AdGuard's per-client schedule is an inverse window that does not match this project's schedule model. Research notes are local (not in this repository). |
 
 ## Tier 3: later
 
-Now planned as items 4 to 10 of [Planned additions](#planned-additions): DNS hardening (item 9, without a VPN/Tor list), focus/homework window (item 7), guest profile (item 10), daily time quota as an estimate (item 8), weekly summary and audit log (item 6), push notifications (item 4), Reward Time (item 5). The activity view beyond the digest stays unplanned.
+Now planned as items 4 to 10 of [Planned additions](#planned-additions): DNS hardening (item 9, without a VPN/Tor list), focus/homework window (item 7), guest profile (item 10), daily time quota as an estimate (item 8), weekly summary and audit log (item 6), push notifications (item 4), Reward Time (item 5). The existing activity view shows scoped estimates and coverage. A calibrated daily online-time balance remains item 8.
 
 ## Planned additions
 
@@ -58,7 +58,7 @@ Source: the comparable-products research (PR #90, `docs/research/comparable-prod
 
 | # | Addition | Value | Effort | Router change | Privacy risk | Needs live proof | Depends on | Owner decisions still needed | Flag (proposed) |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | Ask for time: web UI + parent one-tap approve | High: the most asked-for flow; service exists | M (web only) | No (grants up to 4 h use existing allowances) | Low: the child's reason text is shown only to parents, never in pushes or router policy | Grant lifts a pause/schedule; kernel gate re-blocks at `until` with the service stopped; reboot | #86, #88 merged | None. Already decided (60 min cap, no daily limit, lifts pauses and schedules, a parent's Pause ends it, approvers = scoped parents + admins) | `timeRequests.enabled` (exists) |
+| 1 | Ask for time: web UI + parent one-tap approve | High: service and parent card merged | M | No service change requires a new router release when allowances are supported | Low: the child’s reason is visible only to scoped parents and admins. Pushes and router policy omit it. | Grant lifts a weekly block and the kernel restores it at `until` with the service stopped. Reboot remains a separate check. | #86, #88, #92, #94 merged | Decided: 60-minute cap, no daily limit, a grant lifts pauses and schedules, a parent’s Pause ends it, and scoped parents and admins can approve | `timeRequests.mode` (off, owner, parents) |
 | 2 | Weekly schedules / bedtime with age-band templates | High | M | No for steps S1-S4; optional S5 (router reports kernel tz) | Low | Windows with flow offload off then on, cross-midnight, DST | Item 1 merged (Extra time reuses its allowance path); item 6 audit log | Age bands and template times (new). Already decided: who edits, step-up only on loosening/deleting, Extra time/Skip tonight = allowance with the 60 min cap, merge behind a flag before live proof, cap 8 windows per child | `schedules.editable` |
 | 3 | Unknown-device alerts + new devices default to restricted/unassigned | Medium-high: closes the "new phone escapes" gap | M | Alerts: no (existing read-only `rpc-inventory`). Default-restricted: yes | Low: MAC, vendor prefix, sanitised hostname only; stored for the parent view, never pushed | MAC rotation on phones with private Wi-Fi addresses; default rule never touches protected or management MACs | Item 4 (to notify); Phase 0 router release settled | What "restricted" means (blocked, or guest profile from item 10); whether to default-restrict at all | `deviceAlerts.enabled` (service); router: off unless the desired JSON carries the new field |
 | 4 | Push notifications for approvals, expiries, unknown devices, drift | High: alerts are only visible while the app is open today unless `push.enabled` is on (B7) | M | No | Low if payloads stay content-free (see [Privacy gate](#privacy-design-gate)) | Delivery while WAN/DNS is flaky; honest "not delivered" state | Existing `parent_alerts` | Push provider (self-hosted ntfy vs browser Web Push); quiet hours | `push.enabled` |
@@ -101,7 +101,7 @@ Also avoid OpenAppFilter code (GPL-2.0, not combinable with this AGPL-3.0 projec
   - `service/src/integration-policy.ts`: items 1 (already), 5, 7, 2-S4, 8 (pause op). Phase 1 lands 5 and 7 one after the other, not in parallel.
   - `service/src/http.ts`: one route PR per phase; rebase, do not stack.
   - `shared/src/router-schema.ts`: only Phase 4 (new desired-JSON fields) and Phase 3 if S5 is taken.
-  - `web/public/app.js`: one UI PR in flight at a time; the planned split of tab logic out of `app.js` (Follow-ups) goes before Phase 3 if it can.
+  - Keep one UI PR in flight per shared file. Tab routing landed in `web/public/tabs.js` (#140, `04ebaf2`).
   - `router/` release bytes: at most two new release ids for items 1-10; items 11-13 (PRP-006) add the E1 delivery release and C3/C5 counters, where the read-only C3/C5 counters ride the Phase 4 release and the E1 delivery release needs E1 first (Phase 4, and Phase 5 only if DNS is not ready in time).
 
 ### Privacy design gate
@@ -125,17 +125,16 @@ Every PR in Phases 1-5 and PRP-006 phases A-C states in its description how it m
 
 ### Phase 0: prove what exists
 
-- **Items:** none new. First live rehearsal and permanent install; install watchdog decision; ask-for-time live grant test (item 1's design step S5).
-- **Entry:** owner at home and says go; the M4b install-recovery fix (known blocker for the first rehearsal) is in; a measured install time on a quiet host or the real router for the watchdog bound; the watchdog teardown redesign for a TERM at the `intent` phase; #86, #88 merged.
-- **Exit / done:** rehearsal receipt filled; the installed release id is recorded and known to include router allowances; one 15 min grant observed to lift a block and re-block at `until` with the service stopped. Verified = only what was observed in that run. Still unverified after Phase 0: DST behaviour, flow offload with time rules on, power loss.
-- **Owner decisions before start:** watchdog bound (from the measurement); approve the exact plan hash.
-- **Router release:** settles which release id is live. Open router-byte changes (#87 hardening follow-ups, the watchdog) either go into this release or wait for Phase 4; Phase 4 builds on whatever is live.
-- **Rollout:** `timeRequests.enabled` stays off until the live grant test passes.
-- **Stop / rollback:** any failure in the one run: stop, report, no retry in the same session; console rollback.
+- Earlier empty-policy rehearsal and one-device pilot passed with restoration. Appliance release `54f294f9` deployed at integration schema 17 and passed its external health check. Those results are scoped to the actions observed.
+- The remaining MVP sequence starts with permanent installation and management protection. It then verifies one approved fixed-MAC device and its scoped service path, followed by the grant and activity checks in [Live proof](#live-proof).
+- The 2026-11-08 decision accepted unbounded INSTALL and waived the unsigned M4b receipt for the reviewed rollout. Each exact live invocation requires its own approval. Router-byte follow-ups remain separate unless approved for a release.
+- Record the installed router release and observe one 15-minute grant lifting an active schedule block, followed by router-local re-blocking at expiry while the appliance is stopped. Flow offload variants, DST, reboot and power loss need separate evidence.
+- Keep `timeRequests.mode` off for household rollout until the scoped live grant test passes. Use an explicitly approved flag window for the test.
+- Stop after a failed or uncertain mutation, preserve evidence, and use only the separately approved recovery action.
 
 ### Phase 1: no-router wins on built foundations (items 1, 5, 7 one-shot, 6 audit log)
 
-**Progress (2026-10-29):** steps 1 to 4 and 6 are merged behind flags, all off and unverified on this router; step 5 (item 7, focus window) is half done: the one-shot service is merged (PR #104), the parent web buttons and "Focus" chip are built (item 7 one-shot is done end to end). Item 2 schedule edits: S1, S2a, S2m (service route seam, audit, `GET /people` schedules) and S2b (passkey step-up on loosening/deleting) are built behind `schedules.editable` (off, unverified on this router); the web parts follow. Per-item live proof waits for Phase 0.
+Phase 1 service and parent controls are merged, including the one-shot focus controls and status chip (#176). Live acceptance for grants, Reward Time and focus remains scoped to its respective test. Schedule service progress is tracked in Phase 3.
 
 Can be built and merged offline behind flags before Phase 0 finishes; turning flags on waits for Phase 0.
 
@@ -143,8 +142,8 @@ Can be built and merged offline behind flags before Phase 0 finishes; turning fl
   1. Service: per-account flag gate (owner only / all parents). Tests: gate off, owner only, all. **Built (F1, PR #92, merged): `timeRequests.mode` off, owner or parents plus `ownerAccountId`; unverified on this router.**
   2. Service: audit log table (actor account, action type, child, time, operation id, result; no free text). Writes from pause, resume, bulk, move, grant. Route `GET /audit`: admins see every row, other parents their assigned children. Tests: scoping 404s, no reason text stored. **Built (F2, PR #93, merged; flag `auditLog.enabled`, off; unverified on this router; see [service contract](service-contract.md#audit-log-of-parent-actions-flagged-off)).**
   3. Web: ask-for-time parent card (applying, then confirmed or "couldn't apply"; never optimistic), Grant and End, child "starting..." state; demo router keeps the feature disabled. Tests: Playwright on the demo; update the parent PWA spec. **Built (F3, PR #94, merged): Grant, Grant less, Decline, End extra time, honest Applying/Granted states; the child "starting..." copy was not part of it. Unverified on this router.**
-  4. Service + web: Reward Time as one allowance op through `queue()` (the same path schedules S4 will reuse); cap per the owner's decision. Tests: arithmetic at the cap from router time (the 14400 s horizon is a defence-in-depth guard behind the cap), pause ends it; a paused child with no active allowance is refused, one with an allowance in force is extended. **Service built (F4, PR #95, merged; flag `rewardTime.enabled`, off; unverified on a router; reward + grant together capped at 60 min, refused not clamped; see [service contract](service-contract.md#reward-time-flagged-off)); web UI built (PR #107, merged; per-viewer `rewardTime` field of `GET /people`) behind `rewardTime.enabled`, unverified on this router.**
-  5. Service + web: focus window, one-shot = a timed pause with a "Focus" label. Tests: expiry, ask-for-time interaction per decision. **One-shot service built (F5, PR #104, merged; flag `focus.enabled`, off; unverified on this router; see [service contract](service-contract.md#focus-window-flagged-off)); parent web buttons built.**
+  4. Reward Time landed in the service (#95) and parent UI (#107) behind `rewardTime.enabled`. The per-viewer `rewardTime` field of `GET /people` gates the controls. A reward extends an allowance through `queue()` and refuses totals over 60 minutes from router time. Pause ends the allowance, and a child with a pause and no active allowance is refused. The router horizon adds a second bound. See the [service contract](service-contract.md#reward-time-flagged-off). Live proof remains.
+  5. One-shot focus is a timed pause with a Focus label. The service (#104) and parent controls (#176) are merged behind `focus.enabled`, off by default. See the [service contract](service-contract.md#focus-window-flagged-off) for expiry and the ask-for-time interaction. Live proof remains.
   6. Docs: service contract, operating guide. **Done (F6): [operating notes](service-contract.md#operating-notes-for-the-flagged-features).**
 - **Entry:** #86 and #88 merged.
 - **Exit / done:** all merged with flags off; CI green; each item labelled unverified until its live check (grant lift and re-block, reward arithmetic on the router, focus expiry) passes after Phase 0.
@@ -155,9 +154,9 @@ Can be built and merged offline behind flags before Phase 0 finishes; turning fl
 
 ### Phase 2: notifications and digest (items 4, 6 digest)
 
-Before Phases 3-5 because later items emit events into it.
+The B7 service backend (#118) is merged behind `push.enabled` and `digest.enabled`. It sends content-free ntfy alerts and a counts-only weekly digest. C4 (#168) can add a household blocked-lookup count when content-filter counts are enabled.
 
-- **Steps:** (1) service: push sender behind an interface with ntfy and Web Push adapters, subscription routes, content-free payload, 404/410 cleanup, delivery state per alert; (2) web: settings screen (subscribe, test push, quiet hours, honest state text) and service worker fetch-on-tap; (3) service: digest job (weekly counts per child from the audit log and alerts) delivered through push and shown in-app; (4) docs.
+- Finish the selected provider and subscription lifecycle, parent settings and test-push, honest delivery states, and in-app digest and schedule controls. Use the existing sender and digest job as the starting point.
 - **Tests:** payload snapshot test asserting no names, MACs, addresses or domains; adapter tests against a local fake push endpoint; digest counts from fixtures; quiet-hours boundaries.
 - **Entry:** Phase 1 audit log merged; owner has picked the provider.
 - **Exit / done:** a test push reaches the owner's phone at home (live, but no router needed); a forced failure shows "push failed". Unverified: delivery during a WAN outage beyond what was tried.
@@ -168,10 +167,11 @@ Before Phases 3-5 because later items emit events into it.
 
 ### Phase 3: schedules and age-band templates (items 2, 7 recurring)
 
-- **Steps:** the design's S1-S4: (S1, built behind `schedules.editable`, off, unverified on this router) schedule truth moves from the manifest to the service database, seeded once, with no edit path; (S2) `scheduleMutate` with receipt-based settlement, step-up on loosening/deleting, writes to the Phase 1 audit log; (S3) web editor with age-band templates as editable starting points, status pills, router-time label; (S4) [Extra time / Skip tonight service routes](service-contract.md#schedule-extra-time-and-skip-tonight-roadmap-item-2-s4) through the Phase 1 allowance path, behind `schedules.editable`, unverified on this router. The parent controls follow the schedules web work. Recurring focus is available through the service as a [schedule kind](service-contract.md#recurring-focus-roadmap-item-7), behind both flags and unverified on this router. Optional S5 (router reports kernel tz) is held for the Phase 4 release.
-- **Tests:** validator unit tests (seeded, edited, pending, foreign); HTTP 202 then confirmed via the fake router; 409 races; step-up binding; Playwright with an integration fixture; cross-midnight stored as one record.
-- **Entry:** Phase 1 merged (allowance path, audit log). Building does not need Phase 0; turning on does.
-- **Exit / done:** merged behind `schedules.editable`; live time-window test passed (offload off, then on; cross-midnight; empty set confirmed after cleanup). Unverified until a DST change has been observed: kernel tz behaviour.
+- S1 landed database schedule truth and identity-checked seeding (#177, #185). S2a added admission and receipt settlement (#189). S2m landed audited mutation routes and schedule DTOs (#190), and S2b added passkey step-up for loosening and deletion (#191). The S2a recovery fence leaves a known limit for a router apply that lands after the fence. Unrouted children are refused. Staged windows, late promotion and an operator abandon path remain outside this implementation.
+- S4 landed the [Extra time / Skip tonight service routes](service-contract.md#schedule-extra-time-and-skip-tonight-roadmap-item-2-s4) (#192). The [recurring focus kind](service-contract.md#recurring-focus-roadmap-item-7) landed in #193. The service changes ship behind the applicable flags.
+- Connect the existing editor to integration create/update/delete and passkey step-up, with router time, freshness and confirmed operation states. Expose the S4 controls and recurring kind. Age-band templates follow the owner’s choices. Optional S5, exposing kernel timezone, stays with the next approved router release.
+- The Phase 1 allowance and audit paths are merged. Use an approved window for live testing and complete Phase 0 before household rollout.
+- Merge the remaining controls behind the appropriate flags and observe the live time-window tests with offload off and on, a cross-midnight window, and confirmation of an empty set after cleanup. Kernel timezone behavior across DST requires separate evidence.
 - **Owner decisions before start:** age bands and template times; timezone strategy (trust `--kerneltz` only if the live test passes, otherwise service-compiled UTC windows) is decided at the live test.
 - **Router release:** none (S5 rides Phase 4 if taken).
 - **Rollout:** owner only on one test child device first, then all parents.
@@ -200,7 +200,7 @@ Before Phases 3-5 because later items emit events into it.
 
 ### Risks
 
-- Phase 0 is not done; every live claim waits on it, and the install-recovery blocker gates it.
+- Phase 0 still needs permanent installation and the current-release one-device MVP. Earlier restored pilots and appliance health each cover only their observed scope.
 - Default-restricted or guest rules locking an adult or the management device out (Phase 4 rollback rule).
 - Flow offload bypasses activity counters and may affect time rules: estimates (item 8) and windows (item 2) can be wrong.
 - DST and kernel timezone on this firmware are unverified.
@@ -214,7 +214,7 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 
 | Before | Decision |
 |---|---|
-| Phase 0 | Watchdog bound from a real measurement; approve the plan hash; which open router changes go into the rehearsal release |
+| Phase 0 | Approve each exact live invocation and its bound plan. Review future watchdog and router-byte changes separately. |
 | Phase 1 | Decided (owner, 2026-10-27): the focus window ends only by a parent/admin; a child's ask never ends it. Reward Time total cap 60 min, audit retention 90 days |
 | Phase 2 | Push provider (ntfy vs Web Push); digest recipients and day/time; quiet hours |
 | Phase 3 | Age bands and template times; timezone strategy at the live test |
@@ -223,9 +223,9 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 
 ### Unverified
 
-- Whether the installed router release includes allowances (Phase 0 checks).
+- The permanently installed router release and its allowance behavior on the approved MVP device.
 - Kernel time gate and windows with flow offload on; DST.
-- That a per-account flag gate fits the current account model.
+- Household rollout of the per-account flags beyond the tested account scope.
 - That item 8 needs no router change and that counters give a useful estimate.
 - That the default-restricted rule can be added without touching DNS or WAN config.
 - Push delivery under a flaky WAN.
@@ -233,13 +233,25 @@ Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time
 ## Follow-ups
 
 - Longest CI shard is now `test-transition.py` (four partitions, about 904 s predicted, 50% of the 1800 s lane budget), then `test-rpc.py` (about 861 s); a fifth partition each would bring both under about 730 s.
-- Split the tab logic out of `app.js` into its own file (needs a service static-file allowlist change).
 - Close fd 9 for `timeout` children, a stderr warning when buffered output is lost, and the remaining full-pipe/signal tests (tracked in [tier1-rpc §9](contracts/tier1-rpc.md)).
-- Parent iPhone check of the iOS restyle before it merges.
+- The iOS restyle (#80) still needs the owner’s iPhone check. Check changed web paths before starting another browser slice. The owner decisions draft (#182) covers product choices separately.
 
 ## Live proof
 
-Unproven until a real run: power loss and durability, hardware behaviour, live traffic and packets, reboot, sync timing under the 13 s window with the OS-trust profile, the kernel time gate with flow offload on, and whether the installed release includes router allowances.
+The earlier empty-policy rehearsal passed installation and exact restoration. The earlier one-device pilot passed scoped enrollment, pause and resume, cron-driven timed-pause expiry, and its scoped DNS and counter checks, then restored the prior state. The appliance deploy at `54f294f9` passed schema 17 startup and external health on 2026-11-22. These checks are separate from current router installation and packet acceptance.
+
+### One-device MVP acceptance
+
+Use one assigned parent and one approved fixed-MAC device. Compare each observation with the matching fixture evidence. Keep household identifiers, private manifests and raw captures in private operational records.
+
+| Pending live check | Existing offline coverage |
+| --- | --- |
+| Verify the permanent router release and rollback readiness. Confirm that the approved fixed-MAC test device is outside the full protected set. Observe continued access for the protected management and adult devices and to the appliance, including password recovery access. Confirm the scoped appliance transport before exercising policy. | [Permanent install fixtures](../tests/test-permanent-install.py), [installer and restoration fixtures](../tests/test-install.py) and [RPC fixtures](../tests/test-rpc.py). |
+| Observe a weekly block, manual Pause and Resume, and the parent status after router confirmation. Verify the test device’s actual reachability. | [Schedule service fixtures](../service/tests/integration-schedules.test.ts), [schedule editor browser scenarios](../web/tests/schedule-editor.spec.ts) and [router core fixtures](../tests/test-core.py). |
+| While the weekly block is active, approve a 15-minute request and confirm access returns. With separate approval to stop the appliance, keep it stopped through router expiry and observe that the active schedule blocks again. Restart and reconcile the parent status. | [Grant service fixtures](../service/tests/time-requests-grant.test.ts), [parent request scenarios](../web/tests/time-requests-card.spec.ts) and [router-local re-block fixture](../tests/test-core.py). |
+| Compare a scoped activity baseline and later sample with the parent view. Confirm that it shows estimates and coverage. | [Integration activity fixtures](../service/tests/integration-activity.test.ts) and [activity browser scenarios](../web/tests/activity.spec.ts). |
+
+Record the result of each check against the specific release, device scope and observed conditions. Reboot, power loss, offload variants, DST, general packet coverage, and sync timing inside the 13-second OS-trust window require separate evidence. NextDNS delivery and continuous activity polling are outside this MVP.
 
 ## Limits to state to users
 
