@@ -136,6 +136,9 @@ test('Inactive schedules, unverified clocks and a skip across an unverified offs
     try {
         at(dst, Date.parse('2026-11-01T05:30:00Z') / 1000);
         reviewedClock(dst, 'America/New_York', -240); await dst.observe();
+        const status = dst.policy.people(actor).people[0];
+        assert.ok(status.scheduleAllowanceValidUntil! > dst.now());
+        assert.equal(status.scheduleSkipTonightAvailable, false);
         assert.throws(() => request(dst, skip), code('schedule_clock_unverified'));
         assert.equal(operations(dst), 0);
         at(dst, Date.parse('2026-11-01T01:30:00Z') / 1000);

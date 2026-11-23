@@ -3,14 +3,14 @@ import { operationalAlerts } from './operational-alerts.ts';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
-import { integer, normalizePolicy, policyJSON, healthyConfirmation } from '../../shared/src/router-schema.ts';
+import { effectivePauses, integer, normalizePolicy, policyJSON, healthyConfirmation } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { exactHealthy, normalizeEnvelope, policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
 import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
-import { integrationScheduleState } from './integration-schedules.ts';
+import { activeScheduleEnd, integrationScheduleState } from './integration-schedules.ts';
 import { recurringFocusEnabled, scheduleWindows, scheduleWindowsForDTO, schedulesInDatabase } from './integration-schedule-store.ts';
 import { planWindowKinds, saveScheduleKindIntent } from './integration-schedule-kind.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
@@ -19,6 +19,7 @@ import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
 import { scheduleBuild, scheduleRequestWindows } from './integration-schedule-request.ts';
 import { isScheduleAction } from './integration-schedule-admit.ts';
 import { audited } from './parent-audit.ts';
+import { scheduleSkipDeadline } from './integration-schedule-allowance.ts';
 import { scheduleMutate } from './integration-schedule-mutate.ts';
 import type { ScheduleGate } from './integration-schedule-mutate.ts';
 import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
@@ -240,6 +241,8 @@ export class IntegrationPolicy {
     people(actor: Actor): PeopleDTO {
         const state = this.state(), info = this.store.integrationState(), cached = this.store.observation(), o = cached.value, config = this.store.config;
         const routerHealthy = this.fresh() && o !== null && o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime);
+        const editable = schedulesInDatabase(config), now = this.now(), clockDeadline = config.scheduleClock?.conformance?.validUntil;
+        const paused = editable && routerHealthy ? new Set(effectivePauses(o.acceptedPolicy, o.routerTime).map(p => p.person)) : null;
         const children = activeChildren(this.store).filter(child => actor.personIds.includes(child.id));
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
         let allEnrolled = true;
@@ -247,6 +250,12 @@ export class IntegrationPolicy {
             const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id, this.fresh() ? o?.acceptedPolicy.people.find(p => p.id === child.id)?.macs ?? [] : []);
             const validUntil = Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, allowance = allowanceView(o, healthy, child.id);
             if (!enrolled) allEnrolled = false;
+            const activeEnd = o && healthy && paused && !paused.has(child.id) && o.acceptedPolicy.people.some(p => p.id === child.id)
+                ? activeScheduleEnd(o.acceptedPolicy, config, child.id, o.routerTime, now) : null;
+            const allowanceDeadline = typeof activeEnd === 'number' && clockDeadline !== undefined
+                ? Math.min(activeEnd, validUntil, clockDeadline) : null;
+            const skipAvailable = o !== null && allowanceDeadline !== null && allowanceDeadline > now && typeof activeEnd === 'number' &&
+                typeof scheduleSkipDeadline(config, o.routerTime, activeEnd, o.acceptedPolicy.allowances?.find(a => a.person === child.id)?.until ?? 0) === 'number';
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
             if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
@@ -255,6 +264,10 @@ export class IntegrationPolicy {
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
                 ...this.scheduleList(child.id),
+                ...(editable ? {
+                    scheduleAllowanceValidUntil: allowanceDeadline !== null && allowanceDeadline > now ? allowanceDeadline : null,
+                    scheduleSkipTonightAvailable: skipAvailable,
+                } : {}),
                 ...scheduleWithAllowance(this.scheduleState(o, enrolled, healthy, validUntil, child.id), allowance, validUntil),
                 allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
