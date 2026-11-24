@@ -1,11 +1,12 @@
-<!-- Generated: 2026-10-17 | Files scanned: ~200 | Token estimate: ~379 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~420 -->
 # Router (router/)
 | Path | Role |
 |---|---|
 | install.sh / uninstall.sh | immutable PREPARED before managed writes; exact restore by rename; restartable receipt-bound retirement |
 | cfctl | root-only entry; test mode only under /tmp/couvre-feu-* roots |
 | cfctl-ssh | dropbear forced command; `--rpc-only` limits to rpc-sync/status/activity |
-| generated cron / firewall include | immutable `/etc/.couvrefeu-release-<id>/cfctl --installation-generation <generation> expire\|apply-fw`; stale generations refuse |
+| cfctl-scope | per-admin dropbear forced command (`command="/usr/sbin/cfctl-scope <admin>"` on that admin's own key); admits only `cfctl scope-preview`, `scope-add`, `scope-remove` |
+| cron, firewall.include | checked-in statics (`* * * * * /usr/sbin/cfctl expire`; `exec /usr/sbin/cfctl apply-fw`); installed forms are generated and call the immutable `/etc/.couvrefeu-release-<id>/cfctl --installation-generation <generation> expire\|apply-fw`; stale generations refuse |
 | release.sha256 | frozen manifest (tools/freeze-router-release.py [--check \| --emit DIR]); `--emit` refuses unless router/ is frozen, then writes the shippable tree (cfctl-ssh and cfctl-scope stripped of their CF_TEST_MODE block) to a new DIR. Emitted files are operator-owned (dirs 0700, scripts and static helper 0755, other lib 0644, release.sha256 0600): copy them to the router as root. Only these two wrappers are stripped; other CF_TEST_MODE gates remain in the tree but are unreachable over SSH because the wrappers `exec env -i` |
 | lib/busybox-static | pinned aarch64 static BusyBox setsid launcher; installed root:root0755 under /usr/lib/couvrefeu; journaled exact restore/removal, verified before execution |
 | lib/core.sh | validation, backend wrappers, state load/edit, pause/resume, CLI dispatch |

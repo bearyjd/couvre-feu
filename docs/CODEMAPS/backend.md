@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~340 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~620 -->
 # Backend (service/src)
 Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activity?, timeRequests?, inventory?)` (http.ts:97); query/%/# in URL -> 400.
 
@@ -8,6 +8,12 @@ Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activ
 | POST /auth/register/{options,verify}, /auth/login/{options,verify}, /auth/logout | auth.ts `Auth` |
 | GET /auth/session, /people, /devices, /alerts[/before/N], /operations/:uuid | policy + alerts |
 | GET /people/:id/activity | ActivityStore/activity-report |
+| GET /digest/preview | digest-preview.ts `readDigestPreview`; 404 unless `digestPreview.enabled` and admin; no-store; 503 `digest_preview_unavailable`; blocked total only if the viewer sees every configured child |
+| POST /people/:id/{schedule-extra-time,schedule-skip-tonight} | integration-schedule-allowance.ts (allowance path, 60 min cap); `schedules.editable` |
+| GET/PUT /people/:id/filter, GET /people/:id/filter/counts | content-filter-http.ts; mode-gated (excluded actors get 404 `route_not_found`); counts only when `contentFilter.counts` is on |
+| POST /bulk/{pause-all,resume-all} | integration-bulk.ts `bulkPost` (step-up) |
+| GET /admin/install-readiness, POST /admin/install-readiness/{approve,export} | install-readiness.ts |
+| POST /admin/inventory/:id/{classify,undo,link,stable}, DELETE /admin/inventory/:id/link, GET /admin/inventory/hidden | inventory-http.ts; hidden only with `inventory.triage` |
 | POST /people/:id/{pause,resume}, /people/:id/schedules[/:sid[/delete]] | policy -> operation |
 | POST /people/:id/reward | Reward Time: +15/+30 min allowance (integration-allowance.ts `IntegrationGrants.reward`); 404 unless `rewardTime.enabled` and the viewer may decide (http.ts:240) |
 | POST /people/:id/focus | one-shot focus window = labelled timed pause (`IntegrationPolicy.focus`, integration-policy.ts); 404 unless `focus.enabled` and the viewer may decide (http.ts:248) |
@@ -20,6 +26,8 @@ Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activ
 | POST /step-up/options (action child_batch), POST /admin/children/batch | admin-children-batch.ts `ChildBatchAdmin`; childrenPost claims before singles; ordered canonical binding includes clientKey; one transaction, at most one enroll operation |
 | GET /time-requests; POST /people/:id/request-link[/revoke], /time-requests/:uuid/{approve,decline} | time-requests-http.ts parentGet/parentPost -> TimeRequestService |
 
+`/step-up/options` is shared: each handler claims only its own `action` (child_batch, accounts, bulk, schedule via integration-schedule-stepup.ts, content_filter_set, install-readiness). Methods are GET, POST, PUT, DELETE.
+
 Policy path: HTTP -> `PolicyService` (policy.ts, demo) or `IntegrationPolicy` (integration-policy.ts) -> idempotent `operations` row (revision CAS, key per actor) -> worker.
 
 Auth (auth.ts): bootstrap token (CLI `issueBootstrap`, 10 min, one use) -> WebAuthn registration -> session (hash, csrf, permission_version, browser_hash/epoch binding). Login re-checks account permission_version. Step-up: a fresh passkey confirmation bound to one exact account/passkey/child change (`step_ups` table, migration 007; `/step-up/options`; auth.ts stepUpChallenge/stepUpVerify).
@@ -29,6 +37,8 @@ Batch setup: admin-children-batch.ts normalizes at most 40 create/rename/add ite
 Batch verification: `service/tests/admin-children-batch.test.ts` (transaction/security/recovery), `admin-children-batch-http.test.ts` (HTTP guards and ready-device enrollment), and `fixtures/previous-store.ts` (pre-batch Store reader/writer compatibility). Manual `node service/tests/batch-guard-mutations.ts` disables guards in a disposable source copy and maps each mutation to a failing regression; uses pinned Node 26.13.1 and a private TMPDIR, with `BATCH_REPORT_DIR` for result logs.
 
 Dispatch (integration-worker.ts / integration-automatic.ts): op `pending` + rpc phase queued -> claim (token, epoch, lease) -> dispatch_batches/steps (`observe|apply|receipt|activity`, single step, deadline 1-30 s) -> SSHRouter -> receipt -> op `confirmed|unknown|failed|conflict`. Expired claim -> `uncertain`, never auto-retried. `AutomaticDispatch` is one serialized supervisor.
+
+Schedules (integration-schedule-{admit,allowance,apply,dispatch,kind,mutate,request,settle,stepup,store}.ts, schedule-loosening.ts, schedule-clock.ts): service-compiled windows behind `schedules.editable`. Content filter: content-filter-{config,counts,day,http,reconcile,state,watch,wiring,classes}.ts + nextdns-client.ts (NextDNS analytics, counts only). Also install-readiness.ts, health.ts, account-limits.ts, digest-blocked.ts (local C4 weekly total), digest-preview.ts.
 
 Other modules: alert-rules/parent-alerts/operational-alerts (alerts), parent-audit (audit log), activity-store/report/device-evidence, inventory-store (unknown-device list; shared admin-inventory DTOs include `inScope` for list/acknowledge), integration-scope (`ScopeTracker.inRouterScope` shares the exact assignment eligibility predicate with inventory: manifest floor or fresh, generation-checked remembered clean scope), time-requests + time-request-grants + integration-allowance (15/30/60 min grants as router allowances; legacy rows re-pause), push-sender.ts + push-runtime.ts + digest.ts (flagged `push.enabled` / `digest.enabled`, off: content-free ntfy push to an admin topic, weekly counts-only digest Sun 18:00 America/New_York with 21:00-07:00 quiet hours; started from integration-main.ts; table `notify_state`), doh-list.ts (seven providers, 32 IPv4 + 28 IPv6, merged into each submitted policy when manifest `dnsHardening.dohList` is true; explicit true/false strips twelve retired Mullvad addresses, absent preserves existing entries; integration-policy.ts; see docs/dns-hardening.md), tls.ts (RFC 1918 or Tailscale CGNAT 100.64.0.0/10 only, SIGHUP reload), integration-config.ts (manifest validation, private files), schedule-clock.ts, router-transport.ts (frozen invocations).
 Accounts: many passkeys per account (migration 007), admin-accounts.ts and admin-children.ts with step-up, integration-rebind|revoke CLIs. Owner-account guard (PR #100, admin-accounts.ts:68-72): with `timeRequests.mode` `owner`, other admins get 403 `owner_account_protected` on the owner's account, and the owner cannot deactivate, demote or strip their own last active passkey (409 `owner_self_lockout`).

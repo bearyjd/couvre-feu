@@ -1,6 +1,6 @@
-<!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~229 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~800 -->
 # Data (SQLite, STRICT tables; db.ts `Store`, migrations in service/migrations)
-Main DB migrations 001..015 (`PRAGMA user_version`; integration mode runs 001, 002, 005..015, so its version is 13; db.ts:9). The integration DB adds integration-001..007 (integration-db.ts).
+Main DB migrations 001..019 (`PRAGMA user_version`; integration mode runs 001, 002, 005..019, list at db.ts:9). The integration DB adds integration-001..010 (integration-db.ts); `integration-019-version.sql` is a `SELECT 1` placeholder that reserves the version before schedule migration 019.
 
 | Migration | Adds |
 |---|---|
@@ -17,6 +17,9 @@ Main DB migrations 001..015 (`PRAGMA user_version`; integration mode runs 001, 0
 | 011, 012, 013 | parent_audit rebuilt to admit action `reward_add` (011), `focus_start` (012) and `owner_guard_refused` (013); ids and AUTOINCREMENT counter carried over |
 | 014 | content_filter_desired; parent_audit rebuilt to admit `content_filter_set`, `content_filter_loosened` |
 | 015 | inventory_decisions (parent roles/labels/links/stable checks, keyed by generation + mac, FK to inventory_devices ON DELETE CASCADE); parent_audit rebuilt to admit the five `inventory_*` actions. One-way: snapshot first |
+| 016 | content_filter_day, content_filter_day_class (NextDNS counts per child per New York day; integers and fixed state codes only; empty when `contentFilter.counts` is off) |
+| 017, 018 | parent_audit rebuilt to admit `schedule_set`, `schedule_loosened` (017) and `schedule_extra_time`, `schedule_skip_tonight` (018) |
+| 019 | schedule_windows.kind (bedtime/focus), schedule_kind_intents (digest-keyed); applied by IntegrationStore once the schedule tables exist |
 | integration-001 | integration_state (singleton, generation, dispatch_epoch, dispatch_stopped), operation_rpc (phase queued/claimed/uncertain/resolved; delivery), dispatch_batches, dispatch_steps |
 | integration-002 | dispatch_steps rebuilt (single ordinal, kinds observe/apply/receipt/activity, states consumed/resolved/uncertain/revoked); index dispatch_live_claims |
 | integration-003 | operations.action admits device enrollment (`enroll`) |
@@ -25,10 +28,12 @@ Main DB migrations 001..015 (`PRAGMA user_version`; integration mode runs 001, 0
 | integration-006 | network inventory tables, `inventory` step kind, `new_device` alert kind |
 | integration-007 | operations.action admits `allow` (router allowance for ask-for-time grants and Reward Time; a focus window is a labelled timed pause, not a new kind) |
 | integration-008 | parent_alerts.kind admits `filter_drift` (content filter drift check, PRP-006 A5) |
+| integration-009 | schedule_windows, schedule_seed (weekday sets and clocks only; `schedule_windows_cap` trigger; behind `schedules.editable`) |
+| integration-010 | operations.action admits `schedule_create`, `schedule_update`, `schedule_delete` |
 
 Also referenced: automatic_read_summary (created in integration-db.ts). `notify_state` (key/value: last pushed alert id, last sent digest slot) is created by push-runtime.ts only when `push.enabled`.
 `admin-batches.sql` is additive and does not advance user_version: `admin_batches` stores actor/client_key uniqueness, canonical digest, stored success/refusal response, operation id and creation time (90-day retry retention); `admin_batch_setup` preserves setup completion independently of retry retention; `inventory_coverage` is the latest complete poll's generation/MAC/address-coverage timestamp, separate from historical inventory last_seen. No parent_audit rebuild, action or batch_id column is added. Legacy audit carries one child id/device-count row per touched child; parent audit reuses device_assign per child, inside the batch transaction.
-Highest numbered migration: 013 (service/migrations). Features that write to `parent_audit` are flagged off by default (`auditLog.enabled`).
+Highest numbered migration: 019 (service/migrations). Features that write to `parent_audit` are flagged off by default (`auditLog.enabled`).
 Router-side state: see [router.md](router.md).
 
 Admin inventory HTTP DTOs: `shared/src/admin-inventory.ts` (`InventoryDTO`, `InventoryDeviceDTO`).
