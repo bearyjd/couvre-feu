@@ -384,7 +384,10 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 if (!(policy instanceof IntegrationPolicy) || policy.store.config.digestPreview?.enabled !== true || session.dto.actor.role !== 'admin') {
                     throw new AppError(404, 'route_not_found');
                 }
-                send(response, 200, readDigestPreview(policy.store.config, policy.store, clock(), session.dto.actor.id));
+                const actor = session.dto.actor;
+                send(response, 200, readDigestPreview(policy.store.config, policy.store, clock(), actor.id, {
+                    canSee: person => { try { policy.authorized(actor, person); return true; } catch { return false; } },
+                }));
                 return;
             }
             if (path === '/people') {

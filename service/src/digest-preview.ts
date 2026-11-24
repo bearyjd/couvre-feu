@@ -13,13 +13,21 @@ interface DigestPreview {
     blockedLookups?: {firstDay: string; lastDay: string; count: number; daysCounted: number};
 }
 
+interface PreviewOptions {
+    /** Whether the viewer may see this child; the blocked-lookups total sums every configured child, so one out-of-scope child omits it. */
+    canSee?: (person: string) => boolean;
+    log?: (line: string) => unknown;
+}
+
 /** Read only the closed weekly aggregate and optional local C4 counts. */
-export function readDigestPreview(config: IntegrationConfig, store: IntegrationStore, now: number, accountId: string,
-    log: (line: string) => unknown = line => process.stderr.write(line)): DigestPreview {
-    const end = latestDigestSlot(now), start = latestDigestSlot(end - 1);
-    const filter = config.contentFilter;
-    const blockedReader = filter?.counts?.enabled === true && contentFilterVisible(filter.mode, config.ownerAccountId, accountId) ? digestBlockedReader(config, store) : undefined;
+export function readDigestPreview(config: IntegrationConfig, store: IntegrationStore, now: number, accountId: string, options: PreviewOptions = {}): DigestPreview {
+    const log = options.log ?? (line => process.stderr.write(line));
     try {
+        const end = latestDigestSlot(now), start = latestDigestSlot(end - 1);
+        const filter = config.contentFilter;
+        const everyChildVisible = Object.keys(filter?.profiles ?? {}).every(person => options.canSee?.(person) ?? true);
+        const blockedReader = filter?.counts?.enabled === true && contentFilterVisible(filter.mode, config.ownerAccountId, accountId) && everyChildVisible
+            ? digestBlockedReader(config, store) : undefined;
         const {requests, grants, pauses, blocked} = weeklyCounts(store, start, end, blockedReader, log);
         const preview: DigestPreview = {period: {start, end}, counts: {requests, grants, pauses}};
         if (blocked && blocked.daysCounted > 0) {

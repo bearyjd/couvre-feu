@@ -110,13 +110,55 @@ test('failed blocked read is logged by tag, a failed event read logs its tag and
             profiles: {pilot: 'abcd5678'}, counts: {enabled: true}};
         f.store.run('DROP TABLE content_filter_day');
         const end = epoch('2026-11-08T23:00:00Z');
-        assert.equal(readDigestPreview(f.config, f.store, end, 'operator', l => lines.push(l)).blockedLookups, undefined);
+        assert.equal(readDigestPreview(f.config, f.store, end, 'operator', {log: l => lines.push(l)}).blockedLookups, undefined);
         assert.deepEqual(lines, ['digest_blocked_failed\n']);
         lines.length = 0;
         f.store.run('DROP TABLE time_requests');
-        assert.throws(() => readDigestPreview(f.config, f.store, end, 'operator', l => lines.push(l)), {code: 'digest_preview_unavailable'});
+        assert.throws(() => readDigestPreview(f.config, f.store, end, 'operator', {log: l => lines.push(l)}), {code: 'digest_preview_unavailable'});
         assert.ok(lines.includes('digest_preview_failed\n'));
         assert.ok(lines.every(l => /^[a-z_]+\n$/.test(l)), 'tags only');
+    } finally { f.cleanup(); }
+});
+
+const LINK = "INSERT INTO request_links(id,person_id,token_hash,created_by,created_at) VALUES(?,?,?,'operator',1)";
+const REQUEST = "INSERT INTO time_requests(id,link_id,person_id,minutes,reason,state,created_at,decided_at,expires_at) VALUES(?,?,?,15,'',?,?,?,?)";
+
+test('requests, grants and pauses are counted separately, each in its own field', () => {
+    const f = integrationFixture();
+    try {
+        const end = epoch('2026-11-08T23:00:00Z'), inside = end - 3600;
+        ['a', 'b', 'c'].forEach((id, i) => {
+            const person = 'kid_' + id;
+            f.store.run("INSERT INTO people(id,name,kind,active,created_at) VALUES(?,?,'child',1,1)", person, person);
+            f.store.run(LINK, 'link' + id, person, String(i).repeat(64));
+            f.store.run(REQUEST, id, 'link' + id, person, id === 'a' ? 'approved' : 'pending', inside, id === 'a' ? inside : null, inside + 600);
+        });
+        f.store.run(OP, 'p1', 1, 'k1', inside, inside);
+        assert.deepEqual(readDigestPreview(f.config, f.store, end, 'operator').counts, {requests: 3, grants: 1, pauses: 1});
+    } finally { f.cleanup(); }
+});
+
+test('blocked lookups follow the content-filter mode, the counts flag and the viewer scope', () => {
+    const f = integrationFixture();
+    try {
+        const end = epoch('2026-11-08T23:00:00Z');
+        f.config.ownerAccountId = 'operator';
+        new ContentFilterCountsStore(f.store).put('pilot', {day: '2026-11-07', state: 'ok', total: 4, blocked: 2, classes: {adult: 2}}, 1);
+        const filter = (mode: 'off' | 'owner' | 'parents', counts: boolean) => ({mode, apiKeyFile: '/unused', defaultProfile: 'abcd1234', profiles: {pilot: 'abcd5678'}, counts: {enabled: counts}});
+        const blocked = (account: string, canSee?: (person: string) => boolean) => readDigestPreview(f.config, f.store, end, account, {canSee}).blockedLookups;
+        f.config.contentFilter = filter('parents', true);
+        assert.equal(blocked('operator')?.count, 2);
+        assert.equal(blocked('someone-else')?.count, 2, 'parents mode: any admin');
+        assert.equal(blocked('operator', person => person === 'pilot')?.count, 2, 'in scope');
+        assert.equal(blocked('operator', () => false), undefined, 'a child out of scope omits the household total');
+        f.config.contentFilter = filter('owner', true);
+        assert.equal(blocked('someone-else'), undefined);
+        f.config.contentFilter = filter('off', true);
+        assert.equal(blocked('operator'), undefined);
+        f.config.contentFilter = filter('parents', false);
+        assert.equal(blocked('operator'), undefined);
+        f.config.contentFilter = undefined;
+        assert.equal(blocked('operator'), undefined);
     } finally { f.cleanup(); }
 });
 
@@ -182,6 +224,39 @@ test('preview HTTP enforces flag, admin, and owner-only blocked-lookup visibilit
         assert.deepEqual(await secondResponse.json(), expected);
         assert.equal(f.store.get("SELECT name FROM sqlite_master WHERE name='notify_state'"), undefined);
         assert.equal(JSON.stringify(f.store.get('SELECT (SELECT count(*) FROM operations) o, (SELECT count(*) FROM time_requests) t, (SELECT count(*) FROM sqlite_master) m')), before);
+    } finally {
+        server.close();
+        await once(server, 'close');
+        f.cleanup();
+    }
+});
+
+test('preview HTTP: a scoped admin gets no blocked total, 401 when signed out, and 503 is no-store', async () => {
+    const f = integrationFixture();
+    f.advance(epoch('2026-11-08T23:00:00Z') - f.now());
+    f.store.run("INSERT INTO accounts(id,display_name,role,person_ids,webauthn_user_id) VALUES(?,?,'admin',?,?)", 'scopedadmin', 'Scoped admin', '[]', 'scopedadmin-auth-id');
+    f.config.digestPreview = {enabled: true};
+    f.config.contentFilter = {mode: 'parents', apiKeyFile: '/unused', defaultProfile: 'abcd1234', profiles: {pilot: 'abcd5678'}, counts: {enabled: true}};
+    new ContentFilterCountsStore(f.store).put('pilot', {day: '2026-11-07', state: 'ok', total: 4, blocked: 2, classes: {adult: 2}}, 1);
+    const { freePort } = await import('./free-port.ts');
+    const port = await freePort(), origin = 'http://localhost:' + port;
+    const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
+    const server = appServer(auth, f.policy, {...f.config, port, origin, host: 'localhost:' + port});
+    server.listen(port, '127.0.0.1');
+    await once(server, 'listening');
+    try {
+        assert.equal((await fetch(origin + '/digest/preview')).status, 401);
+        const admin = await signIn(f, origin, 'operator'), scoped = await signIn(f, origin, 'scopedadmin');
+        const full = await (await admin('/digest/preview')).json();
+        assert.equal(full.blockedLookups.count, 2);
+        const limited = await (await scoped('/digest/preview')).json();
+        assert.equal(limited.blockedLookups, undefined);
+        assert.deepEqual(limited.counts, full.counts);
+        f.store.run('DROP TABLE time_requests');
+        const failed = await admin('/digest/preview');
+        assert.equal(failed.status, 503);
+        assert.equal(failed.headers.get('cache-control'), 'no-store');
+        assert.equal((await failed.json()).error.code, 'digest_preview_unavailable');
     } finally {
         server.close();
         await once(server, 'close');
