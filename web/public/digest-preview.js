@@ -3,7 +3,7 @@
 // Nothing is persisted: the body lives in a closure variable that is dropped on clear(). All text is set with textContent.
 const FORMAT = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const WEEK_DAYS = 7;
-const COUNTS = [['requests', 'Requests'], ['grants', 'Grants'], ['pauses', 'Pauses']];
+const COUNTS = [['requests', 'Extra-time requests'], ['grants', 'Requests approved'], ['pauses', 'Pauses started']];
 
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
@@ -25,7 +25,7 @@ const usable = (body) => Boolean(body) && seconds(body.period?.start) && seconds
 
 export function createDigestPreview({ session, offline }) {
   const root = document.querySelector('#digest-preview-panel');
-  let key = '', epoch = 0, loading = false, loaded = false, failed = false, preview = null;
+  let key = '', epoch = 0, loading = false, loaded = false, failed = false, preview = null, refocus = false;
   const sessionKey = () => { const current = session(); return current ? `${current.actor.id}:${current.csrfToken}` : ''; };
   function sync() {
     const next = sessionKey();
@@ -48,11 +48,11 @@ export function createDigestPreview({ session, offline }) {
     const view = [el('h2', { id: 'digest-preview-title', textContent: 'Weekly digest preview' })];
     if (preview) {
       const { period, counts, blockedLookups } = preview;
-      view.push(el('p', { class: 'fine-print', 'data-period': '', textContent: `Recorded events, (start, end]: ${FORMAT.format(period.start * 1000)} to ${FORMAT.format(period.end * 1000)} (New York time)` }));
+      view.push(el('p', { class: 'fine-print', 'data-period': '', textContent: `Last full week: ${FORMAT.format(period.start * 1000)} to ${FORMAT.format(period.end * 1000)} (New York time)` }));
       view.push(el('dl', {}, ...COUNTS.map(([name, label]) => el('div', {}, el('dt', { textContent: label }), el('dd', { 'data-count': name, textContent: String(counts[name]) })))));
       if (blockedLookups) {
         const partial = blockedLookups.daysCounted < WEEK_DAYS ? ` ${blockedLookups.daysCounted} of ${WEEK_DAYS} days counted` : '';
-        view.push(el('p', { 'data-blocked': '', textContent: `Blocked lookups: ${blockedLookups.count} (${blockedLookups.firstDay} to ${blockedLookups.lastDay})${partial}` }));
+        view.push(el('p', { 'data-blocked': '', textContent: `Blocked website lookups: ${blockedLookups.count} (${blockedLookups.firstDay} to ${blockedLookups.lastDay})${partial}` }));
       }
     } else if (failed) {
       view.push(el('p', { role: 'status', 'data-digest-status': '', textContent: 'Digest preview unavailable' }),
@@ -60,6 +60,7 @@ export function createDigestPreview({ session, offline }) {
     } else { clear(); return; }
     root.replaceChildren(...view);
     root.hidden = false;
+    if (refocus) { refocus = false; const title = root.querySelector('#digest-preview-title'); title.tabIndex = -1; title.focus(); }
   }
 
   async function load() {
@@ -81,12 +82,17 @@ export function createDigestPreview({ session, offline }) {
 
   root.addEventListener('click', (event) => {
     const button = event.target.closest('button');
-    if (button?.dataset.action === 'retry' && sync() && !offline()) void load();
+    if (button?.dataset.action === 'retry' && sync() && !offline()) { refocus = true; void load(); }
   });
 
   function update() {
     sync();
-    if (!offered() || offline()) { if (!root.hidden || root.childNodes.length) clear(); return; }
+    if (!offered() || offline()) {
+      // Hidden while offline, but forget the load so the panel is fetched again once the app is back online.
+      if (!loading) { loaded = false; failed = false; }
+      if (!root.hidden || root.childNodes.length) clear();
+      return;
+    }
     if (!loaded && !loading && !failed) void load();
   }
   return { update };

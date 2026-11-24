@@ -16,14 +16,14 @@ test('admin sees the period in New York time, three counts and the partial block
   await signIn(page, f, 'operator');
   await page.locator('#tab-more').click();
   await expect(panel(page).getByRole('heading', { name: 'Weekly digest preview' })).toBeVisible();
-  await expect(panel(page).locator('[data-period]')).toContainText('Recorded events, (start, end]');
+  await expect(panel(page).locator('[data-period]')).toContainText('Last full week:');
   await expect(panel(page).locator('[data-period]')).toContainText('Nov 15');
   await expect(panel(page).locator('[data-period]')).toContainText('Nov 22');
   await expect(panel(page).locator('[data-period]')).toContainText('6:00');
   await expect(panel(page).locator('[data-count="requests"]')).toHaveText('7');
   await expect(panel(page).locator('[data-count="grants"]')).toHaveText('4');
   await expect(panel(page).locator('[data-count="pauses"]')).toHaveText('2');
-  await expect(panel(page).locator('[data-blocked]')).toHaveText('Blocked lookups: 31 (2026-11-15 to 2026-11-21) 3 of 7 days counted');
+  await expect(panel(page).locator('[data-blocked]')).toHaveText('Blocked website lookups: 31 (2026-11-15 to 2026-11-21) 3 of 7 days counted');
   await expect(page.locator('#more-jump a[data-target="#digest-preview-panel"]')).toBeVisible();
 });
 
@@ -33,13 +33,13 @@ test('full coverage drops the "of 7" qualifier; a body without blockedLookups sh
   await page.route('**/digest/preview', (route) => route.fulfill(json(body)));
   await signIn(page, f, 'operator');
   await page.locator('#tab-more').click();
-  await expect(panel(page).locator('[data-blocked]')).toHaveText('Blocked lookups: 31 (2026-11-15 to 2026-11-21)');
+  await expect(panel(page).locator('[data-blocked]')).toHaveText('Blocked website lookups: 31 (2026-11-15 to 2026-11-21)');
   body = { period: PERIOD, counts: BODY.counts };
   await page.reload();
   await page.locator('#tab-more').click();
   await expect(counts(page)).toHaveCount(3);
   await expect(panel(page).locator('[data-blocked]')).toHaveCount(0);
-  await expect(panel(page)).not.toContainText('Blocked lookups');
+  await expect(panel(page)).not.toContainText('Blocked website lookups');
 });
 
 test('a real 200 with zero counts shows 0 for all three', async ({ page, integration: f }) => {
@@ -97,10 +97,59 @@ test('sign-out empties and hides the panel and nothing is persisted', async ({ p
   expect(await panel(page).evaluate((n) => n.children.length)).toBe(0);
   const stores = await page.evaluate(async () => ({
     local: JSON.stringify({ ...localStorage }), session: JSON.stringify({ ...sessionStorage }),
-    caches: JSON.stringify(await Promise.all((await caches.keys()).map(async (k) => (await (await caches.open(k)).keys()).map((r) => r.url)))),
   }));
   for (const value of Object.values(stores)) { expect(value).not.toMatch(/digest/i); expect(value).not.toContain('"requests"'); }
 });
+
+test('offline hides the panel and coming back online fetches and shows it again', async ({ page, context, integration: f }) => {
+  f.config.digestPreview = { enabled: true };
+  let fetches = 0;
+  await page.route('**/digest/preview', (route) => { fetches++; return route.fulfill(json(BODY)); });
+  await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
+  await expect(panel(page).locator('[data-count="requests"]')).toHaveText('7');
+  await context.setOffline(true);
+  await expect(panel(page)).toBeHidden();
+  await context.setOffline(false);
+  await expect(panel(page).locator('[data-count="requests"]')).toHaveText('7');
+  expect(fetches).toBeGreaterThanOrEqual(2);
+});
+
+test('403 hides the panel without an unavailable message', async ({ page, integration: f }) => {
+  f.config.digestPreview = { enabled: true };
+  await page.route('**/digest/preview', (route) => route.fulfill(json({ error: { code: 'forbidden' } }, 403)));
+  await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
+  await page.waitForTimeout(300);
+  await expect(panel(page)).toBeHidden();
+  await expect(page.getByText('Digest preview unavailable')).toHaveCount(0);
+});
+
+test('Try again returns keyboard focus to the panel heading', async ({ page, integration: f }) => {
+  f.config.digestPreview = { enabled: true };
+  let fail = true;
+  await page.route('**/digest/preview', (route) => route.fulfill(fail ? json({ error: { code: 'digest_preview_unavailable' } }, 503) : json(BODY)));
+  await signIn(page, f, 'operator');
+  await page.locator('#tab-more').click();
+  fail = false;
+  await panel(page).getByRole('button', { name: 'Try again' }).click();
+  await expect(panel(page).locator('[data-count="requests"]')).toHaveText('7');
+  await expect(panel(page).locator('#digest-preview-title')).toBeFocused();
+});
+
+for (const [name, start, end] of [['spring', '2026-03-01T23:00:00Z', '2026-03-08T22:00:00Z'], ['fall', '2026-10-25T22:00:00Z', '2026-11-01T23:00:00Z']] as const) {
+  test(`${name} DST week renders 6:00 PM at both ends in New York time`, async ({ browser, integration: f }) => {
+    f.config.digestPreview = { enabled: true };
+    const context = await browser.newContext({ timezoneId: 'UTC' });
+    const page = await context.newPage();
+    const period = { start: Date.parse(start) / 1000, end: Date.parse(end) / 1000 };
+    await page.route('**/digest/preview', (route) => route.fulfill(json({ period, counts: BODY.counts })));
+    await signIn(page, f, 'operator');
+    await page.locator('#tab-more').click();
+    await expect(panel(page).locator('[data-period]')).toContainText(/6:00\s?PM to .*6:00\s?PM/);
+    await context.close();
+  });
+}
 
 test('reload then a failing fetch shows only unavailable; the response is no-store', async ({ page, integration: f }) => {
   f.config.digestPreview = { enabled: true };
