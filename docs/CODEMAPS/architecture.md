@@ -1,4 +1,4 @@
-<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~330 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main 727daf6) | Token estimate: ~330 -->
 # Architecture
 Monorepo: router (OpenWrt ash/awk) + service (Node 26.13.1 TS, no build) + static PWA.
 

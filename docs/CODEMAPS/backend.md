@@ -1,4 +1,4 @@
-<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~620 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main 727daf6) | Token estimate: ~620 -->
 # Backend (service/src)
 Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activity?, timeRequests?, inventory?)` (http.ts:97); query/%/# in URL -> 400.
 

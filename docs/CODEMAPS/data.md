@@ -1,4 +1,4 @@
-<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~800 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main 727daf6) | Token estimate: ~800 -->
 # Data (SQLite, STRICT tables; db.ts `Store`, migrations in service/migrations)
 Main DB migrations 001..019 (`PRAGMA user_version`; integration mode runs 001, 002, 005..019, list at db.ts:9). The integration DB adds integration-001..010 (integration-db.ts); `integration-019-version.sql` is a `SELECT 1` placeholder that reserves the version before schedule migration 019.
 

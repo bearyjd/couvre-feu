@@ -1,4 +1,4 @@
-<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main d3a5782) | Token estimate: ~260 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main 727daf6) | Token estimate: ~260 -->
 # Live tools (tools/live; python3 -I, stdlib only)
 - `first-rehearsal.py` + `.sh`: one SSH session; phases identity gate, prereq, snapshot, empty install, verify, exact uninstall, restore proof, connectivity. Subcommands plan/execute; config keeps real data outside repo (`config.example.json` uses 02:00:00:00:00:xx, 192.0.2.0/24).
 - `penn-pilot.py` + `.sh`: gate 3 of docs/integration-004.md; reuses rehearsal helpers (`cfr_*`). `penn_pilot_v2.py`: schema v2 pieces (roles, policy validator, legs, v2 phase timing, digest rules), loaded by penn-pilot.py (not a script). `penn_pilot_leg2.py`: v2 leg-2 pty driver (marker watcher, `ssh -tt` commit legs, digest-bound argv), also loaded by penn-pilot.py.
