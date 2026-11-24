@@ -7,6 +7,10 @@ import { id } from '../../shared/src/router-schema.ts';
 import { requirePrivatePath } from './integration-config.ts';
 
 export type ContentFilterMode = 'off' | 'owner' | 'parents';
+
+export function contentFilterVisible(mode: ContentFilterMode, ownerAccountId: string | undefined, accountId: string): boolean {
+    return mode === 'parents' || (mode === 'owner' && ownerAccountId !== undefined && accountId === ownerAccountId);
+}
 /**
  * The manifest's contentFilter setting (PRP-006 A2). Absent is off. It names where the API key lives and never contains it.
  * When mode is owner or parents, apiKeyFile, defaultProfile and a non-empty profiles map are all present.

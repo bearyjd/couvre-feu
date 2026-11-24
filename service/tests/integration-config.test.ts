@@ -62,6 +62,15 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         assert.equal(c.installReadiness, undefined);
         for (const enabled of [true, false]) { save({...manifest, installReadiness: {enabled}}); assert.deepEqual(integrationConfig(path).installReadiness, {enabled}); }
         for (const installReadiness of [{enabled: 'true'}, {}, {enabled: true, extra: 1}, true, null]) { save({...manifest, installReadiness}); assert.throws(() => integrationConfig(path)); }
+        // schedules.editable (roadmap item 2, S1): absent is OFF; strict {editable: boolean}. Unverified on this router.
+        assert.equal(c.schedules, undefined);
+        for (const editable of [true, false]) { save({...manifest, schedules: {editable}}); assert.deepEqual(integrationConfig(path).schedules, {editable}); }
+        for (const schedules of [{editable: 'true'}, {}, {editable: true, extra: 1}, true, null]) { save({...manifest, schedules}); assert.throws(() => integrationConfig(path)); }
+        // With the flag on, the one-time seed would hit the 8-per-child trigger at startup: a 9-window manifest is refused when loaded.
+        const windows = (n: number) => Array.from({length: n}, (_, i) => ({person: 'pilot', id: `w${i}`, weekdays: ['Sat'], start: '10:00', stop: '11:00'}));
+        const windowed = (n: number) => ({...manifest, schedules: {editable: true}, scheduleClock: {timezone: 'UTC'}, enrollment: {...manifest.enrollment, schedules: windows(n)}});
+        save(windowed(9)); assert.throws(() => integrationConfig(path), /invalid_schedules/);
+        save(windowed(8)); assert.equal(integrationConfig(path).enrollment.schedules.length, 8);
         // push and digest (B7): absent is OFF; strict {enabled: boolean}; the digest is delivered by push, so it needs push on.
         assert.equal(c.push, undefined); assert.equal(c.digest, undefined);
         for (const enabled of [true, false]) { save({...manifest, push: {enabled}}); assert.deepEqual(integrationConfig(path).push, {enabled}); }
@@ -70,6 +79,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         save({...manifest, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
         save({...manifest, push: {enabled: false}, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
         save({...manifest, push: {enabled: true}, digest: {enabled: true}}); assert.deepEqual(integrationConfig(path).digest, {enabled: true});
+        // digestPreview: absent is OFF; strict {enabled: boolean}; independent of push.
+        assert.equal(c.digestPreview, undefined);
+        for (const enabled of [true, false]) { save({...manifest, digestPreview: {enabled}}); assert.deepEqual(integrationConfig(path).digestPreview, {enabled}); }
+        for (const digestPreview of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, day: 1}, true, null, []]) { save({...manifest, digestPreview}); assert.throws(() => integrationConfig(path)); }
         // rewardTime (F4): absent is OFF; strict {enabled: boolean}.
         assert.equal(c.rewardTime, undefined, 'reward time is off unless explicitly enabled');
         for (const enabled of [true, false]) { save({...manifest, rewardTime: {enabled}}); assert.deepEqual(integrationConfig(path).rewardTime, {enabled}); }

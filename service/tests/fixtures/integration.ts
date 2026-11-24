@@ -121,12 +121,28 @@ export class TestRouter implements AsyncRouter {
         return this.transform ? this.transform(result) : result;
     }
 }
-export function integrationFixture() {
-    const dir = mkdtempSync(join(tmpdir(), 'cf-integration-test-')), config = testConfig(dir), store = new IntegrationStore(config);
+/** Per-run values: UUIDs, 64-hex digests and 32-byte base64url ids (both derived from random ids, or random themselves). */
+const RANDOMISH = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])|(?<![\w-])[\w-]{43}(?![\w-])/g;
+/**
+ * Every table's rows (natural order) as text, with the temporary data directory and per-run values replaced by first-seen indices, so
+ * two runs of one scenario compare equal exactly when they stored the same rows with the same equalities. The one-time schedule seed
+ * marker and the seeded schedule_windows rows are left out. An empty label-intent table is also omitted; unexpected rows still change the snapshot.
+ */
+export function storeDump(store: IntegrationStore): string {
+    const tables = store.all<{name: string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schedule_seed','schedule_windows') AND (name <> 'schedule_kind_intents' OR EXISTS (SELECT 1 FROM schedule_kind_intents)) ORDER BY name");
+    const text = JSON.stringify(tables.map(t => [t.name, store.all(`SELECT * FROM "${t.name}"`)])).replaceAll(store.config.dataDir, '<dataDir>');
+    const seen = new Map<string, number>();
+    return text.replace(RANDOMISH, u => `#${seen.get(u) ?? seen.set(u, seen.size).size - 1}`);
+}
+/** Optional schedules manifest key (absent by default) and a hook that sees the store just before it closes (schedule parity tests). */
+export interface FixtureOptions { schedules?: {editable: boolean}; /** Manifest enrollment carries one nonempty cross-midnight window (and a scheduleClock). */ crossMidnight?: boolean; beforeClose?: (store: IntegrationStore) => void }
+const crossMidnightManifest = () => ({scheduleClock: {timezone: 'UTC'}, enrollment: normalizePolicy({version: 1, revision: 0, people: [{id: 'pilot', macs: ['02:10:20:30:40:50']}], pauses: [], schedules: [{person: 'pilot', id: 'night', weekdays: ['Mon' as const, 'Tue' as const], start: '20:30', stop: '07:00'}]})});
+export function integrationFixture(options: FixtureOptions = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'cf-integration-test-')), config: IntegrationConfig = {...testConfig(dir), ...(options.schedules ? {schedules: options.schedules} : {}), ...(options.crossMidnight ? crossMidnightManifest() : {})}, store = new IntegrationStore(config);
     let clock = 1791691200;
     const now = () => clock, policy = new IntegrationPolicy(store, now), router = new TestRouter(store, now), worker = new IntegrationWorker(store, router, now);
     router.elapse = seconds => { clock += seconds; };
-    return {dir, config, store, now, policy, router, worker, advance: (seconds: number) => {clock += seconds;}, cleanup: () => {store.close(); rmSync(dir, {recursive: true, force: true});},
+    return {dir, config, store, now, policy, router, worker, advance: (seconds: number) => {clock += seconds;}, cleanup: () => {options.beforeClose?.(store); store.close(); rmSync(dir, {recursive: true, force: true});},
         observe: async () => { const plan = worker.prepare('observe'); await worker.execute(plan, plan.scriptSha256); },
         pause: (until = 0, key = 'test_key_123456789') => policy.mutate(actor, 'pilot', 'pause', {until}, policy.people(actor).revisionToken!, key)};
 }

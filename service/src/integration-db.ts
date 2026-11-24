@@ -8,15 +8,21 @@ import { policyJSON } from '../../shared/src/router-schema.ts';
 import { AppError } from '../../shared/src/errors.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { seedChildren } from './integration-children.ts';
+import { schedulesInDatabase, seedScheduleWindows } from './integration-schedule-store.ts';
+import { withFixedErrorCodes } from './integration-router-codes.ts';
 
 export interface IntegrationState {
     generation: string; dispatch_epoch: number; dispatch_stopped: number; active_operation_id: string | null;
     observation_sequence: number; observation_error: string | null;
 }
 export const AUTOMATIC_READ_RETENTION = 64;
+export interface IntegrationStoreOptions {
+    /** Seed schedule_windows on open (flag on, no seed yet). The rebind CLI opens with false: its seed commits only inside a successful rebind. */
+    seedSchedules?: boolean;
+}
 export class IntegrationStore extends Store {
     readonly config: IntegrationConfig;
-    constructor(config: IntegrationConfig) {
+    constructor(config: IntegrationConfig, options: IntegrationStoreOptions = {}) {
         requirePrivatePath(config.dataDir, 'directory');
         const path = join(config.dataDir, 'integration.sqlite');
         for (const name of [path, path + '-wal', path + '-shm', path + '-journal']) {
@@ -66,9 +72,25 @@ export class IntegrationStore extends Store {
         this.runMigration('integration-007.sql', 'operations', "'allow'");
         // integration-008 (content filtering A5): parent_alerts admits `filter_drift`. Marker: the kind CHECK.
         this.runMigration('integration-008.sql', 'parent_alerts', "'filter_drift'");
+        // integration-010 (schedules.editable, S2a): operations.action admits schedule_create/update/delete. Marker: the action CHECK. Only schedule_update is written (flag on).
+        this.runMigration('integration-010.sql', 'operations', "'schedule_delete'");
         // Migration 008 data: the manifest's single child and device seed the database exactly once. Time 0 keeps the seed
         // deterministic and ordered before anything an admin adds later.
         this.transaction(() => seedChildren(this, config, 0));
+        // integration-009 (schedules.editable, S1): additive schedule_windows and schedule_seed tables; applied once (marker: the schedule_seed table). Seeded once, only with the flag on.
+        if (!this.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedule_seed'")) this.transaction(() => this.db.exec(readFileSync(new URL('../migrations/integration-009.sql', import.meta.url), 'utf8')));
+        // Store has reserved integration user_version 17. This atomic marker lets startup resume after an interruption.
+        const hasScheduleKinds = () => this.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedule_kind_intents'");
+        if (!hasScheduleKinds()) {
+            try {
+                this.transaction(() => {
+                    if (!hasScheduleKinds()) this.db.exec(readFileSync(new URL('../migrations/019.sql', import.meta.url), 'utf8'));
+                });
+            } catch (error) { this.close(); throw error; }
+        }
+        if (options.seedSchedules !== false) {
+            try { this.transaction(() => seedScheduleWindows(this, config)); } catch (error) { this.close(); throw error; }
+        }
         // Separate additive state keeps existing manifest-bound databases readable.
         this.db.exec(`CREATE TABLE IF NOT EXISTS automatic_dispatch (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL,
@@ -107,7 +129,9 @@ export class IntegrationStore extends Store {
     integrationState(): IntegrationState { return this.get<IntegrationState>('SELECT * FROM integration_state WHERE singleton=1')!; }
     observation(): {value: RPCObservation | null; observedAt: number | null} {
         const s = this.get<{observation_json: string | null; observed_at: number | null}>('SELECT observation_json,observed_at FROM service_state WHERE singleton=1')!;
-        return {value: s.observation_json ? JSON.parse(s.observation_json) as RPCObservation : null, observedAt: s.observed_at};
+        const value = s.observation_json ? JSON.parse(s.observation_json) as RPCObservation : null;
+        // schedules.editable on (S2a, unverified on this router): router text cached before the flag flip (a rebind keeps observation_json) is never served.
+        return {value: value && schedulesInDatabase(this.config) ? withFixedErrorCodes(value) : value, observedAt: s.observed_at};
     }
     /** Local fence only. It revokes future invocations; it cannot prove remote drain. */
     stopDispatch(now = Math.floor(Date.now() / 1000)): void {

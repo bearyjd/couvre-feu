@@ -3,19 +3,26 @@ import { operationalAlerts } from './operational-alerts.ts';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../shared/src/errors.ts';
 import { object } from '../../shared/src/json.ts';
-import { integer, normalizePolicy, policyJSON, healthyConfirmation } from '../../shared/src/router-schema.ts';
+import { effectivePauses, integer, normalizePolicy, policyJSON, healthyConfirmation } from '../../shared/src/router-schema.ts';
 import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { exactHealthy, normalizeEnvelope, policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
-import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
+import type { Actor, OperationDTO, OperationState, PeopleDTO, PersonDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
-import { integrationScheduleState } from './integration-schedules.ts';
+import { activeScheduleEnd, integrationScheduleState } from './integration-schedules.ts';
+import { recurringFocusEnabled, scheduleWindows, scheduleWindowsForDTO, schedulesInDatabase } from './integration-schedule-store.ts';
+import { planWindowKinds, saveScheduleKindIntent } from './integration-schedule-kind.ts';
 import { allowanceView, scheduleWithAllowance } from './integration-allowance.ts';
-import { activeChildren, configuredMacs, devicesOf, validateManagedPolicy } from './integration-children.ts';
-import type { ChildRow } from './integration-children.ts';
+import { CLIENT_KEY, TOKEN, activeChildren, childrenSeam, configuredMacs, devicesOf, staticDoh, validateManagedPolicy } from './integration-children.ts';
+import type { ChildRow, ScheduleOverlay } from './integration-children.ts';
+import { scheduleBuild, scheduleRequestWindows } from './integration-schedule-request.ts';
+import { isScheduleAction } from './integration-schedule-admit.ts';
 import { audited } from './parent-audit.ts';
-import { reconcileStaticDoh, protectedAddressesOf } from './doh-list.ts';
+import { scheduleSkipDeadline } from './integration-schedule-allowance.ts';
+import { scheduleMutate } from './integration-schedule-mutate.ts';
+import type { ScheduleGate } from './integration-schedule-mutate.ts';
+import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 /** Focus window (F5): the minutes a parent may start. */
@@ -23,7 +30,7 @@ export const FOCUS_MINUTES: readonly number[] = [15, 30, 45, 60, 90, 120];
 /** How a pause ends: 'manual' takes the caller's `until`; 'focus' runs `minutes` from router time (F5). */
 type PauseSpec = {kind: 'manual'} | {kind: 'focus'; minutes: number};
 export interface IntegrationOperation {
-    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow'; revision: number;
+    id: string; actor_id: string; person_id: string; action: 'pause' | 'resume' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow' | 'schedule_create' | 'schedule_update' | 'schedule_delete'; revision: number;
     state: OperationState; payload_json: string; base_json: string; request_json: string; idempotency_key: string;
     created_at: number; updated_at: number; error: string | null; confirmed_at: number | null;
 }
@@ -64,11 +71,26 @@ export class IntegrationPolicy {
     }
     /** Visibility is "any row": a viewer sees an operation through any child they manage. */
     private visibleTo(actor: Actor, op: IntegrationOperation): boolean { return this.affectedPeople(op).some(person => actor.personIds.includes(person)); }
+    /**
+     * Flag off: main's reads (they throw on a missing rpc row or a malformed envelope, which no producer writes). Flag schedules.editable on:
+     * total, so a schedule operation refused for corrupt rows (S0) stays readable with its stored state and error.
+     */
+    private rpcView(op: IntegrationOperation): {phase: string; delivery: string; lease_until: number | null; e: RPCEnvelope | null} {
+        const r = this.store.get<{phase: string; delivery: string; lease_until: number | null}>('SELECT phase,delivery,lease_until FROM operation_rpc WHERE operation_id=?', op.id);
+        // A stored schedule action stays tolerant across flag changes: an S0-settled edit may keep a missing or malformed rpc row after a
+        // permitted rebind to flag off. Every other action keeps main's reads.
+        if (!schedulesInDatabase(this.store.config) && !isScheduleAction(op.action)) return {...r!, e: this.envelope(op.id)};
+        let e: RPCEnvelope | null = null;
+        try { e = this.envelope(op.id); } catch { e = null; }
+        // Bound to this operation before any confirmation or acceptance is derived from it: an envelope naming another id is no envelope.
+        if (e && e.operation_id !== op.id) e = null;
+        return {...(r ?? {phase: 'resolved', delivery: 'not_dispatched', lease_until: null}), e};
+    }
     private dto(op: IntegrationOperation, viewer?: Actor): OperationDTO {
-        const r = this.store.get<{phase: string; delivery: string}>('SELECT phase,delivery FROM operation_rpc WHERE operation_id=?', op.id)!;
-        const o = this.store.observation().value, e = this.envelope(op.id), fresh = this.fresh(), healthy = fresh && o !== null && exactHealthy(o, e);
-        const superseded = fresh && o !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
-        const uncertainClaim = r.phase === 'claimed' && (this.store.get<{lease_until: number}>('SELECT lease_until FROM operation_rpc WHERE operation_id=?', op.id)!.lease_until <= this.now());
+        const {e, ...r} = this.rpcView(op);
+        const o = this.store.observation().value, fresh = this.fresh(), healthy = fresh && o !== null && e !== null && exactHealthy(o, e);
+        const superseded = fresh && o !== null && e !== null && (o.acceptedPolicy.revision !== e.policy.revision || o.policyDigest !== policyDigest(e.policy) || o.currentOperationId !== op.id);
+        const uncertainClaim = r.phase === 'claimed' && (r.lease_until ?? 0) <= this.now();
         const state: OperationState = uncertainClaim ? 'unknown' : op.state === 'confirmed' && !healthy ? superseded ? 'conflict' : 'unknown' : op.state;
         // A bulk operation's representative child may be outside the viewer's scope: name one they can see instead.
         const personId = viewer ? this.affectedPeople(op).find(person => viewer.personIds.includes(person)) ?? op.person_id : op.person_id;
@@ -148,7 +170,7 @@ export class IntegrationPolicy {
      * records local intent (e.g. a device row) under the new operation id before the result is validated.
      */
     queue(actor: Actor, person: string, action: IntegrationOperation['action'], request: string, key: string, precondition: string | null,
-        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person]): IntegrationOperation {
+        build: (base: RouterPolicy) => RouterPolicy, stage?: (id: string) => void, affected: readonly string[] = [person], overlay?: ScheduleOverlay, options?: {preserveDoh: true}): IntegrationOperation {
         if (!this.store.db.isTransaction) throw new Error('queue_requires_transaction');
         if (!this.fresh()) throw new AppError(503, 'approved_router_observation_required');
         const o = this.store.observation().value!;
@@ -156,9 +178,12 @@ export class IntegrationPolicy {
         if (this.store.integrationState().active_operation_id !== null) throw new AppError(409, 'operation_in_progress');
         if (o.generation !== this.store.config.router.generation || o.errors.length || !healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime)) throw new AppError(503, 'router_runtime_unconfirmed');
         validateManagedPolicy(o.acceptedPolicy, this.store.config, this.store, false);
-        const policy = this.withStaticDoh(build(o.acceptedPolicy)), id = randomUUID(), now = this.now();
+        // Schedule edits and schedule allowances each copy DoH from the accepted base.
+        const built = build(o.acceptedPolicy), doh = isScheduleAction(action) || options?.preserveDoh ? {policy: built, tag: null} : staticDoh(built, this.store.config);
+        const policy = doh.policy, id = randomUUID(), now = this.now();
+        if (doh.tag) process.stderr.write(`${doh.tag}\n`);
         stage?.(id);
-        validateManagedPolicy(policy, this.store.config, this.store, false);
+        validateManagedPolicy(policy, this.store.config, this.store, false, overlay);
         const envelope = normalizeEnvelope({rpc_version: 1, generation: o.generation, operation_id: id, expected_revision: o.acceptedPolicy.revision, expected_digest: o.policyDigest, policy});
         this.store.run("INSERT INTO operations(id,actor_id,person_id,action,revision,state,payload_json,base_json,request_json,idempotency_key,created_at,updated_at,error) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?,?)", id, actor.id, person, action, policy.revision, policyJSON(policy), policyJSON(o.acceptedPolicy), request, key, now, now, this.automaticEnabled() ? 'awaiting_automatic_dispatch' : 'awaiting_operator_dispatch');
         for (const child of new Set(affected)) this.store.run('INSERT INTO operation_people(operation_id,person_id) VALUES(?,?)', id, child);
@@ -169,15 +194,42 @@ export class IntegrationPolicy {
         return this.row(id)!;
     }
     /**
-     * Flag dnsHardening.dohList: true adds the static public DoH list (and strips retired entries); an explicit false removes the
-     * list and retired entries from the policy being submitted. An absent key returns the policy untouched.
+     * Schedule edit (roadmap item 2, S2a; flag schedules.editable, off: 404 route_not_found; unverified on this router). No HTTP route in S2a.
+     * One schedule_update operation through queue(): a whole-set replace of ONE child's windows (an empty array deletes them all), built from
+     * the router base by withScheduleWindows, so every other child's windows, pauses, allowances, DoH, people and devices are copied as they are.
+     * Admission inside the transaction: the child must be on the router (check 1), at most 8 windows (check 2), the router limits (check 3, via
+     * normalizePolicy), and main's validation of the built policy with this child's planned windows in place of its committed rows (check 4).
      */
-    private withStaticDoh(policy: RouterPolicy): RouterPolicy {
-        const config = this.store.config;
-        if (config.dnsHardening === undefined) return policy;
-        const merged = reconcileStaticDoh(policy.doh, config.dnsHardening.dohList, protectedAddressesOf(config));
-        if (merged.refused > 0) process.stderr.write(`${merged.tag}\n`);
-        return normalizePolicy({...policy, doh: merged.doh}, config.protectedMacs);
+    scheduleEdit(actor: Actor, person: string, input: unknown, precondition: string | undefined, key: string | undefined): {status: number; result: OperationResult} {
+        if (!schedulesInDatabase(this.store.config)) throw new AppError(404, 'route_not_found');
+        this.authorized(actor, person);
+        if (!key || !CLIENT_KEY.test(key)) throw new AppError(400, 'idempotency_key_required');
+        if (!precondition || !TOKEN.test(precondition)) throw new AppError(428, 'revision_precondition_required');
+        const windows = scheduleRequestWindows(person, input), config = this.store.config;
+        const intent = {person, action: 'schedule_update', windows, precondition, permissionVersion: actor.permissionVersion};
+        const op = this.store.transaction(() => {
+            this.store.assertIdentity();
+            const prior = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE actor_id=? AND idempotency_key=?', actor.id, key);
+            if (prior) {
+                try {
+                    const {windowKinds: _kinds, ...saved} = JSON.parse(prior.request_json);
+                    if (JSON.stringify(saved) === JSON.stringify(intent)) return prior;
+                } catch { /* A damaged prior request cannot match. */ }
+                throw new AppError(409, 'idempotency_payload_conflict');
+            }
+            const request = JSON.stringify({...intent, windowKinds: planWindowKinds(this.store, person, windows)});
+            const queued = this.queue(actor, person, 'schedule_update', request, key, precondition, base => scheduleBuild(base, config, person, windows), undefined, [person], {person, windows});
+            saveScheduleKindIntent(this.store, queued.id, request);
+            return queued;
+        });
+        return this.result(op);
+    }
+    /**
+     * Schedule create/update/delete (roadmap item 2, S2m; unverified on this router). Present only while schedules.editable is on, so the HTTP
+     * route keeps answering 403 schedule_editing_unavailable with the flag off.
+     */
+    get scheduleMutate(): ((actor: Actor, person: string, action: ScheduleAction, input: unknown, scheduleId: string | undefined, precondition: string | undefined, key: string | undefined, gate?: ScheduleGate) => {status: number; result: OperationResult}) | undefined {
+        return schedulesInDatabase(this.store.config) ? (...args) => scheduleMutate(this, ...args) : undefined;
     }
     /** The router holds exactly the child's configured MACs (none when it has no devices). */
     private enrolled(o: RPCObservation | null, child: string): boolean {
@@ -188,6 +240,8 @@ export class IntegrationPolicy {
     people(actor: Actor): PeopleDTO {
         const state = this.state(), info = this.store.integrationState(), cached = this.store.observation(), o = cached.value, config = this.store.config;
         const routerHealthy = this.fresh() && o !== null && o.errors.length === 0 && healthyConfirmation(o.status, o.acceptedPolicy, o.routerTime);
+        const editable = schedulesInDatabase(config), now = this.now(), clockDeadline = config.scheduleClock?.conformance?.validUntil;
+        const paused = editable && routerHealthy ? new Set(effectivePauses(o.acceptedPolicy, o.routerTime).map(p => p.person)) : null;
         const children = activeChildren(this.store).filter(child => actor.personIds.includes(child.id));
         const errors = [...(info.observation_error ? [info.observation_error] : []), ...(!this.fresh() ? ['approved_router_observation_required'] : []), ...(o?.errors ?? []), ...(o?.status.errors ?? [])];
         let allEnrolled = true;
@@ -195,6 +249,12 @@ export class IntegrationPolicy {
             const enrolled = this.enrolled(o, child.id), healthy = enrolled && routerHealthy, configured = configuredMacs(this.store, child.id, this.fresh() ? o?.acceptedPolicy.people.find(p => p.id === child.id)?.macs ?? [] : []);
             const validUntil = Math.min(cached.observedAt ?? 0, o?.routerTime ?? 0) + OBSERVATION_FRESH_SECONDS + 1, allowance = allowanceView(o, healthy, child.id);
             if (!enrolled) allEnrolled = false;
+            const activeEnd = o && healthy && paused && !paused.has(child.id) && o.acceptedPolicy.people.some(p => p.id === child.id)
+                ? activeScheduleEnd(o.acceptedPolicy, config, child.id, o.routerTime, now) : null;
+            const allowanceDeadline = typeof activeEnd === 'number' && clockDeadline !== undefined
+                ? Math.min(activeEnd, validUntil, clockDeadline) : null;
+            const skipAvailable = o !== null && allowanceDeadline !== null && allowanceDeadline > now && typeof activeEnd === 'number' &&
+                typeof scheduleSkipDeadline(config, o.routerTime, activeEnd, o.acceptedPolicy.allowances?.find(a => a.person === child.id)?.until ?? 0) === 'number';
             const latest = this.store.get<IntegrationOperation>('SELECT * FROM operations WHERE id IN (SELECT id FROM operations WHERE person_id=?1 UNION SELECT operation_id FROM operation_people WHERE person_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT 1', child.id);
             const dto = latest ? this.dto(latest, actor) : null;
             if (latest && ['pending', 'unknown'].includes(latest.state)) errors.push(latest.error ?? 'awaiting_operator_dispatch');
@@ -202,7 +262,12 @@ export class IntegrationPolicy {
                 evidence: deviceEvidence({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt, personId: child.id, mac: d.identifier, configuredMacs: configured,
                     policy: o?.acceptedPolicy ?? null, status: o?.status ?? null, readError: Boolean(info.observation_error || o?.errors.length), generationMatches: o?.generation === config.router.generation})})),
                 manualPause: o?.acceptedPolicy.pauses.find(a => a.person === child.id) ?? null, effectiveManualPause: o?.status.effectivePauses.find(a => a.person === child.id) ?? null,
-                ...scheduleWithAllowance(integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child.id), allowance, validUntil),
+                ...this.scheduleList(child.id),
+                ...(editable ? {
+                    scheduleAllowanceValidUntil: allowanceDeadline !== null && allowanceDeadline > now ? allowanceDeadline : null,
+                    scheduleSkipTonightAvailable: skipAvailable,
+                } : {}),
+                ...scheduleWithAllowance(this.scheduleState(o, enrolled, healthy, validUntil, child.id), allowance, validUntil),
                 allowance, pauseLabel: allowance ? null : this.pauseLabel(child.id, o?.status.effectivePauses.find(a => a.person === child.id)?.until),
                 observationHealth: info.observation_error ? 'unreachable' as const : healthy ? 'healthy' as const : 'unconfirmed' as const, status: dto?.state ?? (healthy ? 'confirmed' as const : 'unknown' as const), latestOperation: dto,
                 operationalAlerts: operationalAlerts({source: 'router-policy', now: this.now(), sourceObservedAt: o?.routerTime ?? null, serviceReceivedAt: cached.observedAt,
@@ -217,6 +282,24 @@ export class IntegrationPolicy {
             serviceDesiredRevision: normalizePolicy(JSON.parse(state.desired_json)).revision, routerDesiredRevision: o?.status.desiredRevision ?? null,
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
+    }
+    /** Editable integrations expose the child's committed windows, with kind selection only when recurring focus is enabled. */
+    private scheduleList(child: string): Pick<PersonDTO, 'schedules' | 'schedulesEditable' | 'recurringFocusEditable'> {
+        const {config} = this.store;
+        if (!schedulesInDatabase(config)) return {};
+        const recurring = recurringFocusEnabled(config);
+        return {schedules: scheduleWindowsForDTO(this.store, child, recurring), schedulesEditable: true, ...(recurring ? {recurringFocusEditable: true} : {})};
+    }
+    /**
+     * Flag off: main's schedule view. Flag schedules.editable on (unverified on this router): always the committed windows, never the
+     * manifest or the observation; their state is known only while the router holds the child in a healthy observation (an unowned
+     * observation is never stored and sets observation_error, so it is never healthy).
+     */
+    private scheduleState(o: RPCObservation | null, enrolled: boolean, healthy: boolean, validUntil: number, child: string) {
+        const config = this.store.config;
+        if (!schedulesInDatabase(config)) return integrationScheduleState(enrolled ? o!.acceptedPolicy : config.enrollment, config, o?.routerTime ?? null, healthy, this.now(), validUntil, child);
+        const held = o?.acceptedPolicy.people.some(p => p.id === child) === true;
+        return integrationScheduleState({...config.enrollment, schedules: scheduleWindows(this.store)}, config, o?.routerTime ?? null, healthy && held, this.now(), validUntil, child);
     }
     /**
      * 'focus' only while the pause in force IS the one the child's latest pause-changing operation set, and that operation carried the

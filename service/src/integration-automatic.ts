@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../shared/src/errors.ts';
 import { IntegrationWorker } from './integration-worker.ts';
+import { scheduleAttempted } from './integration-schedule-admit.ts';
 
 /** One serialized supervisor. Expiry of a local claim never permits another apply. */
 export class AutomaticDispatch {
@@ -51,11 +52,13 @@ export class AutomaticDispatch {
             if (!this.authorized()) return;
         }
         const rpc = active ? store.get<{attempt_count: number}>('SELECT attempt_count FROM operation_rpc WHERE operation_id=?', active) : null;
-        await this.worker.executeAutomatic(rpc?.attempt_count ? 'receipt' : 'observe', this.owner, rpc?.attempt_count ? active! : undefined);
+        // S2a, flag on (else false, no read): a schedule claim recorded by its apply step alone still reads its own receipt and is never re-applied.
+        const claimed = Boolean(rpc?.attempt_count) || (active !== null && scheduleAttempted(store, active));
+        await this.worker.executeAutomatic(claimed ? 'receipt' : 'observe', this.owner, claimed ? active! : undefined);
         if (!this.authorized() || !policy.fresh()) return;
         active = store.integrationState().active_operation_id;
         const pending = active ? store.get<{phase: string; attempt_count: number}>('SELECT phase,attempt_count FROM operation_rpc WHERE operation_id=?', active) : null;
-        if (pending?.phase === 'queued' && pending.attempt_count === 0) await this.worker.executeAutomatic('apply', this.owner, active!);
+        if (pending?.phase === 'queued' && pending.attempt_count === 0 && !scheduleAttempted(store, active!)) await this.worker.executeAutomatic('apply', this.owner, active!);
     }
     /**
      * Seconds until the next cycle. After a failure the backoff doubles. Otherwise the cycle is kept to the poll cadence by subtracting the time an

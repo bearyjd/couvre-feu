@@ -28,11 +28,14 @@ export interface SessionInfoDTO extends SessionDTO {
     lastInventoryOkAgeSeconds?: number | null;
 }
 export type OperationAction = 'pause' | 'resume' | 'schedule_create' | 'schedule_update' | 'schedule_delete' | 'enroll' | 'unenroll' | 'pause_all' | 'resume_all' | 'move' | 'allow';
+export type ScheduleKind = 'bedtime' | 'focus';
 export interface ScheduleWindowDTO {
     id: string;
     weekdays: string[];
     start: string;
     stop: string;
+    /** Service-only label, filled on integrations with recurring focus enabled. */
+    kind?: ScheduleKind;
 }
 export type OperationState = 'pending' | 'confirmed' | 'unknown' | 'failed' | 'conflict';
 export interface OperationDTO extends Provenance {
@@ -138,6 +141,12 @@ export interface PersonDTO {
     /** Weekly windows from the latest observed policy; present only where this installation allows editing them. */
     schedules?: ScheduleWindowDTO[];
     schedulesEditable?: boolean;
+    /** Scoped integration editor only, when both schedule editing and recurring focus are enabled. */
+    recurringFocusEditable?: true;
+    /** Editable integration only: exclusive allowance eligibility deadline, bounded by window, observation, and clock review, or null. */
+    scheduleAllowanceValidUntil?: number | null;
+    /** Editable integration only: the proposed skip meets the clock review and cap at observation time. */
+    scheduleSkipTonightAvailable?: boolean;
     scheduleTimezone?: string;
     scheduleWitness?: 'none' | 'unverified' | 'owner-reviewed-clock';
     /** Exclusive epoch deadline for a configured schedule claim; null means unknown. */

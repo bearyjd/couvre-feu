@@ -150,6 +150,13 @@ export class ChildAdmin {
     private obligations(person: string): boolean {
         return hasObligation(this.store, {person, includePending: true});
     }
+    /**
+     * Whether the router would hold no MAC for the row's child once this row's MAC leaves: read from the fresh accepted router
+     * policy, never from local rows, so a stale local row the router does not hold cannot stand in for a device the child still has.
+     */
+    private lastRouterMac(o: {acceptedPolicy: {people: {id: string; macs: string[]}[]}}, row: DeviceRow): boolean {
+        return !o.acceptedPolicy.people.some(p => p.id === row.person_id && p.macs.some(m => m !== row.identifier));
+    }
     private apply(actor: Actor, kind: ChildAction, target: string, params: Record<string, unknown>): {status?: number; body?: unknown; op?: IntegrationOperation; audit: string} {
         const now = this.policy.now(), config = this.store.config;
         if (kind === 'child_create') {
@@ -195,7 +202,7 @@ export class ChildAdmin {
             }
             const device = id('d');
             const op = this.policy.queue(actor, target, 'enroll', request({label: params.label, mac}), id('enroll'), params.precondition as string,
-                base => withDevice(base, config, target, mac),
+                base => withDevice(base, config, target, mac, this.store),
                 operation => this.store.run("INSERT INTO devices(id,person_id,label,identifier_kind,identifier,state,operation_id,created_at) VALUES(?,?,?,'mac',?,'enrolling',?,?)", device, target, params.label as string, mac, operation, now));
             return {op, audit: device};
         }
@@ -211,10 +218,10 @@ export class ChildAdmin {
             this.store.run('DELETE FROM devices WHERE id=?', row.id);
             return {body: {removed: row.id, routerChange: false}, audit: `${row.id}:local`};
         }
-        if (devicesOf(this.store, row.person_id).length === 1 && this.obligations(row.person_id)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
+        if (this.lastRouterMac(o, row) && this.obligations(row.person_id)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
         if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
         const op = this.policy.queue(actor, row.person_id, 'unenroll', request({device: row.id}), id('unenroll'), params.precondition as string,
-            base => withoutDevice(base, config, row.person_id, row.identifier),
+            base => withoutDevice(base, config, row.person_id, row.identifier, this.store),
             operation => this.store.run("UPDATE devices SET state='removing',operation_id=? WHERE id=?", operation, row.id));
         return {op, audit: row.id};
     }
@@ -231,10 +238,10 @@ export class ChildAdmin {
         const o = this.store.observation().value!;
         if (!o.acceptedPolicy.people.some(p => p.id === row.person_id && p.macs.includes(row.identifier))) throw new AppError(409, 'device_not_on_router', 'The router does not hold this device.');
         if (devicesOf(this.store, to).length >= DEVICES_PER_CHILD) throw new AppError(409, 'child_device_limit_reached', `The router holds at most ${DEVICES_PER_CHILD} devices per entry.`);
-        if (devicesOf(this.store, row.person_id).length === 1 && this.obligations(row.person_id)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
+        if (this.lastRouterMac(o, row) && this.obligations(row.person_id)) throw new AppError(409, 'child_has_pending_requests', 'A time request for this child is still open.');
         if (params.precondition === null) throw new AppError(428, 'revision_precondition_required');
         const op = this.policy.queue(actor, row.person_id, 'move', request({device: row.id, to}), id('move'), params.precondition as string,
-            base => movePolicy(base, this.store.config, row.person_id, to, row.identifier),
+            base => movePolicy(base, this.store.config, row.person_id, to, row.identifier, this.store),
             operation => this.store.run("UPDATE devices SET state='moving',move_to=?,operation_id=? WHERE id=?", to, operation, row.id), [row.person_id, to]);
         return {op, audit: `${row.id}:${row.person_id}:${to}`};
     }

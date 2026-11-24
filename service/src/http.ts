@@ -1,7 +1,10 @@
+import { readDigestPreview } from './digest-preview.ts';
 import { ChildAdmin, childrenGet, childrenPost } from './admin-children.ts';
 import { BulkOps, bulkPost } from './integration-bulk.ts';
+import { ScheduleStepUp, scheduleStepUpPost } from './integration-schedule-stepup.ts';
 import { IntegrationPolicy } from './integration-policy.ts';
 import { IntegrationGrants } from './integration-allowance.ts';
+import { scheduleAllowance } from './integration-schedule-allowance.ts';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -131,6 +134,7 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
     // Children/device groups and their devices are database-managed only against a real router integration.
     const children = policy instanceof IntegrationPolicy ? new ChildAdmin(auth, policy) : null;
     const bulk = policy instanceof IntegrationPolicy ? new BulkOps(auth, policy) : null;
+    const scheduleStepUp = policy instanceof IntegrationPolicy ? new ScheduleStepUp(auth, policy) : null;
     // Audit log of parent actions: real-router integration only, and only when the manifest turns it on (read per request).
     const audit = policy instanceof IntegrationPolicy ? auditFor(policy.store) : null;
     // The one gate for the audit routes and for the per-viewer auditLog signal on GET /people.
@@ -263,6 +267,11 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, bulkRoute.status, {...provenance, ...bulkRoute.body as object});
                     return;
                 }
+                const scheduleStep = await scheduleStepUpPost(scheduleStepUp, session, path, payload);
+                if (scheduleStep) {
+                    send(response, scheduleStep.status, {...provenance, ...scheduleStep.body as object});
+                    return;
+                }
                 const inventoryWrite = inventoryPost(inventory ?? null, session, path, payload);
                 if (inventoryWrite) {
                     send(response, inventoryWrite.status, {...provenance, ...inventoryWrite.body as object});
@@ -290,6 +299,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                     send(response, result.status, result.result);
                     return;
                 }
+                const scheduleTime = /^\/people\/([a-z][a-z0-9_]{0,31})\/schedule-(extra-time|skip-tonight)$/.exec(path);
+                if (scheduleTime && grants) {
+                    const result = scheduleAllowance(grants.policy, session.dto.actor, scheduleTime[1], scheduleTime[2] === 'extra-time' ? 'schedule_extra_time' : 'schedule_skip_tonight',
+                        payload, request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    response.setHeader('Location', result.result.operationUrl);
+                    send(response, result.status, result.result);
+                    return;
+                }
                 // Focus window: the same gates as Reward Time, plus its own flag.
                 const focus = /^\/people\/([a-z][a-z0-9_]{0,31})\/focus$/.exec(path);
                 if (focus && grants && focusOn(session.dto.actor)) {
@@ -307,11 +324,14 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
                 }
                 const schedule = /^\/people\/([a-z][a-z0-9_]{0,31})\/schedules(?:\/([a-z][a-z0-9_]{0,31})(\/delete)?)?$/.exec(path);
                 if (schedule) {
+                    // Integration installs (S2b): a loosening or deleting edit needs a passkey step-up first. Demo installs keep the direct dispatch.
                     if (!policy.scheduleMutate) {
                         throw new AppError(403, 'schedule_editing_unavailable', 'Schedules are owner-configured in this installation.');
                     }
                     const action = !schedule[2] ? 'schedule_create' : schedule[3] ? 'schedule_delete' : 'schedule_update';
-                    const result = await policy.scheduleMutate(session.dto.actor, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']));
+                    const result = scheduleStepUp
+                        ? await scheduleStepUp.mutate(session, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']))
+                        : await policy.scheduleMutate(session.dto.actor, schedule[1], action, payload, schedule[2], request.headers['if-match'], clientKey(request.headers['idempotency-key']));
                     response.setHeader('Location', result.result.operationUrl);
                     send(response, result.status, result.result);
                     return;
@@ -358,6 +378,16 @@ export function appServer(auth: Auth, policy: PolicyAPI, config: DemoConfig, ale
             const session = auth.session(sessionToken, jar.cf_browser);
             if (path === '/auth/session') {
                 send(response, 200, sessionInfo(session.dto));
+                return;
+            }
+            if (path === '/digest/preview') {
+                if (!(policy instanceof IntegrationPolicy) || policy.store.config.digestPreview?.enabled !== true || session.dto.actor.role !== 'admin') {
+                    throw new AppError(404, 'route_not_found');
+                }
+                const actor = session.dto.actor;
+                send(response, 200, readDigestPreview(policy.store.config, policy.store, clock(), actor.id, {
+                    canSee: person => { try { policy.authorized(actor, person); return true; } catch { return false; } },
+                }));
                 return;
             }
             if (path === '/people') {
