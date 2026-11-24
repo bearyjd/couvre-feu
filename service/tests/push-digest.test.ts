@@ -335,7 +335,7 @@ test('a failed digest send is retried until it lands, and weeks missed collapse 
 
 // ---- Alert quiet hours (D3): low-urgency kinds are held until 07:00 New York; every other kind pushes at any hour. ----
 const NIGHT = utc(2026, 11, 3, 4, 0), MORNING = utc(2026, 11, 3, 12, 0); // 23:00 and 07:00 EST
-const alertRow = (f: ReturnType<typeof integrationFixture>, kind: string, state = 'open', details = '{}') => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot',?,'info',?,?,?,1,?,?)", kind, f.now(), f.now(), f.now(), state, details);
+const alertRow = (f: ReturnType<typeof integrationFixture>, kind: string, state = 'open', details = '{}', severity = 'info', person = 'pilot') => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES(?,?,?,?,?,?,1,?,?)", person, kind, severity, f.now(), f.now(), f.now(), state, details);
 const mark = (f: ReturnType<typeof integrationFixture>, key: string) => f.store.get<{value: number}>('SELECT value FROM notify_state WHERE key=?', key)?.value;
 async function quiet(start: number, run: (h: {f: ReturnType<typeof integrationFixture>; ntfy: Awaited<ReturnType<typeof fakeNtfy>>; logs: string[]; set(t: number): void; boot(): ReturnType<typeof startNotifications> & {}}) => Promise<void>, handler?: Parameters<typeof fakeNtfy>[0]) {
     const f = integrationFixture(), ntfy = await fakeNtfy(handler), logs: string[] = [];
@@ -458,5 +458,18 @@ test('held pushes stay content-free and logs carry fixed tags only', async () =>
         const all = JSON.stringify(ntfy.seen[0].body) + logs.join('');
         for (const forbidden of [HOSTILE, 'Zed', 'script', 'pilot', 'time_request_pending', TOPIC, TOKEN]) assert.ok(!all.includes(forbidden), forbidden);
         for (const l of logs) assert.match(l, /^[a-z_ ]+\n$/);
+    });
+});
+
+test('filter_drift is split by cause: changed (warning) pushes at night, unreachable (info) is held until 07:00', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'filter_drift', 'open', '{"cause":"unreachable"}', 'info'); await n.tick();
+        assert.equal(ntfy.seen.length, 0, 'unreachable is held at night');
+        alertRow(f, 'filter_drift', 'open', '{"cause":"changed"}', 'warning', 'kid2'); await n.tick();
+        assert.equal(ntfy.seen.length, 1, 'changed is urgent and pushes at once');
+        set(MORNING); await n.tick();
+        assert.equal(ntfy.seen.length, 2, 'the held unreachable alert follows at 07:00');
+        await n.tick(); assert.equal(ntfy.seen.length, 2); await n.stop();
     });
 });

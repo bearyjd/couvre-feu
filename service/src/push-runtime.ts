@@ -11,7 +11,9 @@ export const NOTIFY_POLL_MS = 60000;
 export const STOP_WAIT_MS = 2000;
 /** Low-urgency alert kinds held during quiet hours (21:00 to 07:00 New York, owner decision D3). Every other kind, including any added later, is urgent and pushes at any hour. */
 export const HELD_KINDS = ['time_request_pending', 'repeated_blocked_attempts'] as const;
+/** filter_drift is split by cause (owner decision, 2026-11-24): `changed` is raised as a warning and is urgent; `unreachable` is raised as info and is held. */
 const HELD_SQL = HELD_KINDS.map(k => `'${k}'`).join(',');
+const IS_HELD = `(kind IN (${HELD_SQL}) OR (kind='filter_drift' AND severity='info'))`;
 type Db = Pick<IntegrationStore, 'run' | 'get'>;
 
 /** Created only when push is on, so a flag-off service does no extra database work. */
@@ -68,11 +70,11 @@ function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log
     // Upgrade: installs that predate the held mark start it where the urgent mark is, so the old backlog is not replayed.
     if (!held.exists()) held.write(alerts.read());
     if (digest && !digest.exists()) digest.write(slotOf(now()));
-    const top = (last: number, kinds: 'NOT IN' | 'IN') => store.get<{m: number | null}>(`SELECT MAX(id) m FROM parent_alerts WHERE id > ? AND state='open' AND kind ${kinds} (${HELD_SQL})`, last)!.m;
+    const top = (last: number, held: boolean) => store.get<{m: number | null}>(`SELECT MAX(id) m FROM parent_alerts WHERE id > ? AND state='open' AND ${held ? '' : 'NOT '}${IS_HELD}`, last)!.m;
     const heldLogged = {top: 0};
     // Two marks over disjoint kind sets, so neither can pass an alert it has not pushed. Held kinds are looked at only outside quiet hours; one push covers whatever is pending.
     const alertPass = async () => {
-        const quiet = inQuietHours(now()), urgentTop = top(alerts.read(), 'NOT IN'), heldTop = top(held.read(), 'IN');
+        const quiet = inQuietHours(now()), urgentTop = top(alerts.read(), false), heldTop = top(held.read(), true);
         const releasable = quiet ? null : heldTop;
         if (quiet && heldTop !== null && heldLogged.top !== heldTop) { heldLogged.top = heldTop; log('push_alert_held quiet_hours\n'); }
         if (urgentTop === null && releasable === null) return;
