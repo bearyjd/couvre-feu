@@ -461,15 +461,14 @@ test('held pushes stay content-free and logs carry fixed tags only', async () =>
     });
 });
 
-test('filter_drift is split by cause: changed (warning) pushes at night, unreachable (info) is held until 07:00', async () => {
+test('filter_drift stays urgent for both causes: it is never held, so an in-place escalation cannot be lost', async () => {
     await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
         const n = boot(); await n.tick();
         alertRow(f, 'filter_drift', 'open', '{"cause":"unreachable"}', 'info'); await n.tick();
-        assert.equal(ntfy.seen.length, 0, 'unreachable is held at night');
+        assert.equal(ntfy.seen.length, 1, 'unreachable (info) pushes at night');
         alertRow(f, 'filter_drift', 'open', '{"cause":"changed"}', 'warning', 'kid2'); await n.tick();
-        assert.equal(ntfy.seen.length, 1, 'changed is urgent and pushes at once');
+        assert.equal(ntfy.seen.length, 2, 'changed (warning) pushes at once');
         set(MORNING); await n.tick();
-        assert.equal(ntfy.seen.length, 2, 'the held unreachable alert follows at 07:00');
-        await n.tick(); assert.equal(ntfy.seen.length, 2); await n.stop();
+        assert.equal(ntfy.seen.length, 2, 'nothing is left to release at 07:00'); await n.stop();
     });
 });
