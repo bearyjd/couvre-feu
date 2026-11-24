@@ -1,5 +1,5 @@
-import { contentFilterVisible } from './content-filter-config.ts';
 import { AppError } from '../../shared/src/errors.ts';
+import { contentFilterVisible } from './content-filter-config.ts';
 import { addDays, localDay } from './content-filter-day.ts';
 import { digestBlockedReader, DIGEST_WEEK_DAYS } from './digest-blocked.ts';
 import { latestDigestSlot } from './digest.ts';
@@ -14,12 +14,13 @@ interface DigestPreview {
 }
 
 /** Read only the closed weekly aggregate and optional local C4 counts. */
-export function readDigestPreview(config: IntegrationConfig, store: IntegrationStore, now: number, accountId: string): DigestPreview {
+export function readDigestPreview(config: IntegrationConfig, store: IntegrationStore, now: number, accountId: string,
+    log: (line: string) => unknown = line => process.stderr.write(line)): DigestPreview {
     const end = latestDigestSlot(now), start = latestDigestSlot(end - 1);
     const filter = config.contentFilter;
     const blockedReader = filter?.counts?.enabled === true && contentFilterVisible(filter.mode, config.ownerAccountId, accountId) ? digestBlockedReader(config, store) : undefined;
     try {
-        const {requests, grants, pauses, blocked} = weeklyCounts(store, start, end, blockedReader);
+        const {requests, grants, pauses, blocked} = weeklyCounts(store, start, end, blockedReader, log);
         const preview: DigestPreview = {period: {start, end}, counts: {requests, grants, pauses}};
         if (blocked && blocked.daysCounted > 0) {
             const lastDay = addDays(localDay(end), -1);
@@ -27,6 +28,7 @@ export function readDigestPreview(config: IntegrationConfig, store: IntegrationS
         }
         return preview;
     } catch {
+        log('digest_preview_failed\n');
         throw new AppError(503, 'digest_preview_unavailable');
     }
 }
