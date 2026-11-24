@@ -1,6 +1,6 @@
 import type { IntegrationConfig } from './integration-config.ts';
 import type { IntegrationStore } from './integration-db.ts';
-import { digestTick, latestDigestSlot } from './digest.ts';
+import { digestTick, inQuietHours, latestDigestSlot } from './digest.ts';
 import type { DigestStateStore } from './digest.ts';
 import { NtfyPush, ntfySettings, safeLog } from './push-sender.ts';
 import type { DigestCounts, PushEnv, PushOptions } from './push-sender.ts';
@@ -9,6 +9,9 @@ import type { BlockedWeek } from './digest-blocked.ts';
 export const NOTIFY_POLL_MS = 60000;
 /** Shutdown waits for a pass in flight at most this long (the service unit allows 30 s to stop). */
 export const STOP_WAIT_MS = 2000;
+/** Low-urgency alert kinds held during quiet hours (21:00 to 07:00 New York, owner decision D3). Every other kind, including any added later, is urgent and pushes at any hour. */
+export const HELD_KINDS = ['time_request_pending', 'repeated_blocked_attempts'] as const;
+const HELD_SQL = HELD_KINDS.map(k => `'${k}'`).join(',');
 type Db = Pick<IntegrationStore, 'run' | 'get'>;
 
 /** Created only when push is on, so a flag-off service does no extra database work. */
@@ -59,14 +62,23 @@ export function startNotifications(config: IntegrationConfig, store: Db, deps: N
 function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log: (line: string) => unknown): Notifications {
     const push = new NtfyPush(ntfySettings(deps.env ?? process.env), config.origin, {...deps.options, log});
     const now = deps.now ?? (() => Math.floor(Date.now() / 1000)), slotOf = deps.slot ?? latestDigestSlot, digestOn = config.digest?.enabled === true, blockedOn = digestOn && config.contentFilter !== undefined && config.contentFilter.mode !== 'off' && config.contentFilter.counts?.enabled === true;
-    const alerts = stateStore(store, 'alert_push_id'), digest = digestOn ? stateStore(store, 'digest_slot') : null;
+    const alerts = stateStore(store, 'alert_push_id'), held = stateStore(store, 'alert_held_push_id'), digest = digestOn ? stateStore(store, 'digest_slot') : null;
     // First enable starts from now: no backlog of old alerts and no catch-up digest for the week before. (Turning push or digest off and on again later keeps the old marks, so it sends one backlog push and one catch-up digest.)
     if (!alerts.exists()) alerts.write(store.get<{m: number}>('SELECT COALESCE(MAX(id),0) m FROM parent_alerts')!.m);
+    // Upgrade: installs that predate the held mark start it where the urgent mark is, so the old backlog is not replayed.
+    if (!held.exists()) held.write(alerts.read());
     if (digest && !digest.exists()) digest.write(slotOf(now()));
+    const top = (last: number, kinds: 'NOT IN' | 'IN') => store.get<{m: number | null}>(`SELECT MAX(id) m FROM parent_alerts WHERE id > ? AND state='open' AND kind ${kinds} (${HELD_SQL})`, last)!.m;
+    const heldLogged = {top: 0};
+    // Two marks over disjoint kind sets, so neither can pass an alert it has not pushed. Held kinds are looked at only outside quiet hours; one push covers whatever is pending.
     const alertPass = async () => {
-        const last = alerts.read(), top = store.get<{m: number | null}>("SELECT MAX(id) m FROM parent_alerts WHERE id > ? AND state='open'", last)!.m;
-        if (top === null) return;
-        if ((await push.send({kind: 'alert'}, shutdown.signal)).ok) alerts.write(top);
+        const quiet = inQuietHours(now()), urgentTop = top(alerts.read(), 'NOT IN'), heldTop = top(held.read(), 'IN');
+        const releasable = quiet ? null : heldTop;
+        if (quiet && heldTop !== null && heldLogged.top !== heldTop) { heldLogged.top = heldTop; log('push_alert_held quiet_hours\n'); }
+        if (urgentTop === null && releasable === null) return;
+        if (!(await push.send({kind: 'alert'}, shutdown.signal)).ok) return;
+        if (urgentTop !== null) alerts.write(urgentTop);
+        if (releasable !== null) held.write(releasable);
     };
     const deferralLogged = {slot: 0};
     let flight: Promise<void> | null = null;
