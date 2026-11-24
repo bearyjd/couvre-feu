@@ -8,7 +8,7 @@ import type { RouterPolicy } from '../../shared/src/router-schema.ts';
 import type { RPCObservation } from '../../shared/src/router-rpc.ts';
 import { exactHealthy, normalizeEnvelope, policyDigest, requestDigest } from '../../shared/src/router-rpc.ts';
 import type { RPCEnvelope } from '../../shared/src/router-rpc.ts';
-import type { Actor, OperationDTO, OperationState, PeopleDTO, OperationResult } from '../../shared/src/contracts.ts';
+import type { Actor, OperationDTO, OperationState, PeopleDTO, PersonDTO, OperationResult } from '../../shared/src/contracts.ts';
 import { IntegrationStore } from './integration-db.ts';
 import { activeScheduleEnd, integrationScheduleState } from './integration-schedules.ts';
 import { recurringFocusEnabled, scheduleWindows, scheduleWindowsForDTO, schedulesInDatabase } from './integration-schedule-store.ts';
@@ -23,7 +23,6 @@ import { scheduleSkipDeadline } from './integration-schedule-allowance.ts';
 import { scheduleMutate } from './integration-schedule-mutate.ts';
 import type { ScheduleGate } from './integration-schedule-mutate.ts';
 import type { ScheduleAction } from '../../shared/src/schedule-edit.ts';
-import type { ScheduleWindowDTO } from '../../shared/src/contracts.ts';
 
 export const OBSERVATION_FRESH_SECONDS = 30;
 /** Focus window (F5): the minutes a parent may start. */
@@ -284,10 +283,12 @@ export class IntegrationPolicy {
             routerConfirmedRevision: healthy ? o!.status.confirmedRevision : null, revisionToken: healthy && !info.active_operation_id ? this.token() : null,
             observedAt: cached.observedAt, statusAgeSeconds: cached.observedAt === null ? null : Math.max(0, this.now() - cached.observedAt), lastSuccessfulConfirmationAt: state.last_confirmation_at, errors: [...new Set(errors)]};
     }
-    /** Flag on: the child's committed windows and the editable marker, so the existing schedule editor works; flag off: nothing is added. */
-    private scheduleList(child: string): {schedules?: ScheduleWindowDTO[]; schedulesEditable?: boolean} {
-        if (!schedulesInDatabase(this.store.config)) return {};
-        return {schedules: scheduleWindowsForDTO(this.store, child, recurringFocusEnabled(this.store.config)), schedulesEditable: true};
+    /** Editable integrations expose the child's committed windows, with kind selection only when recurring focus is enabled. */
+    private scheduleList(child: string): Pick<PersonDTO, 'schedules' | 'schedulesEditable' | 'recurringFocusEditable'> {
+        const {config} = this.store;
+        if (!schedulesInDatabase(config)) return {};
+        const recurring = recurringFocusEnabled(config);
+        return {schedules: scheduleWindowsForDTO(this.store, child, recurring), schedulesEditable: true, ...(recurring ? {recurringFocusEditable: true} : {})};
     }
     /**
      * Flag off: main's schedule view. Flag schedules.editable on (unverified on this router): always the committed windows, never the

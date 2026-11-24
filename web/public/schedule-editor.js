@@ -10,6 +10,8 @@ export const MAX_EXPANDED_WINDOWS = 256;
 // Mirrors MAX_WINDOWS_PER_CHILD in the integration schedule store.
 const MAX_INTEGRATION_WINDOWS = 8;
 const EXTRA_MINUTES = [15, 30, 60];
+const KIND_LABELS = { bedtime: 'Bedtime', focus: 'Focus' };
+const validKind = (kind) => typeof kind === 'string' && Object.hasOwn(KIND_LABELS, kind);
 // The exclusive observation deadline is FRESH_SECONDS + 1, as in the app's schedule label.
 const MAX_SCHEDULE_CLAIM_SECONDS = 31;
 
@@ -43,8 +45,9 @@ export function expandedWindows(schedules, deviceCount) {
 }
 
 /** Returns field messages; an empty object means the draft is acceptable to submit. */
-export function validateDraft(draft, { schedules, editingId = null, deviceCount, maxSchedules = MAX_SCHEDULES }) {
+export function validateDraft(draft, { schedules, editingId = null, deviceCount, maxSchedules = MAX_SCHEDULES, kindEditable = false }) {
   const errors = {};
+  if (kindEditable && !validKind(draft.kind)) errors.kind = 'Choose Bedtime or Focus.';
   if (!ID_PATTERN.test(draft.id)) errors.id = 'Use a lowercase letter first, then lowercase letters, digits or underscores (up to 32 characters).';
   else if (editingId === null && schedules.some((schedule) => schedule.id === draft.id)) errors.id = 'A schedule with this name already exists.';
   if (!Array.isArray(draft.weekdays) || draft.weekdays.length === 0 || draft.weekdays.some((day) => !DAYS.includes(day))) errors.weekdays = 'Choose at least one day.';
@@ -68,14 +71,14 @@ export function actionVerb(action) {
 
 const SERVER_FIELD = {
   invalid_id: 'id', schedule_id_exists: 'id', invalid_weekday: 'weekdays', empty_weekdays: 'weekdays', duplicate_value: 'weekdays', array_limit: 'weekdays',
-  invalid_clock: 'start', empty_schedule: 'form', expanded_schedule_limit: 'form',
+  invalid_clock: 'start', empty_schedule: 'form', expanded_schedule_limit: 'form', invalid_schedule_kind: 'kind',
 };
 const PASSKEY_REFUSALS = new Set(['invalid_challenge', 'step_up_required', 'step_up_mismatch', 'credential_not_bound',
   'credential_account_mismatch', 'passkey_verification_failed', 'credential_changed']);
 const SESSION_REFUSALS = new Set(['authentication_required', 'session_expired', 'session_browser_mismatch', 'permissions_changed', 'credential_revoked', 'account_disabled']);
 const WRITE_REFUSALS = {
   400: ['invalid_object', 'invalid_fields', 'invalid_id', 'invalid_clock', 'invalid_weekday', 'empty_weekdays', 'duplicate_value',
-    'array_limit', 'empty_schedule', 'expanded_schedule_limit', 'idempotency_key_required'],
+    'array_limit', 'empty_schedule', 'expanded_schedule_limit', 'idempotency_key_required', 'invalid_schedule_kind'],
   403: ['origin_rejected', 'schedule_editing_unavailable'],
   404: ['person_not_found'],
   409: ['schedule_id_exists', 'operation_in_progress', 'schedule_payload_inadmissible', 'person_has_no_enrolled_device',
@@ -85,6 +88,7 @@ const WRITE_REFUSALS = {
 };
 const REFUSAL_TEXT = {
   operation_in_progress: 'Another router change is already in progress. Refresh status before saving again.',
+  recurring_focus_unavailable: 'Recurring focus settings changed. Refresh status, then reopen the schedule form before saving again.',
   schedule_payload_inadmissible: 'These windows exceed the router’s limits. Review the draft before saving again.',
   person_has_no_enrolled_device: 'This child has no enrolled device. Refresh status before saving again.',
 };
@@ -119,12 +123,13 @@ export function createScheduleEditor(deps) {
 
   const editable = () => (state.people?.people ?? []).filter((person) => person.schedulesEditable === true && Array.isArray(person.schedules));
   const integration = () => state.people?.source === 'real-router-integration';
+  const kindEditable = (entry) => integration() && entry?.recurringFocusEditable === true;
   const maxSchedules = () => integration() ? MAX_INTEGRATION_WINDOWS : MAX_SCHEDULES;
   const person = (id) => editable().find((entry) => entry.id === id);
   const reset = () => { view = { open: null, confirm: null, submitted: false, serverErrors: {} }; };
   const context = () => {
     const entry = person(view.open.person);
-    return { schedules: entry.schedules, editingId: view.open.mode === 'edit' ? view.open.originalId : null, deviceCount: entry.devices.length, maxSchedules: maxSchedules() };
+    return { schedules: entry.schedules, editingId: view.open.mode === 'edit' ? view.open.originalId : null, deviceCount: entry.devices.length, maxSchedules: maxSchedules(), kindEditable: view.open.kindEditable };
   };
   const errorsNow = () => ({ ...(view.submitted ? validateDraft(view.open.draft, context()) : {}), ...view.serverErrors });
 
@@ -141,6 +146,13 @@ export function createScheduleEditor(deps) {
       <h4 id="sched-form-title-${key}">${title}</h4>
       <div class="schedule-field"><label for="sched-id-${key}">Name</label><input id="sched-id-${key}" data-field="id" data-focus-key="id" value="${escape(draft.id)}" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" ${mode === 'edit' ? 'readonly' : ''} ${locked} aria-describedby="sched-id-help-${key} sched-id-error-${key}">
         <p class="field-help" id="sched-id-help-${key}">Lowercase letters, digits and underscores; starts with a letter.</p><p class="field-error" data-error="id" id="sched-id-error-${key}"></p></div>
+      ${view.open.kindEditable && kindEditable(entry) ? `<div class="schedule-field">
+        <label for="sched-kind-${key}">Schedule type</label>
+        <select id="sched-kind-${key}" data-field="kind" data-focus-key="kind" aria-describedby="sched-kind-error-${key}" ${locked}>
+          ${Object.entries(KIND_LABELS).map(([kind, label]) => `<option value="${kind}" ${kind === draft.kind ? 'selected' : ''}>${label}</option>`).join('')}
+        </select>
+        <p class="field-error" data-error="kind" id="sched-kind-error-${key}"></p>
+      </div>` : ''}
       <fieldset class="schedule-days"><legend>Days</legend><div class="day-row">${DAYS.map(day).join('')}</div><p class="field-error" data-error="weekdays"></p></fieldset>
       <div class="time-row">
         <div class="schedule-field"><label for="sched-start-${key}">Start</label><input id="sched-start-${key}" type="time" step="60" data-field="start" data-focus-key="start" value="${escape(draft.start)}" ${locked} required><p class="field-error" data-error="start"></p></div>
@@ -201,7 +213,9 @@ export function createScheduleEditor(deps) {
     const open = view.open?.person === entry.id, confirming = view.confirm?.person === entry.id;
     const items = entry.schedules.map((schedule) => {
       const id = escape(schedule.id);
-      return `<li class="schedule-item" data-schedule-id="${id}"><div class="schedule-summary"><strong>${id}</strong><span>${escape(describe(schedule))}</span>
+      const label = kindEditable(entry) && validKind(schedule.kind)
+        ? `<span data-schedule-kind="${schedule.kind}">${KIND_LABELS[schedule.kind]}</span>` : '';
+      return `<li class="schedule-item" data-schedule-id="${id}"><div class="schedule-summary"><strong>${id}</strong>${label}<span>${escape(describe(schedule))}</span>
         <details><summary>Each window</summary><ul class="window-list">${previewWindows(schedule.weekdays, schedule.start, schedule.stop).map((line) => `<li>${escape(line)}</li>`).join('')}</ul></details></div>
         <div class="schedule-actions"><button class="button secondary" type="button" data-sched-action="edit" data-person-id="${key}" data-schedule="${id}" aria-label="Edit schedule ${id} for ${name}" ${enabled ? '' : 'disabled'}>Edit</button>
         <button class="button secondary" type="button" data-sched-action="delete" data-person-id="${key}" data-schedule="${id}" aria-label="Delete schedule ${id} for ${name}" ${enabled ? '' : 'disabled'}>Delete</button></div></li>`;
@@ -245,7 +259,7 @@ export function createScheduleEditor(deps) {
     if ((view.open && !person(view.open.person)) || (view.confirm && !person(view.confirm.person))) reset();
     const enabled = !active && deps.canControl();
     const allowances = people.map(allowanceStatus);
-    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm, view.serverErrors]);
+    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness, kindEditable(entry)]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm, view.serverErrors]);
     if (key === lastKey) return;
     lastKey = key;
     const focused = document.activeElement?.dataset?.focusKey;
@@ -260,7 +274,16 @@ export function createScheduleEditor(deps) {
   function open(personId, mode, schedule) {
     const entry = person(personId);
     if (!entry) return;
-    view = { open: { person: personId, mode, originalId: schedule?.id ?? null, snapshot: windowSnapshot(schedule), draft: schedule ? { id: schedule.id, weekdays: [...schedule.weekdays], start: schedule.start, stop: schedule.stop } : { id: nextId(entry), weekdays: [], start: '', stop: '' } }, confirm: null, submitted: false, serverErrors: {} };
+    const kinds = kindEditable(entry);
+    if (kinds && schedule && !validKind(schedule.kind)) {
+      deps.announce('The schedule type is unavailable. Refresh status before editing this window.', true);
+      return;
+    }
+    const draft = schedule ? { id: schedule.id, weekdays: [...schedule.weekdays], start: schedule.start, stop: schedule.stop }
+      : { id: nextId(entry), weekdays: [], start: '', stop: '' };
+    if (kinds) draft.kind = schedule?.kind ?? 'bedtime';
+    view = { open: { person: personId, mode, originalId: schedule?.id ?? null, snapshot: windowSnapshot(schedule), kindEditable: kinds, draft },
+      confirm: null, submitted: false, serverErrors: {} };
     lastKey = '';
     render();
     root.querySelector(mode === 'edit' ? '[data-field="day"]' : '[data-field="id"]')?.focus();
@@ -287,7 +310,8 @@ export function createScheduleEditor(deps) {
     const allowance = mode === 'extra' || mode === 'skip';
     const generation = state.generation, beforeRevision = state.people.revisionToken, beforeSession = sessionKey(state.session);
     const attempt = { generation, controller: new AbortController(), posting: false }, intentView = view;
-    const originalWindow = mode === 'delete' ? view.confirm.snapshot : view.open?.snapshot;
+    const opened = mode === 'delete' ? view.confirm : view.open;
+    const originalWindow = opened?.snapshot, beforeKindEditable = opened?.kindEditable;
     const scheduleAction = SCHEDULE_ACTION[mode];
     const isIntegration = integration();
     const operationAction = allowance ? 'allow' : isIntegration ? 'schedule_update' : scheduleAction;
@@ -295,7 +319,8 @@ export function createScheduleEditor(deps) {
     const sameSession = () => generation === state.generation && beforeSession === sessionKey(state.session);
     const headers = { 'If-Match': beforeRevision, 'Idempotency-Key': crypto.randomUUID(), 'X-CSRF-Token': state.session.csrfToken };
     const parent = `/people/${encodeURIComponent(personId)}`, base = `${parent}/schedules`;
-    const window = draft && { weekdays: [...draft.weekdays], start: draft.start, stop: draft.stop };
+    const window = draft && { weekdays: [...draft.weekdays], start: draft.start, stop: draft.stop,
+      ...(beforeKindEditable ? { kind: draft.kind } : {}) };
     const [path, body] = mode === 'extra' ? [`${parent}/schedule-extra-time`, { minutes }]
       : mode === 'skip' ? [`${parent}/schedule-skip-tonight`, {}]
         : mode === 'create' ? [base, { id: draft.id, ...window }]
@@ -338,6 +363,10 @@ export function createScheduleEditor(deps) {
         return false;
       }
       const entry = person(personId);
+      if (!allowance && entry && beforeKindEditable !== kindEditable(entry)) {
+        notice('Schedule type settings changed. Close this draft or confirmation and open it again. No change was queued.');
+        return false;
+      }
       if (scheduleId && originalWindow !== windowSnapshot(entry?.schedules.find((schedule) => schedule.id === scheduleId))) {
         notice('The window changed since you opened it. Close this draft or confirmation and open the current window before trying again.');
         return false;
@@ -445,7 +474,9 @@ export function createScheduleEditor(deps) {
           'child_paused', 'schedule_clock_unverified', 'schedule_not_active'].includes(code)) {
           state.needsRefresh = true;
         }
-        const refusal = (allowance ? ALLOWANCE_TEXT[code] : undefined) ?? REFUSAL_TEXT[code];
+        const refusal = code === 'recurring_focus_unavailable' && mode === 'edit' && !beforeKindEditable
+          ? 'Recurring focus is unavailable. You can delete this window or edit its type after recurring focus is re-enabled.'
+          : (allowance ? ALLOWANCE_TEXT[code] : undefined) ?? REFUSAL_TEXT[code];
         const message = demoRefusal ? error.message : refusal ?? error.message;
         deps.announce(demoRefusal ? `The schedule request failed: ${message} Nothing was changed.`
           : refusal ?? `The service refused the schedule change. ${message}`, true);
@@ -470,7 +501,7 @@ export function createScheduleEditor(deps) {
     const errors = validateDraft(view.open.draft, context());
     if (Object.keys(errors).length) {
       updateLive();
-      const first = ['id', 'weekdays', 'start', 'stop'].find((field) => errors[field]);
+      const first = ['id', 'kind', 'weekdays', 'start', 'stop'].find((field) => errors[field]);
       root.querySelector(first === 'weekdays' ? '[data-field="day"]' : first ? `[data-field="${first}"]` : '[data-sched-submit]')?.focus();
       return;
     }
@@ -501,7 +532,7 @@ export function createScheduleEditor(deps) {
     else if (action === 'edit' && window) open(button.dataset.personId, 'edit', window);
     else if (action === 'cancel') close();
     else if (action === 'delete' && window) {
-      view = { open: null, confirm: { person: entry.id, id: window.id, snapshot: windowSnapshot(window) }, submitted: false, serverErrors: {} };
+      view = { open: null, confirm: { person: entry.id, id: window.id, snapshot: windowSnapshot(window), kindEditable: kindEditable(entry) }, submitted: false, serverErrors: {} };
       lastKey = ''; render(); root.querySelector('[data-focus-key="confirm-delete"]')?.focus();
     }
     else if (action === 'cancel-delete') close();

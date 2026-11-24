@@ -141,6 +141,8 @@ export interface PersonDTO {
     /** Weekly windows from the latest observed policy; present only where this installation allows editing them. */
     schedules?: ScheduleWindowDTO[];
     schedulesEditable?: boolean;
+    /** Scoped integration editor only, when both schedule editing and recurring focus are enabled. */
+    recurringFocusEditable?: true;
     /** Editable integration only: exclusive allowance eligibility deadline, bounded by window, observation, and clock review, or null. */
     scheduleAllowanceValidUntil?: number | null;
     /** Editable integration only: the proposed skip meets the clock review and cap at observation time. */
