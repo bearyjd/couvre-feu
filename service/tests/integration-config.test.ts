@@ -79,6 +79,10 @@ test('private manifest validates explicit real bindings, pinned public keys and 
         save({...manifest, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
         save({...manifest, push: {enabled: false}, digest: {enabled: true}}); assert.throws(() => integrationConfig(path), /digest_requires_push/);
         save({...manifest, push: {enabled: true}, digest: {enabled: true}}); assert.deepEqual(integrationConfig(path).digest, {enabled: true});
+        // digestPreview: absent is OFF; strict {enabled: boolean}; independent of push.
+        assert.equal(c.digestPreview, undefined);
+        for (const enabled of [true, false]) { save({...manifest, digestPreview: {enabled}}); assert.deepEqual(integrationConfig(path).digestPreview, {enabled}); }
+        for (const digestPreview of [{enabled: 'true'}, {enabled: 1}, {}, {enabled: true, day: 1}, true, null, []]) { save({...manifest, digestPreview}); assert.throws(() => integrationConfig(path)); }
         // rewardTime (F4): absent is OFF; strict {enabled: boolean}.
         assert.equal(c.rewardTime, undefined, 'reward time is off unless explicitly enabled');
         for (const enabled of [true, false]) { save({...manifest, rewardTime: {enabled}}); assert.deepEqual(integrationConfig(path).rewardTime, {enabled}); }
