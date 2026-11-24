@@ -160,7 +160,7 @@ The B7 service backend (#118) is merged behind `push.enabled` and `digest.enable
 - **Tests:** payload snapshot test asserting no names, MACs, addresses or domains; adapter tests against a local fake push endpoint; digest counts from fixtures; quiet-hours boundaries.
 - **Entry:** Phase 1 audit log merged; owner has picked the provider.
 - **Exit / done:** a test push reaches the owner's phone at home (live, but no router needed); a forced failure shows "push failed". Unverified: delivery during a WAN outage beyond what was tried.
-- **Owner decisions before start:** push provider; digest recipients and day/time; quiet hours default.
+- **Owner decisions before start:** decided 2026-11-24 (see Decisions only the owner can make): self-hosted ntfy with the iPhone relay on; digest to admins only, Sunday 18:00; digest quiet hours 21:00 to 07:00, alerts at any hour except a short list of low-urgency kinds held until morning.
 - **Router release:** none.
 - **Rollout:** owner only, then all parents; digest off until two weekly digests have been checked by the owner.
 - **Stop / rollback:** any payload with a name, address or domain, or any push to a revoked subscription: flag off.
@@ -172,7 +172,7 @@ The B7 service backend (#118) is merged behind `push.enabled` and `digest.enable
 - Connect the existing editor to integration create/update/delete and passkey step-up, with router time, freshness and confirmed operation states. Expose the S4 controls and recurring kind. Age-band templates follow the owner’s choices. Optional S5, exposing kernel timezone, stays with the next approved router release.
 - The Phase 1 allowance and audit paths are merged. Use an approved window for live testing and complete Phase 0 before household rollout.
 - Merge the remaining controls behind the appropriate flags and observe the live time-window tests with offload off and on, a cross-midnight window, and confirmation of an empty set after cleanup. Kernel timezone behavior across DST requires separate evidence.
-- **Owner decisions before start:** age bands and template times; timezone strategy (trust `--kerneltz` only if the live test passes, otherwise service-compiled UTC windows) is decided at the live test.
+- **Owner decisions before start:** age bands decided 2026-11-24 (four bands, each with a school-night and a weekend off-time, editable starting points); timezone strategy (trust `--kerneltz` only if the live test passes, otherwise service-compiled UTC windows) is decided at the live test.
 - **Router release:** none (S5 rides Phase 4 if taken).
 - **Rollout:** owner only on one test child device first, then all parents.
 - **Stop / rollback:** any window that does not block or does not lift as confirmed: flag off, delete test windows, router must confirm an empty set.
@@ -182,7 +182,7 @@ The B7 service backend (#118) is merged behind `push.enabled` and `digest.enable
 - **Steps:** (1) service: unknown-device detection from the existing `rpc-inventory` (new MAC not assigned and not protected), parent list, alerts and pushes (no router change; can merge early in this phase); (2) router: new desired-JSON field for unassigned devices (restricted or guest: internet only, no LAN) with fixture tests in `tests/test-core.py` / `test-rpc.py`, never applied to protected or management MACs; (3) shared schema + service: send the field only when the flag is on; (4) web: device list actions (assign, keep as guest, block); (5) docs: enforcement contract, runbook.
 - **Entry:** Phase 0 passed and its release id is known; Phase 2 merged.
 - **Exit / done:** separate security and code reviews approved; new release id recorded; live: a new test device lands restricted/guest, cannot reach the LAN or the router admin page, and adult devices keep password login to router and CT107. Unverified: behaviour with every phone OS's private-address rotation.
-- **Owner decisions before start:** what "restricted" means; guest isolation scope; whether 9 joins this release.
+- **Owner decisions before start:** decided 2026-11-24: "restricted" is internet only for 24 hours pending a parent's choice, starting with alerts only (decide default-restrict after a month); guests get internet only, no LAN, printers or casting, and no time limit at first. Item 9 rides this release (D9).
 - **Router release:** the one new release id for items 3, 10 (and S5, and 9 if approved before the release is cut).
 - **Rollout:** alerts first (no router effect); then the router field on for one test device window; then household.
 - **Stop / rollback:** any loss of password access from an adult or management device, or any protected MAC caught by the rule: stop, console rollback to the previous release, report. Hard rule: the unassigned rule must never apply to protected MACs; surface the `protectedAbsent` warning from `scope-preview` (rotated adult address) before any live step.
@@ -193,7 +193,7 @@ The B7 service backend (#118) is merged behind `push.enabled` and `digest.enable
 - **Item 9 steps:** (1) re-measure the DNS baseline and record it; (2) router: wider DoH list (port 853 for kids is already blocked, `router/lib/firewall.sh:53-58`), behind a desired-JSON field; no VPN/Tor list (9c, not built); only the kids' firewall DNS rules may change; (3) bypass tests from a test device; (4) docs with the limits (VPN and Tor still work).
 - **Entry:** Phase 0; for 8 also Phase 2 (warning push); for 9 the owner's lift of 2026-10-27 (kids' firewall DNS rules only; `AGENTS.md:39` still forbids dnsmasq and WAN changes; DHCP and adult/management traffic stay out of scope).
 - **Exit / done:** 8: the measured error is shown next to the estimate. 9: baseline before and after recorded; bypass attempts blocked or the gap documented.
-- **Owner decisions before start:** quota semantics and limits; whether to cut a new release for a wider DoH list.
+- **Owner decisions before start:** decided 2026-11-24: estimate only, no auto-pause, "online" is forwarded traffic in a minute, no limits until measured; the wider DoH list stays the checked static list refreshed by hand quarterly, with no release of its own.
 - **Router release:** 8 none (UNVERIFIED until the spike); 9 (wider DoH list only; 9c not built) joins Phase 4's release if the lift came first, otherwise one more release id.
 - **Rollout:** estimate visible to the owner only for two weeks before anyone acts on it; enforcement only after that.
 - **Stop / rollback:** an estimate off by more than the published error, or any DNS breakage for adults: flag off or roll back the release.
@@ -210,16 +210,18 @@ The B7 service backend (#118) is merged behind `push.enabled` and `digest.enable
 
 ### Decisions only the owner can make
 
+On 2026-11-24 the owner accepted every recommendation in the decision briefs D1 to D9; they are recorded in the rows below and the briefs were removed. Decided means the choice is made, not that the feature exists or is verified on the router. D3 changes behaviour: alert pushes have no quiet-hours check today, so the held-until-morning list is new work for Phase 2 step 2.
+
 Asked per phase, not all up front. Already decided (do not re-ask): ask-for-time 60 min cap, no daily limit, lifts pauses and schedules, pause wins; schedule editors, step-up only on loosening/deleting, Extra time/Skip tonight = allowance with the 60 min cap, merge before live proof behind a flag.
 
 | Before | Decision |
 |---|---|
 | Phase 0 | Approve each exact live invocation and its bound plan. Review future watchdog and router-byte changes separately. |
 | Phase 1 | Decided (owner, 2026-10-27): the focus window ends only by a parent/admin; a child's ask never ends it. Reward Time total cap 60 min, audit retention 90 days |
-| Phase 2 | Push provider (ntfy vs Web Push); digest recipients and day/time; quiet hours |
-| Phase 3 | Age bands and template times; timezone strategy at the live test |
-| Phase 4 | What "restricted" means for new devices; guest isolation scope; whether DNS hardening joins this release |
-| Phase 5 | Quota semantics (estimate only or auto-pause) and limits; new router release for a wider DoH list (the rule lift for the kids' firewall DNS rules was given 2026-10-27) |
+| Phase 2 | Decided (owner, 2026-11-24, D2 to D4): self-hosted ntfy with the iPhone relay on; digest to admins only, Sunday 18:00; digest quiet hours 21:00 to 07:00, alerts at any hour except a short list of low-urgency kinds held until morning |
+| Phase 3 | Decided (owner, 2026-11-24, D1): four age bands, each with a school-night and a weekend off-time, as editable starting points. Still open: timezone strategy at the live test |
+| Phase 4 | Decided (owner, 2026-11-24, D5, D6, D9): alert first; restricted = internet only for 24 h pending a parent's choice; alerts only at first, decide default-restrict after a month. Guests: internet only, no LAN, printers or casting, no time limit at first. DNS hardening rides this release |
+| Phase 5 | Decided (owner, 2026-11-24, D7 to D9): estimate only, no auto-pause; "online" = forwarded traffic in a minute; no limits until measured. Wider DoH list: keep the checked static list, refreshed by hand each quarter with a reminder, and no new router release for it alone (the rule lift for the kids' firewall DNS rules was given 2026-10-27) |
 
 ### Unverified
 

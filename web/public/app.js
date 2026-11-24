@@ -9,6 +9,7 @@ import { createFocusWindow } from './focus-window.js';
 import { createAuditLog } from './audit.js';
 import { createContentFilter } from './content-filter.js';
 import { createInstallReadiness } from './install-readiness.js';
+import { createDigestPreview } from './digest-preview.js';
 import { createAccounts } from './accounts.js';
 import { createTabs } from './tabs.js';
 import { composeAbort, createUpdatePrompt, createSessionGrace } from './pwa-update.js';
@@ -34,6 +35,7 @@ const rewardTime = createRewardTime({ session: () => state.session, people: () =
 const contentFilter = createContentFilter({ session: () => state.session, people: () => state.people?.people ?? [] });
 const auditLog = createAuditLog({ session: () => state.session, people: () => state.people });
 const installReadiness = createInstallReadiness({ session: () => state.session, people: () => state.people, offline: () => state.offline });
+const digestPreview = createDigestPreview({ session: () => state.session, offline: () => state.offline });
 const accounts = createAccounts({ session: () => state.session, people: () => state.people?.people ?? [] });
 const updatePrompt = createUpdatePrompt({ banner: $('#update-banner'), reloadButton: $('#update-reload') });
 const sessionGrace = createSessionGrace({ root: $('#session-grace'), text: $('#session-grace-text'), dismiss: $('#session-grace-dismiss') });
@@ -560,6 +562,7 @@ function render() {
   contentFilter.update();
   auditLog.update();
   installReadiness.update();
+  digestPreview.update();
 }
 
 function tick() {
