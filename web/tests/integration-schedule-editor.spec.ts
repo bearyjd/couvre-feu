@@ -424,10 +424,21 @@ const skipPath = '/people/pilot/schedule-skip-tonight';
 const pilotSchedules = (page: Page) => editor(page).locator('[data-schedule-person="pilot"]');
 const extraButton = (page: Page, minutes: number) => pilotSchedules(page).getByRole('button', { name: `Add ${minutes} minutes of extra time`, exact: true });
 
+/** Dispatch the queued operation, then fire the frozen page clock's one 750 ms operation-poll timer and await that read. */
+async function dispatchAndFollow(page: Page, f: World) {
+  await dispatchPending(f);
+  const polled = page.waitForResponse(response => new URL(response.url()).pathname.startsWith('/operations/'));
+  await page.clock.runFor(750);
+  await polled;
+}
+
 async function openAllowanceEditor(page: Page, f: World, { reviewed = true, active = true, claimSeconds = 0, calibrationSeconds = 7200 } = {}) {
-  // Keep the fake service's claim timestamp bound to the browser's wall clock as status is fetched.
+  // Freeze the browser clock at the fake service clock (openEditor advances it by one second before sign-in) and
+  // re-pin it to the service clock on every status read, so the page's one-second clock-agreement check never races real time.
+  await page.clock.install({ time: new Date((f.now() + 1) * 1000) });
+  await page.clock.pauseAt(new Date((f.now() + 1) * 1000 + 1));
   await page.route('**/people', async (route) => {
-    f.advance(Math.round(Date.now() / 1000) - f.now());
+    await page.clock.setSystemTime(new Date(f.now() * 1000));
     if (!claimSeconds) return route.continue();
     const response = await route.fetch();
     const body = await response.json();
@@ -461,13 +472,13 @@ test('schedule extra time waits for router confirmation, permits extension, and 
   expect(sent[0].headers()['if-match']).toBeTruthy();
   expect(sent[0].headers()['idempotency-key']).toBeTruthy();
   expect(sent[0].headers()['x-csrf-token']).toBeTruthy();
-  await dispatchPending(f);
+  await dispatchAndFollow(page, f);
   await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
   expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 900 }]);
   await expect(pilotSchedules(page).locator('time')).toHaveAttribute('datetime', new Date((started + 900) * 1000).toISOString());
   await extraButton(page, 30).click();
   await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
-  await dispatchPending(f);
+  await dispatchAndFollow(page, f);
   await expect(extraButton(page, 60)).toBeEnabled();
   expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 2700 }]);
   await extraButton(page, 60).click();
@@ -484,7 +495,7 @@ test('Skip tonight explains the cap and sends one empty allowance request', asyn
   await pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true }).click();
   expect((await posted).postDataJSON()).toEqual({});
   await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
-  await dispatchPending(f);
+  await dispatchAndFollow(page, f);
   await expect(pilotSchedules(page)).toContainText('Router reported extra time until');
   expect(f.router.policy.allowances).toEqual([{ person: 'pilot', until: started + 3600 }]);
   await expect(pilotSchedules(page).locator('time')).toHaveAttribute('datetime', new Date((started + 3600) * 1000).toISOString());
@@ -534,12 +545,7 @@ test('allowance eligibility from the service ends when the clock review expires'
 test('schedule allowance controls expire before the overall clock witness', async ({ page, integration: f }) => {
   await openAllowanceEditor(page, f, { claimSeconds: 8 });
   await expect(extraButton(page, 15)).toBeEnabled();
-  await page.evaluate(() => {
-    const wall = Date.now.bind(Date);
-    const monotonic = performance.now.bind(performance);
-    Date.now = () => wall() + 10000;
-    Object.defineProperty(performance, 'now', { value: () => monotonic() + 10000 });
-  });
+  await page.clock.fastForward(10000);
   await expect(extraButton(page, 15)).toBeDisabled();
   await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
   await expect(pilotSchedules(page).getByRole('button', { name: /Edit schedule bedtime/ })).toBeEnabled();
