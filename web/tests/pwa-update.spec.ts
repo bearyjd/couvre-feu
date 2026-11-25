@@ -1,6 +1,10 @@
 import { test, expect, enroll } from './browser-fixture.ts';
 import type { Page } from '@playwright/test';
 
+// A rewrite handler can still be reading a session answer when the test body returns (the reloaded page asks again);
+// let it finish before the browser context closes, or its disposed response fails the test.
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: 'wait' }); });
+
 // Rewrites GET /auth/session answers after the page has signed in; sign-in itself is untouched.
 async function rewriteSession(page: Page, change: (body: Record<string, unknown>) => Record<string, unknown>) {
   await page.route('**/auth/session', async (route) => {
@@ -34,6 +38,9 @@ test('Reload with a waiting worker posts skipWaiting and reloads on controllerch
     navigator.serviceWorker.getRegistration = (async () => ({ waiting: worker })) as unknown as typeof navigator.serviceWorker.getRegistration;
   });
   await enroll(page, demo);
+  // The real worker claims this first page shortly after load and fires a genuine controllerchange; let it settle so it
+  // cannot land after Reload registers its listener and reload the page before the stubbed worker takes over.
+  await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true);
   await page.locator('#refresh').click();
   await rewriteSession(page, (body) => ({ ...body, version: 'next-build' }));
   await page.locator('#refresh').click();
