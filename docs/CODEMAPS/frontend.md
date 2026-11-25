@@ -6,7 +6,7 @@
 | app.js (~650 lines) | main UI; calls /auth/session, /people, ops; imports `createX` factories and hands each a mount `<section>` (hidden until a flag or `/people` capability shows it) |
 | auth-client.js | WebAuthn createPasskey/getPasskey |
 | status-cache.js | actor-scoped cache of status/alert evidence |
-| tabs.js | bottom tab bar (top bar from 900 px); hash routes #home #kids #devices #alerts #more; More sub-routes #more/{schedules,activity,audit,accounts,install,digest,about}; wraps the panels, never re-creates them |
+| tabs.js | bottom tab bar (top bar from 900 px); hash routes #home #kids #devices #alerts #more; More sub-routes #more/{schedules,activity,audit,accounts,install,digest,push,about}; wraps the panels, never re-creates them |
 | children.js | children, devices, Block all/Unblock all, bulk and inventory panels (changes behind step-up) |
 | kids-card.js, kids-model.js | Kids tab cards (PR #172); `replacedMacs` |
 | inventory-wizard.js, -wizard-model.js, inventory-triage.js | find-a-device wizard and triage for "Devices on the network" |
@@ -21,6 +21,7 @@
 | focus-window.js | Focus 15-120 min and the Focus chip (only when `/people` says `focusWindow`) |
 | audit.js | "Activity log" (`GET /audit/limit/50`, older via `/before/:id`; only when `/people` says `auditLog`) |
 | content-filter.js | "Content filter" card on Home (`GET/PUT /people/:id/filter`); 404 `route_not_found` hides it for the session; loosening retries with a passkey step-up after a 403 `step_up_required` |
+| push-settings.js | "Notifications" panel in More (`#more/push`; admin only; read-only quiet hours, held kinds, digest schedule, provider state; `GET /push/settings`, 404/403 hides it; "Send test push" posts `/push/test` and shows only sent to push service / push failed (tag) / no push set up; nothing persisted, cleared on sign-out; behind `push.enabled`, unverified) |
 | digest-preview.js | "Weekly digest preview" panel in More (`#more/digest`; admin only; `GET /digest/preview`; 404/403 hides it, 503 shows "unavailable", never zero; nothing persisted, cleared on sign-out; refetches after offline) |
 | install-readiness.js | "Install readiness" panel (`/admin/install-readiness`, admin) |
 | pwa-update.js | update prompt and session grace (`createUpdatePrompt`, `createSessionGrace`); pairs with the `skipWaiting` handler in sw.js |

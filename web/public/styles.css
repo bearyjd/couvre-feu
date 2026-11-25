@@ -1127,3 +1127,5 @@ body:has(#tabbar:not([hidden])) footer { padding-bottom: calc(32px + 64px + env(
   .wizard-sheet { border-radius: var(--radius); }
   .wizard-open-bar { bottom: 1rem; }
 }
+#push-settings-panel ul { margin: 0; padding-left: 18px; }
+#push-settings-panel [data-test-status] { margin: 8px 0 0; min-height: 1.4em; font-weight: 600; }
