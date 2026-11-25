@@ -197,23 +197,34 @@ test('Send test push: a double click sends exactly one POST', async ({ page, int
   expect(posts).toBe(1);
 });
 
-test('an account switch while the settings GET is in flight never draws the stale answer', async ({ page, integration: f }) => {
-  let release!: () => void, held = false;
+// A parent is never offered the panel, so a switch to one clears it with or without the epoch guard. These switch to a second admin.
+const makeSecondAdmin = (f: Parameters<typeof signIn>[1]) => f.store.run("UPDATE accounts SET role='admin' WHERE id='parent'");
+const SECOND = { push: { ...SETTINGS.push, configured: false } };
+
+test('an account switch while the settings GET is in flight never draws the first admin\'s answer for the second', async ({ page, integration: f }) => {
+  makeSecondAdmin(f);
+  let calls = 0, release!: () => void, held = false;
   const gate = new Promise<void>((resolve) => { release = resolve; });
-  await page.route('**/push/settings', async (route) => { held = true; await gate; await route.fulfill(json(SETTINGS)).catch(() => undefined); });
+  await page.route('**/push/settings', async (route) => {
+    if (++calls > 1) { await route.fulfill(json(SECOND)); return; }
+    held = true; await gate; await route.fulfill(json(SETTINGS)).catch(() => undefined);
+  });
   await open(page, f);
   await expect.poll(() => held).toBe(true);
   await page.locator('#logout').click();
   await expect(page.getByLabel('One-use enrollment token')).toBeVisible();
   await reenroll(page, f, 'parent');
-  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/settings');
+  await expect(panel(page).locator('[data-provider]')).toHaveText('ntfy: not set up');
+  const stale = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/settings');
+  // The second admin's own answer is already drawn, so the next /push/settings response is the held first one.
   release();
-  await answered;
-  await expect(panel(page)).toBeHidden();
-  expect(await panel(page).evaluate((n) => n.children.length)).toBe(0);
+  await stale;
+  await expect(panel(page).locator('[data-provider]')).toHaveText('ntfy: not set up');
+  expect(calls).toBe(2);
 });
 
-test('an account switch while the test POST is in flight never draws the stale result', async ({ page, integration: f }) => {
+test('an account switch while the test POST is in flight never draws the first admin\'s result for the second', async ({ page, integration: f }) => {
+  makeSecondAdmin(f);
   await page.route('**/push/settings', (route) => route.fulfill(json(SETTINGS)));
   let release!: () => void, held = false;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -224,11 +235,14 @@ test('an account switch while the test POST is in flight never draws the stale r
   await page.locator('#logout').click();
   await expect(page.getByLabel('One-use enrollment token')).toBeVisible();
   await reenroll(page, f, 'parent');
+  await expect(panel(page).locator('[data-held] li').first()).toBeVisible();
   const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/test');
   release();
   await answered;
-  await expect(panel(page)).toBeHidden();
-  expect(await panel(page).evaluate((n) => n.textContent)).toBe('');
+  const status = panel(page).locator('[data-test-status]');
+  await expect(status).toHaveText('');
+  await expect(panel(page).locator('[data-sent-note]')).toBeHidden();
+  await expect(panel(page).locator('[data-action="test"]')).toHaveAttribute('aria-disabled', 'false');
 });
 
 test('offline hides the panel, and coming back online fetches the settings again and shows it', async ({ page, context, integration: f }) => {
@@ -246,7 +260,7 @@ test('offline hides the panel, and coming back online fetches the settings again
   expect(gets).toBe(2);
 });
 
-test('a test result that arrives while offline does not redraw the hidden panel', async ({ page, context, integration: f }) => {
+test('a test result that arrives while offline leaves the cleared panel empty', async ({ page, context, integration: f }) => {
   await page.route('**/push/settings', (route) => route.fulfill(json(SETTINGS)));
   let release!: () => void, held = false;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -256,7 +270,42 @@ test('a test result that arrives while offline does not redraw the hidden panel'
   await expect.poll(() => held).toBe(true);
   await context.setOffline(true);
   await expect(panel(page)).toBeHidden();
+  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/test');
   release();
+  await answered;
+  await expect.poll(() => panel(page).evaluate((n) => n.children.length)).toBe(0);
+  await expect(panel(page)).toBeHidden();
+  await context.setOffline(false);
+  await expect(panel(page).locator('[data-held] li').first()).toBeVisible();
+});
+
+test('a redraw with the same status text does not touch the status node', async ({ page, integration: f }) => {
+  await page.route('**/push/settings', (route) => route.fulfill(json({ error: { code: 'x' } }, 503)));
+  await open(page, f);
+  const status = panel(page).locator('[data-test-status]');
+  await expect(status).toHaveText('Notification settings unavailable');
+  await status.evaluate((n) => { (window as unknown as { __mutations: number }).__mutations = 0; new MutationObserver((list) => { (window as unknown as { __mutations: number }).__mutations += list.length; }).observe(n, { childList: true, characterData: true, subtree: true }); });
+  const again = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/settings');
+  await panel(page).getByRole('button', { name: 'Try again' }).click();
+  await again;
+  await expect(panel(page).locator('#push-settings-title')).toBeFocused();
+  expect(await page.evaluate(() => (window as unknown as { __mutations: number }).__mutations)).toBe(0);
+});
+
+test('a settings answer that arrives while offline does not redraw the cleared panel', async ({ page, context, integration: f }) => {
+  let gets = 0, release!: () => void, held = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/push/settings', async (route) => {
+    if (++gets > 1) { await route.fulfill(json(SETTINGS)); return; }
+    held = true; await gate; await route.fulfill(json(SETTINGS)).catch(() => undefined);
+  });
+  await open(page, f);
+  await expect.poll(() => held).toBe(true);
+  await context.setOffline(true);
+  await expect(page.locator('#connection')).toContainText('Offline');
+  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/settings');
+  release();
+  await answered;
   await expect.poll(() => panel(page).evaluate((n) => n.children.length)).toBe(0);
   await expect(panel(page)).toBeHidden();
   await context.setOffline(false);

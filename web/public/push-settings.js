@@ -58,7 +58,9 @@ export function createPushSettings({ session, offline }) {
   }
   function announce() {
     const node = root.querySelector('[data-test-status]'), note = root.querySelector('[data-sent-note]'), button = root.querySelector('[data-action="test"]');
-    if (node) node.textContent = settings ? testStatus : (failed ? 'Notification settings unavailable' : '');
+    // Write only on change: rewriting identical text replaces the text node and can make a screen reader repeat it.
+    const text = settings ? testStatus : (failed ? 'Notification settings unavailable' : '');
+    if (node && node.textContent !== text) node.textContent = text;
     if (note) note.hidden = !(settings && sent);
     // aria-disabled, not disabled: a disabled button drops keyboard focus; sendTest() already ignores clicks while testing.
     if (button) button.setAttribute('aria-disabled', String(testing));
@@ -94,8 +96,8 @@ export function createPushSettings({ session, offline }) {
       view.push(el('button', { class: 'button secondary', type: 'button', 'data-action': 'retry', textContent: 'Try again' }));
     } else { clear(); return; }
     frame().querySelector('[data-body]').replaceChildren(...view);
-    announce();
     root.hidden = false;
+    announce(); // after unhiding, so the first announcement is not made into a hidden region
     if (refocus) { refocus = false; const title = root.querySelector('#push-settings-title'); title.tabIndex = -1; title.focus(); }
   }
 
@@ -113,7 +115,10 @@ export function createPushSettings({ session, offline }) {
       if (error.status === 403 || error.status === 404) { loading = false; loaded = true; clear(); return; }
       failed = true;
     }
-    loading = false; draw();
+    loading = false;
+    // An answer that lands while offline is not drawn; forget it so the panel is fetched again when the app is back online.
+    if (offline()) { loaded = false; failed = false; settings = null; return; }
+    draw();
   }
 
   async function sendTest() {
