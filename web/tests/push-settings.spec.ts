@@ -1,6 +1,7 @@
 import { test, expect, signIn } from './bulk-fixture.ts';
 import type { Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { issueOperatorBootstrap } from '../../service/src/auth.ts';
 
 const MAC_PATTERN = /[0-9a-f]{2}(:[0-9a-f]{2}){5}/i;
 const panel = (page: Page) => page.locator('#push-settings-panel');
@@ -45,8 +46,9 @@ test('flag off: the real route is a 404, the panel and its jump link stay hidden
 
 test('403 hides the panel without an unavailable message', async ({ page, integration: f }) => {
   await page.route('**/push/settings', (route) => route.fulfill(json({ error: { code: 'admin_required' } }, 403)));
+  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/settings' && r.status() === 403);
   await open(page, f);
-  await page.waitForTimeout(300);
+  await answered;
   await expect(panel(page)).toBeHidden();
   await expect(page.getByText('Notification settings unavailable')).toHaveCount(0);
 });
@@ -55,7 +57,8 @@ test('an ordinary parent never requests the settings and sees no panel', async (
   let requests = 0;
   page.on('request', (r) => { if (new URL(r.url()).pathname === '/push/settings') requests++; });
   await open(page, f, 'parent');
-  await page.waitForTimeout(500);
+  await expect(page.locator('#more-jump')).toBeVisible();
+  await expect(page.locator('#more-jump a[data-target="#push-settings-panel"]')).toBeHidden();
   expect(requests).toBe(0);
   await expect(panel(page)).toBeHidden();
 });
@@ -110,7 +113,7 @@ test('Send test push: the cooldown (429) and a network error get plain messages,
   await open(page, f);
   const button = panel(page).getByRole('button', { name: 'Send test push' });
   await button.click();
-  await expect(panel(page).locator('[data-test-status]')).toHaveText('Please wait 30 seconds before sending another test');
+  await expect(panel(page).locator('[data-test-status]')).toHaveText('Please wait before sending another test');
   mode = 'abort';
   await button.click();
   await expect(panel(page).locator('[data-test-status]')).toHaveText('The test could not be sent');
@@ -155,4 +158,107 @@ test('/push-settings.js is in sw.js ASSETS, in the http.ts allowlist, and served
   const response = await page.request.get(`${f.origin}/push-settings.js`);
   expect(response.status()).toBe(200);
   expect(response.headers()['content-type']).toContain('text/javascript');
+});
+
+const reenroll = async (page: Page, f: Parameters<typeof signIn>[1], account: 'operator' | 'parent') => {
+  await page.getByLabel('One-use enrollment token').fill(issueOperatorBootstrap(f.store, account, f.now()));
+  await page.getByRole('button', { name: 'Create a passkey' }).click();
+  await expect(page.locator('#status-view')).toBeVisible();
+  await page.locator('#tab-more').click();
+};
+
+test('Send test push: focus stays on the button and the status is one persistent role=status node', async ({ page, integration: f }) => {
+  await page.route('**/push/settings', (route) => route.fulfill(json(SETTINGS)));
+  await page.route('**/push/test', (route) => route.fulfill(json({ result: 'sent_to_push_service' })));
+  await open(page, f);
+  const button = panel(page).locator('[data-action="test"]'), status = panel(page).locator('[data-test-status]');
+  const handle = await status.elementHandle();
+  await button.focus();
+  await button.press('Enter');
+  await expect(status).toHaveText('Sent to push service');
+  await expect(button).toBeFocused();
+  await expect(button).toBeEnabled();
+  expect(await handle!.evaluate((n) => n.isConnected)).toBe(true);
+  await expect(panel(page).locator('[role="status"]')).toHaveCount(1);
+  await expect(page.locator('#push-settings-panel')).not.toHaveAttribute('aria-live', /.*/);
+});
+
+test('Send test push: a double click sends exactly one POST', async ({ page, integration: f }) => {
+  await page.route('**/push/settings', (route) => route.fulfill(json(SETTINGS)));
+  let posts = 0, release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/push/test', async (route) => { posts++; await gate; await route.fulfill(json({ result: 'sent_to_push_service' })); });
+  await open(page, f);
+  const button = panel(page).locator('[data-action="test"]');
+  await button.dblclick();
+  await expect(button).toBeDisabled();
+  release();
+  await expect(panel(page).locator('[data-test-status]')).toHaveText('Sent to push service');
+  expect(posts).toBe(1);
+});
+
+test('an account switch while the settings GET is in flight never draws the stale answer', async ({ page, integration: f }) => {
+  let release!: () => void, held = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/push/settings', async (route) => { held = true; await gate; await route.fulfill(json(SETTINGS)).catch(() => undefined); });
+  await open(page, f);
+  await expect.poll(() => held).toBe(true);
+  await page.locator('#logout').click();
+  await expect(page.getByLabel('One-use enrollment token')).toBeVisible();
+  await reenroll(page, f, 'parent');
+  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/settings');
+  release();
+  await answered;
+  await expect(panel(page)).toBeHidden();
+  expect(await panel(page).evaluate((n) => n.children.length)).toBe(0);
+});
+
+test('an account switch while the test POST is in flight never draws the stale result', async ({ page, integration: f }) => {
+  await page.route('**/push/settings', (route) => route.fulfill(json(SETTINGS)));
+  let release!: () => void, held = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/push/test', async (route) => { held = true; await gate; await route.fulfill(json({ result: 'sent_to_push_service' })).catch(() => undefined); });
+  await open(page, f);
+  await panel(page).locator('[data-action="test"]').click();
+  await expect.poll(() => held).toBe(true);
+  await page.locator('#logout').click();
+  await expect(page.getByLabel('One-use enrollment token')).toBeVisible();
+  await reenroll(page, f, 'parent');
+  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === '/push/test');
+  release();
+  await answered;
+  await expect(panel(page)).toBeHidden();
+  expect(await panel(page).evaluate((n) => n.textContent)).toBe('');
+});
+
+test('offline hides the panel, and coming back online fetches the settings again and shows it', async ({ page, context, integration: f }) => {
+  let gets = 0;
+  await page.route('**/push/settings', (route) => { gets++; return route.fulfill(json(SETTINGS)); });
+  await open(page, f);
+  await expect(panel(page).locator('[data-held] li').first()).toBeVisible();
+  expect(gets).toBe(1);
+  await context.setOffline(true);
+  await expect(page.locator('#connection')).toContainText('Offline');
+  await expect(panel(page)).toBeHidden();
+  await context.setOffline(false);
+  await expect(page.locator('#connection')).toContainText('Connected');
+  await expect(panel(page).locator('[data-held] li').first()).toBeVisible();
+  expect(gets).toBe(2);
+});
+
+test('a test result that arrives while offline does not redraw the hidden panel', async ({ page, context, integration: f }) => {
+  await page.route('**/push/settings', (route) => route.fulfill(json(SETTINGS)));
+  let release!: () => void, held = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/push/test', async (route) => { held = true; await gate; await route.fulfill(json({ result: 'sent_to_push_service' })).catch(() => undefined); });
+  await open(page, f);
+  await panel(page).locator('[data-action="test"]').click();
+  await expect.poll(() => held).toBe(true);
+  await context.setOffline(true);
+  await expect(panel(page)).toBeHidden();
+  release();
+  await expect.poll(() => panel(page).evaluate((n) => n.children.length)).toBe(0);
+  await expect(panel(page)).toBeHidden();
+  await context.setOffline(false);
+  await expect(panel(page).locator('[data-held] li').first()).toBeVisible();
 });

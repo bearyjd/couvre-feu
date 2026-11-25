@@ -1,5 +1,5 @@
 // Notifications settings (admin only, read only) and a "Send test push" button. Unverified on this router and phone.
-// There is no people flag for this panel, so an admin probes once per session: 404 or 403 means off (push.enabled is off).
+// There is no people flag for this panel, so an admin probes on first load: 404 or 403 means off (push.enabled is off), and the probe repeats after any offline period.
 // Nothing is persisted: the body lives in closure variables dropped on clear(). All text is set with textContent, and only allowlisted
 // fields are read, so a URL, topic or token could never be drawn even if one were sent.
 const KIND_LABELS = { time_request_pending: 'Extra-time requests', repeated_blocked_attempts: 'Repeated blocked attempts' };
@@ -47,7 +47,22 @@ export function createPushSettings({ session, offline }) {
     if (next !== key) { key = next; epoch++; loading = false; loaded = false; failed = false; testing = false; testStatus = ''; sent = false; clear(); }
     return key;
   }
-  function clear() { settings = null; root.replaceChildren(); root.hidden = true; }
+  function clear() { settings = null; refocus = false; root.replaceChildren(); root.hidden = true; }
+  // The heading, the one status node and the sent note persist across redraws; only the body is rebuilt, so a redraw never moves focus or re-announces.
+  function frame() {
+    if (!root.querySelector('[data-body]')) {
+      root.replaceChildren(el('h2', { id: 'push-settings-title', textContent: 'Notifications' }), el('div', { 'data-body': '' }),
+        el('p', { role: 'status', 'data-test-status': '', 'data-push-status': '' }), el('p', { class: 'fine-print', 'data-sent-note': '', hidden: true, textContent: 'Sent to the push service does not prove the phone got it. Check the phone.' }));
+    }
+    return root;
+  }
+  function announce() {
+    const node = root.querySelector('[data-test-status]'), note = root.querySelector('[data-sent-note]'), button = root.querySelector('[data-action="test"]');
+    if (node) node.textContent = settings ? testStatus : (failed ? 'Notification settings unavailable' : '');
+    if (note) note.hidden = !(settings && sent);
+    // aria-disabled, not disabled: a disabled button drops keyboard focus; sendTest() already ignores clicks while testing.
+    if (button) button.setAttribute('aria-disabled', String(testing));
+  }
   const offered = () => Boolean(key) && session()?.actor.role === 'admin';
 
   async function call(path, post) {
@@ -62,7 +77,8 @@ export function createPushSettings({ session, offline }) {
 
   function draw() {
     if (!offered()) { clear(); return; }
-    const view = [el('h2', { id: 'push-settings-title', textContent: 'Notifications' })];
+    if (offline()) return;
+    const view = [];
     if (settings) {
       const { provider, configured, quietHours, heldKinds, digest } = settings;
       const known = (kind) => Object.hasOwn(KIND_LABELS, kind) ? KIND_LABELS[kind] : OTHER_KIND;
@@ -73,14 +89,12 @@ export function createPushSettings({ session, offline }) {
           el('div', {}, el('dt', { textContent: 'Held until morning' }), el('dd', {}, el('ul', { 'data-held': '' }, ...heldKinds.map((kind) => el('li', { textContent: known(kind) }))))),
           el('div', {}, el('dt', { textContent: 'Weekly digest' }), el('dd', { 'data-digest': '', textContent: `Sundays at ${clock(digest.time)} (New York time), to admins` }))),
         el('p', { class: 'fine-print', textContent: 'Other alerts are sent at any hour.' }),
-        el('button', { class: 'button secondary', type: 'button', 'data-action': 'test', disabled: testing, textContent: 'Send test push' }),
-        el('p', { role: 'status', 'data-test-status': '', textContent: testStatus }));
-      if (sent) view.push(el('p', { class: 'fine-print', textContent: 'Sent to the push service does not prove the phone got it. Check the phone.' }));
+        el('button', { class: 'button secondary', type: 'button', 'data-action': 'test', textContent: 'Send test push' }));
     } else if (failed) {
-      view.push(el('p', { role: 'status', 'data-push-status': '', textContent: 'Notification settings unavailable' }),
-        el('button', { class: 'button secondary', type: 'button', 'data-action': 'retry', textContent: 'Try again' }));
+      view.push(el('button', { class: 'button secondary', type: 'button', 'data-action': 'retry', textContent: 'Try again' }));
     } else { clear(); return; }
-    root.replaceChildren(...view);
+    frame().querySelector('[data-body]').replaceChildren(...view);
+    announce();
     root.hidden = false;
     if (refocus) { refocus = false; const title = root.querySelector('#push-settings-title'); title.tabIndex = -1; title.focus(); }
   }
@@ -105,7 +119,7 @@ export function createPushSettings({ session, offline }) {
   async function sendTest() {
     if (testing || !sync()) return;
     const mine = epoch;
-    testing = true; sent = false; testStatus = 'Sending test push...'; draw();
+    testing = true; sent = false; testStatus = 'Sending test push...'; announce();
     try {
       const message = testMessage((await call('/push/test', true)).result);
       if (mine !== epoch) return;
@@ -113,9 +127,9 @@ export function createPushSettings({ session, offline }) {
       testStatus = message ?? 'The test could not be sent';
     } catch (error) {
       if (mine !== epoch) return;
-      testStatus = error.status === 429 ? 'Please wait 30 seconds before sending another test' : 'The test could not be sent';
+      testStatus = error.status === 429 ? 'Please wait before sending another test' : 'The test could not be sent';
     }
-    testing = false; draw();
+    testing = false; announce();
   }
 
   root.addEventListener('click', (event) => {
