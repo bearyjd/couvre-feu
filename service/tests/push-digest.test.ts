@@ -173,7 +173,7 @@ test('overlapping ticks share one pass and the guard clears afterwards', async (
         const insert = (kind: string) => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES('pilot',?,'warning',?,?,?,1,'open','{}')", kind, f.now(), f.now(), f.now());
         insert('possible_bypass'); await Promise.all([n.tick(), n.tick()]);
         assert.equal(slow.seen.length, 1);
-        insert('repeated_blocked_attempts'); await n.tick(); await n.stop();
+        insert('sync_failed'); await n.tick(); await n.stop();
         assert.equal(slow.seen.length, 2, 'not stuck behind a stale guard');
     } finally { slow.close(); f.cleanup(); }
 });
@@ -331,4 +331,144 @@ test('a failed digest send is retried until it lands, and weeks missed collapse 
     assert.equal(await digestTick(h.deps), 'sent');
     h.set(utc(2026, 11, 23, 15, 0)); // three Sundays later
     assert.equal(await digestTick(h.deps), 'sent'); assert.equal(h.sent.length, 3, 'one failed attempt, then two landed: one per slot, three missed weeks collapsed');
+});
+
+// ---- Alert quiet hours (D3): low-urgency kinds are held until 07:00 New York; every other kind pushes at any hour. ----
+const NIGHT = utc(2026, 11, 3, 4, 0), MORNING = utc(2026, 11, 3, 12, 0); // 23:00 and 07:00 EST
+const alertRow = (f: ReturnType<typeof integrationFixture>, kind: string, state = 'open', details = '{}', severity = 'info', person = 'pilot') => f.store.run("INSERT INTO parent_alerts(person_id,kind,severity,created_at,first_seen,last_seen,count,state,details) VALUES(?,?,?,?,?,?,1,?,?)", person, kind, severity, f.now(), f.now(), f.now(), state, details);
+const mark = (f: ReturnType<typeof integrationFixture>, key: string) => f.store.get<{value: number}>('SELECT value FROM notify_state WHERE key=?', key)?.value;
+async function quiet(start: number, run: (h: {f: ReturnType<typeof integrationFixture>; ntfy: Awaited<ReturnType<typeof fakeNtfy>>; logs: string[]; set(t: number): void; boot(): ReturnType<typeof startNotifications> & {}}) => Promise<void>, handler?: Parameters<typeof fakeNtfy>[0]) {
+    const f = integrationFixture(), ntfy = await fakeNtfy(handler), logs: string[] = [];
+    let clock = start;
+    const boot = () => startNotifications({...f.config, push: {enabled: true}}, f.store, {env: ntfy.env, now: () => clock, options: {sleep: noSleep, log: l => logs.push(String(l))}})!;
+    try { await run({f, ntfy, logs, set: t => { clock = t; }, boot}); } finally { ntfy.close(); f.cleanup(); }
+}
+
+test('quiet hours: a held kind at 23:00 gives no push, an urgent kind in the same pass gives one', async () => {
+    await quiet(NIGHT, async ({f, ntfy, logs, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'time_request_pending'); await n.tick();
+        assert.equal(ntfy.seen.length, 0);
+        assert.equal(logs.filter(l => l === 'push_alert_held quiet_hours\n').length, 1);
+        await n.tick(); assert.equal(logs.filter(l => /push_alert_held/.test(l)).length, 1, 'logged once per held top');
+        alertRow(f, 'possible_bypass'); await n.tick();
+        assert.equal(ntfy.seen.length, 1); await n.stop();
+    });
+});
+test('at 07:00 a held alert pushes exactly once; a repeat pass sends nothing', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'repeated_blocked_attempts'); await n.tick(); assert.equal(ntfy.seen.length, 0);
+        set(MORNING - 1); await n.tick(); assert.equal(ntfy.seen.length, 0, '06:59:59 is still quiet');
+        set(MORNING); await n.tick(); await n.tick();
+        assert.equal(ntfy.seen.length, 1); await n.stop();
+    });
+});
+test('an alert resolved or acknowledged overnight is not pushed at 07:00', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'time_request_pending'); alertRow(f, 'repeated_blocked_attempts'); await n.tick();
+        f.store.run("UPDATE parent_alerts SET state='resolved' WHERE kind='time_request_pending'");
+        f.store.run("UPDATE parent_alerts SET state='acknowledged' WHERE kind='repeated_blocked_attempts'");
+        set(MORNING); await n.tick();
+        assert.equal(ntfy.seen.length, 0); await n.stop();
+    });
+});
+test('restart mid-quiet-hours: the held alert is kept and sent once after 07:00; the urgent mark does not pass it', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const first = boot(); await first.tick();
+        alertRow(f, 'time_request_pending'); await first.tick(); await first.stop();
+        const urgentBefore = mark(f, 'alert_push_id');
+        const second = boot(); await second.tick();
+        assert.equal(ntfy.seen.length, 0); assert.equal(mark(f, 'alert_push_id'), urgentBefore);
+        set(MORNING); await second.tick(); await second.tick();
+        assert.equal(ntfy.seen.length, 1); await second.stop();
+        const third = boot(); await third.tick(); assert.equal(ntfy.seen.length, 1, 'no duplicate after another restart'); await third.stop();
+    });
+});
+test('mixed: a lower-id held alert and a higher-id urgent one push once at night; the held one follows at 07:00 without re-sending the urgent one', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'time_request_pending'); alertRow(f, 'new_device'); await n.tick(); await n.tick();
+        assert.equal(ntfy.seen.length, 1);
+        set(MORNING); await n.tick(); await n.tick();
+        assert.equal(ntfy.seen.length, 2, 'held alert sent at 07:00, urgent not repeated'); await n.stop();
+    });
+});
+test('a held and an urgent alert pending together at 07:00 send one push', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'time_request_pending'); await n.tick();
+        set(MORNING); alertRow(f, 'sync_failed'); await n.tick(); await n.tick();
+        assert.equal(ntfy.seen.length, 1); await n.stop();
+    });
+});
+test('quiet hours release at 07:00 local across both DST changes', async () => {
+    for (const [night, release] of [[utc(2026, 11, 1, 3, 0), utc(2026, 11, 1, 12, 0)], [utc(2027, 3, 14, 3, 0), utc(2027, 3, 14, 11, 0)]]) {
+        await quiet(night, async ({f, ntfy, set, boot}) => {
+            const n = boot(); await n.tick();
+            alertRow(f, 'time_request_pending'); await n.tick();
+            set(release - 1); await n.tick(); assert.equal(ntfy.seen.length, 0, `still held at ${release - 1}`);
+            set(release); await n.tick(); assert.equal(ntfy.seen.length, 1, `released at ${release}`); await n.stop();
+        });
+    }
+});
+test('a failed send moves neither watermark and the next pass retries', async () => {
+    let failing = true;
+    await quiet(MORNING, async ({f, ntfy, boot}) => {
+        const n = boot(); await n.tick();
+        const urgent = mark(f, 'alert_push_id'), held = mark(f, 'alert_held_push_id');
+        alertRow(f, 'new_device'); alertRow(f, 'time_request_pending');
+        await n.tick(); assert.equal(mark(f, 'alert_push_id'), urgent); assert.equal(mark(f, 'alert_held_push_id'), held);
+        failing = false; const before = ntfy.seen.length; await n.tick();
+        assert.equal(ntfy.seen.length, before + 1);
+        assert.ok(mark(f, 'alert_push_id')! > urgent!); assert.ok(mark(f, 'alert_held_push_id')! > held!);
+        await n.stop();
+    }, (_s, _n, res) => { res.statusCode = failing ? 500 : 200; res.end('{}'); });
+});
+test('upgrade seeding: the held mark starts at the urgent mark, with no backlog replay and newer held alerts still held', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        alertRow(f, 'time_request_pending'); alertRow(f, 'new_device');
+        const top = f.store.get<{m: number}>('SELECT MAX(id) m FROM parent_alerts')!.m;
+        f.store.run('CREATE TABLE IF NOT EXISTS notify_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT');
+        f.store.run("INSERT INTO notify_state(key,value) VALUES('alert_push_id',?)", top);
+        alertRow(f, 'repeated_blocked_attempts');
+        const n = boot(); await n.tick();
+        assert.equal(mark(f, 'alert_held_push_id'), top);
+        assert.equal(ntfy.seen.length, 0, 'old backlog not replayed, newer held alert held');
+        set(MORNING); await n.tick(); assert.equal(ntfy.seen.length, 1); await n.stop();
+    });
+});
+test('fresh enable seeds both marks from the newest alert', async () => {
+    await quiet(MORNING, async ({f, ntfy, boot}) => {
+        alertRow(f, 'time_request_pending'); alertRow(f, 'new_device');
+        const n = boot(); await n.tick();
+        const top = f.store.get<{m: number}>('SELECT MAX(id) m FROM parent_alerts')!.m;
+        assert.equal(mark(f, 'alert_push_id'), top); assert.equal(mark(f, 'alert_held_push_id'), top);
+        assert.equal(ntfy.seen.length, 0); await n.stop();
+    });
+});
+test('held pushes stay content-free and logs carry fixed tags only', async () => {
+    await quiet(NIGHT, async ({f, ntfy, logs, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'time_request_pending', 'open', JSON.stringify({note: HOSTILE})); await n.tick();
+        set(MORNING); await n.tick(); await n.stop();
+        assert.equal(ntfy.seen.length, 1);
+        assert.equal(ntfy.seen[0].body, 'New alert. Open the app to see it.');
+        const all = JSON.stringify(ntfy.seen[0].body) + logs.join('');
+        for (const forbidden of [HOSTILE, 'Zed', 'script', 'pilot', 'time_request_pending', TOPIC, TOKEN]) assert.ok(!all.includes(forbidden), forbidden);
+        for (const l of logs) assert.match(l, /^[a-z_ ]+\n$/);
+    });
+});
+
+test('filter_drift stays urgent for both causes (info and warning rows both push at night, nothing is held for 07:00)', async () => {
+    await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
+        const n = boot(); await n.tick();
+        alertRow(f, 'filter_drift', 'open', '{"cause":"unreachable"}', 'info'); await n.tick();
+        assert.equal(ntfy.seen.length, 1, 'unreachable (info) pushes at night');
+        alertRow(f, 'filter_drift', 'open', '{"cause":"changed"}', 'warning', 'kid2'); await n.tick();
+        assert.equal(ntfy.seen.length, 2, 'changed (warning) pushes at once');
+        set(MORNING); await n.tick();
+        assert.equal(ntfy.seen.length, 2, 'nothing is left to release at 07:00'); await n.stop();
+    });
 });
