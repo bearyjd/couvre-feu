@@ -461,7 +461,7 @@ test('held pushes stay content-free and logs carry fixed tags only', async () =>
     });
 });
 
-test('filter_drift stays urgent for both causes: it is never held, so an in-place escalation cannot be lost', async () => {
+test('filter_drift stays urgent for both causes (info and warning rows both push at night, nothing is held for 07:00)', async () => {
     await quiet(NIGHT, async ({f, ntfy, set, boot}) => {
         const n = boot(); await n.tick();
         alertRow(f, 'filter_drift', 'open', '{"cause":"unreachable"}', 'info'); await n.tick();

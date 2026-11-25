@@ -11,8 +11,8 @@ export const NOTIFY_POLL_MS = 60000;
 export const STOP_WAIT_MS = 2000;
 /** Low-urgency alert kinds held during quiet hours (21:00 to 07:00 New York, owner decision D3). Every other kind, including any added later, is urgent and pushes at any hour. */
 export const HELD_KINDS = ['time_request_pending', 'repeated_blocked_attempts'] as const;
-// Only kinds whose severity never changes while open may be held: an in-place escalation of a held row would fall between the two watermarks
-// (filter_drift can go info -> warning on the same id, so it stays urgent; see docs/service-contract.md).
+// The held test uses only the immutable `kind`. A kind may be held only if its severity never rises while the alert is open: a severity-based
+// split (filter_drift can go info -> warning on the same id) would let a row fall between the two watermarks. See docs/service-contract.md.
 const HELD_SQL = HELD_KINDS.map(k => `'${k}'`).join(',');
 const IS_HELD = `kind IN (${HELD_SQL})`;
 type Db = Pick<IntegrationStore, 'run' | 'get'>;
