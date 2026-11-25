@@ -424,12 +424,16 @@ const skipPath = '/people/pilot/schedule-skip-tonight';
 const pilotSchedules = (page: Page) => editor(page).locator('[data-schedule-person="pilot"]');
 const extraButton = (page: Page, minutes: number) => pilotSchedules(page).getByRole('button', { name: `Add ${minutes} minutes of extra time`, exact: true });
 
-/** Dispatch the queued operation, then fire the frozen page clock's one 750 ms operation-poll timer and await that read. */
+/**
+ * Dispatch the queued operation, then fire the frozen page clock's 750 ms operation-poll timer until that read happens. The page registers
+ * the timer only after it has processed the POST answer, which can come after the service marks the operation active, so a single runFor
+ * could fire nothing; retrying runFor (well under the 10 s refresh interval) never hangs and never fires the timer twice.
+ */
 async function dispatchAndFollow(page: Page, f: World) {
   await dispatchPending(f);
-  const polled = page.waitForResponse(response => new URL(response.url()).pathname.startsWith('/operations/'));
-  await page.clock.runFor(750);
-  await polled;
+  let followed = false;
+  void page.waitForResponse(response => new URL(response.url()).pathname.startsWith('/operations/')).then(() => { followed = true; });
+  await expect.poll(async () => { if (!followed) await page.clock.runFor(750); return followed; }).toBe(true);
 }
 
 async function openAllowanceEditor(page: Page, f: World, { reviewed = true, active = true, claimSeconds = 0, calibrationSeconds = 7200 } = {}) {
@@ -545,7 +549,8 @@ test('allowance eligibility from the service ends when the clock review expires'
 test('schedule allowance controls expire before the overall clock witness', async ({ page, integration: f }) => {
   await openAllowanceEditor(page, f, { claimSeconds: 8 });
   await expect(extraButton(page, 15)).toBeEnabled();
-  await page.clock.fastForward(10000);
+  // Past the 8 s claim, short of the page's 10 s status refresh (which would re-read /people and re-pin the claim).
+  await page.clock.fastForward(9000);
   await expect(extraButton(page, 15)).toBeDisabled();
   await expect(pilotSchedules(page).getByRole('button', { name: 'Skip tonight', exact: true })).toBeDisabled();
   await expect(pilotSchedules(page).getByRole('button', { name: /Edit schedule bedtime/ })).toBeEnabled();
