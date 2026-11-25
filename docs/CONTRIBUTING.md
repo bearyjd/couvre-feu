@@ -32,6 +32,8 @@ Host `sh -n` alone is not ash proof: `tests/run.sh` reports `PENDING` when BusyB
 | `npm run demo:scenario` | Demo router scenario CLI |
 | `npm run integration:start -- "<PRIVATE_MANIFEST>"` | Integration-mode service |
 | `npm run integration:bootstrap -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>"` | Enroll an account in integration mode |
+| `npm run integration:rebind -- OLD_MANIFEST NEW_MANIFEST OLD_DIGEST NEW_DIGEST` | Operator-only, service stopped: rebind the database to a new manifest, confirmed by each file's sha256; dispatch stays stopped |
+| `npm run integration:revoke-passkeys -- "<PRIVATE_MANIFEST>" "<ACCOUNT_ID>" [--allow-no-admin]` | Operator-only, on the service host: remove every passkey of one account and end its sessions; `--allow-no-admin` is the sole-admin recovery case, then enroll with `integration:bootstrap` |
 | `npm run integration:dispatch -- prepare\|execute\|stop ...` | Permit-bound router dispatch (see [integration-004](integration-004.md)); never run against a real router without approval of the exact invocation |
 | `sh tests/run.sh` | Router static gate plus all router fixture suites (slow) |
 | `sh tests/run.sh --preflight-only` | Recovery, adapter, probe, ShellCheck and `ash -n` only |
@@ -93,6 +95,9 @@ Read by code today; there is no `.env.example` and nothing is read from a dotenv
 | `CF_DEMO_PORT` | demo service config | `4173` | Demo only |
 | `CF_DEMO_DATA_DIR` | demo service config | `.demo-data` | Demo only |
 | `CF_ACTIVITY_RETENTION_DAYS` | activity store | built-in default; integer 1 to 365, otherwise `invalid_activity_retention_days` | Service |
+| `CF_INVENTORY_RETENTION_DAYS` | inventory store | built-in default; positive integer up to the store's maximum, otherwise `invalid_inventory_retention_days` | Service |
+| `COUVRE_NTFY_URL`, `COUVRE_NTFY_TOPIC`, `COUVRE_NTFY_TOKEN` | push sender (only when `push.enabled`) | none; URL must be a bare http(s) origin, topic 20 to 64 of `A-Za-z0-9_-`, token optional 8 to 256 chars and, over plain http, only to a private host | Service; the token is a credential |
+| `HTTPS_PROXY`, `ALL_PROXY`, `NODE_USE_ENV_PROXY` | NextDNS client (content filter) | unset; setting any of them makes the client refuse to run | Service (must stay unset) |
 | `CF_WEB_TEST_PORT` | `web/playwright.config.ts` | `4273` | CI/test only |
 | `CF_BROWSER_EXECUTABLE`, `CF_BROWSER_FONTCONFIG` | Playwright config | unset | Local test override |
 | `CF_TEST_SHELL`, `CF_TEST_AWK`, `CF_TEST_TIMEOUT`, `CF_TEST_WORKERS` | router fixtures | host `sh`; CI sets `busybox ash`, `busybox awk`, `busybox timeout`, `1` | CI/test only |

@@ -1,4 +1,4 @@
-<!-- Generated: 2026-10-29 | Files scanned: ~200 | Token estimate: ~299 -->
+<!-- Generated: 2026-11-24 | Files scanned: ~496 (origin/main 727daf6) | Token estimate: ~330 -->
 # Architecture
 Monorepo: router (OpenWrt ash/awk) + service (Node 26.13.1 TS, no build) + static PWA.
 
@@ -19,7 +19,7 @@ Entry points
 - `integration:bootstrap` issues CLI-only enrollment token (further passkeys: admin UI add-device tokens, approved by an admin, step-up bound); `integration:dispatch` operator dispatch.
 - Router: install.sh / uninstall.sh / cfctl, 16-entry release including the static aarch64 setsid helper pinned by router/release.sha256 (tools/freeze-router-release.py). The shipped tree is `--emit`ted: cfctl-ssh and cfctl-scope lose their CF_TEST_MODE block (tools/strip-test-mode.py); release.sha256 covers final emitted bytes; version-2 CF_RELEASE_ID binds all emitted sources, including install/uninstall/bootstrap, with generated assignments normalized to break pin cycles.
 
-Flagged-off features (manifest keys; absent = off; all unverified on this router): `timeRequests.mode` off|owner|parents (+ `ownerAccountId`), `rewardTime.enabled`, `focus.enabled`, `auditLog.enabled` (table `parent_audit`), `dnsHardening.dohList` (service/src/doh-list.ts), `push.enabled` and `digest.enabled` (service/src/push-*.ts, digest.ts; ntfy settings from `COUVRE_NTFY_*` env). Details: [backend](backend.md), [data](data.md), docs/service-contract.md.
+Flagged-off features (manifest keys; absent = off; all unverified on this router): `timeRequests.mode` off|owner|parents (+ `ownerAccountId`), `rewardTime.enabled`, `focus.enabled`, `auditLog.enabled` (table `parent_audit`), `dnsHardening.dohList` (service/src/doh-list.ts), `push.enabled` and `digest.enabled` (service/src/push-*.ts, digest.ts; ntfy settings from `COUVRE_NTFY_*` env), `digestPreview.enabled` (GET /digest/preview, admin only, read only), `contentFilter` (mode off|owner|parents, optional `counts`; NextDNS), `schedules.editable`, `installReadiness`, `inventoryUi`. Details: [backend](backend.md), [data](data.md), docs/service-contract.md.
 Trust boundaries
 - Service never gets a shell: cfctl-ssh accepts only `cfctl rpc-*|status|pause|resume|sync|expire|apply-fw` tokens.
 - In `owner` mode the owner account is guarded against other admins and against self-lockout (admin-accounts.ts, PR #100).
@@ -30,4 +30,5 @@ Trust boundaries
 
 Maps: [backend](backend.md) [frontend](frontend.md) [data](data.md) [dependencies](dependencies.md) [router](router.md) [live-tools](live-tools.md)
 
-Layout: router/ service/ (migrations 001..013 + integration-001..007) shared/src (contracts, router-rpc, router-schema, activity-evidence, schedule-edit) web/public tools/ tests/ docs/ demo-router/src.
+Layout: router/ service/ (migrations 001..019 + admin-batches.sql + integration-001..010 + integration-019-version) shared/src (contracts, router-rpc/-schema/-activity/-inventory, activity-evidence, schedule-edit, inventory-hints, oui, json, errors) web/public tools/ (freeze, strip-test-mode, gen-oui, live/) deploy/ (CT107: docker, systemd, backup, heartbeat) tests/ docs/ demo-router/src.
+CI: `fixture_preflight` -> `preflight_suites` + 42 `fixture_shards` -> `fixtures` gate; `local-demo` job runs typecheck, service tests, Playwright ([dependencies](dependencies.md)).
