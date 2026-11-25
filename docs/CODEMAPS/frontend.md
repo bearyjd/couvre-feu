@@ -11,7 +11,7 @@
 | kids-card.js, kids-model.js | Kids tab cards (PR #172); `replacedMacs` |
 | inventory-wizard.js, -wizard-model.js, inventory-triage.js | find-a-device wizard and triage for "Devices on the network" |
 | schedule-editor.js/.css | schedule CRUD UI (shared/src/schedule-edit.ts rules); `schedules.editable` |
-| schedule-templates.js | pure age-band template model (D1; four bands x school-night/weekend); not yet wired into the editor; `schedules.editable` |
+| schedule-templates.js | pure age-band template model (D1; four bands x school-night/weekend); wired into the schedule editor's add form as an "Age band (optional)" select (create mode only); `schedules.editable` |
 | activity.js | per-child estimated activity (DOM + textContent only) |
 | parent-alerts.js | server-persisted alerts + badge |
 | operational-alerts.js | browser-local journal of operational alerts |

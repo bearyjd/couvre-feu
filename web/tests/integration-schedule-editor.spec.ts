@@ -873,3 +873,27 @@ test('an opened recurring focus edit cannot overwrite a label changed elsewhere'
   expect(calls.attempts).toHaveLength(0);
   expect(calls.options).toHaveLength(0);
 });
+
+test('a starting point saves one part at seven windows and the chooser is disabled at eight', async ({ page, integration: f }) => {
+  await openEditor(page, f, 7);
+  const calls = requests(page);
+  const add = editor(page).getByRole('button', { name: 'Add a schedule for Explicit test person', exact: true });
+  await add.click();
+  const chooser = editor(page).getByLabel('Age band (optional)');
+  await expect(chooser).toBeEnabled();
+  await chooser.selectOption('16to17:schoolNight');
+  expect(calls.attempts).toHaveLength(0);
+  await expect(editor(page).locator('[data-preview]')).toContainText('Sun 22:30 → Mon 07:00 (next day)');
+  f.store.run('INSERT INTO schedule_windows(person_id,id,weekdays,start,stop) VALUES(?,?,?,?,?)', 'pilot', 'window_extra', 'Sat', '01:00', '02:00');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(chooser).toBeDisabled();
+  f.store.run('DELETE FROM schedule_windows WHERE person_id=? AND id=?', 'pilot', 'window_extra');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(chooser).toBeEnabled();
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  expect(calls.attempts).toHaveLength(1);
+  expect(calls.attempts[0].postDataJSON()).toEqual({ id: 'window_7', weekdays: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'], start: '22:30', stop: '07:00' });
+  await dispatchPending(f);
+  await expect(add).toBeDisabled();
+});

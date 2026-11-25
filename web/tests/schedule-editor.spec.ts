@@ -109,3 +109,39 @@ test('a revision advanced elsewhere cancels the edit, reloads, and keeps the dra
   await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
   expect(writes).toBe(1);
 });
+
+test('an age-band starting point fills the form without a request and saves the same fields as a typed window', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  const storageBefore = await page.evaluate(() => JSON.stringify({ ...localStorage }));
+  const bodies: unknown[] = []; let writes = 0;
+  page.on('request', (request) => { if (request.method() === 'POST' && /\/schedules/.test(request.url())) { writes++; bodies.push(request.postDataJSON()); } });
+  await expect(editor(page).getByLabel('Age band (optional)')).toHaveCount(0);
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const chooser = editor(page).getByLabel('Age band (optional)');
+  await expect(editor(page)).toContainText('Starting point: edit before saving. Unverified on this router.');
+  await chooser.selectOption('10to12:weekend');
+  expect(writes).toBe(0);
+  await expect(editor(page).getByLabel('Start')).toHaveValue('21:30');
+  await expect(editor(page).getByLabel('Stop')).toHaveValue('08:00');
+  await expect(editor(page).getByLabel('Name', { exact: true })).toHaveValue('window_1');
+  for (const day of ['Fri', 'Sat']) await expect(editor(page).getByLabel(day, { exact: true })).toBeChecked();
+  await expect(editor(page).getByLabel('Mon', { exact: true })).not.toBeChecked();
+  await expect(editor(page).locator('[data-preview]')).toContainText('Fri 21:30 → Sat 08:00 (next day)');
+  await expect(chooser).toHaveValue('');
+  expect(await page.evaluate(() => JSON.stringify({ ...localStorage }))).toBe(storageBefore);
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
+  expect(writes).toBe(1);
+  expect(bodies[0]).toEqual({ id: 'window_1', weekdays: ['Fri', 'Sat'], start: '21:30', stop: '08:00' });
+  expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toMatch(/10to12|weekend|template/i);
+});
+
+test('edit mode shows no starting-point chooser', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  await editor(page).locator('[data-schedule-id="browser_fixture"]').getByRole('button', { name: /Edit schedule/ }).click();
+  await expect(editor(page).getByLabel('Start', { exact: true })).toBeVisible();
+  await expect(editor(page).getByLabel('Age band (optional)')).toHaveCount(0);
+  await expect(editor(page)).not.toContainText('Starting point');
+});

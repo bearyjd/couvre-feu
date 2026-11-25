@@ -1,5 +1,6 @@
 import { actorScope } from './status-cache.js';
 import { getPasskey } from './auth-client.js';
+import { BANDS, PARTS, templatePart } from './schedule-templates.js';
 
 // Client-side bounds mirror shared/src/router-schema.ts (the service re-validates authoritatively).
 export const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -10,6 +11,8 @@ export const MAX_EXPANDED_WINDOWS = 256;
 // Mirrors MAX_WINDOWS_PER_CHILD in the integration schedule store.
 const MAX_INTEGRATION_WINDOWS = 8;
 const EXTRA_MINUTES = [15, 30, 60];
+const BAND_LABELS = { under10: 'Under 10', '10to12': '10 to 12', '13to15': '13 to 15', '16to17': '16 to 17' };
+const PART_LABELS = { schoolNight: 'school nights', weekend: 'weekends' };
 const KIND_LABELS = { bedtime: 'Bedtime', focus: 'Focus' };
 const validKind = (kind) => typeof kind === 'string' && Object.hasOwn(KIND_LABELS, kind);
 // The exclusive observation deadline is FRESH_SECONDS + 1, as in the app's schedule label.
@@ -141,9 +144,19 @@ export function createScheduleEditor(deps) {
   function formMarkup(entry, enabled) {
     const { mode, draft } = view.open, key = escape(entry.id), title = mode === 'edit' ? `Edit ${escape(view.open.originalId)}` : `Add a schedule for ${escape(entry.name)}`;
     const locked = active ? 'disabled' : '';
+    const atLimit = entry.schedules.length >= maxSchedules();
+    const chooser = mode === 'create' ? `<div class="schedule-field">
+        <label for="sched-template-${key}">Age band (optional)</label>
+        <select id="sched-template-${key}" data-template data-focus-key="template" aria-describedby="sched-template-help-${key}" ${locked || atLimit ? 'disabled' : ''}>
+          <option value="">Choose a starting point</option>
+          ${BANDS.flatMap((band) => PARTS.map((part) => `<option value="${band}:${part}">${BAND_LABELS[band]}, ${PART_LABELS[part]}</option>`)).join('')}
+        </select>
+        <p class="field-help" id="sched-template-help-${key}">Starting point: edit before saving. Unverified on this router.</p>
+      </div>` : '';
     const day = (name) => `<label class="day-choice"><input type="checkbox" data-field="day" value="${name}" ${draft.weekdays.includes(name) ? 'checked' : ''} data-focus-key="day-${name}" ${locked}> ${name}</label>`;
     return `<form class="schedule-form" data-schedule-form novalidate aria-labelledby="sched-form-title-${key}">
       <h4 id="sched-form-title-${key}">${title}</h4>
+      ${chooser}
       <div class="schedule-field"><label for="sched-id-${key}">Name</label><input id="sched-id-${key}" data-field="id" data-focus-key="id" value="${escape(draft.id)}" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" ${mode === 'edit' ? 'readonly' : ''} ${locked} aria-describedby="sched-id-help-${key} sched-id-error-${key}">
         <p class="field-help" id="sched-id-help-${key}">Lowercase letters, digits and underscores; starts with a letter.</p><p class="field-error" data-error="id" id="sched-id-error-${key}"></p></div>
       ${view.open.kindEditable && kindEditable(entry) ? `<div class="schedule-field">
@@ -242,7 +255,7 @@ export function createScheduleEditor(deps) {
     const lines = previewWindows(draft.weekdays, draft.start, draft.stop), entry = person(view.open.person);
     const clash = entry && lines.length ? entry.schedules.filter((schedule) => schedule.id !== view.open.originalId && overlaps(draft, schedule)).map((schedule) => schedule.id) : [];
     form.querySelector('[data-preview]').innerHTML = lines.length
-      ? `<strong>Blocks access:</strong><ul class="window-list">${lines.map((line) => `<li>${escape(line)}</li>`).join('')}</ul>${clash.length ? `<p class="fine-print">Overlaps ${escape(clash.join(', '))}. Overlaps are allowed; access is blocked whenever any window is active.</p>` : ''}`
+      ? `<strong>Blocks access:</strong><ul class="window-list">${lines.map((line) => `<li>${escape(line)}${crossesMidnight(draft.start, draft.stop) ? ' (next day)' : ''}</li>`).join('')}</ul>${clash.length ? `<p class="fine-print">Overlaps ${escape(clash.join(', '))}. Overlaps are allowed; access is blocked whenever any window is active.</p>` : ''}`
       : '<span class="fine-print">Choose days and two different times to preview the window.</span>';
   }
 
@@ -287,6 +300,16 @@ export function createScheduleEditor(deps) {
     lastKey = '';
     render();
     root.querySelector(mode === 'edit' ? '[data-field="day"]' : '[data-field="id"]')?.focus();
+  }
+
+  function applyTemplate(value) {
+    const [band, part] = String(value).split(':'), template = templatePart(band, part), entry = view.open && person(view.open.person);
+    if (!template || !entry || view.open.mode !== 'create' || active || entry.schedules.length >= maxSchedules()) return;
+    const draft = { id: nextId(entry), weekdays: [...template.weekdays], start: template.start, stop: template.stop };
+    if (view.open.kindEditable) draft.kind = view.open.draft.kind ?? 'bedtime';
+    view = { ...view, open: { ...view.open, draft }, submitted: false, serverErrors: {} };
+    lastKey = '';
+    render();
   }
 
   function close() {
@@ -522,6 +545,7 @@ export function createScheduleEditor(deps) {
     view.serverErrors = {};
     updateLive();
   });
+  root.addEventListener('change', (event) => { if (event.target.dataset?.template !== undefined) applyTemplate(event.target.value); });
   root.addEventListener('submit', (event) => { event.preventDefault(); void save(); });
   root.addEventListener('click', (event) => {
     const button = event.target.closest('[data-sched-action]');
