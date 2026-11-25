@@ -75,9 +75,15 @@ function begin(config: IntegrationConfig, store: Db, deps: NotificationDeps, log
     const heldLogged = {top: 0};
     // Two marks over disjoint kind sets, so neither can pass an alert it has not pushed. Held kinds are looked at only outside quiet hours; one push covers whatever is pending.
     const alertPass = async () => {
-        const quiet = inQuietHours(now()), urgentTop = top(alerts.read(), false), heldTop = top(held.read(), true);
-        const releasable = quiet ? null : heldTop;
-        if (quiet && heldTop !== null && heldLogged.top !== heldTop) { heldLogged.top = heldTop; log('push_alert_held quiet_hours\n'); }
+        const urgentTop = top(alerts.read(), false);
+        // The held side must never block an urgent push: if the quiet-hours check or the held query throws, nothing is released this pass
+        // (the held mark does not move, so the alert is looked at again next pass) and the urgent push below still goes out.
+        let releasable: number | null = null;
+        try {
+            const quiet = inQuietHours(now()), heldTop = top(held.read(), true);
+            releasable = quiet ? null : heldTop;
+            if (quiet && heldTop !== null && heldLogged.top !== heldTop) { heldLogged.top = heldTop; log('push_alert_held quiet_hours\n'); }
+        } catch { log('push_held_pass_failed\n'); }
         if (urgentTop === null && releasable === null) return;
         if (!(await push.send({kind: 'alert'}, shutdown.signal)).ok) return;
         if (urgentTop !== null) alerts.write(urgentTop);
