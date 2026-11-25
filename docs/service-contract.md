@@ -144,6 +144,15 @@ Flags `"push": {"enabled": true}` and `"digest": {"enabled": true}` in the priva
 5. Only after push has run cleanly, add `"digest": {"enabled": true}`, rebind, and check the first two Sunday digests against the app's own numbers before trusting them (roadmap rollout rule).
 6. Turn off: set the keys to `false` or remove them, rebind, restart. Nothing else is written; the `notify_state` marks stay (see re-enable behaviour above).
 
+### Push settings and test push
+
+Exists only with `"push": {"enabled": true}`; with the flag off or absent both routes answer `404 route_not_found`. **Built behind the flag; unverified on this router and on a real ntfy server or phone.** Admin only (`403 admin_required` for anyone else). Service only, no router change, no web UI yet.
+
+- `GET /push/settings` returns `{push: {provider: 'ntfy', configured, quietHours: {start: '21:00', end: '07:00', zone: 'America/New_York', activeNow}, heldKinds, digest: {audience: 'admins', day: 'sunday', time: '18:00', zone: 'America/New_York'}}}`. `configured` is a boolean: whether the ntfy environment validated at startup. `heldKinds` is `HELD_KINDS` from `push-runtime.ts`, imported, not copied.
+- `POST /push/test` (CSRF required, empty body) sends the fixed `{kind: 'test'}` message through `NtfyPush`: title `Couvre-feu`, body `Test notification. Nothing needs your attention.` One attempt, bounded by `PUSH_TIMEOUT_MS`. The answer is `{result}` and nothing else: `sent_to_push_service`, `push_failed:<tag>` (`http_<status>`, `timeout`, `network_error`) or `not_configured`. A second call from the same account within 30 s answers `429 push_test_cooldown`.
+- **Honest state.** `sent_to_push_service` means ntfy accepted the message. The service cannot know the phone received it, and no response, log or doc says so; seeing it on the phone is the check.
+- **Privacy.** No ntfy URL, topic, token or response text in any response or log line (a failure logs only `push_failed <tag> attempts=1`); no names, MACs, addresses or domains in the payload.
+
 ### Weekly digest preview
 
 Integration installations can opt in with `"digestPreview": {"enabled": true}`. The default is off, and preview is independent of push delivery. Authenticated administrators can read `GET /digest/preview`; signed-in ordinary parents and disabled installations receive `404 route_not_found`. The response is served with `Cache-Control: no-store`.

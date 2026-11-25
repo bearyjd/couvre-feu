@@ -7,6 +7,8 @@ import { AutomaticDispatch } from './integration-automatic.ts';
 import { loadTLS } from './tls.ts';
 import { startNotifications } from './push-runtime.ts';
 import { digestBlockedReader } from './digest-blocked.ts';
+import { PushSettings } from './push-settings.ts';
+import { NtfyPush, ntfySettings } from './push-sender.ts';
 import type { Server as HTTPSServer } from 'node:https';
 
 if (process.argv.length !== 3) throw new Error('usage_integration_start_absolute_manifest');
@@ -29,7 +31,13 @@ const stopCounts = startCounts();
 // Off unless push.enabled; a bad ntfy setting or any init failure is logged and leaves notifications off, and no later failure reaches request handling.
 // The digest's household blocked-lookups line reads the counts store only, and only when contentFilter.counts.enabled is also true (push-runtime checks the flag).
 const notifications = startNotifications(config, store, {blocked: digestBlockedReader(config, store)});
-const server = app(auth, config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config);
+// The settings and test-push routes exist only when push.enabled. Bad ntfy settings (already logged by startNotifications) leave the routes answering not_configured.
+// A test push is one attempt, so a click cannot hold the request for the retry back-off.
+function pushSettingsRoutes(): PushSettings | undefined {
+    if (config.push?.enabled !== true) return undefined;
+    try { return new PushSettings(new NtfyPush(ntfySettings(), config.origin, {maxAttempts: 1})); } catch { return new PushSettings(null); }
+}
+const server = app(auth, config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config, pushSettingsRoutes());
 server.listen(config.port, config.listen?.host ?? '127.0.0.1', () => {
     const where = config.trustedProxies ? `private LAN proxy HTTP ${config.origin} via ${config.trustedProxies.length} trusted proxies` : config.listen ? `private LAN HTTPS ${config.origin}` : 'loopback';
     process.stdout.write(automatic ? `Private integration listening on ${where}; manifest-enabled automatic dispatch active.\n` : `Private integration listening on ${where}; dispatch requires an exact one-use operator permit.\n`);

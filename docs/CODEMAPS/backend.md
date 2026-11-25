@@ -13,6 +13,7 @@ Routing is exact-path in http.ts `appServer(auth, policy, config, alerts?, activ
 | GET/PUT /people/:id/filter, GET /people/:id/filter/counts | content-filter-http.ts; mode-gated (excluded actors get 404 `route_not_found`); counts only when `contentFilter.counts` is on |
 | POST /bulk/{pause-all,resume-all} | integration-bulk.ts `bulkPost` (step-up) |
 | GET /admin/install-readiness, POST /admin/install-readiness/{approve,export} | install-readiness.ts |
+| GET /push/settings, POST /push/test (admin, only with `push.enabled`) | push-settings.ts |
 | POST /admin/inventory/:id/{classify,undo,link,stable}, DELETE /admin/inventory/:id/link, GET /admin/inventory/hidden | inventory-http.ts; hidden only with `inventory.triage` |
 | POST /people/:id/{pause,resume}, /people/:id/schedules[/:sid[/delete]] | policy -> operation |
 | POST /people/:id/reward | Reward Time: +15/+30 min allowance (integration-allowance.ts `IntegrationGrants.reward`); 404 unless `rewardTime.enabled` and the viewer may decide (http.ts:240) |
