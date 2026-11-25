@@ -7,6 +7,8 @@ import type { Routed } from './time-requests-http.ts';
 
 /** One test push per account in this window. A real send is at most one attempt of PUSH_TIMEOUT_MS, so a click cannot queue work. */
 export const TEST_COOLDOWN_SECONDS = 30;
+/** The only failure tags a response may carry; the sender's other reasons (aborted, not_sent) and anything unexpected collapse to `other`. */
+const FAILURE_TAG = /^(http_\d{3}|timeout|network_error)$/;
 const hhmm = (hour: number) => `${String(hour).padStart(2, '0')}:00`;
 
 /**
@@ -40,6 +42,6 @@ export class PushSettings {
         if (last !== undefined && now - last < TEST_COOLDOWN_SECONDS) throw new AppError(429, 'push_test_cooldown');
         this.lastTest.set(id, now);
         const result = await this.sender.send({kind: 'test'});
-        return {status: 200, body: {result: result.ok ? 'sent_to_push_service' : `push_failed:${result.reason}`}};
+        return {status: 200, body: {result: result.ok ? 'sent_to_push_service' : `push_failed:${FAILURE_TAG.test(result.reason) ? result.reason : 'other'}`}};
     }
 }

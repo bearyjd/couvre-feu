@@ -15,7 +15,7 @@ const utc = (...a: [number, number, number, number]) => Date.UTC(a[0], a[1] - 1,
 const DAYTIME = utc(2026, 11, 25, 17), NIGHT = utc(2026, 11, 25, 5);
 
 interface Sent { url: string; body: string; headers: Record<string, string> }
-async function world(options: {enabled?: boolean; configured?: boolean; status?: number; now?: {value: number}} = {}) {
+async function world(options: {enabled?: boolean; configured?: boolean; status?: number; now?: {value: number}; failReason?: string} = {}) {
     const f = integrationFixture(), port = await freePort(), origin = `http://localhost:${port}`;
     const auth = new Auth(f.store, origin, f.now, {provenance: f.config.provenance, rpName: 'Private integration test'});
     const sent: Sent[] = [], logs: string[] = [], clock = options.now ?? {value: DAYTIME};
@@ -24,14 +24,16 @@ async function world(options: {enabled?: boolean; configured?: boolean; status?:
         return new Response(RESPONSE_TEXT, {status: options.status ?? 200});
     }) as unknown as typeof fetch;
     const sender = options.configured === false ? null : new NtfyPush(ntfySettings({COUVRE_NTFY_URL: URL_TEXT, COUVRE_NTFY_TOPIC: TOPIC, COUVRE_NTFY_TOKEN: TOKEN}), origin, {fetch: fakeFetch, maxAttempts: 1, log: line => logs.push(String(line))});
-    const push = options.enabled === false ? undefined : new PushSettings(sender, () => clock.value);
+    const stub = options.failReason === undefined ? null : {send: async () => { sent.push({url: 'stub', body: '', headers: {}}); return {ok: false, attempts: 1, reason: options.failReason as string}; }} as unknown as NtfyPush;
+    const push = options.enabled === false ? undefined : new PushSettings(stub ?? sender, () => clock.value);
     const server = appServer(auth, f.policy, {...f.config, port, origin, host: `localhost:${port}`}, undefined, undefined, undefined, f.worker.inventory, undefined, undefined, push);
     server.listen(port, '127.0.0.1'); await once(server, 'listening');
     async function client(account: string) {
         const jar = new Map<string, string>(); let csrf = '';
-        const call = async (method: string, path: string, input?: unknown, omit: string[] = []) => {
+        const call = async (method: string, path: string, input?: unknown, omit: string[] = [], extra: Record<string, string> = {}) => {
             const headers: Record<string, string> = {Origin: origin, Cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; '), 'X-CSRF-Token': csrf, 'Content-Type': 'application/json'};
             for (const key of omit) delete headers[key];
+            Object.assign(headers, extra);
             const response = await fetch(origin + path, {method, headers, ...(input === undefined ? {} : {body: JSON.stringify(input)})});
             for (const entry of response.headers.getSetCookie()) { const [k, v] = entry.split(';')[0].split('='); jar.set(k, v); }
             const text = await response.text(), body = JSON.parse(text) as Record<string, any>;
@@ -40,10 +42,11 @@ async function world(options: {enabled?: boolean; configured?: boolean; status?:
         };
         const key = new TestAuthenticator(), reg = await call('POST', '/auth/register/options', {token: issueOperatorBootstrap(f.store, account, f.now())});
         assert.equal((await call('POST', '/auth/register/verify', {challengeId: reg.body.challengeId, response: key.register(reg.body.options, origin)})).status, 200);
-        return {call, get: () => call('GET', '/push/settings'), test: (omit: string[] = []) => call('POST', '/push/test', {}, omit)};
+        return {call, get: () => call('GET', '/push/settings'), test: (omit: string[] = [], extra: Record<string, string> = {}) => call('POST', '/push/test', {}, omit, extra)};
     }
+    const anonymous = (method: string, path: string, headers: Record<string, string> = {}) => fetch(origin + path, {method, headers: {Origin: origin, 'Content-Type': 'application/json', ...headers}, ...(method === 'POST' ? {body: '{}'} : {})}).then(async r => ({status: r.status, text: await r.text()}));
     const cleanup = async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); f.cleanup(); };
-    return {client, sent, logs, clock, cleanup};
+    return {client, anonymous, origin, sent, logs, clock, cleanup};
 }
 const noSecrets = (text: string) => { for (const s of SECRETS) assert.ok(!text.includes(s), `leaked ${s}`); assert.ok(!/delivered/i.test(text)); };
 
@@ -129,6 +132,41 @@ test('POST without ntfy settings reports not_configured and sends nothing', asyn
         assert.equal(r.status, 200);
         assert.equal(r.body.result, 'not_configured');
         assert.equal(w.sent.length, 0);
+    } finally { await w.cleanup(); }
+});
+
+test('POST failure tag outside the allowlist is reported as push_failed:other and never echoed', async () => {
+    const w = await world({failReason: `http://127.0.0.1:2586/${TOPIC} ${TOKEN}`});
+    try {
+        const r = await (await w.client('operator')).test();
+        assert.equal(r.status, 200);
+        assert.equal(r.body.result, 'push_failed:other');
+        noSecrets(r.text);
+    } finally { await w.cleanup(); }
+});
+
+test('a signed-out request to either route is refused with 401 and nothing is sent', async () => {
+    const w = await world();
+    try {
+        assert.equal((await w.anonymous('GET', '/push/settings')).status, 401);
+        assert.equal((await w.anonymous('POST', '/push/test')).status, 401);
+        assert.equal(w.sent.length, 0);
+    } finally { await w.cleanup(); }
+});
+
+test('POST with a missing or wrong Origin is refused and nothing is sent', async () => {
+    const w = await world();
+    try {
+        const admin = await w.client('operator');
+        const missing = await admin.test(['Origin']);
+        assert.equal(missing.status, 403);
+        assert.equal(missing.body.error.code, 'origin_rejected');
+        const wrong = await admin.test([], {Origin: 'http://evil.example'});
+        assert.equal(wrong.status, 403);
+        assert.equal(wrong.body.error.code, 'origin_rejected');
+        assert.equal(w.sent.length, 0);
+        assert.equal((await admin.test()).status, 200);
+        assert.equal(w.sent.length, 1);
     } finally { await w.cleanup(); }
 });
 

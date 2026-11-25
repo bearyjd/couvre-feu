@@ -35,7 +35,11 @@ const notifications = startNotifications(config, store, {blocked: digestBlockedR
 // A test push is one attempt, so a click cannot hold the request for the retry back-off.
 function pushSettingsRoutes(): PushSettings | undefined {
     if (config.push?.enabled !== true) return undefined;
-    try { return new PushSettings(new NtfyPush(ntfySettings(), config.origin, {maxAttempts: 1})); } catch { return new PushSettings(null); }
+    try { return new PushSettings(new NtfyPush(ntfySettings(), config.origin, {maxAttempts: 1})); } catch {
+        // Fixed tag only: the error text can carry the ntfy URL or topic.
+        process.stderr.write('push_settings_init_failed\n');
+        return new PushSettings(null);
+    }
 }
 const server = app(auth, config.tls ? {...config, tlsMaterial: loadTLS(config.tls)} : config, pushSettingsRoutes());
 server.listen(config.port, config.listen?.host ?? '127.0.0.1', () => {
