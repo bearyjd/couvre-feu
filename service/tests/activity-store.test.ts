@@ -150,6 +150,41 @@ test('offload on or unknown marks a day possibly undercounted; off does not', ()
         assert.deepEqual([day.offload, day.possiblyUndercounted], [offload, flagged]);
     }
 });
+test('PINNED CURRENT BEHAVIOUR: scripted idle and interactive minutes distinguish estimation errors from missing evidence', () => {
+    // Ground truth describes the scripted action. Byte deltas and offload states are synthetic inputs. The expectations pin how the estimate
+    // behaves today (a minute counts only above ACTIVE_MINUTE_THRESHOLD_BYTES; offload changes the undercount flag, never the estimate), so a
+    // deliberate change to the threshold or estimator should update this table rather than be read as a regression. This is calibration-layer
+    // evidence only; the live-router field trial stays open.
+    const cases = [
+        {action: 'background sync', interactive: false, bytes: ACTIVE_MINUTE_THRESHOLD_BYTES + 1, expected: 'falsely counted'},
+        {action: 'read a loaded page', interactive: true, bytes: ACTIVE_MINUTE_THRESHOLD_BYTES, expected: 'missed'},
+        {action: 'load a new page', interactive: true, bytes: ACTIVE_MINUTE_THRESHOLD_BYTES + 1, expected: 'agreement'},
+        {action: 'read during a polling gap', interactive: true, bytes: null, expected: 'unknown'},
+    ];
+    for (const offload of ['off', 'on', 'unknown']) {
+        for (const {action, interactive, bytes, expected} of cases) {
+            const f = fixture();
+            try {
+                f.at(DAY + 60);
+                f.activity.ingest(poll([{person: 'alex', mac: ALEX}], {offload}), DAY);
+                if (bytes !== null) f.activity.ingest(poll([{person: 'alex', mac: ALEX, tx: bytes}], {offload}), DAY + 60);
+                const day = f.activity.report(bryn, 'alex').days.at(-1)!;
+                assert.equal(day.unknownMinutes, bytes === null ? 1 : 0);
+                // With no observed minute (a polling gap) there is no offload claim, so no undercount flag either.
+                assert.equal(day.offload, bytes === null ? null : offload, `offload, ${action}`);
+                assert.equal(day.possiblyUndercounted, bytes !== null && offload !== 'off', `undercount flag, ${action}, offload ${offload}`);
+                const estimate = day.estimatedOnlineMinutes;
+                let outcome = 'agreement';
+                if (estimate === null) outcome = 'unknown';
+                else if (estimate > Number(interactive)) outcome = 'falsely counted';
+                else if (estimate < Number(interactive)) outcome = 'missed';
+                assert.equal(outcome, expected, `${action}, offload ${offload}`);
+            } finally {
+                f.store.close();
+            }
+        }
+    }
+});
 test('a minute is covered only when every assigned device is covered', () => {
     const f = fixture();
     const policy = normalizePolicy({...INITIAL_POLICY, people: [{id: 'alex', macs: [ALEX, '02:00:00:00:02:03']}, {id: 'blair', macs: [BLAIR]}]});
