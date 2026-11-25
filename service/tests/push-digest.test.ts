@@ -472,3 +472,24 @@ test('filter_drift stays urgent for both causes (info and warning rows both push
         assert.equal(ntfy.seen.length, 2, 'nothing is left to release at 07:00'); await n.stop();
     });
 });
+
+test('held-path failure isolation: a throwing held query or quiet-hours check never blocks an urgent push', async () => {
+    await quiet(NIGHT, async ({f, ntfy, logs}) => {
+        // Only the held-kind query throws (the urgent one is `AND NOT kind IN`, the held one `AND kind IN`).
+        const store = new Proxy(f.store, {get: (target, key) => {
+            const value = Reflect.get(target, key, target);
+            if (key !== 'get') return typeof value === 'function' ? value.bind(target) : value;
+            return (sql: string, ...args: unknown[]) => {
+                if (/AND kind IN/.test(sql)) throw new Error('held query failed');
+                return (value as (...a: unknown[]) => unknown).call(target, sql, ...args);
+            };
+        }});
+        const n = startNotifications({...f.config, push: {enabled: true}}, store as typeof f.store, {env: ntfy.env, now: () => NIGHT, options: {sleep: noSleep, log: l => logs.push(String(l))}})!;
+        await n.tick();
+        alertRow(f, 'possible_bypass'); await n.tick();
+        assert.equal(ntfy.seen.length, 1, 'the urgent alert pushes although the held side fails');
+        assert.ok(logs.includes('push_held_pass_failed\n'), 'the failure is logged as a fixed tag');
+        assert.ok(logs.every(l => /^[a-z_ 0-9]+\n$/.test(l)), 'tags only, no error text');
+        await n.stop();
+    });
+});
