@@ -117,6 +117,8 @@ jobs:
             partition: 4
           - suite: test-penn-pilot.py
             partition: 4
+          - suite: test-rpc.py
+            partition: 4
     steps:
       - uses: actions/checkout@v7
       - name: Install CI-only ash runtime
@@ -169,7 +171,7 @@ jobs:
           pattern: fixture-receipt-*
           merge-multiple: true
           path: .ci-fixture-receipts
-      - name: Prove all 42 unique partitions match complete source discovery
+      - name: Prove all 43 unique partitions match complete source discovery
         env:
           CF_TEST_SHELL: busybox ash
         run: python3 tests/run-fixtures.py --verify-receipts .ci-fixture-receipts --plan .ci-fixture-plan/couvre-feu-plan.json

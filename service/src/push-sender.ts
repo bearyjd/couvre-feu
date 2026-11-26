@@ -8,7 +8,7 @@ export interface PushEnv { COUVRE_NTFY_URL?: string; COUVRE_NTFY_TOPIC?: string;
 export interface NtfySettings { baseUrl: string; topic: string; token: string | null }
 /** `blocked` (phase C4) is one household integer and the number of the week's 7 local days it covers; present only when digest and counts are both on. */
 export type DigestCounts = {requests: number; grants: number; pauses: number; blocked?: {count: number; daysCounted: number}};
-export type PushMessage = {kind: 'alert'} | {kind: 'digest'; counts: DigestCounts};
+export type PushMessage = {kind: 'alert'} | {kind: 'digest'; counts: DigestCounts} | {kind: 'test'};
 export interface PushResult { ok: boolean; attempts: number; reason: string }
 export interface PushOptions { fetch?: typeof fetch; sleep?: (ms: number) => Promise<void>; log?: (line: string) => unknown; timeoutMs?: number; maxAttempts?: number; backoffMs?: number }
 
@@ -47,9 +47,15 @@ export function ntfySettings(env: PushEnv = process.env): NtfySettings {
 const count = (n: number) => Number.isSafeInteger(n) && n >= 0 ? n : 0;
 /** The only text that can leave the house. Digest numbers are coerced to non-negative integers. */
 export function pushText(message: PushMessage): {title: string; body: string} {
-    if (message.kind === 'alert') return {title: 'Couvre-feu', body: 'New alert. Open the app to see it.'};
-    const c = message.counts;
-    return {title: 'Couvre-feu weekly summary', body: `Last 7 days: ${count(c.requests)} requests, ${count(c.grants)} grants, ${count(c.pauses)} pauses.${blockedLine(c.blocked)}`};
+    switch (message.kind) {
+        case 'alert': return {title: 'Couvre-feu', body: 'New alert. Open the app to see it.'};
+        case 'test': return {title: 'Couvre-feu', body: 'Test notification. Nothing needs your attention.'};
+        case 'digest': {
+            const c = message.counts;
+            return {title: 'Couvre-feu weekly summary', body: `Last 7 days: ${count(c.requests)} requests, ${count(c.grants)} grants, ${count(c.pauses)} pauses.${blockedLine(c.blocked)}`};
+        }
+        default: return message satisfies never;
+    }
 }
 /** One extra line: a household integer and, if short of a full week, how many days were counted. No zero-day line, no name, class or per-child number. */
 function blockedLine(blocked: DigestCounts['blocked']): string {

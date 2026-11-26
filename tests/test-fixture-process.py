@@ -427,7 +427,7 @@ finally:
                 plan_path.write_text(json.dumps(plan))
                 invalid = [[], ['--write-plan', ''], ['--verify-receipts', ''], ['--plan', ''], ['--receipt', ''], ['--shard', 'unknown.py'], ['--shard', ''], ['--partition', '0'],
                            ['--shard', 'test-core.py', '--partition', '5'],
-                           ['--shard', 'test-rpc.py', '--partition', '4'],
+                           ['--shard', 'test-transition.py', '--partition', '4'],
                            ['--shard', 'test-core.py', '--partition', '01'],
                            ['--shard', 'test-core.py', '--partition', '0']]
                 with patch.object(runner, 'run_lane') as launch:
@@ -491,6 +491,7 @@ finally:
     def test_predicted_heaviest_partition_stays_within_seventy_percent_of_the_lane_budget(self):
         with patch.object(runner, "source_revision", return_value="f" * 40):
             plan = runner.discovery_plan()
+        self.assertEqual(runner.PARTITION_COUNTS["test-rpc.py"], 5)
         self.assertEqual(runner.PARTITION_COUNTS["test-core.py"], 5)
         self.assertEqual(runner.PARTITION_COUNTS["test-penn-pilot.py"], 5)
         self.assertLessEqual(runner.LANE_TIMEOUT, 1800)
