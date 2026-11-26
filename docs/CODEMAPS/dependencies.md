@@ -18,7 +18,7 @@ Deploy (CT107, deploy/): docker/{Dockerfile (node:26.13.1-slim pinned by digest,
 CI (.github/workflows/ci.yml, "isolated-project-checks"; actions checkout@v7, setup-node@v7, upload-artifact@v7, download-artifact@v8, local `pinned-busybox` 1.33.1):
 1. `fixture_preflight`: freeze check, `tests/run.sh --static-only`, timeout audit, acceptance preflight, publish fixture plan.
 2. `preflight_suites`: ~16 entries (install, install-recovery, platform-integration x4, os-trust x3, permanent-install, bundled suites); matrix guarded against tests/run.sh.
-3. `fixture_shards`: 42 partitions (10 suites x 4, plus a fifth each for test-core.py and test-penn-pilot.py; `PARTITION_COUNTS` in tests/run-fixtures.py); receipts per shard.
-4. `fixtures`: gate requiring 1-3 and all 42 unique partitions.
+3. `fixture_shards`: 43 partitions (10 suites x 4, plus a fifth each for test-core.py, test-penn-pilot.py and test-rpc.py; `PARTITION_COUNTS` in tests/run-fixtures.py); receipts per shard.
+4. `fixtures`: gate requiring 1-3 and all 43 unique partitions.
 5. `local-demo`: `npm ci`, typecheck, `npm run test:service`, Playwright chromium, `npm run test:web`.
 Tests: tests/test-*.py (router fixtures; test-timeout-audit.py fails unjustified tight timeouts), service/tests (97) + shared/tests (15) via node --test, web/tests (28 specs).
