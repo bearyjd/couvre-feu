@@ -873,3 +873,45 @@ test('an opened recurring focus edit cannot overwrite a label changed elsewhere'
   expect(calls.attempts).toHaveLength(0);
   expect(calls.options).toHaveLength(0);
 });
+
+test('a starting point saves one part at seven windows and the chooser is disabled at eight', async ({ page, integration: f }) => {
+  await openEditor(page, f, 7);
+  const calls = requests(page);
+  const add = editor(page).getByRole('button', { name: 'Add a schedule for Explicit test person', exact: true });
+  await add.click();
+  const chooser = editor(page).getByLabel('Age band (optional)');
+  await expect(chooser).toBeEnabled();
+  await chooser.selectOption('16to17:schoolNight');
+  expect(calls.attempts).toHaveLength(0);
+  await expect(editor(page).locator('[data-preview]')).toContainText('Sun 22:30 → Mon 07:00');
+  await expect(editor(page).locator('[data-preview]')).not.toContainText('(next day)');
+  f.store.run('INSERT INTO schedule_windows(person_id,id,weekdays,start,stop) VALUES(?,?,?,?,?)', 'pilot', 'window_extra', 'Sat', '01:00', '02:00');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(chooser).toBeDisabled();
+  await expect(chooser).toHaveValue('16to17:schoolNight');
+  await expect(editor(page).locator('[data-template-note]')).toHaveText('Filled from 16 to 17, school nights. Nothing is saved until you press Save.');
+  f.store.run('DELETE FROM schedule_windows WHERE person_id=? AND id=?', 'pilot', 'window_extra');
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(chooser).toBeEnabled();
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  expect(calls.attempts).toHaveLength(1);
+  expect(calls.attempts[0].postDataJSON()).toEqual({ id: 'window_7', weekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Sun'], start: '22:30', stop: '07:00' });
+  await dispatchPending(f);
+  await expect(add).toBeDisabled();
+});
+
+test('a starting point sets the Bedtime type even when the draft was Focus', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const calls = requests(page);
+  await editor(page).getByRole('button', { name: 'Add a schedule for Explicit test person', exact: true }).click();
+  const type = editor(page).getByLabel('Schedule type');
+  await type.selectOption('focus');
+  await editor(page).getByLabel('Age band (optional)').selectOption('13to15:weekend');
+  await expect(type).toHaveValue('bedtime');
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
+  expect(calls.attempts).toHaveLength(1);
+  expect(calls.attempts[0].postDataJSON()).toMatchObject({ weekdays: ['Fri', 'Sat'], start: '22:30', stop: '08:00', kind: 'bedtime' });
+});

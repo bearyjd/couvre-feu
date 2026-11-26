@@ -7,6 +7,7 @@ const templates = await import(new URL('../../web/public/schedule-templates.js',
 };
 const editor = await import(new URL('../../web/public/schedule-editor.js', import.meta.url).href) as {
     validateDraft: (draft: unknown, context: unknown) => Record<string, string>; overlaps: (a: unknown, b: unknown) => boolean;
+    BAND_LABELS: Record<string, string>; PART_LABELS: Record<string, string>;
 };
 const EXPECTED: Record<string, [string, string, string, string]> = {
     under10: ['19:30', '07:00', '20:30', '07:30'], '10to12': ['20:30', '07:00', '21:30', '08:00'],
@@ -20,6 +21,11 @@ test('four bands with a school-night and a weekend part carrying the D1 times', 
         assert.deepEqual(templates.templatePart(band, 'schoolNight'), { weekdays: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'], start: nightStart, stop: nightStop });
         assert.deepEqual(templates.templatePart(band, 'weekend'), { weekdays: ['Fri', 'Sat'], start: endStart, stop: endStop });
     }
+});
+
+test('every band and part has a chooser label', () => {
+    assert.deepEqual(Object.keys(editor.BAND_LABELS), templates.BANDS);
+    assert.deepEqual(Object.keys(editor.PART_LABELS), templates.PARTS);
 });
 
 test('every part crosses midnight, validates, and a band parts never overlap', () => {

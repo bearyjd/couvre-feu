@@ -34,6 +34,7 @@ test('create, edit and delete a cross-midnight window with plain-language previe
   await editor(page).getByLabel('Wed', { exact: true }).check();
   await editor(page).getByLabel('Stop').fill('07:00');
   await expect(editor(page).locator('[data-preview]')).toContainText('Wed 22:00 → Thu 07:00');
+  await expect(editor(page).locator('[data-preview]')).not.toContainText('(next day)');
   await editor(page).getByRole('button', { name: 'Save schedule' }).click();
   await expect(page.locator('.operation')).toContainText('Schedule change confirmed');
   await expect(row).toContainText('Mon, Tue, Wed · 22:00 → 07:00 (next day)');
@@ -108,4 +109,74 @@ test('a revision advanced elsewhere cancels the edit, reloads, and keeps the dra
   await editor(page).getByRole('button', { name: 'Save schedule' }).click();
   await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
   expect(writes).toBe(1);
+});
+
+test('an age-band starting point fills the form without a request and saves the same fields as a typed window', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  const storageBefore = await page.evaluate(() => JSON.stringify({ ...localStorage }));
+  const bodies: unknown[] = []; let writes = 0;
+  page.on('request', (request) => { if (request.method() === 'POST' && /\/schedules/.test(request.url())) { writes++; bodies.push(request.postDataJSON()); } });
+  await expect(editor(page).getByLabel('Age band (optional)')).toHaveCount(0);
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const chooser = editor(page).getByLabel('Age band (optional)');
+  await expect(editor(page)).toContainText('Starting point: edit before saving. Unverified on this router.');
+  await chooser.selectOption('10to12:weekend');
+  expect(writes).toBe(0);
+  await expect(editor(page).getByLabel('Start')).toHaveValue('21:30');
+  await expect(editor(page).getByLabel('Stop')).toHaveValue('08:00');
+  await expect(editor(page).getByLabel('Name', { exact: true })).toHaveValue('window_1');
+  for (const day of ['Fri', 'Sat']) await expect(editor(page).getByLabel(day, { exact: true })).toBeChecked();
+  await expect(editor(page).getByLabel('Mon', { exact: true })).not.toBeChecked();
+  await expect(editor(page).locator('[data-preview]')).toContainText('Fri 21:30 → Sat 08:00');
+  await expect(editor(page).locator('[data-preview]')).not.toContainText('(next day)');
+  await expect(chooser).toHaveValue('10to12:weekend');
+  expect(await page.evaluate(() => JSON.stringify({ ...localStorage }))).toBe(storageBefore);
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
+  expect(writes).toBe(1);
+  expect(bodies[0]).toEqual({ id: 'window_1', weekdays: ['Fri', 'Sat'], start: '21:30', stop: '08:00' });
+  expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toMatch(/10to12|weekend|template/i);
+});
+
+test('a starting point keeps a typed name, stays selected with a note, and posts days in week order', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  const bodies: unknown[] = [];
+  page.on('request', (request) => { if (request.method() === 'POST' && /\/schedules/.test(request.url())) bodies.push(request.postDataJSON()); });
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const chooser = editor(page).getByLabel('Age band (optional)'), name = editor(page).getByLabel('Name', { exact: true });
+  const note = editor(page).locator('[data-template-note]');
+  await expect(note).toHaveAttribute('aria-live', 'polite');
+  await expect(note).toHaveText('');
+  const liveRegion = await note.elementHandle();
+  await name.fill('school_nights');
+  await chooser.selectOption('16to17:schoolNight');
+  await expect(name).toHaveValue('school_nights');
+  await expect(chooser).toHaveValue('16to17:schoolNight');
+  await expect(note).toHaveText('Filled from 16 to 17, school nights. Nothing is saved until you press Save.');
+  // The announcement needs the same live region to change; a re-created one is often silent.
+  expect(await liveRegion!.evaluate((node) => node.isConnected)).toBe(true);
+  await chooser.selectOption('');
+  await expect(note).toHaveText('');
+  await expect(editor(page).getByLabel('Start')).toHaveValue('22:30');
+  await name.fill('');
+  await chooser.selectOption('under10:schoolNight');
+  await expect(name).toHaveValue('window_1');
+  await expect(note).toHaveText('Filled from Under 10, school nights. Nothing is saved until you press Save.');
+  await name.fill('school_nights');
+  expect(bodies).toHaveLength(0);
+  await editor(page).getByRole('button', { name: 'Save schedule' }).click();
+  await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
+  expect(bodies).toEqual([{ id: 'school_nights', weekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Sun'], start: '19:30', stop: '07:00' }]);
+});
+
+test('edit mode shows no starting-point chooser', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  await editor(page).locator('[data-schedule-id="browser_fixture"]').getByRole('button', { name: /Edit schedule/ }).click();
+  await expect(editor(page).getByLabel('Start', { exact: true })).toBeVisible();
+  await expect(editor(page).getByLabel('Age band (optional)')).toHaveCount(0);
+  await expect(editor(page).locator('[data-template-note]')).toHaveCount(0);
+  await expect(editor(page)).not.toContainText('Starting point');
 });
