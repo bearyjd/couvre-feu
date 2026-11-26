@@ -11,8 +11,8 @@ export const MAX_EXPANDED_WINDOWS = 256;
 // Mirrors MAX_WINDOWS_PER_CHILD in the integration schedule store.
 const MAX_INTEGRATION_WINDOWS = 8;
 const EXTRA_MINUTES = [15, 30, 60];
-const BAND_LABELS = { under10: 'Under 10', '10to12': '10 to 12', '13to15': '13 to 15', '16to17': '16 to 17' };
-const PART_LABELS = { schoolNight: 'school nights', weekend: 'weekends' };
+export const BAND_LABELS = { under10: 'Under 10', '10to12': '10 to 12', '13to15': '13 to 15', '16to17': '16 to 17' };
+export const PART_LABELS = { schoolNight: 'school nights', weekend: 'weekends' };
 const KIND_LABELS = { bedtime: 'Bedtime', focus: 'Focus' };
 const validKind = (kind) => typeof kind === 'string' && Object.hasOwn(KIND_LABELS, kind);
 // The exclusive observation deadline is FRESH_SECONDS + 1, as in the app's schedule label.
@@ -149,9 +149,10 @@ export function createScheduleEditor(deps) {
         <label for="sched-template-${key}">Age band (optional)</label>
         <select id="sched-template-${key}" data-template data-focus-key="template" aria-describedby="sched-template-help-${key}" ${locked || atLimit ? 'disabled' : ''}>
           <option value="">Choose a starting point</option>
-          ${BANDS.flatMap((band) => PARTS.map((part) => `<option value="${band}:${part}">${BAND_LABELS[band]}, ${PART_LABELS[part]}</option>`)).join('')}
+          ${BANDS.flatMap((band) => PARTS.map((part) => `<option value="${band}:${part}" ${view.open.template === `${band}:${part}` ? 'selected' : ''}>${BAND_LABELS[band]}, ${PART_LABELS[part]}</option>`)).join('')}
         </select>
         <p class="field-help" id="sched-template-help-${key}">Starting point: edit before saving. Unverified on this router.</p>
+        <p class="field-help" data-template-note aria-live="polite"></p>
       </div>` : '';
     const day = (name) => `<label class="day-choice"><input type="checkbox" data-field="day" value="${name}" ${draft.weekdays.includes(name) ? 'checked' : ''} data-focus-key="day-${name}" ${locked}> ${name}</label>`;
     return `<form class="schedule-form" data-schedule-form novalidate aria-labelledby="sched-form-title-${key}">
@@ -255,8 +256,14 @@ export function createScheduleEditor(deps) {
     const lines = previewWindows(draft.weekdays, draft.start, draft.stop), entry = person(view.open.person);
     const clash = entry && lines.length ? entry.schedules.filter((schedule) => schedule.id !== view.open.originalId && overlaps(draft, schedule)).map((schedule) => schedule.id) : [];
     form.querySelector('[data-preview]').innerHTML = lines.length
-      ? `<strong>Blocks access:</strong><ul class="window-list">${lines.map((line) => `<li>${escape(line)}${crossesMidnight(draft.start, draft.stop) ? ' (next day)' : ''}</li>`).join('')}</ul>${clash.length ? `<p class="fine-print">Overlaps ${escape(clash.join(', '))}. Overlaps are allowed; access is blocked whenever any window is active.</p>` : ''}`
+      ? `<strong>Blocks access:</strong><ul class="window-list">${lines.map((line) => `<li>${escape(line)}</li>`).join('')}</ul>${clash.length ? `<p class="fine-print">Overlaps ${escape(clash.join(', '))}. Overlaps are allowed; access is blocked whenever any window is active.</p>` : ''}`
       : '<span class="fine-print">Choose days and two different times to preview the window.</span>';
+    const note = form.querySelector('[data-template-note]');
+    if (!note) return;
+    const [band, part] = (view.open.template ?? '').split(':');
+    const text = part ? `Filled from ${BAND_LABELS[band]}, ${PART_LABELS[part]}. Nothing is saved until you press Save.` : '';
+    // Written only on change, so typing elsewhere in the form does not announce it again.
+    if (note.textContent !== text) note.textContent = text;
   }
 
   function render() {
@@ -304,12 +311,23 @@ export function createScheduleEditor(deps) {
 
   function applyTemplate(value) {
     const [band, part] = String(value).split(':'), template = templatePart(band, part), entry = view.open && person(view.open.person);
-    if (!template || !entry || view.open.mode !== 'create' || active || entry.schedules.length >= maxSchedules()) return;
-    const draft = { id: nextId(entry), weekdays: [...template.weekdays], start: template.start, stop: template.stop };
-    if (view.open.kindEditable) draft.kind = view.open.draft.kind ?? 'bedtime';
-    view = { ...view, open: { ...view.open, draft }, submitted: false, serverErrors: {} };
-    lastKey = '';
-    render();
+    if (!entry || view.open.mode !== 'create' || active || entry.schedules.length >= maxSchedules()) return;
+    if (!template) {
+      view = { ...view, open: { ...view.open, template: '' } };
+      updateLive();
+      return;
+    }
+    const draft = { id: view.open.draft.id || nextId(entry), weekdays: orderedDays(template.weekdays), start: template.start, stop: template.stop };
+    // Every template is a bedtime window, whatever type the draft had.
+    if (view.open.kindEditable) draft.kind = 'bedtime';
+    view = { ...view, open: { ...view.open, draft, template: value }, submitted: false, serverErrors: {} };
+    // Filled in place, not re-rendered: the note's live region must already exist to be announced.
+    const form = root.querySelector('[data-schedule-form]');
+    for (const input of form.querySelectorAll('[data-field]')) {
+      if (input.dataset.field === 'day') input.checked = draft.weekdays.includes(input.value);
+      else input.value = draft[input.dataset.field];
+    }
+    updateLive();
   }
 
   function close() {
