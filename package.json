@@ -20,5 +20,5 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": { "@simplewebauthn/server": "14.1.0" },
-  "devDependencies": { "@levischuck/tiny-cbor": "0.3.6", "@playwright/test": "1.65.1", "@types/node": "26.6.6", "typescript": "7.0.2" }
+  "devDependencies": { "@levischuck/tiny-cbor": "0.3.6", "@playwright/test": "1.65.1", "@types/node": "26.6.11", "typescript": "7.0.2" }
 }
