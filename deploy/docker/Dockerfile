@@ -2,13 +2,13 @@
 # Build from the repository root:  docker build -f deploy/docker/Dockerfile -t couvrefeu:local .
 # The base is pinned by exact Node version AND the multi-arch index digest (verified 2026-10-17);
 # refresh both together when package.json "engines.node" changes.
-FROM node:26.13.1-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS deps
+FROM node:26.13.1-slim@sha256:abe7e5a82b61a8ef67b315b85497c9e65173387ccf2f4a029248184b8e020be5 AS deps
 WORKDIR /app
 RUN npm install -g npm@11.21.3 && test "$(npm --version)" = "11.21.3"
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
-FROM node:26.13.1-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc
+FROM node:26.13.1-slim@sha256:abe7e5a82b61a8ef67b315b85497c9e65173387ccf2f4a029248184b8e020be5
 # openssh-client is the router transport (the service runs `ssh`). uid/gid 10001 is fixed so that
 # host-owned private files (manifest, data directory, agent socket) can be owned by the same uid.
 RUN apt-get update \
