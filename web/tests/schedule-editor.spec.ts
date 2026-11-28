@@ -207,3 +207,51 @@ test('the starting-point note shows only while the form still matches the chosen
   await editor(page).getByLabel('Mon', { exact: true }).check();
   await expect(note).toHaveText('');
 });
+
+test('choosing a starting point after a refused save clears the error, refills the form and saves the new values', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  const bodies: unknown[] = []; let refuse = true;
+  await page.route('**/people/alex/schedules', async (route) => {
+    if (route.request().method() !== 'POST') { await route.continue(); return; }
+    bodies.push(route.request().postDataJSON());
+    if (!refuse) { await route.continue(); return; }
+    refuse = false;
+    await route.fulfill({ status: 400, json: { error: { code: 'invalid_clock', message: 'Fictional clock refusal.' } } });
+  });
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const chooser = editor(page).getByLabel('Age band (optional)'), note = editor(page).locator('[data-template-note]');
+  const start = editor(page).getByLabel('Start'), startError = editor(page).locator('[data-error="start"]');
+  const save = editor(page).getByRole('button', { name: 'Save schedule' });
+  await editor(page).getByLabel('Name', { exact: true }).fill('retry');
+  await chooser.selectOption('10to12:weekend');
+  await save.click();
+  await expect(startError).toHaveText('Fictional clock refusal.');
+  await expect(start).toHaveAttribute('aria-invalid', '');
+  await expect(chooser).toBeEnabled();
+  await expect(chooser).toHaveValue('10to12:weekend');
+  const liveRegion = await note.elementHandle();
+
+  await chooser.selectOption('under10:schoolNight');
+  await expect(startError).toHaveText('');
+  await expect(start).not.toHaveAttribute('aria-invalid');
+  await expect(start).toHaveValue('19:30');
+  await expect(editor(page).getByLabel('Stop')).toHaveValue('07:00');
+  for (const day of ['Mon', 'Tue', 'Wed', 'Thu', 'Sun']) await expect(editor(page).getByLabel(day, { exact: true })).toBeChecked();
+  for (const day of ['Fri', 'Sat']) await expect(editor(page).getByLabel(day, { exact: true })).not.toBeChecked();
+  await expect(editor(page).getByLabel('Name', { exact: true })).toHaveValue('retry');
+  await expect(note).toHaveText('Filled from Under 10, school nights. Nothing is saved until you press Save.');
+  expect(await liveRegion!.evaluate((node) => node.isConnected)).toBe(true);
+  expect(bodies).toHaveLength(1);
+
+  // A refusal asks for a status refresh first; the refreshed form must keep the new choice and not bring the old error back.
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(save).toBeEnabled();
+  await expect(chooser).toHaveValue('under10:schoolNight');
+  await expect(start).toHaveValue('19:30');
+  await expect(startError).toHaveText('');
+  await save.click();
+  await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1]).toEqual({ id: 'retry', weekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Sun'], start: '19:30', stop: '07:00' });
+});
