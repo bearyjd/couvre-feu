@@ -180,3 +180,30 @@ test('edit mode shows no starting-point chooser', async ({ page, demo }) => {
   await expect(editor(page).locator('[data-template-note]')).toHaveCount(0);
   await expect(editor(page)).not.toContainText('Starting point');
 });
+
+test('the starting-point note shows only while the form still matches the chosen band', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const note = editor(page).locator('[data-template-note]'), start = editor(page).getByLabel('Start'), stop = editor(page).getByLabel('Stop');
+  const filled = 'Filled from 10 to 12, weekends. Nothing is saved until you press Save.';
+  await editor(page).getByLabel('Age band (optional)').selectOption('10to12:weekend');
+  await expect(note).toHaveText(filled);
+  // The name is not filled from a band, so changing it leaves the note true.
+  await editor(page).getByLabel('Name', { exact: true }).fill('late_nights');
+  await expect(note).toHaveText(filled);
+  await start.fill('21:45');
+  await expect(note).toHaveText('');
+  await start.fill('21:30');
+  await expect(note).toHaveText(filled);
+  await stop.fill('08:15');
+  await expect(note).toHaveText('');
+  await stop.fill('08:00');
+  await expect(note).toHaveText(filled);
+  await editor(page).getByLabel('Fri', { exact: true }).uncheck();
+  await expect(note).toHaveText('');
+  await editor(page).getByLabel('Fri', { exact: true }).check();
+  await expect(note).toHaveText(filled);
+  await editor(page).getByLabel('Mon', { exact: true }).check();
+  await expect(note).toHaveText('');
+});

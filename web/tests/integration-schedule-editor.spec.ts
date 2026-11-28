@@ -641,6 +641,20 @@ test('recurring focus capability reaches assigned empty cards and focus creation
   await expect(pilot.locator('[data-schedule-id="window_1"] [data-schedule-kind="focus"]')).toHaveText('Focus');
 });
 
+test('changing the schedule type after a starting point withdraws its note', async ({ page, integration: f }) => {
+  f.config.focus = { enabled: true };
+  await openEditor(page, f);
+  const pilot = pilotSchedules(page), note = pilot.locator('[data-template-note]');
+  const filled = 'Filled from 10 to 12, weekends. Nothing is saved until you press Save.';
+  await pilot.getByRole('button', { name: /Add a schedule/ }).click();
+  await pilot.getByLabel('Age band (optional)').selectOption('10to12:weekend');
+  await expect(note).toHaveText(filled);
+  await pilot.getByLabel('Schedule type').selectOption('focus');
+  await expect(note).toHaveText('');
+  await pilot.getByLabel('Schedule type').selectOption('bedtime');
+  await expect(note).toHaveText(filled);
+});
+
 test('disabling recurring focus after create preflight keeps the refused draft', async ({ page, integration: f }) => {
   f.config.focus = { enabled: true };
   await openEditor(page, f);

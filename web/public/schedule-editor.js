@@ -261,7 +261,11 @@ export function createScheduleEditor(deps) {
     const note = form.querySelector('[data-template-note]');
     if (!note) return;
     const [band, part] = (view.open.template ?? '').split(':');
-    const text = part ? `Filled from ${BAND_LABELS[band]}, ${PART_LABELS[part]}. Nothing is saved until you press Save.` : '';
+    const template = templatePart(band, part);
+    // The chosen band stays selected after hand edits, so the note is shown only while the form still holds what that band filled in.
+    const matches = template && orderedDays(template.weekdays).join() === draft.weekdays.join() && template.start === draft.start &&
+      template.stop === draft.stop && (!view.open.kindEditable || draft.kind === 'bedtime');
+    const text = matches ? `Filled from ${BAND_LABELS[band]}, ${PART_LABELS[part]}. Nothing is saved until you press Save.` : '';
     // Written only on change, so typing elsewhere in the form does not announce it again.
     if (note.textContent !== text) note.textContent = text;
   }
