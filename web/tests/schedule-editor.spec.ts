@@ -180,3 +180,128 @@ test('edit mode shows no starting-point chooser', async ({ page, demo }) => {
   await expect(editor(page).locator('[data-template-note]')).toHaveCount(0);
   await expect(editor(page)).not.toContainText('Starting point');
 });
+
+test('the starting-point note shows only while the form still matches the chosen band', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const note = editor(page).locator('[data-template-note]'), start = editor(page).getByLabel('Start'), stop = editor(page).getByLabel('Stop');
+  const filled = 'Filled from 10 to 12, weekends. Nothing is saved until you press Save.';
+  await editor(page).getByLabel('Age band (optional)').selectOption('10to12:weekend');
+  await expect(note).toHaveText(filled);
+  // The name is not filled from a band, so changing it leaves the note true.
+  await editor(page).getByLabel('Name', { exact: true }).fill('late_nights');
+  await expect(note).toHaveText(filled);
+  await start.fill('21:45');
+  await expect(note).toHaveText('');
+  await start.fill('21:30');
+  await expect(note).toHaveText(filled);
+  await stop.fill('08:15');
+  await expect(note).toHaveText('');
+  await stop.fill('08:00');
+  await expect(note).toHaveText(filled);
+  await editor(page).getByLabel('Fri', { exact: true }).uncheck();
+  await expect(note).toHaveText('');
+  await editor(page).getByLabel('Fri', { exact: true }).check();
+  await expect(note).toHaveText(filled);
+  await editor(page).getByLabel('Mon', { exact: true }).check();
+  await expect(note).toHaveText('');
+});
+
+/** Refuses the first `count` schedule creations with a start-field error, then lets the rest through; returns every posted body. */
+async function refuseSaves(page: Page, count: number) {
+  const bodies: unknown[] = [];
+  await page.route('**/people/alex/schedules', async (route) => {
+    if (route.request().method() !== 'POST') { await route.continue(); return; }
+    bodies.push(route.request().postDataJSON());
+    if (bodies.length > count) { await route.continue(); return; }
+    await route.fulfill({ status: 400, json: { error: { code: 'invalid_clock', message: 'Fictional clock refusal.' } } });
+  });
+  return bodies;
+}
+
+/** The app re-renders the control state every second; outlasting two ticks proves a node is not rebuilt, and no event exists for that. */
+const pastControlTick = (page: Page) => page.waitForTimeout(2500);
+
+test('choosing a starting point after a refused save clears the error, refills the form and saves the new values', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  const bodies = await refuseSaves(page, 1);
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const chooser = editor(page).getByLabel('Age band (optional)'), note = editor(page).locator('[data-template-note]');
+  const start = editor(page).getByLabel('Start'), startError = editor(page).locator('[data-error="start"]');
+  const save = editor(page).getByRole('button', { name: 'Save schedule' });
+  await editor(page).getByLabel('Name', { exact: true }).fill('retry');
+  await chooser.selectOption('10to12:weekend');
+  await save.click();
+  await expect(startError).toHaveText('Fictional clock refusal.');
+  await expect(start).toHaveAttribute('aria-invalid', '');
+  await expect(chooser).toBeEnabled();
+  await expect(chooser).toHaveValue('10to12:weekend');
+  const liveRegion = await note.elementHandle();
+
+  await chooser.selectOption('under10:schoolNight');
+  await expect(startError).toHaveText('');
+  await expect(start).not.toHaveAttribute('aria-invalid');
+  await expect(start).toHaveValue('19:30');
+  await expect(editor(page).getByLabel('Stop')).toHaveValue('07:00');
+  for (const day of ['Mon', 'Tue', 'Wed', 'Thu', 'Sun']) await expect(editor(page).getByLabel(day, { exact: true })).toBeChecked();
+  for (const day of ['Fri', 'Sat']) await expect(editor(page).getByLabel(day, { exact: true })).not.toBeChecked();
+  await expect(editor(page).getByLabel('Name', { exact: true })).toHaveValue('retry');
+  await expect(note).toHaveText('Filled from Under 10, school nights. Nothing is saved until you press Save.');
+  await pastControlTick(page);
+  expect(await liveRegion!.evaluate((node) => node.isConnected)).toBe(true);
+  await expect(startError).toHaveText('');
+  expect(bodies).toHaveLength(1);
+
+  // A refusal asks for a status refresh first; the refreshed form must keep the new choice and not bring the old error back.
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(save).toBeEnabled();
+  await expect(chooser).toHaveValue('under10:schoolNight');
+  await expect(start).toHaveValue('19:30');
+  await expect(startError).toHaveText('');
+  await save.click();
+  await expect(page.locator('.operation')).toContainText('Schedule addition confirmed');
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1]).toEqual({ id: 'retry', weekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Sun'], start: '19:30', stop: '07:00' });
+});
+
+test('a hand edit after a refused save keeps the form in place, and later errors still show and clear', async ({ page, demo }) => {
+  await enroll(page, demo);
+  await openTab(page, 'more');
+  const bodies = await refuseSaves(page, 2);
+  await editor(page).getByRole('button', { name: 'Add a schedule for Alex (fictional)' }).click();
+  const name = editor(page).getByLabel('Name', { exact: true }), startError = editor(page).locator('[data-error="start"]');
+  const formError = editor(page).locator('[data-error="form"]'), save = editor(page).getByRole('button', { name: 'Save schedule' });
+  await editor(page).getByLabel('Age band (optional)').selectOption('10to12:weekend');
+  await save.click();
+  await expect(startError).toHaveText('Fictional clock refusal.');
+  await expect(save).toBeDisabled();
+  await pastControlTick(page);
+  await expect(startError).toHaveText('Fictional clock refusal.');
+  const nodes = await Promise.all(['[data-template-note]', '[data-preview]', '[data-field="id"]'].map((selector) => editor(page).locator(selector).elementHandle()));
+
+  await name.fill('by_hand');
+  await expect(startError).toHaveText('');
+  await pastControlTick(page);
+  for (const node of nodes) expect(await node!.evaluate((element) => element.isConnected)).toBe(true);
+  await expect(name).toBeFocused();
+  await expect(startError).toHaveText('');
+
+  // Save is disabled until a refresh; a submit that still arrives must explain itself, and the next edit must clear that.
+  await editor(page).locator('[data-schedule-form]').evaluate((form: HTMLFormElement) => form.requestSubmit());
+  await expect(formError).toContainText('Controls are unavailable until status is refreshed.');
+  await name.fill('by_hand_again');
+  await expect(formError).toHaveText('');
+  await pastControlTick(page);
+  await expect(formError).toHaveText('');
+  expect(bodies).toHaveLength(1);
+
+  // The same refusal a second time is shown again.
+  await page.getByRole('button', { name: 'Refresh status' }).click();
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect(startError).toHaveText('Fictional clock refusal.');
+  await expect(name).toHaveValue('by_hand_again');
+  expect(bodies).toHaveLength(2);
+});

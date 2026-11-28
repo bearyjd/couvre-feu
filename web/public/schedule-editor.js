@@ -261,7 +261,11 @@ export function createScheduleEditor(deps) {
     const note = form.querySelector('[data-template-note]');
     if (!note) return;
     const [band, part] = (view.open.template ?? '').split(':');
-    const text = part ? `Filled from ${BAND_LABELS[band]}, ${PART_LABELS[part]}. Nothing is saved until you press Save.` : '';
+    const template = templatePart(band, part);
+    // The chosen band stays selected after hand edits, so the note is shown only while the form still holds what that band filled in.
+    const matches = template && orderedDays(template.weekdays).join() === draft.weekdays.join() && template.start === draft.start &&
+      template.stop === draft.stop && (!view.open.kindEditable || draft.kind === 'bedtime');
+    const text = matches ? `Filled from ${BAND_LABELS[band]}, ${PART_LABELS[part]}. Nothing is saved until you press Save.` : '';
     // Written only on change, so typing elsewhere in the form does not announce it again.
     if (note.textContent !== text) note.textContent = text;
   }
@@ -279,7 +283,9 @@ export function createScheduleEditor(deps) {
     if ((view.open && !person(view.open.person)) || (view.confirm && !person(view.confirm.person))) reset();
     const enabled = !active && deps.canControl();
     const allowances = people.map(allowanceStatus);
-    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness, kindEditable(entry)]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm, view.serverErrors]);
+    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness, kindEditable(entry)]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm]);
+    // Server errors are left out of the key: updateLive writes and clears them in place, so an edit after a refusal does not rebuild the
+    // form (and its live regions) on the next tick. A path that must show an error without an edit resets lastKey before rendering.
     if (key === lastKey) return;
     lastKey = key;
     const focused = document.activeElement?.dataset?.focusKey;
