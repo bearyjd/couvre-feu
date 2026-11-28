@@ -909,7 +909,7 @@ test('a starting point saves one part at seven windows and the chooser is disabl
   await expect(chooser).toBeEnabled();
   await editor(page).getByRole('button', { name: 'Save schedule' }).click();
   await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
-  expect(calls.attempts).toHaveLength(1);
+  await expect.poll(() => calls.attempts.length).toBe(1);
   expect(calls.attempts[0].postDataJSON()).toEqual({ id: 'window_7', weekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Sun'], start: '22:30', stop: '07:00' });
   await dispatchPending(f);
   await expect(add).toBeDisabled();
@@ -926,6 +926,6 @@ test('a starting point sets the Bedtime type even when the draft was Focus', asy
   await expect(type).toHaveValue('bedtime');
   await editor(page).getByRole('button', { name: 'Save schedule' }).click();
   await expect.poll(() => f.store.integrationState().active_operation_id).not.toBeNull();
-  expect(calls.attempts).toHaveLength(1);
+  await expect.poll(() => calls.attempts.length).toBe(1);
   expect(calls.attempts[0].postDataJSON()).toMatchObject({ weekdays: ['Fri', 'Sat'], start: '22:30', stop: '08:00', kind: 'bedtime' });
 });
