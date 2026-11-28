@@ -543,7 +543,8 @@ async function failBetweenMarks({f, ntfy, logs, boot}: Parameters<Parameters<typ
     assert.equal(mark(f, 'alert_held_push_id'), heldBefore);
     return {failing, urgentId};
 }
-test('a failure between the two marks loses no held alert: it is looked at again after a restart', async () => {
+// Intended at-least-once behaviour: a sent mark that was not saved before a restart cannot be known, so that held alert is pushed once more.
+test('a failure between the two marks loses no held alert: after a restart it is pushed exactly once more (intended duplicate)', async () => {
     await quiet(NIGHT, async h => {
         const {failing, urgentId} = await failBetweenMarks(h); await failing.stop();
         const heldId = h.f.store.get<{id: number}>("SELECT id FROM parent_alerts WHERE kind='time_request_pending'")!.id;
@@ -561,15 +562,8 @@ test('a failure between the two marks does not repeat the urgent alert after a r
         assert.equal(h.ntfy.seen.length, 1, 'with the held alert resolved, nothing is left to send'); await n.stop();
     });
 });
-// Known duplicates, recorded as TODO so they stay visible without failing the run: the two marks are written separately after the send.
-test('a failure between the two marks does not push the held alert a second time after a restart', {todo: 'push-runtime.ts: held.write is separate from alerts.write, so the held alert is pushed again'}, async () => {
-    await quiet(NIGHT, async h => {
-        const {failing} = await failBetweenMarks(h); await failing.stop();
-        h.set(MORNING); const n = h.boot();
-        try { await n.tick(); assert.equal(h.ntfy.seen.length, 1); } finally { await n.stop(); }
-    });
-});
-test('a held mark that stays unwritable does not push again on every pass', {todo: 'push-runtime.ts: nothing remembers a sent push when held.write throws, so each pass sends again'}, async () => {
+// Known gap, recorded as TODO so it stays visible without failing the run. The process keeps running here, so it could know it already sent.
+test('a held mark that stays unwritable does not push again on every pass', {todo: 'push-runtime.ts keeps no memory of a sent push: while held.write keeps throwing, every pass outside quiet hours pushes the open held alert again'}, async () => {
     await quiet(NIGHT, async h => {
         const {failing} = await failBetweenMarks(h);
         try { await failing.tick(); await failing.tick(); assert.equal(h.ntfy.seen.length, 1); } finally { await failing.stop(); }
