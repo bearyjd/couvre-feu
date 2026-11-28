@@ -268,6 +268,9 @@ test('latestDigestSlot is the most recent Sunday 18:00 ET across DST weeks (2026
     assert.equal(latestDigestSlot(utc(2026, 3, 15, 4, 30)), utc(2026, 3, 8, 22, 0));
 });
 
+// 21:00 New York as a UTC instant: the evenings before and of each DST change (2026-11-01 back, 2027-03-14 forward).
+const QUIET_STARTS = [utc(2026, 11, 1, 1, 0), utc(2026, 11, 2, 2, 0), utc(2027, 3, 14, 2, 0), utc(2027, 3, 15, 1, 0)];
+
 test('quiet hours: 21:00 to 07:00 New York, across DST', () => {
     // EDT (UTC-4): 20:59:59 open, 21:00 quiet, 06:59:59 quiet, 07:00 open.
     assert.equal(inQuietHours(utc(2026, 10, 29, 0, 59) + 59), false);
@@ -491,5 +494,84 @@ test('held-path failure isolation: a throwing held query or quiet-hours check ne
         assert.ok(logs.includes('push_held_pass_failed\n'), 'the failure is logged as a fixed tag');
         assert.ok(logs.every(l => /^[a-z_ 0-9]+\n$/.test(l)), 'tags only, no error text');
         await n.stop();
+    });
+});
+
+test('quiet hours start at exactly 21:00 New York, including the evenings around both DST changes', () => {
+    for (const start of QUIET_STARTS) {
+        assert.equal(inQuietHours(start - 1), false, `just before ${start}`);
+        assert.equal(inQuietHours(start), true, `exactly at ${start}`);
+        assert.equal(inQuietHours(start + 1), true, `just after ${start}`);
+    }
+});
+test('a held alert pushes just before 21:00 and is held at and just after 21:00', async () => {
+    for (const start of QUIET_STARTS) {
+        await quiet(start - 1, async ({f, ntfy, set, boot}) => {
+            const n = boot(); await n.tick();
+            alertRow(f, 'time_request_pending'); await n.tick();
+            assert.equal(ntfy.seen.length, 1, `pushed just before ${start}`);
+            const pushed = mark(f, 'alert_held_push_id');
+            set(start); alertRow(f, 'repeated_blocked_attempts'); await n.tick();
+            assert.equal(ntfy.seen.length, 1, `held exactly at ${start}`);
+            set(start + 1); await n.tick();
+            assert.equal(ntfy.seen.length, 1, `held just after ${start}`);
+            assert.equal(mark(f, 'alert_held_push_id'), pushed, 'the held alert stays pending'); await n.stop();
+        });
+    }
+});
+
+/** Leaves a held alert from overnight and a new urgent one, then runs the 07:00 pass with the held mark unwritable: the push is sent and only the urgent mark is stored. */
+async function failBetweenMarks({f, ntfy, logs, boot}: Parameters<Parameters<typeof quiet>[1]>[0]) {
+    const night = boot(); await night.tick();
+    alertRow(f, 'time_request_pending'); await night.tick(); await night.stop();
+    const heldBefore = mark(f, 'alert_held_push_id');
+    alertRow(f, 'new_device');
+    const urgentId = f.store.get<{m: number}>('SELECT MAX(id) m FROM parent_alerts')!.m;
+    const store = new Proxy(f.store, {get: (target, key) => {
+        const value = Reflect.get(target, key, target);
+        if (key !== 'run') return typeof value === 'function' ? value.bind(target) : value;
+        return (sql: string, ...args: unknown[]) => {
+            if (args[0] === 'alert_held_push_id') throw new Error('stopped between the marks');
+            return (value as (...a: unknown[]) => unknown).call(target, sql, ...args);
+        };
+    }});
+    const failing = startNotifications({...f.config, push: {enabled: true}}, store as typeof f.store, {env: ntfy.env, now: () => MORNING, options: {sleep: noSleep, log: l => logs.push(String(l))}})!;
+    await failing.tick();
+    assert.equal(ntfy.seen.length, 1);
+    assert.ok(logs.includes('push_alert_pass_failed\n'));
+    assert.equal(mark(f, 'alert_push_id'), urgentId);
+    assert.equal(mark(f, 'alert_held_push_id'), heldBefore);
+    return {failing, urgentId};
+}
+test('a failure between the two marks loses no held alert: it is looked at again after a restart', async () => {
+    await quiet(NIGHT, async h => {
+        const {failing, urgentId} = await failBetweenMarks(h); await failing.stop();
+        const heldId = h.f.store.get<{id: number}>("SELECT id FROM parent_alerts WHERE kind='time_request_pending'")!.id;
+        h.set(MORNING); const n = h.boot(); await n.tick(); await n.tick();
+        assert.equal(h.ntfy.seen.length, 2, 'the held alert, whose mark was not stored, is pushed again, once');
+        assert.equal(mark(h.f, 'alert_push_id'), urgentId);
+        assert.equal(mark(h.f, 'alert_held_push_id'), heldId); await n.stop();
+    });
+});
+test('a failure between the two marks does not repeat the urgent alert after a restart', async () => {
+    await quiet(NIGHT, async h => {
+        const {failing} = await failBetweenMarks(h); await failing.stop();
+        h.f.store.run("UPDATE parent_alerts SET state='resolved' WHERE kind='time_request_pending'");
+        h.set(MORNING); const n = h.boot(); await n.tick();
+        assert.equal(h.ntfy.seen.length, 1, 'with the held alert resolved, nothing is left to send'); await n.stop();
+    });
+});
+// Known duplicates, recorded as TODO so they stay visible without failing the run: the two marks are written separately after the send.
+test('a failure between the two marks does not push the held alert a second time after a restart', {todo: 'push-runtime.ts: held.write is separate from alerts.write, so the held alert is pushed again'}, async () => {
+    await quiet(NIGHT, async h => {
+        const {failing} = await failBetweenMarks(h); await failing.stop();
+        h.set(MORNING); const n = h.boot();
+        try { await n.tick(); assert.equal(h.ntfy.seen.length, 1); } finally { await n.stop(); }
+    });
+});
+test('a held mark that stays unwritable does not push again on every pass', {todo: 'push-runtime.ts: nothing remembers a sent push when held.write throws, so each pass sends again'}, async () => {
+    await quiet(NIGHT, async h => {
+        const {failing} = await failBetweenMarks(h);
+        try { await failing.tick(); await failing.tick(); assert.equal(h.ntfy.seen.length, 1); } finally { await failing.stop(); }
     });
 });
