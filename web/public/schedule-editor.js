@@ -283,7 +283,9 @@ export function createScheduleEditor(deps) {
     if ((view.open && !person(view.open.person)) || (view.confirm && !person(view.confirm.person))) reset();
     const enabled = !active && deps.canControl();
     const allowances = people.map(allowanceStatus);
-    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness, kindEditable(entry)]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm, view.serverErrors]);
+    const key = JSON.stringify([integration(), allowances, people.map((entry) => [entry.id, entry.name, entry.schedules, entry.devices.length, entry.scheduleTimezone, entry.scheduleWitness, kindEditable(entry)]), enabled, Boolean(active), Boolean(active?.posting), view.open && [view.open.person, view.open.mode, view.open.originalId], view.confirm]);
+    // Server errors are left out of the key: updateLive writes and clears them in place, so an edit after a refusal does not rebuild the
+    // form (and its live regions) on the next tick. A path that must show an error without an edit resets lastKey before rendering.
     if (key === lastKey) return;
     lastKey = key;
     const focused = document.activeElement?.dataset?.focusKey;
